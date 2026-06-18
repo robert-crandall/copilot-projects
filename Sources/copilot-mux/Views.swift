@@ -26,8 +26,12 @@ struct SidebarView: View {
             set: { model.selectProject($0) }
         )) {
             Section("Projects") {
-                ForEach(model.projects) { project in
-                    ProjectRow(project: project)
+                ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
+                    ProjectRow(
+                        project: project,
+                        number: index < 9 ? index + 1 : nil,
+                        showNumber: model.numberHint == .projects
+                    )
                         .tag(project.id)
                         .contextMenu {
                             Button("New Session") { model.addSession(toProjectId: project.id) }
@@ -58,6 +62,8 @@ struct SidebarView: View {
 
 struct ProjectRow: View {
     let project: Project
+    var number: Int? = nil
+    var showNumber: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -70,7 +76,9 @@ struct ProjectRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            if project.hasUnread {
+            if showNumber, let number {
+                NumberBadge(number: number)
+            } else if project.hasUnread {
                 Image(systemName: "bell.badge.fill")
                     .foregroundStyle(.blue)
                     .font(.caption)
@@ -105,6 +113,24 @@ struct StatusDot: View {
         case .running: return Color.blue
         case .waiting: return Color.orange
         }
+    }
+}
+
+/// Keycap-style number shown on projects (⌘) / tabs (⌃) while the modifier is held.
+struct NumberBadge: View {
+    let number: Int
+
+    var body: some View {
+        Text("\(number)")
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(.white)
+            .frame(width: 18, height: 18)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.accentColor))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .strokeBorder(.white.opacity(0.3), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
     }
 }
 
@@ -191,10 +217,12 @@ struct SessionTabBar: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 4) {
-                ForEach(project.sessions) { session in
+                ForEach(Array(project.sessions.enumerated()), id: \.element.id) { index, session in
                     SessionTab(
                         session: session,
                         isActive: session.id == project.selectedSessionId,
+                        number: index < 9 ? index + 1 : nil,
+                        showNumber: model.numberHint == .tabs,
                         onSelect: { model.selectSession(projectId: project.id, sessionId: session.id) },
                         onClose: { model.requestCloseSession(projectId: project.id, sessionId: session.id) }
                     )
@@ -216,12 +244,18 @@ struct SessionTabBar: View {
 struct SessionTab: View {
     let session: Session
     let isActive: Bool
+    var number: Int? = nil
+    var showNumber: Bool = false
     let onSelect: () -> Void
     let onClose: () -> Void
 
     var body: some View {
         HStack(spacing: 6) {
-            StatusDot(status: session.status)
+            if showNumber, let number {
+                NumberBadge(number: number)
+            } else {
+                StatusDot(status: session.status)
+            }
             Text(session.title)
                 .font(.callout)
                 .lineLimit(1)

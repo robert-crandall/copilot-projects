@@ -8,6 +8,7 @@ import CopilotMuxCore
 final class AppModel: ObservableObject {
     @Published private(set) var projects: [Project] = []
     @Published private(set) var selectedProjectId: String?
+    @Published var numberHint: NumberHint = .none
 
     private var controllers: [String: TerminalController] = [:]
     private var server: ControlServer?
@@ -350,6 +351,15 @@ final class AppModel: ObservableObject {
         guard let pid = selectedProjectId, let pi = projectIndex(pid),
               index >= 0, index < projects[pi].sessions.count else { return }
         selectSession(projectId: pid, sessionId: projects[pi].sessions[index].id)
+    }
+
+    func selectProjectByIndex(_ index: Int) {
+        guard index >= 0, index < projects.count else { return }
+        selectProject(projects[index].id)
+    }
+
+    func setNumberHint(_ hint: NumberHint) {
+        if numberHint != hint { numberHint = hint }
     }
 
     func selectAdjacentSession(_ delta: Int) {

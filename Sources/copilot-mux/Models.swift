@@ -61,3 +61,10 @@ struct PersistedState: Codable {
     var projects: [Project]
     var selectedProjectId: String?
 }
+
+/// Which number-key overlay to show while a modifier is held.
+enum NumberHint {
+    case none      // nothing held
+    case projects  // ⌘ held → number badges on projects
+    case tabs      // ⌃ held → number badges on session tabs
+}

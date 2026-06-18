@@ -25,13 +25,6 @@ struct CopilotMuxApp: App {
                     .keyboardShortcut("]", modifiers: [.command, .shift])
                 Button("Previous Session") { appDelegate.model.selectAdjacentSession(-1) }
                     .keyboardShortcut("[", modifiers: [.command, .shift])
-                Divider()
-                ForEach(1...9, id: \.self) { n in
-                    Button("Select Session \(n)") {
-                        appDelegate.model.selectSessionByIndex(n - 1)
-                    }
-                    .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
-                }
             }
         }
     }
@@ -41,6 +34,8 @@ struct CopilotMuxApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     private let notifications = NotificationManager()
+    private var eventMonitor: Any?
+    private var hintWork: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -62,6 +57,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.activate(ignoringOtherApps: true)
+
+        // ⌘/⌃ + number navigation, and the modifier-hold number overlay.
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
+            guard let self else { return event }
+            return self.handleKeyEvent(event)
+        }
+    }
+
+    private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
+        switch event.type {
+        case .flagsChanged:
+            updateNumberHint(event.modifierFlags)
+            return event
+        case .keyDown:
+            hintWork?.cancel()
+            model.setNumberHint(.none)
+            let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            if let digit = Self.digit(from: event) {
+                if mods == .command { model.selectProjectByIndex(digit - 1); return nil }
+                if mods == .control { model.selectSessionByIndex(digit - 1); return nil }
+            }
+            return event
+        default:
+            return event
+        }
+    }
+
+    private func updateNumberHint(_ flags: NSEvent.ModifierFlags) {
+        let mods = flags.intersection([.command, .control, .option, .shift])
+        let target: NumberHint = mods == .command ? .projects : (mods == .control ? .tabs : .none)
+        hintWork?.cancel()
+        guard target != .none else {
+            model.setNumberHint(.none)
+            return
+        }
+        // Brief delay so quick combos (⌘C, ⌘T…) don't flash the overlay.
+        let work = DispatchWorkItem { [weak self] in self?.model.setNumberHint(target) }
+        hintWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+    }
+
+    private static func digit(from event: NSEvent) -> Int? {
+        guard let s = event.charactersIgnoringModifiers, s.count == 1,
+              let n = Int(s), (1...9).contains(n) else { return nil }
+        return n
     }
 
     func applicationWillTerminate(_ notification: Notification) {
