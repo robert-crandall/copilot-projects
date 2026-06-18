@@ -45,6 +45,11 @@ mkdir -p "$MACOS" "$RES"
 
 cp "$BUILD_DIR/$EXE_NAME" "$MACOS/$EXE_NAME"
 
+# App icon
+if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
+  cp "$ROOT/Resources/AppIcon.icns" "$RES/AppIcon.icns"
+fi
+
 # Build + bundle the dtach helper (resumability backend) as a universal binary.
 DTACH_SRC="$ROOT/vendor/dtach"
 if [ -d "$DTACH_SRC" ]; then
@@ -82,7 +87,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>CFBundleIconFile</key><string></string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
 </dict>
 </plist>
 PLIST
