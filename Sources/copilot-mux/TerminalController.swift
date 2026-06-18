@@ -8,6 +8,12 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     let sessionId: String
     let terminalView: LocalProcessTerminalView
 
+    /// PID of the shell this terminal is running (0 until spawned). Used for the
+    /// process-liveness check.
+    var shellPID: pid_t {
+        terminalView.process?.shellPid ?? 0
+    }
+
     var onTitle: ((String) -> Void)?
     var onDirectory: ((String?) -> Void)?
     var onExit: ((Int32?) -> Void)?

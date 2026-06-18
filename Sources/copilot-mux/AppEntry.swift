@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.attach(notifications: notifications)
         model.bootstrapIfNeeded()
         model.startServer()
+        model.startLivenessReconciler()
         model.installCLISymlinkIfPossible()
         CopilotHooks.installIfPossible()
 

@@ -14,6 +14,25 @@ final class AppModel: ObservableObject {
     private weak var notifications: NotificationManager?
     private var saveWork: DispatchWorkItem?
 
+    private var livenessTimer: Timer?
+
+    /// Process names treated as a live coding agent for the liveness backstop.
+    /// Override with COPILOT_MUX_AGENT_PROCESSES (comma-separated); disable the
+    /// whole check with COPILOT_MUX_LIVENESS=0.
+    private var agentProcessNames: Set<String> {
+        if let raw = ProcessInfo.processInfo.environment["COPILOT_MUX_AGENT_PROCESSES"], !raw.isEmpty {
+            let names = raw.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !names.isEmpty { return Set(names) }
+        }
+        return ["copilot"]
+    }
+
+    private var livenessEnabled: Bool {
+        ProcessInfo.processInfo.environment["COPILOT_MUX_LIVENESS"] != "0"
+    }
+
     init() {
         load()
     }
@@ -282,8 +301,47 @@ final class AppModel: ObservableObject {
 
     func setStatus(sessionId: String, status: SessionStatus, text: String?) {
         guard let loc = locateIndex(sessionId) else { return }
+        let current = projects[loc.p].sessions[loc.s]
+        guard current.status != status || current.statusText != text else { return }
         projects[loc.p].sessions[loc.s].status = status
         projects[loc.p].sessions[loc.s].statusText = text
+    }
+
+    /// Backstop for flaky agent stop / sessionEnd hooks: a session can only stay
+    /// `running`/`waiting` while its shell actually hosts a live agent process.
+    /// This never clears status while the agent is genuinely working (unlike a
+    /// time-based decay), and clears promptly when the agent exits or crashes.
+    func startLivenessReconciler() {
+        livenessTimer?.invalidate()
+        guard livenessEnabled else { return }
+        let timer = Timer(timeInterval: 8, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.reconcileLiveness() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        livenessTimer = timer
+    }
+
+    private func reconcileLiveness() {
+        let hasActive = projects.contains { project in
+            project.sessions.contains { $0.status == .running || $0.status == .waiting }
+        }
+        guard hasActive else { return }
+
+        let names = agentProcessNames
+        let snapshot = ProcessTree.snapshot()
+        for pi in projects.indices {
+            for si in projects[pi].sessions.indices {
+                let status = projects[pi].sessions[si].status
+                guard status == .running || status == .waiting else { continue }
+                let sid = projects[pi].sessions[si].id
+                let shell = controllers[sid]?.shellPID ?? 0
+                let alive = ProcessTree.hasDescendant(under: shell, named: names, in: snapshot)
+                if !alive {
+                    projects[pi].sessions[si].status = .idle
+                    projects[pi].sessions[si].statusText = nil
+                }
+            }
+        }
     }
 
     func postNotification(projectId: String, sessionId: String, title: String, body: String?) {

@@ -43,22 +43,27 @@ public enum CopilotHooks {
       idle)    set_status idle ;;
       pre)
         payload="$(cat 2>/dev/null || true)"
-        if is_ask_user "$payload"; then set_status waiting; fi
+        if is_ask_user "$payload"; then set_status waiting; else set_status running; fi
         ;;
       post)
-        payload="$(cat 2>/dev/null || true)"
-        if is_ask_user "$payload"; then set_status running; fi
+        cat >/dev/null 2>&1 || true   # drain stdin
+        set_status running            # also refreshes the liveness heartbeat
         ;;
     esac
     emit
     exit 0
     """#
 
-    /// Copilot CLI hook wiring (one entry per lifecycle event).
+    /// Copilot CLI hook wiring (one entry per lifecycle event). sessionStart and
+    /// sessionEnd reset to idle so a fresh / exited agent never reads as running;
+    /// tool events refresh the heartbeat so the app can decay a stuck "running".
     public static let config = #"""
     {
       "version": 1,
       "hooks": {
+        "sessionStart": [
+          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" idle", "timeoutSec": 5 }
+        ],
         "userPromptSubmitted": [
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" running", "timeoutSec": 5 }
         ],
@@ -69,6 +74,9 @@ public enum CopilotHooks {
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" post", "timeoutSec": 10 }
         ],
         "agentStop": [
+          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" idle", "timeoutSec": 5 }
+        ],
+        "sessionEnd": [
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" idle", "timeoutSec": 5 }
         ]
       }

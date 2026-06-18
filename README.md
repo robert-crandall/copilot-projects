@@ -92,15 +92,24 @@ agent lifecycle to status:
 
 | Copilot CLI event | status |
 | --- | --- |
+| `sessionStart` | `idle` |
 | `userPromptSubmitted` | `running` |
 | `preToolUse` (tool = `ask_user`) | `waiting` |
 | `postToolUse` (tool = `ask_user`) | `running` |
 | `agentStop` | `idle` |
+| `sessionEnd` | `idle` |
 
 The hook no-ops outside a copilot-mux terminal (it checks `COPILOT_MUX_SESSION`), so it
 coexists with other integrations (e.g. cmux) and is safe to leave installed globally. Manage
 it with `copilot-mux install-hooks` / `uninstall-hooks`. Start a new Copilot CLI session to
 pick up changes.
+
+**Liveness backstop.** Stop/exit hooks can be missed (a crash, `kill`, a closed terminal), so
+the app also reconciles: a session can only stay `running`/`waiting` while its shell actually
+hosts a live `copilot` process. The moment the agent exits, the dot drops to idle — and it is
+never cleared while the agent is genuinely working (no timing guesswork). Tune the detected
+process names with `COPILOT_MUX_AGENT_PROCESSES` (comma-separated, default `copilot`) or turn
+the check off with `COPILOT_MUX_LIVENESS=0`.
 
 For other agents, call the CLI from their hooks directly:
 
