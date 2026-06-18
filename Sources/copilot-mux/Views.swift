@@ -40,6 +40,8 @@ struct RootView: View {
             }
         }
         .frame(height: 38)
+        .frame(maxWidth: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -263,7 +265,6 @@ struct SessionTabBar: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
         }
-        .background(Color(nsColor: .underPageBackgroundColor))
     }
 }
 
