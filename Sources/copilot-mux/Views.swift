@@ -10,7 +10,8 @@ struct RootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            topBar
+            titleBarStrip
+            tabRow
             Divider()
             HStack(spacing: 0) {
                 SidebarView(model: model)
@@ -34,7 +35,7 @@ struct RootView: View {
             Color(nsColor: .windowBackgroundColor)
             Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
         }
-        .frame(width: 6)
+        .frame(width: 10)
         .frame(maxHeight: .infinity)
         .contentShape(Rectangle())
         .onHover { hovering in
@@ -52,16 +53,25 @@ struct RootView: View {
 
     // Browser-style title strip: macOS traffic lights at the far left, then the
     // selected project's session tabs fill the rest (no wasted top space).
-    private var topBar: some View {
-        HStack(spacing: 6) {
-            Color.clear.frame(width: 70)            // room for the traffic lights
+    // The macOS traffic lights live in this thin strip, which is the system's
+    // draggable title region. Tabs can't go here: dragging in the title region
+    // moves the window, which steals the tabs' drag-to-reorder. So tabs sit just
+    // below it instead (same window-background color, so it reads as one header).
+    private var titleBarStrip: some View {
+        Color(nsColor: .windowBackgroundColor)
+            .frame(height: 28)
+            .frame(maxWidth: .infinity)
+    }
+
+    private var tabRow: some View {
+        HStack(spacing: 0) {
             if let project = model.selectedProject, !project.sessions.isEmpty {
                 SessionTabBar(model: model, project: project)
             } else {
                 Spacer(minLength: 0)
             }
         }
-        .frame(height: 38)
+        .frame(height: 34)
         .frame(maxWidth: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
     }

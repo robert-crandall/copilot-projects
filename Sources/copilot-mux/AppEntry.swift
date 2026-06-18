@@ -103,6 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         case .keyDown:
             let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            // ⌘W closes the current tab. (macOS's default ⌘W closes the *window*,
+            // which quits the app — that's the accidental-quit footgun.)
+            if mods == .command, event.charactersIgnoringModifiers == "w" {
+                model.closeSelectedSession()
+                return nil
+            }
             // Control+Tab / Control+Shift+Tab cycle tabs (browser-style). Keep the
             // overlay up if it's showing so you can keep cycling while holding ⌃.
             if event.keyCode == 48 {  // Tab
