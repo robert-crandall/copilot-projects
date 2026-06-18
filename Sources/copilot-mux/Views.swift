@@ -1,31 +1,53 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import CopilotMuxCore
 
 struct RootView: View {
     @ObservedObject var model: AppModel
     @AppStorage("sidebarWidth") private var sidebarWidth: Double = 240
+    @State private var dragStart: Double?
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
             Divider()
-            HSplitView {
+            HStack(spacing: 0) {
                 SidebarView(model: model)
-                    .frame(minWidth: 200, idealWidth: sidebarWidth, maxWidth: 360)
-                    .background(GeometryReader { geo in
-                        // Persist the user's drag so the width survives project
-                        // switches and app restarts (idealWidth seeds the launch).
-                        Color.clear.onChange(of: geo.size.width) { w in
-                            if w >= 200, w <= 360 { sidebarWidth = w }
-                        }
-                    })
+                    .frame(width: sidebarWidth)
+                    .frame(maxHeight: .infinity)
+                resizeHandle
                 DetailView(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .ignoresSafeArea(.container, edges: .top)
         .background(WindowConfigurator())
+    }
+
+    // A real 6px column (not an overlay, so the terminal's AppKit view can't steal
+    // its drags) with a centered hairline. Width is a fixed frame restored straight
+    // from @AppStorage and only written on an actual drag, so it never gets
+    // clobbered by transient layout and survives project switches + app restarts.
+    private var resizeHandle: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+        }
+        .frame(width: 6)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    if dragStart == nil { dragStart = sidebarWidth }
+                    sidebarWidth = min(max((dragStart ?? sidebarWidth) + value.translation.width, 200), 360)
+                }
+                .onEnded { _ in dragStart = nil }
+        )
     }
 
     // Browser-style title strip: macOS traffic lights at the far left, then the
@@ -241,6 +263,7 @@ struct ProjectTerminalsView: View {
 struct SessionTabBar: View {
     @ObservedObject var model: AppModel
     let project: Project
+    @State private var draggedSession: Session?
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -254,6 +277,13 @@ struct SessionTabBar: View {
                         onSelect: { model.selectSession(projectId: project.id, sessionId: session.id) },
                         onClose: { model.requestCloseSession(projectId: project.id, sessionId: session.id) }
                     )
+                    .onDrag {
+                        draggedSession = session
+                        return NSItemProvider(object: session.id as NSString)
+                    }
+                    .onDrop(of: [.text], delegate: TabDropDelegate(
+                        target: session, dragged: $draggedSession,
+                        model: model, projectId: project.id))
                 }
                 Button { model.addSession(toProjectId: project.id) } label: {
                     Image(systemName: "plus").font(.caption)
@@ -266,6 +296,22 @@ struct SessionTabBar: View {
             .padding(.vertical, 5)
         }
     }
+}
+
+/// Live drag-to-reorder for session tabs: as the dragged tab passes over another,
+/// it moves to that slot.
+private struct TabDropDelegate: DropDelegate {
+    let target: Session
+    @Binding var dragged: Session?
+    let model: AppModel
+    let projectId: String
+
+    func dropEntered(info: DropInfo) {
+        guard let dragged, dragged.id != target.id else { return }
+        model.moveSession(projectId: projectId, draggedId: dragged.id, targetId: target.id)
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool { dragged = nil; return true }
 }
 
 struct SessionTab: View {

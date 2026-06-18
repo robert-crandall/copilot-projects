@@ -364,6 +364,16 @@ final class AppModel: ObservableObject {
         save()
     }
 
+    /// Reorder session tabs within a project (drag-and-drop in the tab bar).
+    func moveSession(projectId: String, draggedId: String, targetId: String) {
+        guard let pi = projectIndex(projectId),
+              let from = projects[pi].sessions.firstIndex(where: { $0.id == draggedId }),
+              let to = projects[pi].sessions.firstIndex(where: { $0.id == targetId }),
+              from != to else { return }
+        projects[pi].sessions.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        save()
+    }
+
     func setNumberHint(_ hint: NumberHint) {
         if numberHint != hint { numberHint = hint }
     }
