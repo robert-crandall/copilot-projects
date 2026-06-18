@@ -56,7 +56,7 @@ public struct ControlClient {
         }
         if connectResult != 0 {
             throw ControlClientError.cannotConnect(
-                "is Copilot Mux running? (\(socketPath), errno \(errno))")
+                "is Copilot Projects running? (\(socketPath), errno \(errno))")
         }
 
         var payload = try Wire.encodeLine(request)

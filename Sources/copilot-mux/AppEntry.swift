@@ -6,10 +6,11 @@ struct CopilotMuxApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Window("Copilot Mux", id: "main") {
+        Window("Copilot Projects", id: "main") {
             RootView(model: appDelegate.model)
                 .frame(minWidth: 820, minHeight: 520)
         }
+        .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Project…") { appDelegate.model.addProjectInteractive() }
@@ -123,18 +124,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.detachAllClients()   // keep dtach masters alive for resume
         model.stopServer()
         model.save()
-    }
-
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let active = model.activeSessionCount
-        guard active > 0 else { return .terminateNow }
-        let alert = NSAlert()
-        alert.messageText = active == 1 ? "A session is still working" : "\(active) sessions are still working"
-        alert.informativeText = "Quitting copilot-mux ends them. Quit anyway?"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Quit")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

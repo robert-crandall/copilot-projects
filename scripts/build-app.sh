@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Assemble Copilot Mux.app from the SwiftPM build product.
+# Assemble Copilot Projects.app from the SwiftPM build product.
 #
-#   scripts/build-app.sh            # debug build -> dist/Copilot Mux.app
+#   scripts/build-app.sh            # debug build -> dist/Copilot Projects.app
 #   scripts/build-app.sh --release  # release build
 #   scripts/build-app.sh --launch   # build then open the app
 set -euo pipefail
@@ -20,7 +20,7 @@ for arg in "$@"; do
   esac
 done
 
-APP_NAME="Copilot Mux"
+APP_NAME="Copilot Projects"
 BUNDLE_ID="com.obvioussean.copilot-mux"
 EXE_NAME="copilot-mux"
 VERSION="0.1.0"

@@ -47,11 +47,11 @@ view. The result is a few Swift files instead of hundreds.
 Requires Xcode 15+ (Swift 5.9+), macOS 13+.
 
 ```bash
-./scripts/build-app.sh --launch        # debug build -> dist/Copilot Mux.app, then open it
+./scripts/build-app.sh --launch        # debug build -> dist/Copilot Projects.app, then open it
 ./scripts/build-app.sh --release        # optimized build
 ```
 
-`build-app.sh` runs `swift build`, assembles `dist/Copilot Mux.app` (with `Info.plist`,
+`build-app.sh` runs `swift build`, assembles `dist/Copilot Projects.app` (with `Info.plist`,
 the SwiftTerm resource bundle, and an ad-hoc code signature so notifications work), and
 prints the app path.
 

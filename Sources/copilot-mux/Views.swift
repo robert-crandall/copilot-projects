@@ -12,7 +12,23 @@ struct RootView: View {
         } detail: {
             DetailView(model: model)
         }
+        .background(WindowConfigurator())
     }
+}
+
+/// Hides the window title text so the titlebar stays minimal.
+struct WindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            if let window = view.window {
+                window.titleVisibility = .hidden
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 // MARK: - Sidebar (vertical projects)
@@ -56,7 +72,6 @@ struct SidebarView: View {
             .buttonStyle(.borderless)
             .padding(8)
         }
-        .navigationTitle("Copilot Mux")
     }
 }
 
@@ -175,17 +190,6 @@ struct ProjectTerminalsView: View {
                     Divider()
                     terminalArea
                 }
-            }
-        }
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Text(project.name).fontWeight(.semibold)
-            }
-            ToolbarItem {
-                Button { model.addSession(toProjectId: project.id) } label: {
-                    Image(systemName: "plus")
-                }
-                .help("New Session (⌘T)")
             }
         }
     }
