@@ -123,31 +123,62 @@ final class AppModel: ObservableObject {
         return project
     }
 
-    /// Choose a folder, then create a project rooted there.
+    /// Create a project from just a name (no folder required).
     func addProjectInteractive() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Open Project"
-        panel.message = "Choose a folder for the new project"
-        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let project = makeProject(name: url.lastPathComponent, cwd: url.path, withSession: true)
+        let defaultName = "Project \(projects.count + 1)"
+        guard let name = promptForText(
+            title: "New Project",
+            message: "Name this project. Sessions can run anywhere — a project is just a group.",
+            confirmTitle: "Create",
+            initialText: defaultName
+        ) else { return }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let project = makeProject(name: name, cwd: home, withSession: true)
         projects.append(project)
         selectProject(project.id)
+    }
+
+    /// Shared single-field prompt. Returns trimmed text, or nil if empty/cancelled.
+    private func promptForText(title: String, message: String,
+                               confirmTitle: String, initialText: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = initialText
+        alert.accessoryView = field
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     @discardableResult
     func addSession(toProjectId pid: String, cwd: String? = nil) -> String? {
         guard let pi = projectIndex(pid) else { return nil }
-        let dir = cwd ?? projects[pi].cwd
+        let dir = cwd ?? defaultCwd(forProjectIndex: pi)
         let session = Session(title: "shell", cwd: dir)
         projects[pi].sessions.append(session)
         projects[pi].selectedSessionId = session.id
         controller(for: session.id)
         save()
         return session.id
+    }
+
+    /// Where a new session should start: inherit the active pane's directory
+    /// (kept fresh by OSC 7 when the shell emits it), else the project default,
+    /// else home.
+    private func defaultCwd(forProjectIndex pi: Int) -> String {
+        let project = projects[pi]
+        if let sid = project.selectedSessionId,
+           let session = project.sessions.first(where: { $0.id == sid }),
+           !session.cwd.isEmpty {
+            return session.cwd
+        }
+        if !project.cwd.isEmpty { return project.cwd }
+        return FileManager.default.homeDirectoryForCurrentUser.path
     }
 
     func addSessionToSelected() {
@@ -198,17 +229,13 @@ final class AppModel: ObservableObject {
 
     func renameProjectInteractive(_ pid: String) {
         guard let pi = projectIndex(pid) else { return }
-        let alert = NSAlert()
-        alert.messageText = "Rename Project"
-        alert.informativeText = "Enter a new name for this project."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        field.stringValue = projects[pi].name
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            renameProject(pid, name: field.stringValue)
-        }
+        guard let name = promptForText(
+            title: "Rename Project",
+            message: "Enter a new name for this project.",
+            confirmTitle: "Rename",
+            initialText: projects[pi].name
+        ) else { return }
+        renameProject(pid, name: name)
     }
 
     func selectProject(_ id: String?) {
@@ -337,7 +364,9 @@ final class AppModel: ObservableObject {
             return .success()
         case "new-project":
             let cwd = req.cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
-            let name = req.name ?? URL(fileURLWithPath: cwd).lastPathComponent
+            let name = req.name
+                ?? req.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? "Project \(projects.count + 1)"
             let project = makeProject(name: name, cwd: cwd, withSession: true)
             projects.append(project)
             selectProject(project.id)

@@ -23,10 +23,11 @@ view. The result is a few Swift files instead of hundreds.
 
 ## Features
 
-- **Projects (vertical sidebar):** each project has a working directory and a set of
-  terminal sessions. Create one from a folder picker (`⌘N`).
+- **Projects (vertical sidebar):** a project is just a named group of sessions. Create one
+  with `⌘N` (name it; no folder required).
 - **Sessions (horizontal splits):** add as many shells as you want per project (`⌘T`),
-  resizable side-by-side. Close with `⌘W` or the pane's ✕.
+  resizable side-by-side. New sessions start in the active pane's directory (falling back to
+  home). Close with `⌘W` or the pane's ✕.
 - **Status:** each session reports `idle` / `running` / `waiting`. The sidebar dot rolls
   up per project (orange if anything is waiting, blue if anything is running, grey if idle).
 - **Notifications:** post a native macOS banner from any session; clicking it focuses the
