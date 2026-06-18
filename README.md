@@ -26,9 +26,9 @@ view. The result is a few Swift files instead of hundreds.
 - **Projects (vertical sidebar):** a project is just a named group of sessions. Create one
   with `⌘N` (name it; no folder required). Jump to one with **`⌘1`–`⌘9`**.
 - **Sessions (browser-style tabs):** each project shows a horizontal tab strip; one terminal
-  is visible at a time. Add a tab with `⌘T`, switch with a click / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`,
-  close with `⌘W` or the tab's ✕. Background tabs keep running. Hold **⌘** (projects) or **⌃**
-  (tabs) to see the number on each.
+  is visible at a time. Add a tab with `⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
+  (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, close with `⌘W` or the tab's ✕. Background tabs keep
+  running. Hold **⌘** (projects) or **⌃** (tabs) to see the number on each.
 - **Status:** each session reports `idle` / `running` / `waiting`. The sidebar dot rolls
   up per project (orange if anything is waiting, blue if anything is running, grey if idle).
   With the Copilot CLI hooks installed (below), this is driven automatically.

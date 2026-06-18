@@ -71,13 +71,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateNumberHint(event.modifierFlags)
             return event
         case .keyDown:
+            let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            // Control+Tab / Control+Shift+Tab cycle tabs (browser-style). Keep the
+            // overlay up if it's showing so you can keep cycling while holding ⌃.
+            if event.keyCode == 48 {  // Tab
+                if mods == .control { model.selectAdjacentSession(1); return nil }
+                if mods == [.control, .shift] { model.selectAdjacentSession(-1); return nil }
+            }
+            // ⌘ / ⌃ + number jumps to a project / tab.
+            if let digit = Self.digit(from: event) {
+                if mods == .command {
+                    hintWork?.cancel(); model.setNumberHint(.none)
+                    model.selectProjectByIndex(digit - 1); return nil
+                }
+                if mods == .control {
+                    hintWork?.cancel(); model.setNumberHint(.none)
+                    model.selectSessionByIndex(digit - 1); return nil
+                }
+            }
+            // Any other key dismisses the overlay.
             hintWork?.cancel()
             model.setNumberHint(.none)
-            let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
-            if let digit = Self.digit(from: event) {
-                if mods == .command { model.selectProjectByIndex(digit - 1); return nil }
-                if mods == .control { model.selectSessionByIndex(digit - 1); return nil }
-            }
             return event
         default:
             return event
