@@ -29,25 +29,32 @@ public enum CopilotHooks {
 
     if [ -z "${COPILOT_MUX_SESSION:-}" ]; then emit; exit 0; fi
 
+    state_dir="$(dirname "${COPILOT_MUX_SOCKET:-$HOME/.local/state/copilot-mux/control.sock}")"
+
     cli="$(command -v copilot-mux 2>/dev/null || true)"
     if [ -z "$cli" ] && [ -x "$HOME/.local/bin/copilot-mux" ]; then
       cli="$HOME/.local/bin/copilot-mux"
     fi
-    if [ -z "$cli" ]; then emit; exit 0; fi
 
-    set_status() { "$cli" set-status "$1" >/dev/null 2>&1 || true; }
+    # Persist the status to a marker file (survives an app restart and stays
+    # current even while the app isn't running) and notify the live app.
+    status() {
+      mkdir -p "$state_dir/sessions" 2>/dev/null || true
+      printf '%s' "$1" > "$state_dir/sessions/$COPILOT_MUX_SESSION.status" 2>/dev/null || true
+      [ -n "$cli" ] && "$cli" set-status "$1" >/dev/null 2>&1 || true
+    }
     is_ask_user() { printf '%s' "$1" | grep -q '"toolName"[[:space:]]*:[[:space:]]*"ask_user"'; }
 
     case "${1:-}" in
-      running) set_status running ;;
-      idle)    set_status idle ;;
+      running) status running ;;
+      idle)    status idle ;;
       pre)
         payload="$(cat 2>/dev/null || true)"
-        if is_ask_user "$payload"; then set_status waiting; else set_status running; fi
+        if is_ask_user "$payload"; then status waiting; else status running; fi
         ;;
       post)
         cat >/dev/null 2>&1 || true   # drain stdin
-        set_status running            # also refreshes the liveness heartbeat
+        status running
         ;;
     esac
     emit

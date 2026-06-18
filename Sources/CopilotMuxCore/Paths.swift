@@ -40,6 +40,12 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).sock").path
     }
 
+    /// Per-session status marker, written by the Copilot hook so status survives
+    /// an app restart (and stays current even while the app isn't running).
+    public static func statusMarkerPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).status").path
+    }
+
     /// The bundled dtach helper (resumability backend), or an override, or nil.
     public static var dtachExecutable: String? {
         let env = ProcessInfo.processInfo.environment

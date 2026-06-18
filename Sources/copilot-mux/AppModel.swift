@@ -259,6 +259,7 @@ final class AppModel: ObservableObject {
             }
         }
         try? FileManager.default.removeItem(atPath: socket)
+        try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
         closeSession(projectId: pid, sessionId: sid)
     }
 
@@ -291,6 +292,7 @@ final class AppModel: ObservableObject {
                 kill(master, SIGTERM)
             }
             try? FileManager.default.removeItem(atPath: socket)
+            try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: session.id))
             controllers[session.id]?.terminate()
             controllers[session.id] = nil
         }
@@ -388,6 +390,7 @@ final class AppModel: ObservableObject {
     func startLivenessReconciler() {
         livenessTimer?.invalidate()
         guard livenessEnabled else { return }
+        reconcileLiveness()   // immediately clear any restored-but-dead statuses
         let timer = Timer(timeInterval: 8, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reconcileLiveness() }
         }
@@ -408,8 +411,10 @@ final class AppModel: ObservableObject {
                 let status = projects[pi].sessions[si].status
                 guard status == .running || status == .waiting else { continue }
                 if !liveSessions.contains(projects[pi].sessions[si].id) {
+                    let sid = projects[pi].sessions[si].id
                     projects[pi].sessions[si].status = .idle
                     projects[pi].sessions[si].statusText = nil
+                    try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
                 }
             }
         }
@@ -485,6 +490,7 @@ final class AppModel: ObservableObject {
         guard let loc = locateIndex(sessionId) else { return }
         let projectId = projects[loc.p].id
         try? FileManager.default.removeItem(atPath: socket)
+        try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sessionId))
         closeSession(projectId: projectId, sessionId: sessionId)
     }
 
@@ -602,11 +608,22 @@ final class AppModel: ObservableObject {
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
-                projects[pi].sessions[si].status = .idle
+                projects[pi].sessions[si].status = restoredStatus(forSession: projects[pi].sessions[si].id)
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false
             }
         }
+    }
+
+    /// Restore a session's status from its marker file (written by the Copilot
+    /// hook). The liveness reconciler then clears any whose agent is no longer alive.
+    private func restoredStatus(forSession sessionId: String) -> SessionStatus {
+        let path = Paths.statusMarkerPath(sessionId: sessionId)
+        if let raw = try? String(contentsOfFile: path, encoding: .utf8) {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let status = SessionStatus(rawValue: trimmed) { return status }
+        }
+        return .idle
     }
 
     private func scheduleSave() {
