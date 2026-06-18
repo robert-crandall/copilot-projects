@@ -5,43 +5,27 @@ import CopilotMuxCore
 struct RootView: View {
     @ObservedObject var model: AppModel
     @AppStorage("sidebarWidth") private var sidebarWidth: Double = 240
-    @State private var dragStartWidth: Double?
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
             Divider()
-            HStack(spacing: 0) {
+            HSplitView {
                 SidebarView(model: model)
-                    .frame(width: sidebarWidth)
-                resizeHandle
+                    .frame(minWidth: 200, idealWidth: sidebarWidth, maxWidth: 360)
+                    .background(GeometryReader { geo in
+                        // Persist the user's drag so the width survives project
+                        // switches and app restarts (idealWidth seeds the launch).
+                        Color.clear.onChange(of: geo.size.width) { w in
+                            if w >= 200, w <= 360 { sidebarWidth = w }
+                        }
+                    })
                 DetailView(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .ignoresSafeArea(.container, edges: .top)
         .background(WindowConfigurator())
-    }
-
-    // A persisted drag-resizable divider. (HSplitView forgets its divider
-    // position whenever the detail pane is rebuilt on a project switch.)
-    private var resizeHandle: some View {
-        Divider()
-            .overlay(
-                Color.clear
-                    .frame(width: 8)
-                    .contentShape(Rectangle())
-                    .onHover { $0 ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
-                    .gesture(
-                        DragGesture(minimumDistance: 1)
-                            .onChanged { value in
-                                if dragStartWidth == nil { dragStartWidth = sidebarWidth }
-                                let base = dragStartWidth ?? sidebarWidth
-                                sidebarWidth = min(max(base + value.translation.width, 200), 360)
-                            }
-                            .onEnded { _ in dragStartWidth = nil }
-                    )
-            )
     }
 
     // Browser-style title strip: macOS traffic lights at the far left, then the
@@ -200,7 +184,6 @@ struct DetailView: View {
     var body: some View {
         if let project = model.selectedProject {
             ProjectTerminalsView(model: model, project: project)
-                .id(project.id)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "rectangle.split.3x1")
