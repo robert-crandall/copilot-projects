@@ -144,17 +144,10 @@ struct ProjectTerminalsView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                HSplitView {
-                    ForEach(project.sessions) { session in
-                        TerminalPane(
-                            model: model,
-                            projectId: project.id,
-                            session: session,
-                            isActive: session.id == project.selectedSessionId
-                        )
-                        .frame(minWidth: 260)
-                        .id(session.id)
-                    }
+                VStack(spacing: 0) {
+                    SessionTabBar(model: model, project: project)
+                    Divider()
+                    terminalArea
                 }
             }
         }
@@ -163,64 +156,101 @@ struct ProjectTerminalsView: View {
                 Text(project.name).fontWeight(.semibold)
             }
             ToolbarItem {
-                Button {
-                    model.addSession(toProjectId: project.id)
-                } label: {
-                    Image(systemName: "plus.rectangle")
+                Button { model.addSession(toProjectId: project.id) } label: {
+                    Image(systemName: "plus")
                 }
                 .help("New Session (⌘T)")
             }
         }
     }
+
+    /// All session terminals stay mounted (alive + correctly sized); only the
+    /// selected one is visible — browser-tab behavior.
+    private var terminalArea: some View {
+        let active = project.selectedSessionId ?? project.sessions.first?.id
+        return ZStack {
+            ForEach(project.sessions) { session in
+                if let controller = model.controller(for: session.id) {
+                    TerminalHostView(
+                        terminalView: controller.terminalView,
+                        isActive: session.id == active
+                    )
+                    .opacity(session.id == active ? 1 : 0)
+                    .allowsHitTesting(session.id == active)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 }
 
-struct TerminalPane: View {
+struct SessionTabBar: View {
     @ObservedObject var model: AppModel
-    let projectId: String
-    let session: Session
-    let isActive: Bool
+    let project: Project
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            if let controller = model.controller(for: session.id) {
-                TerminalHostView(terminalView: controller.terminalView, isActive: isActive)
-            } else {
-                Color.black
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(project.sessions) { session in
+                    SessionTab(
+                        session: session,
+                        isActive: session.id == project.selectedSessionId,
+                        onSelect: { model.selectSession(projectId: project.id, sessionId: session.id) },
+                        onClose: { model.closeSession(projectId: project.id, sessionId: session.id) }
+                    )
+                }
+                Button { model.addSession(toProjectId: project.id) } label: {
+                    Image(systemName: "plus").font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .padding(.horizontal, 4)
+                .help("New Session (⌘T)")
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
         }
-        .overlay(
-            Rectangle()
-                .stroke(isActive ? Color.accentColor.opacity(0.6) : Color.clear, lineWidth: 1.5)
-        )
+        .background(Color(nsColor: .underPageBackgroundColor))
     }
+}
 
-    private var header: some View {
+struct SessionTab: View {
+    let session: Session
+    let isActive: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
         HStack(spacing: 6) {
             StatusDot(status: session.status)
-            Text(session.title).font(.caption).lineLimit(1)
-            if let text = session.statusText, !text.isEmpty {
-                Text(text)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            Text(session.title)
+                .font(.callout)
+                .lineLimit(1)
+            if session.hasUnread {
+                Circle().fill(Color.blue).frame(width: 6, height: 6)
             }
-            Spacer()
-            Button {
-                model.closeSession(projectId: projectId, sessionId: session.id)
-            } label: {
-                Image(systemName: "xmark").font(.caption2)
+            Button(action: onClose) {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
             }
             .buttonStyle(.borderless)
+            .opacity(0.6)
             .help("Close Session")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(isActive ? Color.accentColor.opacity(0.12) : Color(nsColor: .windowBackgroundColor))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .frame(maxWidth: 210)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(isActive
+                      ? Color(nsColor: .selectedContentBackgroundColor).opacity(0.25)
+                      : Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(isActive ? Color.accentColor.opacity(0.55) : Color.gray.opacity(0.15),
+                        lineWidth: 1)
+        )
         .contentShape(Rectangle())
-        .onTapGesture {
-            model.selectSession(projectId: projectId, sessionId: session.id)
-        }
+        .onTapGesture(perform: onSelect)
+        .help(session.statusText ?? session.title)
     }
 }

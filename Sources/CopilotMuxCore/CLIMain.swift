@@ -15,6 +15,7 @@ public enum CLIMain {
         "focus",
         "ping",
         "install-cli",
+        "install-hooks", "uninstall-hooks",
         "help", "--help", "-h",
     ]
 
@@ -36,6 +37,19 @@ public enum CLIMain {
             return 0
         case "install-cli":
             return installCLI(rest)
+        case "install-hooks":
+            do {
+                let message = try CopilotHooks.install()
+                print(message)
+                return 0
+            } catch {
+                fail("\(error)")
+                return 1
+            }
+        case "uninstall-hooks":
+            CopilotHooks.uninstall()
+            print("Removed copilot-mux Copilot CLI hooks.")
+            return 0
         default:
             break
         }
@@ -205,6 +219,8 @@ public enum CLIMain {
           copilot-mux focus                   Focus a project/session [--project ID] [--session ID]
           copilot-mux ping                    Check the app is reachable
           copilot-mux install-cli [--dir D]   Symlink this binary onto your PATH
+          copilot-mux install-hooks           Install Copilot CLI status hooks (~/.copilot/hooks)
+          copilot-mux uninstall-hooks         Remove the Copilot CLI status hooks
           copilot-mux help                    Show this help
 
         Inside a copilot-mux terminal, COPILOT_MUX_PROJECT / COPILOT_MUX_SESSION are set,

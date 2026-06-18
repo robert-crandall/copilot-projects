@@ -263,6 +263,21 @@ final class AppModel: ObservableObject {
         save()
     }
 
+    func selectSessionByIndex(_ index: Int) {
+        guard let pid = selectedProjectId, let pi = projectIndex(pid),
+              index >= 0, index < projects[pi].sessions.count else { return }
+        selectSession(projectId: pid, sessionId: projects[pi].sessions[index].id)
+    }
+
+    func selectAdjacentSession(_ delta: Int) {
+        guard let pid = selectedProjectId, let pi = projectIndex(pid) else { return }
+        let sessions = projects[pi].sessions
+        guard !sessions.isEmpty else { return }
+        let current = sessions.firstIndex { $0.id == projects[pi].selectedSessionId } ?? 0
+        let next = (current + delta + sessions.count) % sessions.count
+        selectSession(projectId: pid, sessionId: sessions[next].id)
+    }
+
     // MARK: - status / notifications (driven by the CLI)
 
     func setStatus(sessionId: String, status: SessionStatus, text: String?) {

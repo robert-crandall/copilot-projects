@@ -14,12 +14,24 @@ struct CopilotMuxApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Project…") { appDelegate.model.addProjectInteractive() }
                     .keyboardShortcut("n", modifiers: .command)
+            }
+            CommandMenu("Session") {
                 Button("New Session") { appDelegate.model.addSessionToSelected() }
                     .keyboardShortcut("t", modifiers: .command)
-            }
-            CommandGroup(replacing: .saveItem) {
                 Button("Close Session") { appDelegate.model.closeSelectedSession() }
                     .keyboardShortcut("w", modifiers: .command)
+                Divider()
+                Button("Next Session") { appDelegate.model.selectAdjacentSession(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                Button("Previous Session") { appDelegate.model.selectAdjacentSession(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                Divider()
+                ForEach(1...9, id: \.self) { n in
+                    Button("Select Session \(n)") {
+                        appDelegate.model.selectSessionByIndex(n - 1)
+                    }
+                    .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
+                }
             }
         }
     }
@@ -32,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        NSWindow.allowsAutomaticWindowTabbing = false
 
         notifications.onActivate = { [weak self] projectId, sessionId in
             self?.model.focus(projectId: projectId, sessionId: sessionId)
@@ -42,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.bootstrapIfNeeded()
         model.startServer()
         model.installCLISymlinkIfPossible()
+        CopilotHooks.installIfPossible()
 
         NSApp.activate(ignoringOtherApps: true)
     }
