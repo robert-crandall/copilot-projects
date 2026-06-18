@@ -20,8 +20,11 @@ final class MuxTerminalView: LocalProcessTerminalView {
     private var scrollAccum: CGFloat = 0
 
     /// Returns true if the wheel event was handled (and so should be consumed).
-    /// Returns false to let SwiftTerm scroll its own buffer.
-    func forwardScroll(_ event: NSEvent) -> Bool {
+    /// Returns false to let SwiftTerm scroll its own buffer. `agentLive` is true
+    /// when a copilot agent owns this session: such a session is a mouse-reporting
+    /// TUI even when SwiftTerm's mode looks off after a dtach-resume desync, so the
+    /// wheel is forwarded as mouse events regardless.
+    func forwardScroll(_ event: NSEvent, agentLive: Bool) -> Bool {
         guard let terminal = terminal else { return false }
 
         // Accumulate fractional/precise deltas so a single trackpad flick (dozens
@@ -41,8 +44,8 @@ final class MuxTerminalView: LocalProcessTerminalView {
         let up = steps > 0
         let count = min(abs(steps), 8)
 
-        if allowMouseReporting && terminal.mouseMode != .off {
-            // 1. App reads the mouse → send wheel button events.
+        if agentLive || (allowMouseReporting && terminal.mouseMode != .off) {
+            // 1. App reads the mouse (or is a live agent TUI) → send wheel buttons.
             let mods = event.modifierFlags
             let flags = terminal.encodeButton(
                 button: up ? 4 : 5, release: false,

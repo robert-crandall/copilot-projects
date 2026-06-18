@@ -18,6 +18,10 @@ final class AppModel: ObservableObject {
 
     private var livenessTimer: Timer?
 
+    /// Sessions hosting a live agent (refreshed by the liveness reconciler). Used
+    /// by scroll-wheel forwarding to keep working on resumed (desynced) sessions.
+    private(set) var liveAgentSessions: Set<String> = []
+
     /// Process names treated as a live coding agent for the liveness backstop.
     /// Override with COPILOT_MUX_AGENT_PROCESSES (comma-separated); disable the
     /// whole check with COPILOT_MUX_LIVENESS=0.
@@ -420,13 +424,20 @@ final class AppModel: ObservableObject {
     }
 
     private func reconcileLiveness() {
+        let snapshot = ProcessTree.snapshot()
+        // Sessions whose shell currently hosts a live agent (copilot) process.
+        // Also used by scroll-forwarding: a resumed session's terminal is desynced
+        // (SwiftTerm restarted in the normal buffer, copilot never re-emits its
+        // mouse mode), but copilot's input parser still expects mouse events — so
+        // the wheel is force-forwarded as mouse when the session has a live agent.
+        liveAgentSessions = ProcessTree.agentSessions(agentNames: agentProcessNames, in: snapshot)
+
         let hasActive = projects.contains { project in
             project.sessions.contains { $0.status == .running || $0.status == .waiting }
         }
         guard hasActive else { return }
 
-        let snapshot = ProcessTree.snapshot()
-        let liveSessions = ProcessTree.agentSessions(agentNames: agentProcessNames, in: snapshot)
+        let liveSessions = liveAgentSessions
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let status = projects[pi].sessions[si].status

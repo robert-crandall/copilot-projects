@@ -94,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // alt-screen pager, or normal scrollback); otherwise pass it through.
             if let c = model.activeController,
                c.terminalView.containsPointer(for: event),
-               c.terminalView.forwardScroll(event) {
+               c.terminalView.forwardScroll(event, agentLive: model.liveAgentSessions.contains(c.sessionId)) {
                 return nil
             }
             return event
