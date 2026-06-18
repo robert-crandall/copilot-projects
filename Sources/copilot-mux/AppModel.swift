@@ -128,6 +128,15 @@ final class AppModel: ObservableObject {
         return c
     }
 
+    /// The live terminal for the currently visible session (without creating one)
+    /// — used by the scroll-wheel monitor.
+    var activeController: TerminalController? {
+        guard let pid = selectedProjectId, let pi = projectIndex(pid) else { return nil }
+        guard let sid = projects[pi].selectedSessionId ?? projects[pi].sessions.first?.id
+        else { return nil }
+        return controllers[sid]
+    }
+
     private func environment(projectId: String, sessionId: String) -> [String: String] {
         [
             "COPILOT_MUX": "1",
@@ -230,21 +239,10 @@ final class AppModel: ObservableObject {
         requestCloseSession(projectId: pid, sessionId: sid)
     }
 
-    /// User-initiated close (⌘W / tab ✕). Confirms first if the session has an
-    /// active agent, so an in-flight turn isn't lost by accident.
+    /// User-initiated close (⌘W / tab ✕). Ends the session immediately with no
+    /// confirmation — an explicit close is intentional, and app restarts resume
+    /// sessions, so there's nothing to protect against here.
     func requestCloseSession(projectId pid: String, sessionId sid: String) {
-        if let loc = locateIndex(sid) {
-            let session = projects[loc.p].sessions[loc.s]
-            if session.status == .running || session.status == .waiting {
-                let alert = NSAlert()
-                alert.messageText = "“\(session.title)” is still working"
-                alert.informativeText = "Closing this tab ends the session. Close anyway?"
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "Close")
-                alert.addButton(withTitle: "Cancel")
-                guard alert.runModal() == .alertFirstButtonReturn else { return }
-            }
-        }
         destroySession(projectId: pid, sessionId: sid)
     }
 
@@ -358,6 +356,12 @@ final class AppModel: ObservableObject {
     func selectProjectByIndex(_ index: Int) {
         guard index >= 0, index < projects.count else { return }
         selectProject(projects[index].id)
+    }
+
+    /// Reorder projects (drag-and-drop in the sidebar).
+    func moveProjects(fromOffsets source: IndexSet, toOffset destination: Int) {
+        projects.move(fromOffsets: source, toOffset: destination)
+        save()
     }
 
     func setNumberHint(_ hint: NumberHint) {

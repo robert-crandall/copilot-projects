@@ -6,7 +6,7 @@ import SwiftTerm
 /// ObservableObject: the live NSView is kept out of the SwiftUI observation graph.
 final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     let sessionId: String
-    let terminalView: LocalProcessTerminalView
+    let terminalView: MuxTerminalView
 
     /// PID of the shell this terminal is running (0 until spawned). Used for the
     /// process-liveness check.
@@ -23,7 +23,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     init(sessionId: String, cwd: String, extraEnvironment: [String: String],
          dtachExecutable: String?, dtachSocket: String?) {
         self.sessionId = sessionId
-        self.terminalView = LocalProcessTerminalView(
+        self.terminalView = MuxTerminalView(
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         super.init()
         terminalView.processDelegate = self

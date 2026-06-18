@@ -10,7 +10,6 @@ struct CopilotMuxApp: App {
             RootView(model: appDelegate.model)
                 .frame(minWidth: 820, minHeight: 520)
         }
-        .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Project…") { appDelegate.model.addProjectInteractive() }
@@ -59,15 +58,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
 
-        // ⌘/⌃ + number navigation, and the modifier-hold number overlay.
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
+        // ⌘/⌃ + number navigation, the modifier-hold number overlay, and
+        // scroll-wheel forwarding into mouse-reporting TUIs.
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .scrollWheel]) { [weak self] event in
             guard let self else { return event }
             return self.handleKeyEvent(event)
+        }
+
+        // If focus leaves the app while a modifier is held (e.g. ⌘-Tab away), the
+        // local monitor stops receiving the matching key-up, so the number overlay
+        // would stay stuck. Clear it whenever we resign active.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.hintWork?.cancel()
+                self?.model.setNumberHint(.none)
+            }
         }
     }
 
     private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
         switch event.type {
+        case .scrollWheel:
+            // Forward the wheel into a full-screen TUI (copilot, vim, less) that
+            // has mouse reporting on; otherwise let SwiftTerm scroll its buffer.
+            if let c = model.activeController,
+               c.terminalView.containsPointer(for: event),
+               c.terminalView.forwardScroll(event) {
+                return nil
+            }
+            return event
         case .flagsChanged:
             updateNumberHint(event.modifierFlags)
             return event

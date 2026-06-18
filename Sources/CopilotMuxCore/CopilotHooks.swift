@@ -43,18 +43,21 @@ public enum CopilotHooks {
       printf '%s' "$1" > "$state_dir/sessions/$COPILOT_MUX_SESSION.status" 2>/dev/null || true
       [ -n "$cli" ] && "$cli" set-status "$1" >/dev/null 2>&1 || true
     }
-    is_ask_user() { printf '%s' "$1" | grep -q '"toolName"[[:space:]]*:[[:space:]]*"ask_user"'; }
+    # The agent is blocked on the user when the CLI raises an elicitation
+    # (the ask_user tool) or a permission prompt. Those don't fire tool hooks —
+    # they arrive via the `notification` hook, tagged with a notification_type.
+    is_input_wait() {
+      printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"(elicitation_dialog|permission_prompt)"'
+    }
 
     case "${1:-}" in
       running) status running ;;
       idle)    status idle ;;
-      pre)
+      pre)  cat >/dev/null 2>&1 || true; status running ;;   # a tool call ⇒ working
+      post) cat >/dev/null 2>&1 || true; status running ;;
+      notify)
         payload="$(cat 2>/dev/null || true)"
-        if is_ask_user "$payload"; then status waiting; else status running; fi
-        ;;
-      post)
-        cat >/dev/null 2>&1 || true   # drain stdin
-        status running
+        if is_input_wait "$payload"; then status waiting; fi
         ;;
     esac
     emit
@@ -63,7 +66,8 @@ public enum CopilotHooks {
 
     /// Copilot CLI hook wiring (one entry per lifecycle event). sessionStart and
     /// sessionEnd reset to idle so a fresh / exited agent never reads as running;
-    /// tool events refresh the heartbeat so the app can decay a stuck "running".
+    /// tool events keep it running; the notification hook surfaces "waiting" when
+    /// the agent raises an ask_user / permission prompt (which fire no tool hook).
     public static let config = #"""
     {
       "version": 1,
@@ -79,6 +83,9 @@ public enum CopilotHooks {
         ],
         "postToolUse": [
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" post", "timeoutSec": 10 }
+        ],
+        "notification": [
+          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" notify", "timeoutSec": 5 }
         ],
         "agentStop": [
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-mux-hook.sh\" idle", "timeoutSec": 5 }

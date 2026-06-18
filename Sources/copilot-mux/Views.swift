@@ -12,6 +12,7 @@ struct RootView: View {
         } detail: {
             DetailView(model: model)
         }
+        .toolbar(.hidden, for: .windowToolbar)
         .background(WindowConfigurator())
     }
 }
@@ -41,24 +42,23 @@ struct SidebarView: View {
             get: { model.selectedProjectId },
             set: { model.selectProject($0) }
         )) {
-            Section("Projects") {
-                ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
-                    ProjectRow(
-                        project: project,
-                        number: index < 9 ? index + 1 : nil,
-                        showNumber: model.numberHint == .projects
-                    )
-                        .tag(project.id)
-                        .contextMenu {
-                            Button("New Session") { model.addSession(toProjectId: project.id) }
-                            Button("Rename…") { model.renameProjectInteractive(project.id) }
-                            Divider()
-                            Button("Close Project", role: .destructive) {
-                                model.closeProject(project.id)
-                            }
+            ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
+                ProjectRow(
+                    project: project,
+                    number: index < 9 ? index + 1 : nil,
+                    showNumber: model.numberHint == .projects
+                )
+                    .tag(project.id)
+                    .contextMenu {
+                        Button("New Session") { model.addSession(toProjectId: project.id) }
+                        Button("Rename…") { model.renameProjectInteractive(project.id) }
+                        Divider()
+                        Button("Close Project", role: .destructive) {
+                            model.closeProject(project.id)
                         }
-                }
+                    }
             }
+            .onMove { model.moveProjects(fromOffsets: $0, toOffset: $1) }
         }
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) {
