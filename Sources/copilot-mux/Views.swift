@@ -4,15 +4,58 @@ import CopilotMuxCore
 
 struct RootView: View {
     @ObservedObject var model: AppModel
+    @AppStorage("sidebarWidth") private var sidebarWidth: Double = 240
+    @State private var dragStartWidth: Double?
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(model: model)
-                .navigationSplitViewColumnWidth(min: 210, ideal: 250, max: 380)
-        } detail: {
-            DetailView(model: model)
+        VStack(spacing: 0) {
+            topBar
+            Divider()
+            HStack(spacing: 0) {
+                SidebarView(model: model)
+                    .frame(width: sidebarWidth)
+                resizeHandle
+                DetailView(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
+        .ignoresSafeArea(.container, edges: .top)
         .background(WindowConfigurator())
+    }
+
+    // A persisted drag-resizable divider. (HSplitView forgets its divider
+    // position whenever the detail pane is rebuilt on a project switch.)
+    private var resizeHandle: some View {
+        Divider()
+            .overlay(
+                Color.clear
+                    .frame(width: 8)
+                    .contentShape(Rectangle())
+                    .onHover { $0 ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { value in
+                                if dragStartWidth == nil { dragStartWidth = sidebarWidth }
+                                let base = dragStartWidth ?? sidebarWidth
+                                sidebarWidth = min(max(base + value.translation.width, 200), 360)
+                            }
+                            .onEnded { _ in dragStartWidth = nil }
+                    )
+            )
+    }
+
+    // Browser-style title strip: macOS traffic lights at the far left, then the
+    // selected project's session tabs fill the rest (no wasted top space).
+    private var topBar: some View {
+        HStack(spacing: 6) {
+            Color.clear.frame(width: 70)            // room for the traffic lights
+            if let project = model.selectedProject, !project.sessions.isEmpty {
+                SessionTabBar(model: model, project: project)
+            } else {
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(height: 38)
     }
 }
 
@@ -185,11 +228,7 @@ struct ProjectTerminalsView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                VStack(spacing: 0) {
-                    SessionTabBar(model: model, project: project)
-                    Divider()
-                    terminalArea
-                }
+                terminalArea
             }
         }
     }
