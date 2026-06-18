@@ -1,0 +1,215 @@
+import Foundation
+
+/// Command-line front end. When the `copilot-mux` binary is invoked with a known
+/// subcommand it acts as a thin client to the running app's control socket.
+public enum CLIMain {
+    /// Subcommands that should be handled by the CLI (vs. launching the GUI).
+    public static let commands: Set<String> = [
+        "set-status", "status",
+        "notify",
+        "list-projects", "projects",
+        "list-status",
+        "new-project",
+        "new-session",
+        "rename-project",
+        "focus",
+        "ping",
+        "install-cli",
+        "help", "--help", "-h",
+    ]
+
+    public static func isCommand(_ s: String) -> Bool {
+        commands.contains(s)
+    }
+
+    public static func run(_ args: [String]) -> Int32 {
+        guard let raw = args.first else {
+            printUsage()
+            return 1
+        }
+        let command = canonical(raw)
+        let rest = Array(args.dropFirst())
+
+        switch command {
+        case "help":
+            printUsage()
+            return 0
+        case "install-cli":
+            return installCLI(rest)
+        default:
+            break
+        }
+
+        let parsed = parseFlags(rest)
+        let env = ProcessInfo.processInfo.environment
+
+        var req = ControlRequest(command: command)
+        req.projectId = parsed.flags["project"] ?? env["COPILOT_MUX_PROJECT"]
+        req.sessionId = parsed.flags["session"] ?? env["COPILOT_MUX_SESSION"]
+
+        switch command {
+        case "set-status":
+            guard let status = parsed.flags["status"] ?? parsed.positionals.first else {
+                fail("set-status requires a status: idle | running | waiting")
+                return 1
+            }
+            req.status = status
+            req.text = parsed.flags["text"]
+        case "notify":
+            req.title = parsed.flags["title"] ?? parsed.positionals.first
+            req.body = parsed.flags["body"]
+                ?? (parsed.positionals.count > 1 ? parsed.positionals[1] : nil)
+            if req.title == nil {
+                fail("notify requires a title")
+                return 1
+            }
+        case "new-project":
+            req.name = parsed.flags["name"] ?? parsed.positionals.first
+            req.cwd = parsed.flags["cwd"]
+        case "new-session":
+            req.cwd = parsed.flags["cwd"]
+        case "rename-project":
+            req.name = parsed.flags["name"] ?? parsed.positionals.first
+            if req.name == nil {
+                fail("rename-project requires a name")
+                return 1
+            }
+        case "focus", "list-projects", "list-status", "ping":
+            break
+        default:
+            fail("unknown command: \(command)")
+            return 1
+        }
+
+        do {
+            let resp = try ControlClient().send(req)
+            if let text = resp.text, !text.isEmpty {
+                print(text)
+            }
+            if !resp.ok {
+                fail(resp.error ?? "unknown error")
+                return 1
+            }
+            return 0
+        } catch {
+            fail("\(error)")
+            return 1
+        }
+    }
+
+    // MARK: - aliases
+
+    private static func canonical(_ command: String) -> String {
+        switch command {
+        case "status": return "set-status"
+        case "projects": return "list-projects"
+        case "--help", "-h": return "help"
+        default: return command
+        }
+    }
+
+    // MARK: - flag parsing
+
+    private struct Parsed {
+        var positionals: [String] = []
+        var flags: [String: String] = [:]
+    }
+
+    private static func parseFlags(_ args: [String]) -> Parsed {
+        var out = Parsed()
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if a == "--" {
+                out.positionals.append(contentsOf: args[(i + 1)...])
+                break
+            }
+            if a.hasPrefix("--") {
+                let body = String(a.dropFirst(2))
+                if let eq = body.firstIndex(of: "=") {
+                    out.flags[String(body[..<eq])] = String(body[body.index(after: eq)...])
+                } else if i + 1 < args.count && !args[i + 1].hasPrefix("--") {
+                    out.flags[body] = args[i + 1]
+                    i += 1
+                } else {
+                    out.flags[body] = ""   // boolean-ish flag
+                }
+            } else {
+                out.positionals.append(a)
+            }
+            i += 1
+        }
+        return out
+    }
+
+    // MARK: - install-cli
+
+    private static func installCLI(_ args: [String]) -> Int32 {
+        let parsed = parseFlags(args)
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let dir = parsed.flags["dir"].map { URL(fileURLWithPath: $0) }
+            ?? home.appendingPathComponent(".local/bin", isDirectory: true)
+        guard let exe = currentExecutablePath() else {
+            fail("could not resolve the running executable path")
+            return 1
+        }
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let link = dir.appendingPathComponent("copilot-mux")
+            if fm.fileExists(atPath: link.path) {
+                try? fm.removeItem(at: link)
+            }
+            try fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
+            print("Linked \(link.path) -> \(exe)")
+            let pathEnv = ProcessInfo.processInfo.environment["PATH"] ?? ""
+            if !pathEnv.split(separator: ":").contains(Substring(dir.path)) {
+                print("note: \(dir.path) is not on your PATH; add it to use `copilot-mux`.")
+            }
+            return 0
+        } catch {
+            fail("\(error)")
+            return 1
+        }
+    }
+
+    private static func currentExecutablePath() -> String? {
+        if let p = Bundle.main.executablePath { return p }
+        let arg0 = CommandLine.arguments.first ?? ""
+        if arg0.hasPrefix("/") { return arg0 }
+        return nil
+    }
+
+    // MARK: - output
+
+    private static func fail(_ message: String) {
+        FileHandle.standardError.write(Data("copilot-mux: \(message)\n".utf8))
+    }
+
+    private static func printUsage() {
+        let usage = """
+        copilot-mux — project-organized terminal sessions
+
+        Usage:
+          copilot-mux                         Launch the app
+          copilot-mux set-status <state>      Set status of the current session
+                                              state: idle | running | waiting
+              [--text "..."] [--session ID] [--project ID]
+          copilot-mux notify <title> [body]   Post a macOS notification
+              [--title T] [--body B] [--session ID] [--project ID]
+          copilot-mux list-projects           List projects and their status
+          copilot-mux list-status             List per-session status
+          copilot-mux new-project [name]      Create a project [--cwd DIR]
+          copilot-mux new-session             Add a session to a project [--cwd DIR] [--project ID]
+          copilot-mux rename-project <name>   Rename a project [--project ID]
+          copilot-mux focus                   Focus a project/session [--project ID] [--session ID]
+          copilot-mux ping                    Check the app is reachable
+          copilot-mux install-cli [--dir D]   Symlink this binary onto your PATH
+          copilot-mux help                    Show this help
+
+        Inside a copilot-mux terminal, COPILOT_MUX_PROJECT / COPILOT_MUX_SESSION are set,
+        so set-status / notify target the current session automatically.
+        """
+        print(usage)
+    }
+}

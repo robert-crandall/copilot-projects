@@ -1,0 +1,98 @@
+import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
+
+public enum ControlClientError: Error, CustomStringConvertible {
+    case cannotConnect(String)
+    case io(String)
+    case decode(String)
+
+    public var description: String {
+        switch self {
+        case .cannotConnect(let m): return "cannot connect: \(m)"
+        case .io(let m): return "io error: \(m)"
+        case .decode(let m): return "decode error: \(m)"
+        }
+    }
+}
+
+/// Minimal blocking client for the control socket: connect, send one JSON line,
+/// read one JSON line, close.
+public struct ControlClient {
+    public let socketPath: String
+
+    public init(socketPath: String = Paths.socketPath) {
+        self.socketPath = socketPath
+    }
+
+    public func send(_ request: ControlRequest) throws -> ControlResponse {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 {
+            throw ControlClientError.cannotConnect("socket() failed (errno \(errno))")
+        }
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(socketPath.utf8)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        if pathBytes.count >= capacity {
+            throw ControlClientError.cannotConnect("socket path too long")
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: capacity) { dst in
+                for (i, b) in pathBytes.enumerated() {
+                    dst[i] = CChar(bitPattern: b)
+                }
+                dst[pathBytes.count] = 0
+            }
+        }
+
+        let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if connectResult != 0 {
+            throw ControlClientError.cannotConnect(
+                "is Copilot Mux running? (\(socketPath), errno \(errno))")
+        }
+
+        var payload = try Wire.encodeLine(request)
+        try payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            var off = 0
+            let base = raw.bindMemory(to: UInt8.self).baseAddress!
+            while off < raw.count {
+                let n = write(fd, base + off, raw.count - off)
+                if n <= 0 { throw ControlClientError.io("write failed (errno \(errno))") }
+                off += n
+            }
+        }
+
+        var response = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = read(fd, &buf, buf.count)
+            if n < 0 { throw ControlClientError.io("read failed (errno \(errno))") }
+            if n == 0 { break }
+            response.append(contentsOf: buf[0..<n])
+            if buf[0..<n].contains(0x0A) { break }
+        }
+
+        let line: Data
+        if let nl = response.firstIndex(of: 0x0A) {
+            line = response.subdata(in: response.startIndex..<nl)
+        } else {
+            line = response
+        }
+        if line.isEmpty {
+            throw ControlClientError.io("empty response")
+        }
+        do {
+            return try Wire.decode(ControlResponse.self, from: line)
+        } catch {
+            throw ControlClientError.decode("\(error)")
+        }
+    }
+}
