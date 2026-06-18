@@ -196,7 +196,7 @@ struct SessionTabBar: View {
                         session: session,
                         isActive: session.id == project.selectedSessionId,
                         onSelect: { model.selectSession(projectId: project.id, sessionId: session.id) },
-                        onClose: { model.closeSession(projectId: project.id, sessionId: session.id) }
+                        onClose: { model.requestCloseSession(projectId: project.id, sessionId: session.id) }
                     )
                 }
                 Button { model.addSession(toProjectId: project.id) } label: {

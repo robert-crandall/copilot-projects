@@ -220,7 +220,32 @@ final class AppModel: ObservableObject {
     func closeSelectedSession() {
         guard let pid = selectedProjectId, let pi = projectIndex(pid),
               let sid = projects[pi].selectedSessionId else { return }
+        requestCloseSession(projectId: pid, sessionId: sid)
+    }
+
+    /// User-initiated close (⌘W / tab ✕). Confirms first if the session has an
+    /// active agent, so an in-flight turn isn't lost by accident.
+    func requestCloseSession(projectId pid: String, sessionId sid: String) {
+        if let loc = locateIndex(sid) {
+            let session = projects[loc.p].sessions[loc.s]
+            if session.status == .running || session.status == .waiting {
+                let alert = NSAlert()
+                alert.messageText = "“\(session.title)” is still working"
+                alert.informativeText = "Closing this tab ends the session. Close anyway?"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Close")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+        }
         closeSession(projectId: pid, sessionId: sid)
+    }
+
+    /// Count of sessions with an in-flight agent (running or waiting).
+    var activeSessionCount: Int {
+        projects.reduce(0) { acc, project in
+            acc + project.sessions.filter { $0.status == .running || $0.status == .waiting }.count
+        }
     }
 
     func closeProject(_ pid: String) {

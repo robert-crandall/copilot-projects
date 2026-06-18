@@ -66,6 +66,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.save()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let active = model.activeSessionCount
+        guard active > 0 else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = active == 1 ? "A session is still working" : "\(active) sessions are still working"
+        alert.informativeText = "Quitting copilot-mux ends them. Quit anyway?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
