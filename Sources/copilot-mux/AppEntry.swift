@@ -10,6 +10,7 @@ struct CopilotMuxApp: App {
             RootView(model: appDelegate.model)
                 .frame(minWidth: 820, minHeight: 520)
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Project…") { appDelegate.model.addProjectInteractive() }
@@ -76,13 +77,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.model.setNumberHint(.none)
             }
         }
+
+        // When the app is activated (clicked / ⌘-Tab'd back), put keyboard focus
+        // on the visible terminal instead of the sidebar list.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.model.focusActiveTerminal() }
+        }
     }
 
     private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
         switch event.type {
         case .scrollWheel:
-            // Forward the wheel into a full-screen TUI (copilot, vim, less) that
-            // has mouse reporting on; otherwise let SwiftTerm scroll its buffer.
+            // Forward the wheel into the active terminal (mouse-reporting TUI,
+            // alt-screen pager, or normal scrollback); otherwise pass it through.
             if let c = model.activeController,
                c.terminalView.containsPointer(for: event),
                c.terminalView.forwardScroll(event) {

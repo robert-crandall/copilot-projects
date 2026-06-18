@@ -453,6 +453,14 @@ final class AppModel: ObservableObject {
         updateDockBadge()
     }
 
+    /// Make the visible session's terminal the first responder. Used when the app
+    /// is activated (clicked / ⌘-Tab'd back) so focus lands on the terminal rather
+    /// than the sidebar project list.
+    func focusActiveTerminal() {
+        guard let view = activeController?.terminalView, let window = view.window else { return }
+        window.makeFirstResponder(view)
+    }
+
     private func updateDockBadge() {
         let count = projects.reduce(0) { acc, p in
             acc + p.sessions.filter { $0.hasUnread }.count

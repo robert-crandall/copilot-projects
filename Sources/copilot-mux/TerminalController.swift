@@ -27,6 +27,10 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         super.init()
         terminalView.processDelegate = self
+        // Make OSC 8 hyperlinks and plain URLs open on a normal click (the macOS
+        // default requires holding ⌘). SwiftTerm's default delegate opens them
+        // via NSWorkspace.
+        terminalView.linkHighlightMode = .hover
         start(cwd: cwd, extraEnvironment: extraEnvironment,
               dtachExecutable: dtachExecutable, dtachSocket: dtachSocket)
     }

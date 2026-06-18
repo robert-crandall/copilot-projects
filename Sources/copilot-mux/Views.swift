@@ -12,19 +12,19 @@ struct RootView: View {
         } detail: {
             DetailView(model: model)
         }
-        .toolbar(.hidden, for: .windowToolbar)
         .background(WindowConfigurator())
     }
 }
 
-/// Hides the window title text so the titlebar stays minimal.
+/// Hides the window title/chrome so the content fills to the top with only the
+/// floating traffic lights, keeping the header minimal.
 struct WindowConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
-            if let window = view.window {
-                window.titleVisibility = .hidden
-            }
+            guard let window = view.window else { return }
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
         }
         return view
     }
