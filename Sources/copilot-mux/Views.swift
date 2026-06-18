@@ -251,11 +251,14 @@ struct SessionTab: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            if showNumber, let number {
-                NumberBadge(number: number)
-            } else {
+            ZStack {
                 StatusDot(status: session.status)
+                    .opacity(showNumber ? 0 : 1)
+                if showNumber, let number {
+                    NumberBadge(number: number)
+                }
             }
+            .frame(width: 18, height: 18)
             Text(session.title)
                 .font(.callout)
                 .lineLimit(1)
