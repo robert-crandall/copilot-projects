@@ -35,6 +35,10 @@ view. The result is a few Swift files instead of hundreds.
   originating project/session. Unread sessions get a bell badge + a Dock badge count.
 - **Control socket + CLI:** the same `copilot-mux` binary is also a CLI that talks to the
   running app over a Unix socket — ideal for agent hooks.
+- **Resumable sessions:** each terminal runs under a bundled [dtach](https://github.com/crigler/dtach),
+  so quitting/relaunching/crashing the app does **not** kill your shells or in-flight agents.
+  Relaunch reattaches. You can also `ssh` into the machine and `copilot-mux attach` to reconnect
+  from another host.
 - **Persistence:** projects/sessions are restored on relaunch.
 
 ## Build & run
@@ -119,6 +123,28 @@ copilot-mux set-status waiting --text "needs approval"
 copilot-mux notify "Agent needs input"
 copilot-mux set-status idle
 ```
+
+## Resumability & SSH reattach
+
+Each session's shell runs under a bundled, universal [dtach](https://github.com/crigler/dtach)
+(GPLv2; source vendored in `vendor/dtach`). dtach forwards raw bytes — it is **not** a second
+terminal emulator — so keyboard, title (OSC 0/2) and cwd (OSC 7) all stay native; SwiftTerm is
+the only emulator.
+
+- **Quit / relaunch / crash:** the dtach master daemonizes away from the app, so shells +
+  agents keep running. Relaunch reattaches (`dtach -A`).
+- **Close a tab (⌘W / ✕):** *ends* that session (kills its dtach master).
+- **Reconnect from another host:**
+  ```bash
+  ssh you@mac
+  copilot-mux ls                 # list sessions + ids
+  copilot-mux attach <id|prefix> # raw reattach in this terminal (Ctrl-\ to detach)
+  ```
+- **Tradeoff:** scrollback *history* doesn't survive a detach (a full-screen TUI like copilot
+  repaints on reattach; a plain shell starts fresh). Live scrollback while attached is normal.
+
+Sockets live under `~/.local/state/copilot-mux/sessions/`. If the bundled dtach is missing,
+sessions fall back to plain (non-resumable) shells. Override the helper with `COPILOT_MUX_DTACH`.
 
 ## How it works
 

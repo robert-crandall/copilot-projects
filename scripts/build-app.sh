@@ -45,6 +45,23 @@ mkdir -p "$MACOS" "$RES"
 
 cp "$BUILD_DIR/$EXE_NAME" "$MACOS/$EXE_NAME"
 
+# Build + bundle the dtach helper (resumability backend) as a universal binary.
+DTACH_SRC="$ROOT/vendor/dtach"
+if [ -d "$DTACH_SRC" ]; then
+  echo "==> building dtach helper (universal)"
+  ( cd "$DTACH_SRC"
+    [ -f config.h ] || ./configure >/dev/null 2>&1
+    clang -O2 -arch arm64 -arch x86_64 -I. -o dtach-universal \
+      main.c master.c attach.c )
+  if [ -f "$DTACH_SRC/dtach-universal" ]; then
+    mkdir -p "$CONTENTS/Helpers"
+    cp "$DTACH_SRC/dtach-universal" "$CONTENTS/Helpers/dtach"
+    chmod +x "$CONTENTS/Helpers/dtach"
+  else
+    echo "warning: dtach build failed — resumability will fall back to plain shells"
+  fi
+fi
+
 # SwiftTerm resource bundle (Metal shaders). Place where Bundle.module looks.
 if [ -d "$BUILD_DIR/SwiftTerm_SwiftTerm.bundle" ]; then
   cp -R "$BUILD_DIR/SwiftTerm_SwiftTerm.bundle" "$RES/"

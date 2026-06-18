@@ -20,16 +20,19 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     private(set) var exited = false
 
-    init(sessionId: String, cwd: String, extraEnvironment: [String: String]) {
+    init(sessionId: String, cwd: String, extraEnvironment: [String: String],
+         dtachExecutable: String?, dtachSocket: String?) {
         self.sessionId = sessionId
         self.terminalView = LocalProcessTerminalView(
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         super.init()
         terminalView.processDelegate = self
-        start(cwd: cwd, extraEnvironment: extraEnvironment)
+        start(cwd: cwd, extraEnvironment: extraEnvironment,
+              dtachExecutable: dtachExecutable, dtachSocket: dtachSocket)
     }
 
-    private func start(cwd: String, extraEnvironment: [String: String]) {
+    private func start(cwd: String, extraEnvironment: [String: String],
+                       dtachExecutable: String?, dtachSocket: String?) {
         let processEnv = ProcessInfo.processInfo.environment
         let shell = processEnv["SHELL"] ?? "/bin/zsh"
         let shellName = (shell as NSString).lastPathComponent
@@ -45,15 +48,27 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             ? FileManager.default.homeDirectoryForCurrentUser.path
             : cwd
 
-        // Leading "-" in argv[0] makes this a login shell so it sources the
-        // user's profile (full PATH, etc.).
-        terminalView.startProcess(
-            executable: shell,
-            args: [],
-            environment: envArray,
-            execName: "-\(shellName)",
-            currentDirectory: dir
-        )
+        if let dtach = dtachExecutable, let socket = dtachSocket {
+            // Resumable: dtach owns the shell PTY and survives app quit.
+            //   -A attach-or-create, -r winch redraw-on-attach,
+            //   -z no suspend key, -E no detach key (fully raw → keyboard passthrough).
+            terminalView.startProcess(
+                executable: dtach,
+                args: ["-A", socket, "-r", "winch", "-z", "-E", shell, "-l"],
+                environment: envArray,
+                execName: nil,
+                currentDirectory: dir
+            )
+        } else {
+            // Fallback (no dtach helper): direct login shell, not resumable.
+            terminalView.startProcess(
+                executable: shell,
+                args: [],
+                environment: envArray,
+                execName: "-\(shellName)",
+                currentDirectory: dir
+            )
+        }
     }
 
     func terminate() {

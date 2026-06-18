@@ -53,4 +53,70 @@ enum ProcessTree {
         }
         return false
     }
+
+    /// argv + environment of a process via KERN_PROCARGS2 (same-uid only).
+    static func inspect(_ pid: pid_t) -> (args: [String], env: [String: String]) {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        if sysctl(&mib, 3, nil, &size, nil, 0) != 0 || size < MemoryLayout<Int32>.size {
+            return ([], [:])
+        }
+        var buffer = [UInt8](repeating: 0, count: size)
+        if sysctl(&mib, 3, &buffer, &size, nil, 0) != 0 { return ([], [:]) }
+
+        var argc: Int32 = 0
+        withUnsafeMutableBytes(of: &argc) { dst in
+            buffer.withUnsafeBytes { src in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src[0..<4]))
+            }
+        }
+
+        var i = MemoryLayout<Int32>.size
+        while i < size && buffer[i] != 0 { i += 1 }      // skip exec_path
+        while i < size && buffer[i] == 0 { i += 1 }      // skip alignment nulls
+
+        func nextCString() -> String {
+            let start = i
+            while i < size && buffer[i] != 0 { i += 1 }
+            let s = String(decoding: buffer[start..<i], as: UTF8.self)
+            if i < size { i += 1 }
+            return s
+        }
+
+        var args: [String] = []
+        var n = 0
+        while n < Int(max(0, argc)) && i < size {
+            args.append(nextCString())
+            n += 1
+        }
+
+        var env: [String: String] = [:]
+        while i < size {
+            let kv = nextCString()
+            if let eq = kv.firstIndex(of: "=") {
+                env[String(kv[..<eq])] = String(kv[kv.index(after: eq)...])
+            }
+        }
+        return (args, env)
+    }
+
+    /// Sessions (by COPILOT_MUX_SESSION env) that currently host a live agent
+    /// process. Works regardless of how the shell is wrapped (dtach or direct).
+    static func agentSessions(agentNames: Set<String>, in snap: Snapshot) -> Set<String> {
+        var sessions = Set<String>()
+        for (pid, name) in snap.nameOf where agentNames.contains(name) {
+            if let sid = inspect(pid).env["COPILOT_MUX_SESSION"], !sid.isEmpty {
+                sessions.insert(sid)
+            }
+        }
+        return sessions
+    }
+
+    /// The dtach master process owning a given session socket (for kill).
+    static func dtachMaster(forSocket socket: String, in snap: Snapshot) -> pid_t? {
+        for (pid, name) in snap.nameOf where name == "dtach" {
+            if inspect(pid).args.contains(socket) { return pid }
+        }
+        return nil
+    }
 }

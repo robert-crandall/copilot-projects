@@ -55,13 +55,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.bootstrapIfNeeded()
         model.startServer()
         model.startLivenessReconciler()
-        model.installCLISymlinkIfPossible()
-        CopilotHooks.installIfPossible()
+        // A test/isolated instance can opt out of mutating the user's CLI + hooks.
+        if ProcessInfo.processInfo.environment["COPILOT_MUX_NO_INSTALL"] != "1" {
+            model.installCLISymlinkIfPossible()
+            CopilotHooks.installIfPossible()
+        }
 
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        model.beginTermination()
+        model.detachAllClients()   // keep dtach masters alive for resume
         model.stopServer()
         model.save()
     }

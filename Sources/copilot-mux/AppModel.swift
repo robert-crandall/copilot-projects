@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     private var server: ControlServer?
     private weak var notifications: NotificationManager?
     private var saveWork: DispatchWorkItem?
+    private(set) var isTerminating = false
 
     private var livenessTimer: Timer?
 
@@ -109,10 +110,15 @@ final class AppModel: ObservableObject {
         guard let loc = locateIndex(sessionId) else { return nil }
         let project = projects[loc.p]
         let session = project.sessions[loc.s]
+        Paths.ensureStateDir()
+        let dtach = Paths.dtachExecutable
+        let socket = dtach != nil ? Paths.dtachSocketPath(sessionId: sessionId) : nil
         let c = TerminalController(
             sessionId: sessionId,
             cwd: session.cwd,
-            extraEnvironment: environment(projectId: project.id, sessionId: sessionId)
+            extraEnvironment: environment(projectId: project.id, sessionId: sessionId),
+            dtachExecutable: dtach,
+            dtachSocket: socket
         )
         c.onTitle = { [weak self] title in self?.updateTitle(sessionId: sessionId, title: title) }
         c.onDirectory = { [weak self] dir in self?.updateCwd(sessionId: sessionId, dir: dir) }
@@ -238,7 +244,34 @@ final class AppModel: ObservableObject {
                 guard alert.runModal() == .alertFirstButtonReturn else { return }
             }
         }
+        destroySession(projectId: pid, sessionId: sid)
+    }
+
+    /// Permanently end a session: kill its dtach master (so it does not resume),
+    /// remove its socket, and drop it from the model.
+    private func destroySession(projectId pid: String, sessionId sid: String) {
+        let socket = Paths.dtachSocketPath(sessionId: sid)
+        if Paths.dtachExecutable != nil {
+            let snapshot = ProcessTree.snapshot()
+            if let master = ProcessTree.dtachMaster(forSocket: socket, in: snapshot) {
+                kill(master, SIGTERM)
+            }
+        }
+        try? FileManager.default.removeItem(atPath: socket)
         closeSession(projectId: pid, sessionId: sid)
+    }
+
+    /// Detach (don't destroy) every live terminal — used on app quit so dtach
+    /// masters survive and sessions resume on next launch.
+    func detachAllClients() {
+        for controller in controllers.values {
+            controller.terminate()
+        }
+        controllers.removeAll()
+    }
+
+    func beginTermination() {
+        isTerminating = true
     }
 
     /// Count of sessions with an in-flight agent (running or waiting).
@@ -250,7 +283,13 @@ final class AppModel: ObservableObject {
 
     func closeProject(_ pid: String) {
         guard let pi = projectIndex(pid) else { return }
+        let snapshot = Paths.dtachExecutable != nil ? ProcessTree.snapshot() : nil
         for session in projects[pi].sessions {
+            let socket = Paths.dtachSocketPath(sessionId: session.id)
+            if let snapshot, let master = ProcessTree.dtachMaster(forSocket: socket, in: snapshot) {
+                kill(master, SIGTERM)
+            }
+            try? FileManager.default.removeItem(atPath: socket)
             controllers[session.id]?.terminate()
             controllers[session.id] = nil
         }
@@ -352,16 +391,13 @@ final class AppModel: ObservableObject {
         }
         guard hasActive else { return }
 
-        let names = agentProcessNames
         let snapshot = ProcessTree.snapshot()
+        let liveSessions = ProcessTree.agentSessions(agentNames: agentProcessNames, in: snapshot)
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let status = projects[pi].sessions[si].status
                 guard status == .running || status == .waiting else { continue }
-                let sid = projects[pi].sessions[si].id
-                let shell = controllers[sid]?.shellPID ?? 0
-                let alive = ProcessTree.hasDescendant(under: shell, named: names, in: snapshot)
-                if !alive {
+                if !liveSessions.contains(projects[pi].sessions[si].id) {
                     projects[pi].sessions[si].status = .idle
                     projects[pi].sessions[si].statusText = nil
                 }
@@ -426,9 +462,20 @@ final class AppModel: ObservableObject {
 
     private func handleExit(sessionId: String) {
         controllers[sessionId] = nil
+        guard !isTerminating else { return }   // app quitting → keep for resume
+
+        let socket = Paths.dtachSocketPath(sessionId: sessionId)
+        // If a live dtach master still owns the socket, the shell is alive and
+        // this was just a detached client — keep the session.
+        if Paths.dtachExecutable != nil, FileManager.default.fileExists(atPath: socket),
+           ProcessTree.dtachMaster(forSocket: socket, in: ProcessTree.snapshot()) != nil {
+            return
+        }
+
         guard let loc = locateIndex(sessionId) else { return }
-        let pid = projects[loc.p].id
-        closeSession(projectId: pid, sessionId: sessionId)
+        let projectId = projects[loc.p].id
+        try? FileManager.default.removeItem(atPath: socket)
+        closeSession(projectId: projectId, sessionId: sessionId)
     }
 
     // MARK: - control socket handler

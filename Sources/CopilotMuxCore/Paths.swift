@@ -30,6 +30,31 @@ public enum Paths {
         stateDir.appendingPathComponent("state.json")
     }
 
+    /// Directory holding per-session dtach sockets.
+    public static var sessionsDir: URL {
+        stateDir.appendingPathComponent("sessions", isDirectory: true)
+    }
+
+    /// dtach socket for a session (kept short to stay under the ~104-byte sun_path limit).
+    public static func dtachSocketPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).sock").path
+    }
+
+    /// The bundled dtach helper (resumability backend), or an override, or nil.
+    public static var dtachExecutable: String? {
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["COPILOT_MUX_DTACH"], !override.isEmpty,
+           FileManager.default.isExecutableFile(atPath: override) {
+            return override
+        }
+        let bundled = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers/dtach")
+        if FileManager.default.isExecutableFile(atPath: bundled.path) {
+            return bundled.path
+        }
+        return nil
+    }
+
     /// Best-effort creation of the (user-private) state directory.
     @discardableResult
     public static func ensureStateDir() -> Bool {
@@ -37,6 +62,11 @@ public enum Paths {
         do {
             try fm.createDirectory(
                 at: stateDir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try? fm.createDirectory(
+                at: sessionsDir,
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )

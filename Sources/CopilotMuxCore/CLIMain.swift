@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Command-line front end. When the `copilot-mux` binary is invoked with a known
 /// subcommand it acts as a thin client to the running app's control socket.
@@ -8,11 +11,12 @@ public enum CLIMain {
         "set-status", "status",
         "notify",
         "list-projects", "projects",
-        "list-status",
+        "list-status", "ls",
         "new-project",
         "new-session",
         "rename-project",
         "focus",
+        "attach",
         "ping",
         "install-cli",
         "install-hooks", "uninstall-hooks",
@@ -50,6 +54,8 @@ public enum CLIMain {
             CopilotHooks.uninstall()
             print("Removed copilot-mux Copilot CLI hooks.")
             return 0
+        case "attach":
+            return attachSession(rest)
         default:
             break
         }
@@ -117,9 +123,65 @@ public enum CLIMain {
         switch command {
         case "status": return "set-status"
         case "projects": return "list-projects"
+        case "ls": return "list-status"
         case "--help", "-h": return "help"
         default: return command
         }
+    }
+
+    // MARK: - attach (resume a session, incl. over SSH)
+
+    private static func attachSession(_ args: [String]) -> Int32 {
+        guard let dtach = Paths.dtachExecutable else {
+            fail("dtach helper not found (resumability backend missing)")
+            return 1
+        }
+        let parsed = parseFlags(args)
+        let fm = FileManager.default
+        let dir = Paths.sessionsDir
+        let socks = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasSuffix(".sock") }
+        let env = ProcessInfo.processInfo.environment
+        let wanted = parsed.positionals.first
+            ?? parsed.flags["session"]
+            ?? env["COPILOT_MUX_SESSION"]
+
+        let socketPath: String
+        if let wanted = wanted, !wanted.isEmpty {
+            if socks.contains("\(wanted).sock") {
+                socketPath = Paths.dtachSocketPath(sessionId: wanted)
+            } else {
+                let matches = socks.filter { $0.hasPrefix(wanted) }
+                if matches.count == 1 {
+                    socketPath = dir.appendingPathComponent(matches[0]).path
+                } else if matches.isEmpty {
+                    fail("no session matching “\(wanted)” (try: copilot-mux ls)")
+                    return 1
+                } else {
+                    fail("ambiguous “\(wanted)” — matches \(matches.count) sessions")
+                    return 1
+                }
+            }
+        } else if socks.count == 1 {
+            socketPath = dir.appendingPathComponent(socks[0]).path
+        } else {
+            fail("specify a session id (copilot-mux ls to list)")
+            return 1
+        }
+
+        guard fm.fileExists(atPath: socketPath) else {
+            fail("session socket not found: \(socketPath)")
+            return 1
+        }
+
+        // Replace this process with a dtach attach client (no -E, so Ctrl-\
+        // detaches when used over SSH).
+        let argv = [dtach, "-a", socketPath, "-r", "winch"]
+        var cargs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
+        cargs.append(nil)
+        execv(dtach, &cargs)
+        fail("failed to launch dtach: \(String(cString: strerror(errno)))")
+        return 1
     }
 
     // MARK: - flag parsing
@@ -212,7 +274,8 @@ public enum CLIMain {
           copilot-mux notify <title> [body]   Post a macOS notification
               [--title T] [--body B] [--session ID] [--project ID]
           copilot-mux list-projects           List projects and their status
-          copilot-mux list-status             List per-session status
+          copilot-mux list-status (ls)        List per-session status + ids
+          copilot-mux attach [session]        Attach/resume a session (also works over SSH)
           copilot-mux new-project [name]      Create a project [--cwd DIR]
           copilot-mux new-session             Add a session to a project [--cwd DIR] [--project ID]
           copilot-mux rename-project <name>   Rename a project [--project ID]
