@@ -6,20 +6,11 @@ out horizontally. It keeps the parts of [cmux](https://github.com/manaflow-ai/cm
 matter most for working with coding agents — **status indicators** and **notifications** —
 and drops everything else.
 
+![Copilot Projects — vertical project sidebar, terminal sessions as horizontal tabs](docs/screenshot.png)
+
 It replaces cmux's Ghostty integration (a GPU renderer behind several AppKit/portal
 layers) with [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), a pure-Swift terminal
 view. The result is a few Swift files instead of hundreds.
-
-```
-┌────────────┬─────────────────────────────────────────────┐
-│ ● home     │ [ shell ] [ claude ] [ build ]  +           │
-│ ◐ api   2  ├─────────────────────────────────────────────┤
-│ ● web      │  $ …                                         │
-│            │   (one session visible; tabs switch)         │
-│ + New Proj │                                              │
-└────────────┴─────────────────────────────────────────────┘
-  ^ projects (vertical)            ^ sessions (browser tabs)
-```
 
 ## Features
 
