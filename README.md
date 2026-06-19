@@ -163,23 +163,6 @@ sessions fall back to plain (non-resumable) shells. Override the helper with `CO
 Override locations with `COPILOT_PROJECTS_SOCKET` and `COPILOT_PROJECTS_STATE_DIR` (useful for running
 an isolated instance).
 
-## Upgrading from copilot-mux
-
-This project used to be called **copilot-mux**. Existing installs are preserved on
-first launch: running sessions reattach, and the saved sidebar width / window frame
-are copied into the renamed app. A few things keep the old name for compatibility and
-are intentionally *not* migrated:
-
-- **Storage dir.** An install that already has sessions under `~/.local/state/copilot-mux`
-  keeps using it — the live dtach sockets can't be moved out from under running sessions.
-  Fresh installs use `~/.local/state/copilot-projects`.
-- **CLI alias.** `~/.local/bin/copilot-mux` is repointed to the new binary, so old hooks
-  and scripts keep working. The CLI is now `copilot-projects`.
-- **Env vars.** New sessions get `COPILOT_PROJECTS_*`; the app still reads the legacy
-  `COPILOT_MUX_*` names that pre-rebrand shells carry.
-
-macOS ties notification permission to the (now changed) bundle id, so it re-prompts once.
-
 ## License
 
 MIT.

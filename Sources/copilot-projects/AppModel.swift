@@ -594,8 +594,40 @@ final class AppModel: ObservableObject {
         case "focus":
             focus(projectId: req.projectId, sessionId: req.sessionId)
             return .success()
+        case "screenshot":
+            let path = req.path ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads/copilot-projects.png").path
+            return captureWindow(to: path)
         default:
             return .failure("unknown command: \(req.command)")
+        }
+    }
+
+    /// Renders the app's own window to a PNG — the app drawing itself, so it needs
+    /// no Screen Recording permission (unlike `screencapture`).
+    private func captureWindow(to path: String) -> ControlResponse {
+        guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil })
+                ?? NSApp.mainWindow ?? NSApp.windows.first,
+              let view = window.contentView else {
+            return .failure("no window to capture")
+        }
+        let bounds = view.bounds
+        guard bounds.width > 1, bounds.height > 1,
+              let rep = view.bitmapImageRepForCachingDisplay(in: bounds) else {
+            return .failure("could not allocate bitmap")
+        }
+        view.cacheDisplay(in: bounds, to: rep)
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            return .failure("could not encode PNG")
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try data.write(to: URL(fileURLWithPath: path))
+            return .success(path)
+        } catch {
+            return .failure("write failed: \(error.localizedDescription)")
         }
     }
 

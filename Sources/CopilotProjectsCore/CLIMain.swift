@@ -18,6 +18,7 @@ public enum CLIMain {
         "focus",
         "attach",
         "ping",
+        "screenshot",
         "install-cli",
         "install-hooks", "uninstall-hooks",
         "help", "--help", "-h",
@@ -94,6 +95,10 @@ public enum CLIMain {
                 fail("rename-project requires a name")
                 return 1
             }
+        case "screenshot":
+            var p = parsed.flags["path"] ?? parsed.positionals.first ?? "copilot-projects.png"
+            if !p.hasPrefix("/") { p = FileManager.default.currentDirectoryPath + "/" + p }
+            req.path = p
         case "focus", "list-projects", "list-status", "ping":
             break
         default:
@@ -283,6 +288,7 @@ public enum CLIMain {
           copilot-projects rename-project <name>   Rename a project [--project ID]
           copilot-projects focus                   Focus a project/session [--project ID] [--session ID]
           copilot-projects ping                    Check the app is reachable
+          copilot-projects screenshot [path]       Save a PNG of the app window
           copilot-projects install-cli [--dir D]   Symlink this binary onto your PATH
           copilot-projects install-hooks           Install Copilot CLI status hooks (~/.copilot/hooks)
           copilot-projects uninstall-hooks         Remove the Copilot CLI status hooks
