@@ -31,6 +31,13 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         // default requires holding ⌘). SwiftTerm's default delegate opens them
         // via NSWorkspace.
         terminalView.linkHighlightMode = .hover
+        // Don't report mouse events to the program: a mouse-reporting TUI (a live
+        // agent) would otherwise swallow click-drags, so you couldn't select text,
+        // and SwiftTerm would clear any selection on each new line of output. With
+        // reporting off, a plain drag selects and the selection survives streaming
+        // output. The scroll wheel is still forwarded to the agent separately (see
+        // ProjectsTerminalView.forwardScroll), so scrolling keeps working.
+        terminalView.allowMouseReporting = false
         start(cwd: cwd, extraEnvironment: extraEnvironment,
               dtachExecutable: dtachExecutable, dtachSocket: dtachSocket)
     }
