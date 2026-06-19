@@ -9,32 +9,35 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             titleBarStrip
-            tabRow
-            Divider()
             HSplitView {
                 SidebarView(model: model)
                     .frame(minWidth: 200, idealWidth: 240, maxWidth: 360)
                     .background(SplitViewAutosaver(name: "copilotmux.sidebar"))
-                DetailView(model: model)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 0) {
+                    tabRow
+                    Divider()
+                    DetailView(model: model)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
         .ignoresSafeArea(.container, edges: .top)
         .background(WindowConfigurator())
     }
 
-    // Browser-style title strip: macOS traffic lights at the far left, then the
-    // selected project's session tabs fill the rest (no wasted top space).
-    // The macOS traffic lights live in this thin strip, which is the system's
-    // draggable title region. Tabs can't go here: dragging in the title region
-    // moves the window, which steals the tabs' drag-to-reorder. So tabs sit just
-    // below it instead (same window-background color, so it reads as one header).
+    // Thin strip holding the macOS traffic lights (the system's draggable title
+    // region), spanning the full width above both panes.
     private var titleBarStrip: some View {
         Color(nsColor: .windowBackgroundColor)
             .frame(height: 28)
             .frame(maxWidth: .infinity)
     }
 
+    // Session tabs for the selected project. Lives at the top of the right-hand
+    // (detail) pane — to the right of the sidebar, not above it — so it reads as
+    // belonging to the terminal area. It sits below the titleBarStrip (not in it),
+    // because dragging in the title region moves the window and would steal the
+    // tabs' drag-to-reorder.
     private var tabRow: some View {
         HStack(spacing: 0) {
             if let project = model.selectedProject, !project.sessions.isEmpty {
@@ -133,12 +136,11 @@ struct ProjectRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            StatusDot(status: project.aggregateStatus)
+            ProjectDotView(state: project.dotState)
             VStack(alignment: .leading, spacing: 1) {
                 Text(project.name).lineLimit(1)
-                Text(subtitle)
+                subtitle
                     .font(.caption)
-                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
@@ -153,31 +155,96 @@ struct ProjectRow: View {
         .padding(.vertical, 2)
     }
 
-    private var subtitle: String {
+    // "N sessions" stays muted; the running/waiting counts are colored to match
+    // their status (blue / orange), so the detail line reads at a glance.
+    private var subtitle: Text {
         let count = project.sessions.count
-        var parts = ["\(count) session\(count == 1 ? "" : "s")"]
-        if project.runningCount > 0 { parts.append("\(project.runningCount) running") }
-        if project.waitingCount > 0 { parts.append("\(project.waitingCount) waiting") }
-        return parts.joined(separator: " · ")
+        var text = Text("\(count) session\(count == 1 ? "" : "s")")
+            .foregroundColor(.secondary)
+        if project.runningCount > 0 {
+            text = text + Text("  ·  ").foregroundColor(.secondary)
+                + Text("\(project.runningCount) running").foregroundColor(.blue)
+        }
+        if project.waitingCount > 0 {
+            text = text + Text("  ·  ").foregroundColor(.secondary)
+                + Text("\(project.waitingCount) waiting").foregroundColor(.orange)
+        }
+        return text
     }
 }
 
-struct StatusDot: View {
-    let status: SessionStatus
+/// The indicator at the left of a session tab. A spinner means the agent is busy
+/// (running); orange means it's waiting on your input; blue means it has finished
+/// and you haven't viewed it yet ("ready for interaction"); idle shows nothing.
+/// The 9pt frame keeps the slot a constant size whether or not a dot is shown.
+struct SessionTabIndicator: View {
+    let session: Session
+
+    var body: some View {
+        Group {
+            switch kind {
+            case .busy:
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.6)
+            case .dot(let color):
+                Circle()
+                    .fill(color)
+                    .overlay(Circle().stroke(.black.opacity(0.15), lineWidth: 0.5))
+            case .none:
+                Color.clear
+            }
+        }
+        .frame(width: 9, height: 9)
+        .help(help)
+    }
+
+    private enum Kind { case busy, dot(Color), none }
+
+    private var kind: Kind {
+        switch session.status {
+        case .running: return .busy
+        case .waiting: return .dot(.orange)
+        case .idle: return session.finishedUnseen ? .dot(.blue) : .none
+        }
+    }
+
+    private var help: String {
+        switch session.status {
+        case .running: return "running"
+        case .waiting: return "waiting for input"
+        case .idle: return session.finishedUnseen ? "finished — ready for you" : "idle"
+        }
+    }
+}
+
+/// The sidebar's per-project dot. Shown only when a project needs you: blue once a
+/// session has finished and is unviewed, orange while one is waiting on input. An
+/// idle project shows no dot at all (the space is reserved so names stay aligned).
+struct ProjectDotView: View {
+    let state: ProjectDotState
 
     var body: some View {
         Circle()
-            .fill(color)
+            .fill(color ?? .clear)
             .frame(width: 9, height: 9)
-            .overlay(Circle().stroke(.black.opacity(0.15), lineWidth: 0.5))
-            .help(status.rawValue)
+            .overlay(Circle().stroke(color == nil ? .clear : .black.opacity(0.15), lineWidth: 0.5))
+            .help(help)
     }
 
-    private var color: Color {
-        switch status {
-        case .idle: return Color.gray.opacity(0.55)
-        case .running: return Color.blue
-        case .waiting: return Color.orange
+    private var color: Color? {
+        switch state {
+        case .idle: return nil
+        case .finished: return .blue
+        case .waiting: return .orange
+        }
+    }
+
+    private var help: String {
+        switch state {
+        case .idle: return "idle"
+        case .finished: return "finished — ready for you"
+        case .waiting: return "waiting for input"
         }
     }
 }
@@ -359,7 +426,7 @@ struct SessionTab: View {
     var body: some View {
         HStack(spacing: 6) {
             ZStack {
-                StatusDot(status: session.status)
+                SessionTabIndicator(session: session)
                     .opacity(showNumber ? 0 : 1)
                 if showNumber, let number {
                     NumberBadge(number: number)

@@ -12,6 +12,9 @@ struct Session: Identifiable, Codable, Equatable {
     var status: SessionStatus = .idle
     var statusText: String? = nil
     var hasUnread: Bool = false
+    /// The agent went active → idle while you weren't looking at this session, so it
+    /// has finished and is waiting for you to come back. Cleared when you view it.
+    var finishedUnseen: Bool = false
 
     private enum CodingKeys: String, CodingKey { case id, title, cwd }
 
@@ -44,16 +47,33 @@ struct Project: Identifiable, Codable, Equatable {
 }
 
 extension Project {
-    /// Project-level rollup used for the sidebar dot.
+    /// Project-level rollup for the CLI/status text (idle | running | waiting).
     var aggregateStatus: SessionStatus {
         if sessions.contains(where: { $0.status == .waiting }) { return .waiting }
         if sessions.contains(where: { $0.status == .running }) { return .running }
         return .idle
     }
 
+    /// What the sidebar dot shows. Unlike `aggregateStatus`, "running" is *not* an
+    /// attention state here (it's already conveyed by the subtitle and the tab dot);
+    /// the dot only lights up when a session needs you: blocked on input (waiting),
+    /// or finished and not yet viewed.
+    var dotState: ProjectDotState {
+        if sessions.contains(where: { $0.status == .waiting }) { return .waiting }
+        if sessions.contains(where: { $0.finishedUnseen }) { return .finished }
+        return .idle
+    }
+
     var runningCount: Int { sessions.filter { $0.status == .running }.count }
     var waitingCount: Int { sessions.filter { $0.status == .waiting }.count }
     var hasUnread: Bool { sessions.contains { $0.hasUnread } }
+}
+
+/// The sidebar status dot's meaning (see `Project.dotState`).
+enum ProjectDotState {
+    case idle      // nothing needs you (covers actively-running)
+    case finished  // a session finished and hasn't been viewed yet
+    case waiting   // a session is blocked on your input
 }
 
 /// On-disk shape of the app state.

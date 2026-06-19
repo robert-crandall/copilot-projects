@@ -84,7 +84,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.model.focusActiveTerminal() }
+            Task { @MainActor in
+                self?.model.markActiveSessionSeen()
+                self?.model.focusActiveTerminal()
+            }
         }
     }
 

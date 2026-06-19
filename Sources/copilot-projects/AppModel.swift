@@ -340,6 +340,12 @@ final class AppModel: ObservableObject {
             for i in projects[pi].sessions.indices {
                 projects[pi].sessions[i].hasUnread = false
             }
+            // Only the project's visible (selected) tab counts as "seen" — leave the
+            // other tabs' finished flags so the dot still nudges you to them.
+            if let sid = projects[pi].selectedSessionId,
+               let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
+                projects[pi].sessions[si].finishedUnseen = false
+            }
             for session in projects[pi].sessions {
                 controller(for: session.id)
             }
@@ -352,6 +358,7 @@ final class AppModel: ObservableObject {
         guard let pi = projectIndex(pid) else { return }
         if let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
             projects[pi].sessions[si].hasUnread = false
+            projects[pi].sessions[si].finishedUnseen = false
         }
         projects[pi].selectedSessionId = sid
         controller(for: sid)
@@ -410,10 +417,24 @@ final class AppModel: ObservableObject {
 
     func setStatus(sessionId: String, status: SessionStatus, text: String?) {
         guard let loc = locateIndex(sessionId) else { return }
-        let current = projects[loc.p].sessions[loc.s]
-        guard current.status != status || current.statusText != text else { return }
+        let previous = projects[loc.p].sessions[loc.s].status
+        guard previous != status || projects[loc.p].sessions[loc.s].statusText != text else { return }
         projects[loc.p].sessions[loc.s].status = status
         projects[loc.p].sessions[loc.s].statusText = text
+        // The agent just went active → idle. If you're not currently looking at this
+        // session, flag it as finished-and-unseen (drives the blue sidebar/tab dot).
+        if status == .idle, previous == .running || previous == .waiting,
+           !isVisible(projectIndex: loc.p, sessionIndex: loc.s) {
+            projects[loc.p].sessions[loc.s].finishedUnseen = true
+        }
+    }
+
+    /// Whether a session is the one on screen right now (app active + its project and
+    /// tab selected). Used to decide if a just-finished session needs an attention dot.
+    private func isVisible(projectIndex pi: Int, sessionIndex si: Int) -> Bool {
+        NSApp.isActive
+            && selectedProjectId == projects[pi].id
+            && projects[pi].selectedSessionId == projects[pi].sessions[si].id
     }
 
     /// Backstop for flaky agent stop / sessionEnd hooks: a session can only stay
@@ -423,7 +444,7 @@ final class AppModel: ObservableObject {
     func startLivenessReconciler() {
         livenessTimer?.invalidate()
         guard livenessEnabled else { return }
-        reconcileLiveness()   // immediately clear any restored-but-dead statuses
+        reconcileLiveness(markFinished: false)   // startup: clear dead statuses without flagging them as "finished while away"
         let timer = Timer(timeInterval: 8, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.reconcileLiveness() }
         }
@@ -431,7 +452,7 @@ final class AppModel: ObservableObject {
         livenessTimer = timer
     }
 
-    private func reconcileLiveness() {
+    private func reconcileLiveness(markFinished: Bool = true) {
         let snapshot = ProcessTree.snapshot()
         // Sessions whose shell currently hosts a live agent (copilot) process.
         // Also used by scroll-forwarding: a resumed session's terminal is desynced
@@ -454,6 +475,11 @@ final class AppModel: ObservableObject {
                     let sid = projects[pi].sessions[si].id
                     projects[pi].sessions[si].status = .idle
                     projects[pi].sessions[si].statusText = nil
+                    // The agent exited/crashed (active → idle). Flag it as finished &
+                    // unseen unless you're looking at it right now.
+                    if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
+                        projects[pi].sessions[si].finishedUnseen = true
+                    }
                     try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
                 }
             }
@@ -479,14 +505,30 @@ final class AppModel: ObservableObject {
             selectedProjectId = projects[loc.p].id
             projects[loc.p].selectedSessionId = sessionId
             projects[loc.p].sessions[loc.s].hasUnread = false
+            projects[loc.p].sessions[loc.s].finishedUnseen = false
         } else if let projectId, let pi = projectIndex(projectId) {
             selectedProjectId = projectId
             for i in projects[pi].sessions.indices {
                 projects[pi].sessions[i].hasUnread = false
             }
+            if let sid = projects[pi].selectedSessionId,
+               let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
+                projects[pi].sessions[si].finishedUnseen = false
+            }
         }
         if let sid = currentSelectedSessionId { controller(for: sid) }
         updateDockBadge()
+    }
+
+    /// Clear the on-screen session's "finished" flag when the app is brought forward
+    /// (you're now looking at it). Other tabs keep their flag until you switch to them.
+    func markActiveSessionSeen() {
+        guard let pid = selectedProjectId, let pi = projectIndex(pid),
+              let sid = projects[pi].selectedSessionId,
+              let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) else { return }
+        if projects[pi].sessions[si].finishedUnseen {
+            projects[pi].sessions[si].finishedUnseen = false
+        }
     }
 
     /// Make the visible session's terminal the first responder. Used when the app
