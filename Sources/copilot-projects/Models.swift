@@ -54,12 +54,11 @@ extension Project {
         return .idle
     }
 
-    /// What the sidebar dot shows. Unlike `aggregateStatus`, "running" is *not* an
-    /// attention state here (it's already conveyed by the subtitle and the tab dot);
-    /// the dot only lights up when a session needs you: blocked on input (waiting),
-    /// or finished and not yet viewed.
+    /// What the sidebar dot shows. The dot lights up only when a project has a
+    /// session that finished and you haven't viewed it yet ("ready for you").
+    /// Running and waiting are conveyed by the color-coded subtitle counts, not the
+    /// dot, so an idle/busy/waiting project stays dot-free.
     var dotState: ProjectDotState {
-        if sessions.contains(where: { $0.status == .waiting }) { return .waiting }
         if sessions.contains(where: { $0.finishedUnseen }) { return .finished }
         return .idle
     }
@@ -71,9 +70,8 @@ extension Project {
 
 /// The sidebar status dot's meaning (see `Project.dotState`).
 enum ProjectDotState {
-    case idle      // nothing needs you (covers actively-running)
-    case finished  // a session finished and hasn't been viewed yet
-    case waiting   // a session is blocked on your input
+    case idle      // no dot — nothing finished is waiting to be seen
+    case finished  // a session finished and hasn't been viewed yet (blue)
 }
 
 /// On-disk shape of the app state.

@@ -218,9 +218,10 @@ struct SessionTabIndicator: View {
     }
 }
 
-/// The sidebar's per-project dot. Shown only when a project needs you: blue once a
-/// session has finished and is unviewed, orange while one is waiting on input. An
-/// idle project shows no dot at all (the space is reserved so names stay aligned).
+/// The sidebar's per-project dot — blue once a session has finished and is unviewed
+/// ("ready for you"). Anything else shows no dot; running and waiting are surfaced
+/// by the color-coded subtitle counts instead. The 9pt frame is always reserved so
+/// project names stay aligned whether or not a dot is shown.
 struct ProjectDotView: View {
     let state: ProjectDotState
 
@@ -236,7 +237,6 @@ struct ProjectDotView: View {
         switch state {
         case .idle: return nil
         case .finished: return .blue
-        case .waiting: return .orange
         }
     }
 
@@ -244,7 +244,6 @@ struct ProjectDotView: View {
         switch state {
         case .idle: return "idle"
         case .finished: return "finished — ready for you"
-        case .waiting: return "waiting for input"
         }
     }
 }
