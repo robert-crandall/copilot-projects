@@ -1,4 +1,4 @@
-# copilot-mux
+# Copilot Projects
 
 A deliberately small macOS terminal app that organizes CLI sessions by **project**.
 Projects are listed vertically in a sidebar; each project's terminal sessions are laid
@@ -34,11 +34,11 @@ view. The result is a few Swift files instead of hundreds.
   With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Notifications:** post a native macOS banner from any session; clicking it focuses the
   originating project/session. Unread sessions get a bell badge + a Dock badge count.
-- **Control socket + CLI:** the same `copilot-mux` binary is also a CLI that talks to the
+- **Control socket + CLI:** the same `copilot-projects` binary is also a CLI that talks to the
   running app over a Unix socket — ideal for agent hooks.
 - **Resumable sessions:** each terminal runs under a bundled [dtach](https://github.com/crigler/dtach),
   so quitting/relaunching/crashing the app does **not** kill your shells or in-flight agents.
-  Relaunch reattaches. You can also `ssh` into the machine and `copilot-mux attach` to reconnect
+  Relaunch reattaches. You can also `ssh` into the machine and `copilot-projects attach` to reconnect
   from another host.
 - **Persistence:** projects/sessions are restored on relaunch.
 
@@ -55,12 +55,12 @@ Requires Xcode 15+ (Swift 5.9+), macOS 13+.
 the SwiftTerm resource bundle, and an ad-hoc code signature so notifications work), and
 prints the app path.
 
-On first launch the app symlinks its binary to `~/.local/bin/copilot-mux`. Put that on your
+On first launch the app symlinks its binary to `~/.local/bin/copilot-projects`. Put that on your
 `PATH` to use the CLI from anywhere:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
-copilot-mux ping            # -> pong
+copilot-projects ping            # -> pong
 ```
 
 > **Note:** if `swift build` fails with `cannot use bare repository … safe.bareRepository is
@@ -70,29 +70,29 @@ copilot-mux ping            # -> pong
 
 ## CLI
 
-Inside a copilot-mux terminal, `COPILOT_MUX_PROJECT` / `COPILOT_MUX_SESSION` /
-`COPILOT_MUX_SOCKET` are set, so commands auto-target the current session.
+Inside a copilot-projects terminal, `COPILOT_PROJECTS_PROJECT` / `COPILOT_PROJECTS_SESSION` /
+`COPILOT_PROJECTS_SOCKET` are set, so commands auto-target the current session.
 
 ```bash
-copilot-mux set-status running               # set the current session's status
-copilot-mux set-status waiting --text "review my diff"
-copilot-mux notify "Build finished" "All tests green"
-copilot-mux list-projects
-copilot-mux list-status
-copilot-mux new-project myapp                # name only; --cwd optional
-copilot-mux new-session --project <id> --cwd /tmp
-copilot-mux focus --session <id>             # bring app forward + select
-copilot-mux install-hooks                    # wire up Copilot CLI status hooks
-copilot-mux help
+copilot-projects set-status running               # set the current session's status
+copilot-projects set-status waiting --text "review my diff"
+copilot-projects notify "Build finished" "All tests green"
+copilot-projects list-projects
+copilot-projects list-status
+copilot-projects new-project myapp                # name only; --cwd optional
+copilot-projects new-session --project <id> --cwd /tmp
+copilot-projects focus --session <id>             # bring app forward + select
+copilot-projects install-hooks                    # wire up Copilot CLI status hooks
+copilot-projects help
 ```
 
 Targeting flags (`--project`, `--session`) override the environment defaults.
 
 ## Copilot CLI integration (automatic status)
 
-So the status dot tracks a coding agent without any manual calls, copilot-mux installs a
+So the status dot tracks a coding agent without any manual calls, copilot-projects installs a
 [Copilot CLI hook](https://docs.github.com/copilot) bridge into `~/.copilot/hooks/`
-(`copilot-mux-hook.sh` + `copilot-mux.json`) the first time the app launches. It maps the
+(`copilot-projects-hook.sh` + `copilot-projects.json`) the first time the app launches. It maps the
 agent lifecycle to status:
 
 | Copilot CLI event | status |
@@ -104,25 +104,25 @@ agent lifecycle to status:
 | `agentStop` | `idle` |
 | `sessionEnd` | `idle` |
 
-The hook no-ops outside a copilot-mux terminal (it checks `COPILOT_MUX_SESSION`), so it
+The hook no-ops outside a copilot-projects terminal (it checks `COPILOT_PROJECTS_SESSION`), so it
 coexists with other integrations (e.g. cmux) and is safe to leave installed globally. Manage
-it with `copilot-mux install-hooks` / `uninstall-hooks`. Start a new Copilot CLI session to
+it with `copilot-projects install-hooks` / `uninstall-hooks`. Start a new Copilot CLI session to
 pick up changes.
 
 **Liveness backstop.** Stop/exit hooks can be missed (a crash, `kill`, a closed terminal), so
 the app also reconciles: a session can only stay `running`/`waiting` while its shell actually
 hosts a live `copilot` process. The moment the agent exits, the dot drops to idle — and it is
 never cleared while the agent is genuinely working (no timing guesswork). Tune the detected
-process names with `COPILOT_MUX_AGENT_PROCESSES` (comma-separated, default `copilot`) or turn
-the check off with `COPILOT_MUX_LIVENESS=0`.
+process names with `COPILOT_PROJECTS_AGENT_PROCESSES` (comma-separated, default `copilot`) or turn
+the check off with `COPILOT_PROJECTS_LIVENESS=0`.
 
 For other agents, call the CLI from their hooks directly:
 
 ```bash
-copilot-mux set-status running
-copilot-mux set-status waiting --text "needs approval"
-copilot-mux notify "Agent needs input"
-copilot-mux set-status idle
+copilot-projects set-status running
+copilot-projects set-status waiting --text "needs approval"
+copilot-projects notify "Agent needs input"
+copilot-projects set-status idle
 ```
 
 ## Resumability & SSH reattach
@@ -138,30 +138,47 @@ the only emulator.
 - **Reconnect from another host:**
   ```bash
   ssh you@mac
-  copilot-mux ls                 # list sessions + ids
-  copilot-mux attach <id|prefix> # raw reattach in this terminal (Ctrl-\ to detach)
+  copilot-projects ls                 # list sessions + ids
+  copilot-projects attach <id|prefix> # raw reattach in this terminal (Ctrl-\ to detach)
   ```
 - **Tradeoff:** scrollback *history* doesn't survive a detach (a full-screen TUI like copilot
   repaints on reattach; a plain shell starts fresh). Live scrollback while attached is normal.
 
-Sockets live under `~/.local/state/copilot-mux/sessions/`. If the bundled dtach is missing,
-sessions fall back to plain (non-resumable) shells. Override the helper with `COPILOT_MUX_DTACH`.
+Sockets live under `~/.local/state/copilot-projects/sessions/`. If the bundled dtach is missing,
+sessions fall back to plain (non-resumable) shells. Override the helper with `COPILOT_PROJECTS_DTACH`.
 
 ## How it works
 
-- One executable, two roles (`Sources/copilot-mux/main.swift`): a recognized subcommand runs
+- One executable, two roles (`Sources/copilot-projects/main.swift`): a recognized subcommand runs
   the CLI client; anything else launches the SwiftUI app.
-- `Sources/CopilotMuxCore` is Foundation-only: paths, the JSON-line wire protocol, the socket
+- `Sources/CopilotProjectsCore` is Foundation-only: paths, the JSON-line wire protocol, the socket
   client, and CLI parsing.
 - The app keeps value-type `Project`/`Session` state in `AppModel` and holds the live
   SwiftTerm views **outside** the observable graph (`controllers` dictionary), so SwiftUI
   list diffing stays cheap.
-- `ControlServer` listens on `~/.local/state/copilot-mux/control.sock` (mode 0600 in a 0700
+- `ControlServer` listens on `~/.local/state/copilot-projects/control.sock` (mode 0600 in a 0700
   dir); each connection is one JSON request → one JSON response.
-- State is persisted to `~/.local/state/copilot-mux/state.json`.
+- State is persisted to `~/.local/state/copilot-projects/state.json`.
 
-Override locations with `COPILOT_MUX_SOCKET` and `COPILOT_MUX_STATE_DIR` (useful for running
+Override locations with `COPILOT_PROJECTS_SOCKET` and `COPILOT_PROJECTS_STATE_DIR` (useful for running
 an isolated instance).
+
+## Upgrading from copilot-mux
+
+This project used to be called **copilot-mux**. Existing installs are preserved on
+first launch: running sessions reattach, and the saved sidebar width / window frame
+are copied into the renamed app. A few things keep the old name for compatibility and
+are intentionally *not* migrated:
+
+- **Storage dir.** An install that already has sessions under `~/.local/state/copilot-mux`
+  keeps using it — the live dtach sockets can't be moved out from under running sessions.
+  Fresh installs use `~/.local/state/copilot-projects`.
+- **CLI alias.** `~/.local/bin/copilot-mux` is repointed to the new binary, so old hooks
+  and scripts keep working. The CLI is now `copilot-projects`.
+- **Env vars.** New sessions get `COPILOT_PROJECTS_*`; the app still reads the legacy
+  `COPILOT_MUX_*` names that pre-rebrand shells carry.
+
+macOS ties notification permission to the (now changed) bundle id, so it re-prompts once.
 
 ## License
 

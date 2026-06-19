@@ -3,23 +3,47 @@ import Foundation
 /// Filesystem locations used by both the app and the CLI.
 ///
 /// All paths can be overridden via environment variables so that tagged / test
-/// instances can run fully isolated from a production copilot-mux.
+/// instances can run fully isolated from a production copilot-projects.
 public enum Paths {
-    /// `~/.local/state/copilot-mux` (override with `COPILOT_MUX_STATE_DIR`).
+    /// The storage root. Honors `COPILOT_PROJECTS_STATE_DIR` (or the legacy
+    /// `COPILOT_MUX_STATE_DIR`); otherwise see `defaultStateDir`.
     public static var stateDir: URL {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["COPILOT_MUX_STATE_DIR"], !override.isEmpty {
+        if let override = env["COPILOT_PROJECTS_STATE_DIR"] ?? env["COPILOT_MUX_STATE_DIR"],
+           !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true)
         }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
-            .appendingPathComponent(".local/state/copilot-mux", isDirectory: true)
+        return defaultStateDir
     }
 
-    /// Unix domain socket the app listens on (override with `COPILOT_MUX_SOCKET`).
+    /// Resolved once per process. An install that already has sessions under the
+    /// pre-rebrand `copilot-mux` directory keeps using it — the directory is
+    /// internal and is deliberately never moved, because the live dtach masters
+    /// were launched with their old socket paths baked into argv, so relocating
+    /// the sockets would strand them. Fresh installs use the current name.
+    private static let defaultStateDir: URL = {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let current = home.appendingPathComponent(".local/state/copilot-projects", isDirectory: true)
+        let legacy = home.appendingPathComponent(".local/state/copilot-mux", isDirectory: true)
+        if hasMeaningfulState(legacy) && !hasMeaningfulState(current) { return legacy }
+        return current
+    }()
+
+    /// True if a directory holds real session state, so an empty/accidental dir
+    /// never wins the legacy-vs-current decision above.
+    private static func hasMeaningfulState(_ dir: URL) -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: dir.appendingPathComponent("state.json").path) { return true }
+        let sessions = dir.appendingPathComponent("sessions").path
+        if let items = try? fm.contentsOfDirectory(atPath: sessions), !items.isEmpty { return true }
+        return false
+    }
+
+    /// Unix domain socket the app listens on (override with `COPILOT_PROJECTS_SOCKET`).
     public static var socketPath: String {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["COPILOT_MUX_SOCKET"], !override.isEmpty {
+        if let override = env["COPILOT_PROJECTS_SOCKET"] ?? env["COPILOT_MUX_SOCKET"],
+           !override.isEmpty {
             return override
         }
         return stateDir.appendingPathComponent("control.sock").path
@@ -49,7 +73,8 @@ public enum Paths {
     /// The bundled dtach helper (resumability backend), or an override, or nil.
     public static var dtachExecutable: String? {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["COPILOT_MUX_DTACH"], !override.isEmpty,
+        if let override = env["COPILOT_PROJECTS_DTACH"] ?? env["COPILOT_MUX_DTACH"],
+           !override.isEmpty,
            FileManager.default.isExecutableFile(atPath: override) {
             return override
         }

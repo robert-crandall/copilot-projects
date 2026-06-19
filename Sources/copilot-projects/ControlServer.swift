@@ -2,7 +2,7 @@ import Foundation
 #if canImport(Darwin)
 import Darwin
 #endif
-import CopilotMuxCore
+import CopilotProjectsCore
 
 /// Accepts one-shot JSON-line requests on a Unix domain socket and replies with
 /// one JSON-line response. The handler runs on the server's background queue;
@@ -12,7 +12,8 @@ final class ControlServer {
     private let handler: (ControlRequest) -> ControlResponse
     private var listenFD: Int32 = -1
     private var running = false
-    private let queue = DispatchQueue(label: "com.obvioussean.copilot-mux.control")
+    private var boundSocket = false
+    private let queue = DispatchQueue(label: "com.obvioussean.copilot-projects.control")
 
     init(socketPath: String = Paths.socketPath,
          handler: @escaping (ControlRequest) -> ControlResponse) {
@@ -22,11 +23,18 @@ final class ControlServer {
 
     func start() {
         Paths.ensureStateDir()
+        // Don't steal the socket from a still-running instance (possible during the
+        // bundle-id transition, when macOS no longer treats old + new as one app):
+        // only remove a stale socket file that nothing is listening on.
+        if socketIsAlive(socketPath) {
+            NSLog("copilot-projects control: another instance is already listening on \(socketPath); not starting a second control server")
+            return
+        }
         unlink(socketPath)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            NSLog("copilot-mux control: socket() failed errno \(errno)")
+            NSLog("copilot-projects control: socket() failed errno \(errno)")
             return
         }
 
@@ -35,7 +43,7 @@ final class ControlServer {
         let bytes = Array(socketPath.utf8)
         let cap = MemoryLayout.size(ofValue: addr.sun_path)
         guard bytes.count < cap else {
-            NSLog("copilot-mux control: socket path too long")
+            NSLog("copilot-projects control: socket path too long")
             close(fd)
             return
         }
@@ -52,22 +60,23 @@ final class ControlServer {
             }
         }
         guard bound == 0 else {
-            NSLog("copilot-mux control: bind failed errno \(errno)")
+            NSLog("copilot-projects control: bind failed errno \(errno)")
             close(fd)
             return
         }
         chmod(socketPath, 0o600)
 
         guard listen(fd, 16) == 0 else {
-            NSLog("copilot-mux control: listen failed errno \(errno)")
+            NSLog("copilot-projects control: listen failed errno \(errno)")
             close(fd)
             return
         }
 
         listenFD = fd
         running = true
+        boundSocket = true
         queue.async { [weak self] in self?.acceptLoop() }
-        NSLog("copilot-mux control: listening on \(socketPath)")
+        NSLog("copilot-projects control: listening on \(socketPath)")
     }
 
     func stop() {
@@ -76,7 +85,35 @@ final class ControlServer {
             close(listenFD)
             listenFD = -1
         }
-        unlink(socketPath)
+        if boundSocket {
+            unlink(socketPath)
+            boundSocket = false
+        }
+    }
+
+    /// True if a process is currently accepting on `path` (a live listener), vs. a
+    /// stale leftover socket file that connect() refuses with ECONNREFUSED.
+    private func socketIsAlive(_ path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        let cap = MemoryLayout.size(ofValue: addr.sun_path)
+        guard bytes.count < cap else { return false }
+        withUnsafeMutablePointer(to: &addr.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: cap) { dst in
+                for (i, b) in bytes.enumerated() { dst[i] = CChar(bitPattern: b) }
+                dst[bytes.count] = 0
+            }
+        }
+        let r = withUnsafePointer(to: &addr) { p -> Int32 in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return r == 0
     }
 
     private func acceptLoop() {

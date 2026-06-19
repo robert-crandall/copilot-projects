@@ -1,6 +1,6 @@
 import SwiftUI
 import AppKit
-import CopilotMuxCore
+import CopilotProjectsCore
 
 /// Single source of truth. Holds value-type projects/sessions (observed) and live
 /// terminal controllers (NOT observed, kept out of the SwiftUI graph).
@@ -23,10 +23,12 @@ final class AppModel: ObservableObject {
     private(set) var liveAgentSessions: Set<String> = []
 
     /// Process names treated as a live coding agent for the liveness backstop.
-    /// Override with COPILOT_MUX_AGENT_PROCESSES (comma-separated); disable the
-    /// whole check with COPILOT_MUX_LIVENESS=0.
+    /// Override with COPILOT_PROJECTS_AGENT_PROCESSES (comma-separated); disable the
+    /// whole check with COPILOT_PROJECTS_LIVENESS=0.
     private var agentProcessNames: Set<String> {
-        if let raw = ProcessInfo.processInfo.environment["COPILOT_MUX_AGENT_PROCESSES"], !raw.isEmpty {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["COPILOT_PROJECTS_AGENT_PROCESSES"] ?? env["COPILOT_MUX_AGENT_PROCESSES"],
+           !raw.isEmpty {
             let names = raw.split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
@@ -36,7 +38,8 @@ final class AppModel: ObservableObject {
     }
 
     private var livenessEnabled: Bool {
-        ProcessInfo.processInfo.environment["COPILOT_MUX_LIVENESS"] != "0"
+        let env = ProcessInfo.processInfo.environment
+        return (env["COPILOT_PROJECTS_LIVENESS"] ?? env["COPILOT_MUX_LIVENESS"]) != "0"
     }
 
     init() {
@@ -78,16 +81,21 @@ final class AppModel: ObservableObject {
     }
 
     /// Best-effort: symlink the bundled binary onto the user's PATH so terminal
-    /// hooks can call `copilot-mux`.
+    /// hooks can call `copilot-projects`.
     func installCLISymlinkIfPossible() {
         guard let exe = Bundle.main.executablePath else { return }
         let fm = FileManager.default
         let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin", isDirectory: true)
-        let link = dir.appendingPathComponent("copilot-mux")
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        if let dest = try? fm.destinationOfSymbolicLink(atPath: link.path), dest == exe { return }
-        try? fm.removeItem(at: link)
-        try? fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
+        // copilot-projects is the CLI; copilot-mux is repointed (not removed) as a
+        // compatibility alias so shells/hooks created before the rebrand keep
+        // reaching the binary instead of silently no-opping.
+        for name in ["copilot-projects", "copilot-mux"] {
+            let link = dir.appendingPathComponent(name)
+            if let dest = try? fm.destinationOfSymbolicLink(atPath: link.path), dest == exe { continue }
+            try? fm.removeItem(at: link)
+            try? fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
+        }
     }
 
     // MARK: - derived
@@ -143,10 +151,10 @@ final class AppModel: ObservableObject {
 
     private func environment(projectId: String, sessionId: String) -> [String: String] {
         [
-            "COPILOT_MUX": "1",
-            "COPILOT_MUX_SOCKET": Paths.socketPath,
-            "COPILOT_MUX_PROJECT": projectId,
-            "COPILOT_MUX_SESSION": sessionId,
+            "COPILOT_PROJECTS": "1",
+            "COPILOT_PROJECTS_SOCKET": Paths.socketPath,
+            "COPILOT_PROJECTS_PROJECT": projectId,
+            "COPILOT_PROJECTS_SESSION": sessionId,
         ]
     }
 

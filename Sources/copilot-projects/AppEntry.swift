@@ -1,8 +1,8 @@
 import SwiftUI
 import AppKit
-import CopilotMuxCore
+import CopilotProjectsCore
 
-struct CopilotMuxApp: App {
+struct CopilotProjectsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
@@ -52,7 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.startServer()
         model.startLivenessReconciler()
         // A test/isolated instance can opt out of mutating the user's CLI + hooks.
-        if ProcessInfo.processInfo.environment["COPILOT_MUX_NO_INSTALL"] != "1" {
+        let env = ProcessInfo.processInfo.environment
+        if (env["COPILOT_PROJECTS_NO_INSTALL"] ?? env["COPILOT_MUX_NO_INSTALL"]) != "1" {
             model.installCLISymlinkIfPossible()
             CopilotHooks.installIfPossible()
         }

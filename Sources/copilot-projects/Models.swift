@@ -1,5 +1,5 @@
 import Foundation
-import CopilotMuxCore
+import CopilotProjectsCore
 
 /// A terminal session inside a project. Value type; the live terminal NSView lives
 /// elsewhere (AppModel.controllers) and is keyed by `id`.

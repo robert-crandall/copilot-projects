@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "copilot-mux",
+    name: "copilot-projects",
     platforms: [
         .macOS(.v13)
     ],
@@ -11,16 +11,16 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "CopilotMuxCore",
-            path: "Sources/CopilotMuxCore"
+            name: "CopilotProjectsCore",
+            path: "Sources/CopilotProjectsCore"
         ),
         .executableTarget(
-            name: "copilot-mux",
+            name: "copilot-projects",
             dependencies: [
-                "CopilotMuxCore",
+                "CopilotProjectsCore",
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
-            path: "Sources/copilot-mux"
+            path: "Sources/copilot-projects"
         )
     ]
 )

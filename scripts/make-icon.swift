@@ -3,7 +3,7 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 
-// Renders the copilot-mux app icon to a 1024x1024 PNG.
+// Renders the copilot-projects app icon to a 1024x1024 PNG.
 // Usage: swift make-icon.swift <out.png>
 
 let S = 1024.0

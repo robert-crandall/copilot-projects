@@ -12,9 +12,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             if let error = error {
-                NSLog("copilot-mux: notification auth error \(error)")
+                NSLog("copilot-projects: notification auth error \(error)")
             } else {
-                NSLog("copilot-mux: notification auth granted=\(granted)")
+                NSLog("copilot-projects: notification auth granted=\(granted)")
             }
         }
     }
@@ -35,7 +35,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         )
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
-                NSLog("copilot-mux: failed to post notification \(error)")
+                NSLog("copilot-projects: failed to post notification \(error)")
             }
         }
     }

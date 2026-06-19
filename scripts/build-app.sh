@@ -21,8 +21,12 @@ for arg in "$@"; do
 done
 
 APP_NAME="Copilot Projects"
-BUNDLE_ID="com.obvioussean.copilot-mux"
-EXE_NAME="copilot-mux"
+# Bundle id carries the project name. It is also the UserDefaults domain (saved
+# sidebar width, window frame); LegacyDefaults.migrateIfNeeded() copies the old
+# domain across on first launch so those survive the rename. macOS keys
+# notification authorization to the bundle id, so it re-prompts once.
+BUNDLE_ID="com.obvioussean.copilot-projects"
+EXE_NAME="copilot-projects"
 VERSION="0.1.0"
 
 # SwiftPM needs this when the user's global git sets safe.bareRepository=explicit.

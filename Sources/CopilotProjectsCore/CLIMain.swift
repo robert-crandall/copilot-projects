@@ -3,7 +3,7 @@ import Foundation
 import Darwin
 #endif
 
-/// Command-line front end. When the `copilot-mux` binary is invoked with a known
+/// Command-line front end. When the `copilot-projects` binary is invoked with a known
 /// subcommand it acts as a thin client to the running app's control socket.
 public enum CLIMain {
     /// Subcommands that should be handled by the CLI (vs. launching the GUI).
@@ -52,7 +52,7 @@ public enum CLIMain {
             }
         case "uninstall-hooks":
             CopilotHooks.uninstall()
-            print("Removed copilot-mux Copilot CLI hooks.")
+            print("Removed copilot-projects Copilot CLI hooks.")
             return 0
         case "attach":
             return attachSession(rest)
@@ -64,8 +64,8 @@ public enum CLIMain {
         let env = ProcessInfo.processInfo.environment
 
         var req = ControlRequest(command: command)
-        req.projectId = parsed.flags["project"] ?? env["COPILOT_MUX_PROJECT"]
-        req.sessionId = parsed.flags["session"] ?? env["COPILOT_MUX_SESSION"]
+        req.projectId = parsed.flags["project"] ?? Env.projectId(env)
+        req.sessionId = parsed.flags["session"] ?? Env.sessionId(env)
 
         switch command {
         case "set-status":
@@ -144,7 +144,7 @@ public enum CLIMain {
         let env = ProcessInfo.processInfo.environment
         let wanted = parsed.positionals.first
             ?? parsed.flags["session"]
-            ?? env["COPILOT_MUX_SESSION"]
+            ?? Env.sessionId(env)
 
         let socketPath: String
         if let wanted = wanted, !wanted.isEmpty {
@@ -155,7 +155,7 @@ public enum CLIMain {
                 if matches.count == 1 {
                     socketPath = dir.appendingPathComponent(matches[0]).path
                 } else if matches.isEmpty {
-                    fail("no session matching “\(wanted)” (try: copilot-mux ls)")
+                    fail("no session matching “\(wanted)” (try: copilot-projects ls)")
                     return 1
                 } else {
                     fail("ambiguous “\(wanted)” — matches \(matches.count) sessions")
@@ -165,7 +165,7 @@ public enum CLIMain {
         } else if socks.count == 1 {
             socketPath = dir.appendingPathComponent(socks[0]).path
         } else {
-            fail("specify a session id (copilot-mux ls to list)")
+            fail("specify a session id (copilot-projects ls to list)")
             return 1
         }
 
@@ -232,15 +232,17 @@ public enum CLIMain {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let link = dir.appendingPathComponent("copilot-mux")
-            if fm.fileExists(atPath: link.path) {
-                try? fm.removeItem(at: link)
-            }
+            let link = dir.appendingPathComponent("copilot-projects")
+            try? fm.removeItem(at: link)
             try fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
+            // Keep the old name working for shells/scripts created before the rename.
+            let legacyLink = dir.appendingPathComponent("copilot-mux")
+            try? fm.removeItem(at: legacyLink)
+            try? fm.createSymbolicLink(atPath: legacyLink.path, withDestinationPath: exe)
             print("Linked \(link.path) -> \(exe)")
             let pathEnv = ProcessInfo.processInfo.environment["PATH"] ?? ""
             if !pathEnv.split(separator: ":").contains(Substring(dir.path)) {
-                print("note: \(dir.path) is not on your PATH; add it to use `copilot-mux`.")
+                print("note: \(dir.path) is not on your PATH; add it to use `copilot-projects`.")
             }
             return 0
         } catch {
@@ -259,34 +261,34 @@ public enum CLIMain {
     // MARK: - output
 
     private static func fail(_ message: String) {
-        FileHandle.standardError.write(Data("copilot-mux: \(message)\n".utf8))
+        FileHandle.standardError.write(Data("copilot-projects: \(message)\n".utf8))
     }
 
     private static func printUsage() {
         let usage = """
-        copilot-mux — project-organized terminal sessions
+        copilot-projects — project-organized terminal sessions
 
         Usage:
-          copilot-mux                         Launch the app
-          copilot-mux set-status <state>      Set status of the current session
+          copilot-projects                         Launch the app
+          copilot-projects set-status <state>      Set status of the current session
                                               state: idle | running | waiting
               [--text "..."] [--session ID] [--project ID]
-          copilot-mux notify <title> [body]   Post a macOS notification
+          copilot-projects notify <title> [body]   Post a macOS notification
               [--title T] [--body B] [--session ID] [--project ID]
-          copilot-mux list-projects           List projects and their status
-          copilot-mux list-status (ls)        List per-session status + ids
-          copilot-mux attach [session]        Attach/resume a session (also works over SSH)
-          copilot-mux new-project [name]      Create a project [--cwd DIR]
-          copilot-mux new-session             Add a session to a project [--cwd DIR] [--project ID]
-          copilot-mux rename-project <name>   Rename a project [--project ID]
-          copilot-mux focus                   Focus a project/session [--project ID] [--session ID]
-          copilot-mux ping                    Check the app is reachable
-          copilot-mux install-cli [--dir D]   Symlink this binary onto your PATH
-          copilot-mux install-hooks           Install Copilot CLI status hooks (~/.copilot/hooks)
-          copilot-mux uninstall-hooks         Remove the Copilot CLI status hooks
-          copilot-mux help                    Show this help
+          copilot-projects list-projects           List projects and their status
+          copilot-projects list-status (ls)        List per-session status + ids
+          copilot-projects attach [session]        Attach/resume a session (also works over SSH)
+          copilot-projects new-project [name]      Create a project [--cwd DIR]
+          copilot-projects new-session             Add a session to a project [--cwd DIR] [--project ID]
+          copilot-projects rename-project <name>   Rename a project [--project ID]
+          copilot-projects focus                   Focus a project/session [--project ID] [--session ID]
+          copilot-projects ping                    Check the app is reachable
+          copilot-projects install-cli [--dir D]   Symlink this binary onto your PATH
+          copilot-projects install-hooks           Install Copilot CLI status hooks (~/.copilot/hooks)
+          copilot-projects uninstall-hooks         Remove the Copilot CLI status hooks
+          copilot-projects help                    Show this help
 
-        Inside a copilot-mux terminal, COPILOT_MUX_PROJECT / COPILOT_MUX_SESSION are set,
+        Inside a copilot-projects terminal, COPILOT_PROJECTS_PROJECT / COPILOT_PROJECTS_SESSION are set,
         so set-status / notify target the current session automatically.
         """
         print(usage)

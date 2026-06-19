@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
-import CopilotMuxCore
+import CopilotProjectsCore
 
 struct RootView: View {
     @ObservedObject var model: AppModel

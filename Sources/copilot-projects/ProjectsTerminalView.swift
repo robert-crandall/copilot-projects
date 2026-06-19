@@ -16,7 +16,7 @@ import SwiftTerm
 ///  2. App is on the alternate screen without mouse reporting → "alternate
 ///     scroll": send cursor up/down keys so pagers/TUIs scroll.
 ///  3. Otherwise (normal shell) → let SwiftTerm scroll its own scrollback.
-final class MuxTerminalView: LocalProcessTerminalView {
+final class ProjectsTerminalView: LocalProcessTerminalView {
     private var scrollAccum: CGFloat = 0
 
     /// Returns true if the wheel event was handled (and so should be consumed).

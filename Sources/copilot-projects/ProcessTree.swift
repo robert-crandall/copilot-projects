@@ -1,4 +1,5 @@
 import Foundation
+import CopilotProjectsCore
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -100,12 +101,12 @@ enum ProcessTree {
         return (args, env)
     }
 
-    /// Sessions (by COPILOT_MUX_SESSION env) that currently host a live agent
+    /// Sessions (by COPILOT_PROJECTS_SESSION env) that currently host a live agent
     /// process. Works regardless of how the shell is wrapped (dtach or direct).
     static func agentSessions(agentNames: Set<String>, in snap: Snapshot) -> Set<String> {
         var sessions = Set<String>()
         for (pid, name) in snap.nameOf where agentNames.contains(name) {
-            if let sid = inspect(pid).env["COPILOT_MUX_SESSION"], !sid.isEmpty {
+            if let sid = Env.sessionId(inspect(pid).env) {
                 sessions.insert(sid)
             }
         }
