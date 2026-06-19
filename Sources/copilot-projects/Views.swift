@@ -6,9 +6,16 @@ import CopilotProjectsCore
 struct RootView: View {
     @ObservedObject var model: AppModel
 
+    // Top strip in the window's title-bar region: the fleet status sits at the
+    // right; the traffic lights float over the left. The session tabs live in a
+    // separate thin row just below it — out of the window's drag region — so a
+    // drag reorders them instead of moving the window. (Content in the title-bar
+    // drag region always moves the window on macOS, so the tabs can't live there.)
+    private let titleStripHeight: CGFloat = 38
+
     var body: some View {
         VStack(spacing: 0) {
-            titleBarStrip
+            topStrip
             HSplitView {
                 SidebarView(model: model)
                     .frame(minWidth: 200, idealWidth: 240, maxWidth: 360)
@@ -25,19 +32,17 @@ struct RootView: View {
         .background(WindowConfigurator())
     }
 
-    // Thin strip holding the macOS traffic lights (the system's draggable title
-    // region), spanning the full width above both panes.
-    private var titleBarStrip: some View {
-        Color(nsColor: .windowBackgroundColor)
-            .frame(height: 28)
-            .frame(maxWidth: .infinity)
+    private var topStrip: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            FleetStatusBar(model: model)
+                .padding(.trailing, 12)
+        }
+        .frame(height: titleStripHeight)
+        .frame(maxWidth: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    // Session tabs for the selected project. Lives at the top of the right-hand
-    // (detail) pane — to the right of the sidebar, not above it — so it reads as
-    // belonging to the terminal area. It sits below the titleBarStrip (not in it),
-    // because dragging in the title region moves the window and would steal the
-    // tabs' drag-to-reorder.
     private var tabRow: some View {
         HStack(spacing: 0) {
             if let project = model.selectedProject, !project.sessions.isEmpty {
@@ -46,26 +51,56 @@ struct RootView: View {
                 Spacer(minLength: 0)
             }
         }
-        .frame(height: 34)
+        .frame(height: 32)
         .frame(maxWidth: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
-/// Hides the window title/chrome so the content fills to the top with only the
-/// floating traffic lights, keeping the header minimal.
+/// Removes the title-bar/content separator (a thin line that can pick up the
+/// accent color under the strip) and keeps chrome minimal. Retries until the
+/// window is attached (it's nil at first).
 struct WindowConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        DispatchQueue.main.async {
-            guard let window = view.window else { return }
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
+        func apply(_ attempt: Int) {
+            if let window = view.window {
+                window.titlebarSeparatorStyle = .none
+            } else if attempt < 40 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { apply(attempt + 1) }
+            }
         }
+        DispatchQueue.main.async { apply(0) }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+/// Roll-up of what every agent is doing, drawn as a trailing title-bar accessory:
+/// the running count (green), then the waiting (orange) and ready (blue) counts;
+/// "all idle" when nothing is active. (No spinner here — an NSProgressIndicator
+/// breaks Auto Layout inside the title-bar accessory's hosting view.)
+struct FleetStatusBar: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let running = model.totalRunning
+        let waiting = model.totalWaiting
+        let ready = model.totalReady
+        HStack(spacing: 10) {
+            if running > 0 { Text("\(running) running").foregroundStyle(.green) }
+            if waiting > 0 { Text("\(waiting) waiting").foregroundStyle(.orange) }
+            if ready > 0 { Text("\(ready) ready").foregroundStyle(.blue) }
+            if running == 0, waiting == 0, ready == 0 {
+                Text("all idle").foregroundStyle(.tertiary)
+            }
+        }
+        .font(.system(size: 12))
+        .lineLimit(1)
+        .fixedSize()
+        .allowsHitTesting(false)
+    }
 }
 
 /// Gives the HSplitView's underlying NSSplitView an autosave name so it persists
@@ -137,9 +172,13 @@ struct ProjectRow: View {
     var body: some View {
         HStack(spacing: 8) {
             ProjectDotView(state: project.dotState)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(project.name).lineLimit(1)
-                subtitle
+                Text("\(project.sessions.count) session\(project.sessions.count == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                statusLine
                     .font(.caption)
                     .lineLimit(1)
             }
@@ -155,21 +194,21 @@ struct ProjectRow: View {
         .padding(.vertical, 2)
     }
 
-    // "N sessions" stays muted; the running/waiting counts are colored to match
-    // their status (blue / orange), so the detail line reads at a glance.
-    private var subtitle: Text {
-        let count = project.sessions.count
-        var text = Text("\(count) session\(count == 1 ? "" : "s")")
-            .foregroundColor(.secondary)
-        if project.runningCount > 0 {
-            text = text + Text("  ·  ").foregroundColor(.secondary)
-                + Text("\(project.runningCount) running").foregroundColor(.blue)
+    // Its own line, always present (even when "idle"), so the row height never
+    // changes as agents start/stop. Waiting is the actionable one, so it's orange;
+    // running is muted; idle is fainter still.
+    @ViewBuilder private var statusLine: some View {
+        let running = project.runningCount
+        let waiting = project.waitingCount
+        if running > 0 || waiting > 0 {
+            HStack(spacing: 4) {
+                if running > 0 { Text("\(running) running").foregroundStyle(.green) }
+                if running > 0, waiting > 0 { Text("·").foregroundStyle(.tertiary) }
+                if waiting > 0 { Text("\(waiting) waiting").foregroundStyle(.orange) }
+            }
+        } else {
+            Text("idle").foregroundStyle(.tertiary)
         }
-        if project.waitingCount > 0 {
-            text = text + Text("  ·  ").foregroundColor(.secondary)
-                + Text("\(project.waitingCount) waiting").foregroundColor(.orange)
-        }
-        return text
     }
 }
 
@@ -376,6 +415,7 @@ struct SessionTabBar: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
         }
+        .focusEffectDisabled()
     }
 
     private var insertionBar: some View {

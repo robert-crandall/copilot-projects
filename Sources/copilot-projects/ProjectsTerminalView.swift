@@ -94,4 +94,17 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
               let hit = win.contentView?.hitTest(event.locationInWindow) else { return false }
         return hit === self || hit.isDescendant(of: self)
     }
+
+    /// Hide SwiftTerm's OSC 9;4 progress bar (`TerminalProgressBarView`): a 2pt
+    /// accent bar pinned to the top edge that the Copilot CLI triggers while
+    /// working, which reads as a stray blue line (the tab spinner already signals
+    /// "running"). `apply()` only toggles `isHidden`/layer colors, never
+    /// `alphaValue`, so zeroing alpha hides it for good without yanking it out of
+    /// the hierarchy mid-insertion.
+    override func didAddSubview(_ subview: NSView) {
+        super.didAddSubview(subview)
+        if String(describing: type(of: subview)) == "TerminalProgressBarView" {
+            subview.alphaValue = 0
+        }
+    }
 }

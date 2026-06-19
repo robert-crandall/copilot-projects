@@ -237,9 +237,19 @@ final class AppModel: ObservableObject {
         guard let pi = projectIndex(pid) else { return }
         controllers[sid]?.terminate()
         controllers[sid] = nil
+        let closedIndex = projects[pi].sessions.firstIndex { $0.id == sid }
+        let wasSelected = projects[pi].selectedSessionId == sid
         projects[pi].sessions.removeAll { $0.id == sid }
-        if projects[pi].selectedSessionId == sid {
-            projects[pi].selectedSessionId = projects[pi].sessions.first?.id
+        if wasSelected {
+            if projects[pi].sessions.isEmpty {
+                projects[pi].selectedSessionId = nil
+            } else {
+                // Select the tab to the left of the one just closed (or the new
+                // leftmost if the closed tab was first), rather than jumping to
+                // the first tab.
+                let newIndex = max(0, (closedIndex ?? 0) - 1)
+                projects[pi].selectedSessionId = projects[pi].sessions[newIndex].id
+            }
         }
         updateDockBadge()
         save()
@@ -291,6 +301,13 @@ final class AppModel: ObservableObject {
         projects.reduce(0) { acc, project in
             acc + project.sessions.filter { $0.status == .running || $0.status == .waiting }.count
         }
+    }
+
+    /// Fleet roll-ups across every project, for the title-bar status line.
+    var totalRunning: Int { projects.reduce(0) { $0 + $1.runningCount } }
+    var totalWaiting: Int { projects.reduce(0) { $0 + $1.waitingCount } }
+    var totalReady: Int {
+        projects.reduce(0) { $0 + $1.sessions.filter { $0.finishedUnseen }.count }
     }
 
     func closeProject(_ pid: String) {

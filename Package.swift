@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "copilot-projects",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.13.0")

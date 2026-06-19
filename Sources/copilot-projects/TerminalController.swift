@@ -27,9 +27,15 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         super.init()
         terminalView.processDelegate = self
-        // Make OSC 8 hyperlinks and plain URLs open on a normal click (the macOS
-        // default requires holding ⌘). SwiftTerm's default delegate opens them
-        // via NSWorkspace.
+        // Make links clickable on a plain click. `.hover` makes BOTH explicit OSC 8
+        // hyperlinks AND implicitly-detected bare URLs (http(s)://…) clickable: on
+        // mouseUp SwiftTerm sets the hover range to the link under the cursor, then
+        // opens it. `.always` only opens explicit OSC 8 links — but the Copilot CLI
+        // mostly prints full bare URLs (PR links, etc.) which are implicit, so
+        // `.always` left those dead. (Mouse reporting is off, so clicks aren't
+        // swallowed by the agent TUI.) AppDelegate's mouseUp handler briefly flips
+        // this to `.hoverWithModifier` when a selection is active, so dragging to
+        // select a URL doesn't open it.
         terminalView.linkHighlightMode = .hover
         // Don't report mouse events to the program: a mouse-reporting TUI (a live
         // agent) would otherwise swallow click-drags, so you couldn't select text,
@@ -38,6 +44,10 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         // output. The scroll wheel is still forwarded to the agent separately (see
         // ProjectsTerminalView.forwardScroll), so scrolling keeps working.
         terminalView.allowMouseReporting = false
+        // The active session's terminal becomes first responder, which draws a blue
+        // focus ring around it (a line along the top + right edges). The selected tab
+        // already shows which session is active, so suppress the ring.
+        terminalView.focusRingType = .none
         start(cwd: cwd, extraEnvironment: extraEnvironment,
               dtachExecutable: dtachExecutable, dtachSocket: dtachSocket)
     }

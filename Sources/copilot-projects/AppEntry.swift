@@ -60,9 +60,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
 
-        // ⌘/⌃ + number navigation, the modifier-hold number overlay, and
-        // scroll-wheel forwarding into mouse-reporting TUIs.
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .scrollWheel]) { [weak self] event in
+        // ⌘/⌃ + number navigation, the modifier-hold number overlay, double-click
+        // title-bar zoom, link-vs-selection disambiguation, and scroll-wheel
+        // forwarding into mouse-reporting TUIs.
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .scrollWheel, .leftMouseDown, .leftMouseUp]) { [weak self] event in
             guard let self else { return event }
             return self.handleKeyEvent(event)
         }
@@ -134,8 +135,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hintWork?.cancel()
             model.setNumberHint(.none)
             return event
+        case .leftMouseDown:
+            // Double-click the top title strip (but not the traffic lights) to run
+            // the user's title-bar double-click action; .hiddenTitleBar + our
+            // SwiftUI strip otherwise swallows the native gesture.
+            if event.clickCount == 2, let window = event.window, isInTitleStrip(event, window: window) {
+                performTitleBarDoubleClick(window)
+                return nil
+            }
+            return event
+        case .leftMouseUp:
+            // SwiftTerm opens the link under the release point on mouseUp (in
+            // `.hover`, explicit OR bare URL) with no guard for whether the user was
+            // selecting text — so dragging to select a URL (to copy it) would open
+            // the browser. SwiftTerm can't be subclassed here (its mouse methods are
+            // `public`, not `open`), so disambiguate from this monitor, which runs
+            // before the view's own mouseUp: if a selection is active at release (a
+            // drag or double/triple-click — a plain click clears it in mouseDown),
+            // briefly require ⌘ so SwiftTerm finds no clickable link, then restore.
+            if let c = model.activeController, c.terminalView.selectionActive,
+               !event.modifierFlags.contains(.command) {
+                let tv = c.terminalView
+                tv.linkHighlightMode = .hoverWithModifier
+                DispatchQueue.main.async { tv.linkHighlightMode = .hover }
+            }
+            return event
         default:
             return event
+        }
+    }
+
+    /// True when the pointer is in the top title strip (matching RootView's 38pt
+    /// titleStripHeight), past the traffic lights.
+    private func isInTitleStrip(_ event: NSEvent, window: NSWindow) -> Bool {
+        guard let content = window.contentView else { return false }
+        let p = content.convert(event.locationInWindow, from: nil)
+        let yFromTop = content.bounds.height - p.y
+        return yFromTop >= 0 && yFromTop <= 38 && p.x > 80
+    }
+
+    /// Mirror the system "double-click a window's title bar to" preference
+    /// (System Settings ▸ Desktop & Dock); defaults to zoom when unset/unknown.
+    private func performTitleBarDoubleClick(_ window: NSWindow) {
+        switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+        case "Minimize": window.miniaturize(nil)
+        case "None": break
+        default: window.zoom(nil)
         }
     }
 
