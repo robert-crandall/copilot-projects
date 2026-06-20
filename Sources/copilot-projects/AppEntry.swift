@@ -147,19 +147,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return event
         case .leftMouseUp:
-            // SwiftTerm opens the link under the release point on mouseUp (in
-            // `.hover`, explicit OR bare URL) with no guard for whether the user was
-            // selecting text — so dragging to select a URL (to copy it) would open
-            // the browser. SwiftTerm can't be subclassed here (its mouse methods are
-            // `public`, not `open`), so disambiguate from this monitor, which runs
-            // before the view's own mouseUp: if a selection is active at release (a
-            // drag or double/triple-click — a plain click clears it in mouseDown),
-            // briefly require ⌘ so SwiftTerm finds no clickable link, then restore.
-            if let c = model.activeController, c.terminalView.selectionActive,
-               !event.modifierFlags.contains(.command) {
+            // SwiftTerm opens the link under the release point on its own mouseUp
+            // (in `.hover`, explicit OSC 8 OR autodetected bare URL). Its mouse
+            // methods are `public`, not `open`, so we steer from this monitor (which
+            // runs first) by briefly flipping `linkHighlightMode` to
+            // `.hoverWithModifier` — so SwiftTerm finds no link without ⌘ — then
+            // restoring it.
+            if let c = model.activeController, !event.modifierFlags.contains(.command) {
                 let tv = c.terminalView
-                tv.linkHighlightMode = .hoverWithModifier
-                DispatchQueue.main.async { tv.linkHighlightMode = .hover }
+                let plainAgentClick = !tv.selectionActive
+                    && model.liveAgentSessions.contains(c.sessionId)
+                    && tv.containsPointer(for: event)
+                if plainAgentClick {
+                    // Live-agent TUI: forward the click so the CLI's own handler runs.
+                    // The Copilot CLI opens links (markdown AND autolinked bare URLs)
+                    // by tracking link rects and acting on the click — it emits no
+                    // OSC 8 — so this is the only way they open.
+                    tv.forwardClick(event)
+                }
+                if tv.selectionActive || plainAgentClick {
+                    // Suppress SwiftTerm's own link-open:
+                    //  • selection (drag / multi-click) → don't open a URL you're
+                    //    selecting to copy.
+                    //  • live-agent plain click → the CLI already opens it; without
+                    //    this a bare URL would open twice (CLI + SwiftTerm).
+                    tv.linkHighlightMode = .hoverWithModifier
+                    DispatchQueue.main.async { tv.linkHighlightMode = .hover }
+                }
             }
             return event
         default:

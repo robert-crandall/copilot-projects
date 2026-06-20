@@ -73,9 +73,25 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         return true
     }
 
-    /// Approximate on-screen cell under the pointer. SwiftTerm's exact hit-test
-    /// and cell metrics are internal, so we derive cell size from the view bounds
-    /// and the terminal's row/column count — fine for wheel events.
+    /// Forward a plain click (button-0 press + release) to a mouse-reporting
+    /// agent so its own click handling fires. The Copilot CLI tracks markdown-link
+    /// rectangles and opens the URL when it receives the click — it does NOT emit
+    /// OSC 8 — so without this, markdown links are dead. Only plain clicks are
+    /// forwarded (drags still select text locally), mirroring Terminal.app.
+    func forwardClick(_ event: NSEvent) {
+        guard let terminal = terminal else { return }
+        let pos = gridPosition(for: event)
+        let mods = event.modifierFlags
+        let shift = mods.contains(.shift), meta = mods.contains(.option), ctrl = mods.contains(.control)
+        let press = terminal.encodeButton(button: 0, release: false, shift: shift, meta: meta, control: ctrl)
+        terminal.sendEvent(buttonFlags: press, x: pos.col, y: pos.row)
+        let release = terminal.encodeButton(button: 0, release: true, shift: shift, meta: meta, control: ctrl)
+        terminal.sendEvent(buttonFlags: release, x: pos.col, y: pos.row)
+    }
+
+    /// Approximate on-screen cell under the pointer (SwiftTerm's exact hit-test
+    /// and cell metrics are internal). Good enough for wheel events and click
+    /// forwarding, since agent link rects span whole words.
     private func gridPosition(for event: NSEvent) -> (col: Int, row: Int) {
         guard let terminal = terminal, bounds.width > 0, bounds.height > 0 else { return (0, 0) }
         let p = convert(event.locationInWindow, from: nil)
