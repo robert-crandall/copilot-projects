@@ -356,6 +356,7 @@ struct ProjectTerminalsView: View {
                         terminalView: controller.terminalView,
                         isActive: session.id == active
                     )
+                    .clipped()
                     .opacity(session.id == active ? 1 : 0)
                     .allowsHitTesting(session.id == active)
                 }

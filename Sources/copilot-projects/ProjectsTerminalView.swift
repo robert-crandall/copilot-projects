@@ -19,6 +19,19 @@ import SwiftTerm
 final class ProjectsTerminalView: LocalProcessTerminalView {
     private var scrollAccum: CGFloat = 0
 
+    /// Width SwiftTerm reserves for its (now hidden) legacy NSScroller —
+    /// `getEffectiveWidth` subtracts it from the column count, which otherwise
+    /// leaves an empty margin where the scrollbar was. We inflate our frame by
+    /// this width (see `setFrameSize`) so the reserved column falls off the
+    /// host-clipped right edge and the terminal content fills the full width.
+    static let reservedScrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+
+    /// Inflate the frame by the reserved scroller width so SwiftTerm sizes its
+    /// columns to the full visible width (the extra column is clipped by the host).
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(NSSize(width: newSize.width + Self.reservedScrollerWidth, height: newSize.height))
+    }
+
     /// Returns true if the wheel event was handled (and so should be consumed).
     /// Returns false to let SwiftTerm scroll its own buffer. `agentLive` is true
     /// when a copilot agent owns this session: such a session is a mouse-reporting
@@ -89,13 +102,13 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         terminal.sendEvent(buttonFlags: release, x: pos.col, y: pos.row)
     }
 
-    /// Approximate on-screen cell under the pointer (SwiftTerm's exact hit-test
-    /// and cell metrics are internal). Good enough for wheel events and click
-    /// forwarding, since agent link rects span whole words.
+    /// On-screen cell under the pointer. Subtracts the reserved scroller width so
+    /// the derived cell width matches SwiftTerm's (content spans bounds.width minus
+    /// that reserved column) — keeps click/scroll hit-testing aligned.
     private func gridPosition(for event: NSEvent) -> (col: Int, row: Int) {
         guard let terminal = terminal, bounds.width > 0, bounds.height > 0 else { return (0, 0) }
         let p = convert(event.locationInWindow, from: nil)
-        let cellW = bounds.width / CGFloat(terminal.cols)
+        let cellW = (bounds.width - Self.reservedScrollerWidth) / CGFloat(terminal.cols)
         let cellH = bounds.height / CGFloat(terminal.rows)
         let col = min(max(0, Int(p.x / max(cellW, 1))), terminal.cols - 1)
         let row = min(max(0, Int((bounds.height - p.y) / max(cellH, 1))), terminal.rows - 1)
@@ -121,6 +134,11 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         super.didAddSubview(subview)
         if String(describing: type(of: subview)) == "TerminalProgressBarView" {
             subview.alphaValue = 0
+        } else if subview is NSScroller {
+            // The CLI (a full-screen TUI) draws its own scrollbar, so SwiftTerm's
+            // native scroller is redundant. updateScroller only toggles isEnabled,
+            // never isHidden, so hiding it here sticks.
+            subview.isHidden = true
         }
     }
 }
