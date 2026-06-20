@@ -139,7 +139,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Double-click the top title strip (but not the traffic lights) to run
             // the user's title-bar double-click action; .hiddenTitleBar + our
             // SwiftUI strip otherwise swallows the native gesture.
-            if event.clickCount == 2, let window = event.window, isInTitleStrip(event, window: window) {
+            if event.clickCount == 2,
+               let window = event.window ?? NSApp.keyWindow ?? NSApp.mainWindow,
+               isInTitleStrip(event, window: window) {
                 performTitleBarDoubleClick(window)
                 return nil
             }
@@ -166,12 +168,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// True when the pointer is in the top title strip (matching RootView's 38pt
-    /// titleStripHeight), past the traffic lights.
+    /// titleStripHeight), past the traffic lights. Measures from the window frame's
+    /// top: under .hiddenTitleBar the contentView doesn't span the full frame, so
+    /// converting through it mismeasures (yields a negative offset for top clicks).
     private func isInTitleStrip(_ event: NSEvent, window: NSWindow) -> Bool {
-        guard let content = window.contentView else { return false }
-        let p = content.convert(event.locationInWindow, from: nil)
-        let yFromTop = content.bounds.height - p.y
-        return yFromTop >= 0 && yFromTop <= 38 && p.x > 80
+        let loc = event.locationInWindow
+        let yFromTop = window.frame.height - loc.y
+        return yFromTop >= 0 && yFromTop <= 38 && loc.x > 80
     }
 
     /// Mirror the system "double-click a window's title bar to" preference
