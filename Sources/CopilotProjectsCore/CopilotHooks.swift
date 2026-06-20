@@ -69,25 +69,60 @@ public enum CopilotHooks {
     is_input_wait() {
       printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"(elicitation_dialog|permission_prompt)"'
     }
+    # Record the Copilot CLI session id (carried by tool/notification payloads as
+    # "sessionId") so the app can auto-resume THIS exact agent session after a
+    # reboot — copilot --resume=<id> — instead of guessing per tab. Best-effort;
+    # validates the id charset so nothing unsafe lands in the marker.
+    record_cli_session() {
+      # Match only a UUID-shaped value and take the leftmost: this relies on the
+      # CLI emitting the real top-level "sessionId" first (escaped occurrences inside
+      # tool args/results don't match the unescaped pattern). Captured only on
+      # tool/notification events, so a pure-chat session that never calls a tool
+      # isn't recorded — best-effort.
+      cid="$(printf '%s' "$1" \
+        | grep -oE '"sessionId"[[:space:]]*:[[:space:]]*"[0-9A-Fa-f-]{36}"' \
+        | head -1 \
+        | sed -E 's/.*"([0-9A-Fa-f-]{36})"$/\1/')"
+      case "$cid" in
+        ""|*[!0-9A-Fa-f-]*) : ;;   # empty or non-UUID charset -> skip
+        *) mkdir -p "$state_dir/sessions" 2>/dev/null || true
+           # Write atomically (tmp + mv) so the app never reads a half-truncated marker.
+           tmp="$state_dir/sessions/.$session_id.copilot-session.$$"
+           if printf '%s' "$cid" > "$tmp" 2>/dev/null; then
+             mv -f "$tmp" "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+           fi || true ;;
+      esac
+    }
 
     case "${1:-}" in
       running) status running ;;
       idle)    status idle ;;
-      pre)  cat >/dev/null 2>&1 || true; status running ;;   # a tool call ⇒ working
-      post) cat >/dev/null 2>&1 || true; status running ;;
+      pre)  record_cli_session "$(cat 2>/dev/null || true)"; status running ;;   # a tool call ⇒ working
+      post) record_cli_session "$(cat 2>/dev/null || true)"; status running ;;
       notify)
         payload="$(cat 2>/dev/null || true)"
+        record_cli_session "$payload"
         if is_input_wait "$payload"; then status waiting; fi
+        ;;
+      end)
+        # The agent session ENDED (user exited) — drop the resume marker so the tab
+        # doesn't boot back into a session the user already left ("zombie resume").
+        # Only sessionEnd maps here; agentStop (between-turn idle, session alive) uses
+        # `idle` and must NOT clear it. If a reboot kills the agent mid-session, this
+        # never fires, so the marker survives and the session resumes — as intended.
+        rm -f "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null || true
+        status idle
         ;;
     esac
     emit
     exit 0
     """#
 
-    /// Copilot CLI hook wiring (one entry per lifecycle event). sessionStart and
-    /// sessionEnd reset to idle so a fresh / exited agent never reads as running;
-    /// tool events keep it running; the notification hook surfaces "waiting" when
-    /// the agent raises an ask_user / permission prompt (which fire no tool hook).
+    /// Copilot CLI hook wiring (one entry per lifecycle event). sessionStart resets
+    /// to idle so a fresh agent never reads as running; tool events keep it running;
+    /// the notification hook surfaces "waiting" when the agent raises an ask_user /
+    /// permission prompt (which fire no tool hook); sessionEnd (`end`) resets to idle
+    /// AND drops the resume marker so an exited session isn't auto-resumed on reboot.
     public static let config = #"""
     {
       "version": 1,
@@ -111,7 +146,7 @@ public enum CopilotHooks {
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-projects-hook.sh\" idle", "timeoutSec": 5 }
         ],
         "sessionEnd": [
-          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-projects-hook.sh\" idle", "timeoutSec": 5 }
+          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-projects-hook.sh\" end", "timeoutSec": 5 }
         ]
       }
     }

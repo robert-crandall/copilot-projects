@@ -70,6 +70,14 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).status").path
     }
 
+    /// Per-session marker holding the last Copilot CLI session id seen in this tab
+    /// (written by the hook from tool/notification payloads, which carry `sessionId`).
+    /// Lets the app auto-resume the exact agent session after a reboot recreates the
+    /// shell — `copilot --resume=<id>` — instead of guessing per tab.
+    public static func copilotSessionMarkerPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).copilot-session").path
+    }
+
     /// The bundled dtach helper (resumability backend), or an override, or nil.
     public static var dtachExecutable: String? {
         let env = ProcessInfo.processInfo.environment

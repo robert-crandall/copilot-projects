@@ -21,7 +21,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     private(set) var exited = false
 
     init(sessionId: String, cwd: String, extraEnvironment: [String: String],
-         dtachExecutable: String?, dtachSocket: String?) {
+         dtachExecutable: String?, dtachSocket: String?, copilotSessionId: String? = nil) {
         self.sessionId = sessionId
         self.terminalView = ProjectsTerminalView(
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
@@ -49,11 +49,13 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         // already shows which session is active, so suppress the ring.
         terminalView.focusRingType = .none
         start(cwd: cwd, extraEnvironment: extraEnvironment,
-              dtachExecutable: dtachExecutable, dtachSocket: dtachSocket)
+              dtachExecutable: dtachExecutable, dtachSocket: dtachSocket,
+              copilotSessionId: copilotSessionId)
     }
 
     private func start(cwd: String, extraEnvironment: [String: String],
-                       dtachExecutable: String?, dtachSocket: String?) {
+                       dtachExecutable: String?, dtachSocket: String?,
+                       copilotSessionId: String? = nil) {
         let processEnv = ProcessInfo.processInfo.environment
         let shell = processEnv["SHELL"] ?? "/bin/zsh"
         let shellName = (shell as NSString).lastPathComponent
@@ -87,9 +89,23 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             // Resumable: dtach owns the shell PTY and survives app quit.
             //   -A attach-or-create, -r winch redraw-on-attach,
             //   -z no suspend key, -E no detach key (fully raw → keyboard passthrough).
+            // The program after -E only runs when dtach CREATES a fresh master. On
+            // reattach (app quit→relaunch with the master still alive) it's ignored,
+            // so a normal relaunch never re-runs it. After a reboot kills the master,
+            // dtach -A recreates it and the program runs — so an agent tab with a
+            // recorded Copilot session id auto-resumes THAT exact session, then drops
+            // to a normal login shell when the agent exits.
+            var program = [shell, "-l"]
+            if let cid = copilotSessionId, Self.isSafeSessionId(cid) {
+                // Quote the shell path (spaces/apostrophes) and warn — without blocking
+                // the shell fallback — if the session can't be resumed (e.g. deleted).
+                let resume = "copilot --resume=\(cid)"
+                    + " || printf '\\n[Copilot Projects] could not resume Copilot session \(cid)\\n'"
+                program = [shell, "-l", "-c", "\(resume); exec \(Self.shellSingleQuote(shell)) -l"]
+            }
             terminalView.startProcess(
                 executable: dtach,
-                args: ["-A", socket, "-r", "winch", "-z", "-E", shell, "-l"],
+                args: ["-A", socket, "-r", "winch", "-z", "-E"] + program,
                 environment: envArray,
                 execName: nil,
                 currentDirectory: dir
@@ -108,6 +124,21 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     func terminate() {
         terminalView.terminate()
+    }
+
+    /// Whether a recorded Copilot session id is a strict UUID (the only form the
+    /// hook writes and the form `copilot --resume` expects). Rejects anything else
+    /// before it's interpolated into the shell command — defense-in-depth alongside
+    /// the hook's own validation.
+    static func isSafeSessionId(_ s: String) -> Bool {
+        UUID(uuidString: s) != nil
+    }
+
+    /// POSIX single-quote a string for safe interpolation into a shell command:
+    /// wrap in single quotes, and emit any embedded quote as `'\''`. Used for the
+    /// shell path in the resume command so spaces or apostrophes can't break it.
+    static func shellSingleQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: - LocalProcessTerminalViewDelegate

@@ -126,12 +126,19 @@ final class AppModel: ObservableObject {
         Paths.ensureStateDir()
         let dtach = Paths.dtachExecutable
         let socket = dtach != nil ? Paths.dtachSocketPath(sessionId: sessionId) : nil
+        // Last Copilot session id seen in this tab (written by the hook). If the
+        // shell is created fresh after a reboot, the controller resumes this exact
+        // agent session; on a normal relaunch dtach reattaches and ignores it.
+        let recordedCopilot = (try? String(contentsOfFile:
+            Paths.copilotSessionMarkerPath(sessionId: sessionId), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let c = TerminalController(
             sessionId: sessionId,
             cwd: session.cwd,
             extraEnvironment: environment(projectId: project.id, sessionId: sessionId),
             dtachExecutable: dtach,
-            dtachSocket: socket
+            dtachSocket: socket,
+            copilotSessionId: (recordedCopilot?.isEmpty == false) ? recordedCopilot : nil
         )
         c.onTitle = { [weak self] title in self?.updateTitle(sessionId: sessionId, title: title) }
         c.onDirectory = { [weak self] dir in self?.updateCwd(sessionId: sessionId, dir: dir) }
@@ -280,6 +287,7 @@ final class AppModel: ObservableObject {
         }
         try? FileManager.default.removeItem(atPath: socket)
         try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
+        try? FileManager.default.removeItem(atPath: Paths.copilotSessionMarkerPath(sessionId: sid))
         closeSession(projectId: pid, sessionId: sid)
     }
 
@@ -320,6 +328,7 @@ final class AppModel: ObservableObject {
             }
             try? FileManager.default.removeItem(atPath: socket)
             try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: session.id))
+            try? FileManager.default.removeItem(atPath: Paths.copilotSessionMarkerPath(sessionId: session.id))
             controllers[session.id]?.terminate()
             controllers[session.id] = nil
         }
