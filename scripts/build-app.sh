@@ -27,7 +27,7 @@ APP_NAME="Copilot Projects"
 # notification authorization to the bundle id, so it re-prompts once.
 BUNDLE_ID="com.obvioussean.copilot-projects"
 EXE_NAME="copilot-projects"
-VERSION="0.1.0"
+VERSION="${VERSION:-0.1.0}"
 
 # SwiftPM needs this when the user's global git sets safe.bareRepository=explicit.
 export GIT_CONFIG_COUNT="${GIT_CONFIG_COUNT:-1}"

@@ -33,6 +33,21 @@ view. The result is a few Swift files instead of hundreds.
   from another host.
 - **Persistence:** projects/sessions are restored on relaunch.
 
+## Install
+
+Download the latest `Copilot-Projects-<version>.dmg` from
+[Releases](https://github.com/sirfergy/copilot-projects/releases), open it, and drag
+**Copilot Projects** onto **Applications**.
+
+The app is ad-hoc signed (not notarized), so macOS Gatekeeper quarantines the download.
+Clear it once, then launch normally:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Copilot Projects.app"
+```
+
+Requires macOS 13+. Apple Silicon (arm64).
+
 ## Build & run
 
 Requires Xcode 15+ (Swift 5.9+), macOS 13+.
@@ -58,6 +73,20 @@ copilot-projects ping            # -> pong
 > 'explicit'`, your global git config blocks SwiftPM's clone. `build-app.sh` already injects
 > an override; to run `swift build` directly, prefix it with
 > `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.bareRepository GIT_CONFIG_VALUE_0=all`.
+
+### Cutting a release
+
+`scripts/release.sh` builds the optimized `.app`, packages a drag-to-Applications DMG, and
+(with `--publish`) creates the GitHub release + tag:
+
+```bash
+./scripts/release.sh 0.1.0             # -> dist/Copilot-Projects-0.1.0.dmg (local only)
+./scripts/release.sh 0.1.0 --publish   # also publishes the GitHub release
+```
+
+`--publish` uses the active `gh` account, so run it as the account that owns the repo. The
+DMG is ad-hoc signed (not notarized); the generated release notes tell users to clear the
+download quarantine once with `xattr`.
 
 ## CLI
 
