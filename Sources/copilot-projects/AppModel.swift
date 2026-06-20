@@ -54,8 +54,7 @@ final class AppModel: ObservableObject {
 
     func bootstrapIfNeeded() {
         if projects.isEmpty {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let project = makeProject(name: "home", cwd: home, withSession: true)
+            let project = makeProject(name: "home", cwd: Paths.defaultStartupDir, withSession: true)
             projects.append(project)
             selectedProjectId = project.id
             save()
@@ -186,8 +185,7 @@ final class AppModel: ObservableObject {
             confirmTitle: "Create",
             initialText: defaultName
         ) else { return }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let project = makeProject(name: name, cwd: home, withSession: true)
+        let project = makeProject(name: name, cwd: Paths.defaultStartupDir, withSession: true)
         projects.append(project)
         selectProject(project.id)
     }
@@ -223,7 +221,7 @@ final class AppModel: ObservableObject {
 
     /// Where a new session should start: inherit the active pane's directory
     /// (kept fresh by OSC 7 when the shell emits it), else the project default,
-    /// else home.
+    /// else the default startup folder (~/Repos).
     private func defaultCwd(forProjectIndex pi: Int) -> String {
         let project = projects[pi]
         if let sid = project.selectedSessionId,
@@ -232,7 +230,7 @@ final class AppModel: ObservableObject {
             return session.cwd
         }
         if !project.cwd.isEmpty { return project.cwd }
-        return FileManager.default.homeDirectoryForCurrentUser.path
+        return Paths.defaultStartupDir
     }
 
     func addSessionToSelected() {
@@ -585,8 +583,11 @@ final class AppModel: ObservableObject {
 
     private func updateCwd(sessionId: String, dir: String?) {
         guard let dir, !dir.isEmpty, let loc = locateIndex(sessionId) else { return }
-        if projects[loc.p].sessions[loc.s].cwd != dir {
-            projects[loc.p].sessions[loc.s].cwd = dir
+        // Shells report OSC 7 as a `file://host/path` URL; store the plain path so
+        // a session that later inherits this cwd can actually chdir into it.
+        let normalized = Paths.normalizedDirectory(dir)
+        if projects[loc.p].sessions[loc.s].cwd != normalized {
+            projects[loc.p].sessions[loc.s].cwd = normalized
             scheduleSave()
         }
     }
@@ -640,7 +641,7 @@ final class AppModel: ObservableObject {
             }
             return .success()
         case "new-project":
-            let cwd = req.cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
+            let cwd = req.cwd ?? Paths.defaultStartupDir
             let name = req.name
                 ?? req.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
                 ?? "Project \(projects.count + 1)"
@@ -756,6 +757,9 @@ final class AppModel: ObservableObject {
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
+                // Migrate any legacy `file://host/path` cwds (stored before OSC 7 was
+                // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.
+                projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
                 projects[pi].sessions[si].status = restoredStatus(forSession: projects[pi].sessions[si].id)
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false

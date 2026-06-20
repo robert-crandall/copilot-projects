@@ -5,6 +5,35 @@ import Foundation
 /// All paths can be overridden via environment variables so that tagged / test
 /// instances can run fully isolated from a production copilot-projects.
 public enum Paths {
+    /// Where new projects/sessions start by default: `~/Repos` when it exists,
+    /// otherwise the home directory. Override with `COPILOT_PROJECTS_DEFAULT_DIR`
+    /// (a leading `~` is expanded). Gives a deterministic startup folder instead of
+    /// sometimes-`/` / sometimes-`~`.
+    public static var defaultStartupDir: String {
+        let fm = FileManager.default
+        if let override = ProcessInfo.processInfo.environment["COPILOT_PROJECTS_DEFAULT_DIR"],
+           !override.isEmpty {
+            return (override as NSString).expandingTildeInPath
+        }
+        let home = fm.homeDirectoryForCurrentUser
+        let repos = home.appendingPathComponent("Repos", isDirectory: true)
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: repos.path, isDirectory: &isDir), isDir.boolValue {
+            return repos.path
+        }
+        return home.path
+    }
+
+    /// Normalize a working-directory value to a plain filesystem path. Shells emit
+    /// OSC 7 as a `file://host/path` URL; stored and later reused verbatim it is not
+    /// a path `chdir` accepts, so the shell silently falls back to `/`. Converts such
+    /// URLs to their decoded path; returns any other value unchanged.
+    public static func normalizedDirectory(_ raw: String) -> String {
+        guard raw.hasPrefix("file://"), let url = URL(string: raw) else { return raw }
+        let path = url.path
+        return path.isEmpty ? raw : path
+    }
+
     /// The storage root. Honors `COPILOT_PROJECTS_STATE_DIR` (or the legacy
     /// `COPILOT_MUX_STATE_DIR`); otherwise see `defaultStateDir`.
     public static var stateDir: URL {

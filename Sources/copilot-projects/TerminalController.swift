@@ -1,5 +1,6 @@
 import AppKit
 import SwiftTerm
+import CopilotProjectsCore
 
 /// Owns a single SwiftTerm terminal + its child shell, and republishes the
 /// process-delegate callbacks as plain closures. Deliberately NOT an
@@ -81,9 +82,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
 
         let envArray = env.map { "\($0.key)=\($0.value)" }
-        let dir = cwd.isEmpty
-            ? FileManager.default.homeDirectoryForCurrentUser.path
-            : cwd
+        let dir = cwd.isEmpty ? Paths.defaultStartupDir : Paths.normalizedDirectory(cwd)
 
         if let dtach = dtachExecutable, let socket = dtachSocket {
             // Resumable: dtach owns the shell PTY and survives app quit.
