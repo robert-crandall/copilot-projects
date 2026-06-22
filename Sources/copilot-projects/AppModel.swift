@@ -424,6 +424,32 @@ final class AppModel: ObservableObject {
         save()
     }
 
+    /// Move a session into another project by dragging its tab onto a project row
+    /// in the sidebar. The live terminal is preserved — controllers are keyed by
+    /// session id, so the agent keeps running and only the owning project changes
+    /// (status/notification/focus routing all resolve by session id). No-op when
+    /// dropped on the project the session already belongs to.
+    @discardableResult
+    func moveSession(toProjectId targetPid: String, draggedId sid: String) -> Bool {
+        guard let tpi = projectIndex(targetPid), let from = locateIndex(sid),
+              projects[from.p].id != targetPid else { return false }
+
+        let session = projects[from.p].sessions.remove(at: from.s)
+        // Keep the source project's selection sane (mirrors closeSession): fall back
+        // to the tab left of the one that moved, or clear if it's now empty.
+        if projects[from.p].selectedSessionId == sid {
+            projects[from.p].selectedSessionId =
+                projects[from.p].sessions.isEmpty
+                    ? nil
+                    : projects[from.p].sessions[max(0, from.s - 1)].id
+        }
+        projects[tpi].sessions.append(session)
+        projects[tpi].selectedSessionId = session.id
+        updateDockBadge()
+        save()
+        return true
+    }
+
     func setNumberHint(_ hint: NumberHint) {
         if numberHint != hint { numberHint = hint }
     }
@@ -650,13 +676,13 @@ final class AppModel: ObservableObject {
             selectProject(project.id)
             return .success(project.id)
         case "new-session":
-            guard let pid = req.projectId ?? selectedProjectId else { return .failure("no project") }
+            guard let pid = resolveProject(req) else { return .failure("no project") }
             guard let sid = addSession(toProjectId: pid, cwd: req.cwd) else {
                 return .failure("unknown project: \(pid)")
             }
             return .success(sid)
         case "rename-project":
-            guard let pid = req.projectId ?? selectedProjectId else { return .failure("no project") }
+            guard let pid = resolveProject(req) else { return .failure("no project") }
             guard let name = req.name else { return .failure("rename-project requires a name") }
             renameProject(pid, name: name)
             return .success()
@@ -710,6 +736,16 @@ final class AppModel: ObservableObject {
             }
         }
         return nil
+    }
+
+    /// The project a project-scoped command (new-session / rename-project) acts on.
+    /// An explicit `--project` wins; otherwise derive it from the session id, which —
+    /// unlike the COPILOT_PROJECTS_PROJECT env — stays correct after a tab is dragged
+    /// to another project; finally fall back to the on-screen project.
+    private func resolveProject(_ req: ControlRequest) -> String? {
+        if let pid = req.projectId { return pid }
+        if let sid = req.sessionId, let loc = locateIndex(sid) { return projects[loc.p].id }
+        return selectedProjectId
     }
 
     private func renderProjects() -> String {

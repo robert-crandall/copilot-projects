@@ -125,6 +125,7 @@ struct SplitViewAutosaver: NSViewRepresentable {
 
 struct SidebarView: View {
     @ObservedObject var model: AppModel
+    @State private var dropTargetProjectId: String?
 
     var body: some View {
         List(selection: Binding(
@@ -135,9 +136,14 @@ struct SidebarView: View {
                 ProjectRow(
                     project: project,
                     number: index < 9 ? index + 1 : nil,
-                    showNumber: model.numberHint == .projects
+                    showNumber: model.numberHint == .projects,
+                    isDropTarget: dropTargetProjectId == project.id
                 )
                     .tag(project.id)
+                    .onDrop(of: [.text], delegate: ProjectDropDelegate(
+                        projectId: project.id,
+                        dropTargetProjectId: $dropTargetProjectId,
+                        model: model))
                     .contextMenu {
                         Button("New Session") { model.addSession(toProjectId: project.id) }
                         Button("Rename…") { model.renameProjectInteractive(project.id) }
@@ -168,6 +174,7 @@ struct ProjectRow: View {
     let project: Project
     var number: Int? = nil
     var showNumber: Bool = false
+    var isDropTarget: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -192,6 +199,16 @@ struct ProjectRow: View {
             }
         }
         .padding(.vertical, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(Color.accentColor, lineWidth: isDropTarget ? 2 : 0)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.accentColor.opacity(isDropTarget ? 0.15 : 0))
+                )
+                .padding(.horizontal, -5)
+                .padding(.vertical, -2)
+        )
     }
 
     // Its own line, always present (even when "idle"), so the row height never
@@ -451,6 +468,32 @@ private struct TabDropDelegate: DropDelegate {
         }
         dragged = nil
         dropTargetId = nil
+        return true
+    }
+}
+
+/// Drop target for a session tab dragged onto a project row in the sidebar —
+/// moves that session into the project. `dropTargetProjectId` drives the row's
+/// drag-over highlight. A project-reorder drag (List `.onMove`) doesn't vend a
+/// `.text` item, so `validateDrop` ignores it and the two gestures don't collide.
+private struct ProjectDropDelegate: DropDelegate {
+    let projectId: String
+    @Binding var dropTargetProjectId: String?
+    let model: AppModel
+
+    func validateDrop(info: DropInfo) -> Bool { info.hasItemsConforming(to: [.text]) }
+    func dropEntered(info: DropInfo) { dropTargetProjectId = projectId }
+    func dropExited(info: DropInfo) {
+        if dropTargetProjectId == projectId { dropTargetProjectId = nil }
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool {
+        dropTargetProjectId = nil
+        guard let provider = info.itemProviders(for: [.text]).first else { return false }
+        provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let sid = object as? String else { return }
+            DispatchQueue.main.async { model.moveSession(toProjectId: projectId, draggedId: sid) }
+        }
         return true
     }
 }

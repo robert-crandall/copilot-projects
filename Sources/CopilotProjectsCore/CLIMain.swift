@@ -65,7 +65,10 @@ public enum CLIMain {
         let env = ProcessInfo.processInfo.environment
 
         var req = ControlRequest(command: command)
-        req.projectId = parsed.flags["project"] ?? Env.projectId(env)
+        // Only an explicit --project sets the target project. The implicit project is
+        // derived server-side from the session id: COPILOT_PROJECTS_PROJECT goes stale
+        // when a tab is dragged to another project, but the session id never does.
+        req.projectId = parsed.flags["project"]
         req.sessionId = parsed.flags["session"] ?? Env.sessionId(env)
 
         switch command {
