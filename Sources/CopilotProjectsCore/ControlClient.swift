@@ -59,15 +59,39 @@ public struct ControlClient {
             }
         }
 
+        // Bound connect() too: SO_RCVTIMEO/SO_SNDTIMEO only cover read/write, so a
+        // blocking connect to an app whose accept loop is briefly stalled would
+        // hang here unbounded — and this client runs inside the preToolUse status
+        // hook, where blocking past the hook timeout makes the CLI DENY the agent's
+        // tool call. Connect non-blocking, wait at most ~2s for completion, then
+        // restore blocking mode so the SO_*TIMEO above govern the read/write.
+        let savedFlags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, savedFlags | O_NONBLOCK)
+
         let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         if connectResult != 0 {
-            throw ControlClientError.cannotConnect(
-                "is Copilot Projects running? (\(socketPath), errno \(errno))")
+            if errno == EINPROGRESS {
+                var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                let pr = poll(&pfd, nfds_t(1), 2000)   // wait up to 2s for writability
+                if pr <= 0 {
+                    throw ControlClientError.cannotConnect("connect timed out (\(socketPath))")
+                }
+                var soErr: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &len)
+                if soErr != 0 {
+                    throw ControlClientError.cannotConnect("connect failed (\(socketPath), errno \(soErr))")
+                }
+            } else {
+                throw ControlClientError.cannotConnect(
+                    "is Copilot Projects running? (\(socketPath), errno \(errno))")
+            }
         }
+        _ = fcntl(fd, F_SETFL, savedFlags)   // back to blocking; SO_*TIMEO now apply
 
         var payload = try Wire.encodeLine(request)
         try payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
