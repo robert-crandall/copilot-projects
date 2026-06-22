@@ -119,6 +119,15 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
                 currentDirectory: dir
             )
         }
+
+        // Mark this terminal's pty master close-on-exec so the NEXT session's dtach
+        // (a posix_spawn/fork+exec) doesn't inherit it. SwiftTerm doesn't set this,
+        // so without it every dtach accumulates a copy of every prior session's pty
+        // master — a descriptor leak that grows with each session/relaunch and was
+        // pinning ptys open. The app keeps using the fd; CLOEXEC only affects children.
+        if let childfd = terminalView.process?.childfd, childfd >= 0 {
+            _ = fcntl(childfd, F_SETFD, FD_CLOEXEC)
+        }
     }
 
     func terminate() {

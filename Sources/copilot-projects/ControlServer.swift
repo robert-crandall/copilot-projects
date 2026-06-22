@@ -37,6 +37,11 @@ final class ControlServer {
             NSLog("copilot-projects control: socket() failed errno \(errno)")
             return
         }
+        // Don't let spawned children (each dtach helper, and the shells under them)
+        // inherit the listening socket. Without FD_CLOEXEC every dtach we launch keeps
+        // a copy of this fd open, leaking one descriptor per session/relaunch and
+        // pinning the socket inode — over a long-lived app that grows without bound.
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -123,6 +128,8 @@ final class ControlServer {
                 if errno == EINTR { continue }
                 break
             }
+            // Spawned children must not inherit live client connections either.
+            _ = fcntl(clientFD, F_SETFD, FD_CLOEXEC)
             handleClient(clientFD)
         }
     }
