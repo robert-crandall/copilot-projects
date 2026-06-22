@@ -124,6 +124,88 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         return hit === self || hit.isDescendant(of: self)
     }
 
+    // MARK: - Copy: strip the CLI's scrollbar gutter
+
+    /// Glyphs the Copilot CLI (and similar TUIs) use to paint a vertical
+    /// scrollbar in the terminal's last column: heavy vertical + block/shade
+    /// elements. The light `│` (U+2502), double `║`, and dotted box verticals are
+    /// deliberately EXCLUDED — those are what tables, `git log --graph`, and panel
+    /// borders use, so that common box content isn't mistaken for a scrollbar.
+    /// (A heavy/block border hugging the last column could still match, but that's
+    /// rare and further guarded by the detection threshold + margin rule below.)
+    private static let scrollbarGlyphs: Set<Character> = [
+        "\u{2503}",                                                    // ┃ heavy vertical (the Copilot scrollbar)
+        "\u{2588}", "\u{2589}", "\u{258A}", "\u{258B}", "\u{258C}",    // █ ▉ ▊ ▋ ▌
+        "\u{258D}", "\u{258E}", "\u{258F}", "\u{2590}", "\u{2595}",    // ▍ ▎ ▏ ▐ ▕
+        "\u{2591}", "\u{2592}", "\u{2593}",                            // ░ ▒ ▓ (shaded tracks)
+    ]
+
+    /// The Copilot CLI (and other TUIs) paint a vertical scrollbar in the last
+    /// column; SwiftTerm's selection copies that column verbatim, so a multi-line
+    /// copy ends every line with a stray bar (e.g. `┃`). Detect the scrollbar from
+    /// the live buffer's last column and strip the gutter from the clipboard.
+    /// Detection means the text is only ever touched when a scrollbar is actually
+    /// present — ordinary copies pass through unchanged.
+    override func copy(_ sender: Any) {
+        super.copy(sender)
+        guard let terminal = terminal else { return }
+        let pasteboard = NSPasteboard.general
+        guard let raw = pasteboard.string(forType: .string), !raw.isEmpty else { return }
+        let bars = Self.scrollbarColumnGlyphs(in: terminal)
+        guard !bars.isEmpty else { return }
+        let cleaned = Self.strippingScrollbarGutter(raw, bars: bars)
+        if cleaned != raw {
+            pasteboard.clearContents()
+            pasteboard.setString(cleaned, forType: .string)
+        }
+    }
+
+    /// Glyphs occupying the last column on a meaningful run of visible rows — an
+    /// actual scrollbar track/thumb, not an incidental box-drawing character. The
+    /// threshold is on the COMBINED occupancy (track + thumb), and every glyph
+    /// actually seen in that column is returned, so a thumb drawn with a different
+    /// (brighter) glyph than the track is stripped too rather than left behind.
+    private static func scrollbarColumnGlyphs(in terminal: Terminal) -> Set<Character> {
+        let cols = terminal.cols, rows = terminal.rows
+        guard cols > 1, rows > 0 else { return [] }
+        var counts: [Character: Int] = [:]
+        for r in 0 ..< rows {
+            if let ch = terminal.getCharacter(col: cols - 1, row: r), scrollbarGlyphs.contains(ch) {
+                counts[ch, default: 0] += 1
+            }
+        }
+        let total = counts.values.reduce(0, +)
+        return total >= max(3, rows / 5) ? Set(counts.keys) : []
+    }
+
+    /// Remove a trailing scrollbar gutter from each line: the bar glyph plus the
+    /// whitespace margin separating it from content. Requires a >=2-space margin
+    /// (or an otherwise-blank line) so single-space-padded table borders and
+    /// `git log --graph` `│` are left intact.
+    static func strippingScrollbarGutter(_ text: String, bars: Set<Character>) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
+            var tail = line.endIndex
+            while tail > line.startIndex {
+                let p = line.index(before: tail)
+                let c = line[p]
+                if c == " " || c == "\t" { tail = p } else { break }
+            }
+            guard tail > line.startIndex else { return line }            // empty / all whitespace
+            let barIdx = line.index(before: tail)
+            guard bars.contains(line[barIdx]) else { return line }       // no scrollbar at line end
+            var content = barIdx
+            var margin = 0
+            while content > line.startIndex {
+                let p = line.index(before: content)
+                if line[p] == " " || line[p] == "\t" { margin += 1; content = p } else { break }
+            }
+            if content == line.startIndex || margin >= 2 {
+                return line[line.startIndex ..< content]                 // strip the gutter + margin
+            }
+            return line                                                  // bar adjacent to content -> keep
+        }.joined(separator: "\n")
+    }
+
     /// Hide SwiftTerm's OSC 9;4 progress bar (`TerminalProgressBarView`): a 2pt
     /// accent bar pinned to the top edge that the Copilot CLI triggers while
     /// working, which reads as a stray blue line (the tab spinner already signals
