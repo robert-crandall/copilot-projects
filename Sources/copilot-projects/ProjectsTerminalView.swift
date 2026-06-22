@@ -93,6 +93,12 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
     /// forwarded (drags still select text locally), mirroring Terminal.app.
     func forwardClick(_ event: NSEvent) {
         guard let terminal = terminal else { return }
+        // A resumed session's terminal reverts to the default x10 mouse protocol (dtach
+        // replays nothing; the CLI doesn't re-emit ?1006h on reattach), so a forwarded
+        // click would be x10-encoded and the CLI's SGR-based link handler ignores it —
+        // markdown links go dead until the CLI restarts. Re-assert SGR so the click
+        // encodes the way the CLI expects. Idempotent, and only live-agent clicks reach here.
+        terminal.feed(byteArray: Array("\u{1b}[?1006h".utf8))
         let pos = gridPosition(for: event)
         let mods = event.modifierFlags
         let shift = mods.contains(.shift), meta = mods.contains(.option), ctrl = mods.contains(.control)
