@@ -33,6 +33,16 @@ public struct ControlClient {
         }
         defer { close(fd) }
 
+        // Bound every phase so a slow/hung app can never block the caller. This
+        // client runs inside the Copilot status hook; a hook that blocks past its
+        // timeout is treated as an error that DENIES the agent's tool call. Keeping
+        // it synchronous (not backgrounded) preserves status ordering — a
+        // running→waiting transition can't land out of order — while the timeout
+        // prevents a hang.
+        var tv = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(socketPath.utf8)
