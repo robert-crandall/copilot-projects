@@ -61,7 +61,11 @@ public enum CopilotHooks {
     status() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true
       printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
-      [ -n "$cli" ] && "$cli" set-status "$1" >/dev/null 2>&1 || true
+      # Notify the live app in the background: a slow/hung control socket must never
+      # block the hook. preToolUse has a timeout, and a timed-out hook is treated as
+      # an error that DENIES the agent's tool call. The marker file above is the
+      # source of truth; the socket notify is a best-effort live-UI update.
+      [ -n "$cli" ] && ( "$cli" set-status "$1" >/dev/null 2>&1 & ) || true
     }
     # The agent is blocked on the user when the CLI raises an elicitation
     # (the ask_user tool) or a permission prompt. Those don't fire tool hooks —
