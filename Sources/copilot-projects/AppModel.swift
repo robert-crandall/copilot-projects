@@ -86,14 +86,22 @@ final class AppModel: ObservableObject {
         let fm = FileManager.default
         let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        // copilot-projects is the CLI; copilot-mux is repointed (not removed) as a
-        // compatibility alias so shells/hooks created before the rebrand keep
-        // reaching the binary instead of silently no-opping.
-        for name in ["copilot-projects", "copilot-mux"] {
-            let link = dir.appendingPathComponent(name)
-            if let dest = try? fm.destinationOfSymbolicLink(atPath: link.path), dest == exe { continue }
+
+        // Keep the copilot-projects CLI symlink pointed at the running bundle.
+        let link = dir.appendingPathComponent("copilot-projects")
+        if (try? fm.destinationOfSymbolicLink(atPath: link.path)) != exe {
             try? fm.removeItem(at: link)
             try? fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
+        }
+
+        // Retire the pre-rebrand `copilot-mux` alias: the hook resolves
+        // copilot-projects first, so it's dead weight. Only remove it when it's a
+        // symlink we created (points at a Copilot Projects executable), never a real
+        // file the user may have placed there.
+        let legacy = dir.appendingPathComponent("copilot-mux")
+        if let dest = try? fm.destinationOfSymbolicLink(atPath: legacy.path),
+           dest.hasSuffix("/copilot-projects") || dest.hasSuffix("/copilot-mux") {
+            try? fm.removeItem(at: legacy)
         }
     }
 
