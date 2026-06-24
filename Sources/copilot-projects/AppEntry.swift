@@ -108,6 +108,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         case .keyDown:
             let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            // Esc cancels a busy Copilot turn, but the CLI fires no hook for that, so
+            // the running spinner would linger. Optimistically clear the focused
+            // session's busy status. The event still passes through below, so the CLI
+            // performs the actual cancel.
+            if event.keyCode == 53, mods.isEmpty {  // Esc
+                model.clearActiveSessionBusyStatusOnEscape()
+            }
             // ⌘W closes the current tab. (macOS's default ⌘W closes the *window*,
             // which quits the app — that's the accidental-quit footgun.)
             if mods == .command, event.charactersIgnoringModifiers == "w" {

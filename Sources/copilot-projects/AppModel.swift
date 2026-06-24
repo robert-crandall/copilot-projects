@@ -462,6 +462,27 @@ final class AppModel: ObservableObject {
         if numberHint != hint { numberHint = hint }
     }
 
+    /// Esc-cancel optimistic status clear. The Copilot CLI emits no hook when you
+    /// Esc-cancel a busy turn, so the running/waiting spinner would otherwise
+    /// linger until the next hook event — and because the agent process stays
+    /// alive, the liveness backstop can't catch it either. When Esc is pressed with
+    /// the active terminal focused, clear that session's status immediately; if the
+    /// agent actually kept working, its next tool hook re-asserts running.
+    func clearActiveSessionBusyStatusOnEscape() {
+        guard let controller = activeController else { return }
+        // Only when the terminal itself is focused — not a rename dialog or the
+        // sidebar — so Esc elsewhere doesn't wipe a background session's status.
+        let tv = controller.terminalView
+        guard let responder = tv.window?.firstResponder as? NSView,
+              responder === tv || responder.isDescendant(of: tv) else { return }
+        guard let loc = locateIndex(controller.sessionId) else { return }
+        let status = projects[loc.p].sessions[loc.s].status
+        guard status == .running || status == .waiting else { return }
+        setStatus(sessionId: controller.sessionId, status: .idle, text: nil)
+        // Drop the stale 'running' marker so a restart doesn't restore the spinner.
+        try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: controller.sessionId))
+    }
+
     func selectAdjacentSession(_ delta: Int) {
         guard let pid = selectedProjectId, let pi = projectIndex(pid) else { return }
         let sessions = projects[pi].sessions
