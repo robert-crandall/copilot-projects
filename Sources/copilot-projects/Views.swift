@@ -386,12 +386,13 @@ struct ProjectTerminalsView: View {
 
     /// All session terminals stay mounted (so each keeps the correct size and its
     /// CLI keeps rendering + reflowing live); only the selected one is visible —
-    /// browser-tab behavior. Inactive panes are hidden with opacity rather than
-    /// unmounted: unmounting froze a background tab's terminal size, so its
-    /// full-screen CLI drew its bottom bar at the wrong row and the reveal showed a
-    /// blank strip. SwiftTerm's partial-redraw optimization (which made an
-    /// opacity-revealed pane paint stale) is disabled in TerminalController, so the
-    /// reveal repaints fully.
+    /// browser-tab behavior. The active pane is stacked on top with `zIndex` and the
+    /// rest stay at full opacity behind it (the active terminal's opaque background
+    /// fully covers them) rather than being hidden with `opacity(0)`: an opacity-0
+    /// layer isn't repainted by AppKit while it's hidden, so a tab that streamed in
+    /// the background showed a stale/blank pane on reveal (the repaint-on-reveal
+    /// bug). Keeping background panes rendered keeps their layers current, so the
+    /// reveal shows the live content immediately.
     private var terminalArea: some View {
         let active = project.selectedSessionId ?? project.sessions.first?.id
         return ZStack {
@@ -402,8 +403,12 @@ struct ProjectTerminalsView: View {
                         isActive: session.id == active
                     )
                     .clipped()
-                    .opacity(session.id == active ? 1 : 0)
+                    .background(session.id == active
+                                ? Color(nsColor: controller.terminalView.nativeBackgroundColor)
+                                : .clear)
+                    .zIndex(session.id == active ? 1 : 0)
                     .allowsHitTesting(session.id == active)
+                    .transition(.identity)
                 }
             }
         }
