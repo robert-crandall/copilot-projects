@@ -28,6 +28,15 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         super.init()
         terminalView.processDelegate = self
+        // Force SwiftTerm to fully repaint on every change instead of its Big Sur
+        // partial-redraw optimization (disableFullRedrawOnAnyChanges + a cached
+        // .RGBA8Uint layer). That optimization left a revealed/streaming pane's
+        // static chrome (CLI top/bottom bars) blank, because only the rows that
+        // changed got redrawn. Setting this false BEFORE the first draw means the
+        // .RGBA8Uint workaround is never applied, so any invalidation repaints the
+        // whole surface — the chrome self-heals on the next streamed output. Only the
+        // active pane is mounted, so the extra redraw cost is bounded to one pane.
+        terminalView.disableFullRedrawOnAnyChanges = false
         // Make links clickable on a plain click. `.hover` makes BOTH explicit OSC 8
         // hyperlinks AND implicitly-detected bare URLs (http(s)://…) clickable: on
         // mouseUp SwiftTerm sets the hover range to the link under the cursor, then

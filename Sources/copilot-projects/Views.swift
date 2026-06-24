@@ -362,22 +362,27 @@ struct ProjectTerminalsView: View {
         }
     }
 
-    /// Mounts only the selected session's terminal. The others' controllers (and
-    /// thus their shells + scrollback) stay alive in AppModel regardless of being
-    /// unmounted, so switching back re-inserts the retained view. Mounting only the
-    /// active pane — rather than keeping all panes and hiding them with opacity —
-    /// means AppKit gives the revealed view a guaranteed full redraw, which avoids
-    /// the partial-stale repaint a dropped opacity-0 layer backing would cause.
+    /// All session terminals stay mounted (so each keeps the correct size and its
+    /// CLI keeps rendering + reflowing live); only the selected one is visible —
+    /// browser-tab behavior. Inactive panes are hidden with opacity rather than
+    /// unmounted: unmounting froze a background tab's terminal size, so its
+    /// full-screen CLI drew its bottom bar at the wrong row and the reveal showed a
+    /// blank strip. SwiftTerm's partial-redraw optimization (which made an
+    /// opacity-revealed pane paint stale) is disabled in TerminalController, so the
+    /// reveal repaints fully.
     private var terminalArea: some View {
         let active = project.selectedSessionId ?? project.sessions.first?.id
-        // Keep every session's controller alive (shells running, buffers updating)
-        // even though only the active one is mounted.
-        for session in project.sessions { _ = model.controller(for: session.id) }
         return ZStack {
-            if let active, let controller = model.controller(for: active) {
-                TerminalHostView(terminalView: controller.terminalView)
+            ForEach(project.sessions) { session in
+                if let controller = model.controller(for: session.id) {
+                    TerminalHostView(
+                        terminalView: controller.terminalView,
+                        isActive: session.id == active
+                    )
                     .clipped()
-                    .id(active)
+                    .opacity(session.id == active ? 1 : 0)
+                    .allowsHitTesting(session.id == active)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
