@@ -17,6 +17,13 @@ final class AppModel: ObservableObject {
     private(set) var isTerminating = false
 
     private var livenessTimer: Timer?
+    private var footerTimer: Timer?
+
+    /// Per-session count of consecutive footer scans that read idle while the tab is
+    /// still marked running. Debounces the footer backstop (clear only after the
+    /// footer has stayed idle for a couple of scans) so a single transient read
+    /// never clears a live spinner.
+    private var footerIdleTicks: [String: Int] = [:]
 
     /// Sessions hosting a live agent (refreshed by the liveness reconciler). Used
     /// by scroll-wheel forwarding to keep working on resumed (desynced) sessions.
@@ -308,6 +315,8 @@ final class AppModel: ObservableObject {
 
     func beginTermination() {
         isTerminating = true
+        footerTimer?.invalidate()
+        livenessTimer?.invalidate()
     }
 
     /// Count of sessions with an in-flight agent (running or waiting).
@@ -501,6 +510,20 @@ final class AppModel: ObservableObject {
     /// time-based decay), and clears promptly when the agent exits or crashes.
     func startLivenessReconciler() {
         livenessTimer?.invalidate()
+        footerTimer?.invalidate()
+
+        // Footer backstop (always on): the only signal that catches an Esc-cancel,
+        // which fires no stop hook and leaves the agent process alive — so the
+        // process-liveness check below can't help. Cheap (scans a few rows of the
+        // running/waiting sessions only), so it runs every second for a snappy
+        // spinner clear, independent of the heavier process snapshot.
+        reconcileAgentFooters()
+        let footer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.reconcileAgentFooters() }
+        }
+        RunLoop.main.add(footer, forMode: .common)
+        footerTimer = footer
+
         guard livenessEnabled else { return }
         reconcileLiveness(markFinished: false)   // startup: clear dead statuses without flagging them as "finished while away"
         let timer = Timer(timeInterval: 8, repeats: true) { [weak self] _ in
@@ -508,6 +531,57 @@ final class AppModel: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         livenessTimer = timer
+    }
+
+    /// Backstop for cancelled turns. An Esc-cancel fires no stop hook and leaves the
+    /// agent alive, so neither the stop hook nor `reconcileLiveness` clears the tab
+    /// spinner — but the agent's own footer returns to its idle signature (and keeps
+    /// updating even while the tab is backgrounded, since the CLI renders on
+    /// focus-out). Clear a stale `running` status once the footer has read idle for a
+    /// couple of consecutive scans. Scoped to `running` only (never `waiting`, whose
+    /// confirmation UI we don't want to second-guess) and acts only on a positive
+    /// idle footer, so a genuine in-progress turn — whose footer reads `working` the
+    /// whole time — is never cleared.
+    private func reconcileAgentFooters() {
+        var active: Set<String> = []
+        var runningCount = 0
+        for pi in projects.indices {
+            for si in projects[pi].sessions.indices {
+                guard projects[pi].sessions[si].status == .running else { continue }
+                runningCount += 1
+                let sid = projects[pi].sessions[si].id
+                guard let controller = controllers[sid] else {
+                    TerminalController.debugLog("reconcile: running sid=\(sid.prefix(8)) but NO controller")
+                    continue
+                }
+                active.insert(sid)
+                if controller.agentActivity == .idle {
+                    let ticks = (footerIdleTicks[sid] ?? 0) + 1
+                    footerIdleTicks[sid] = ticks
+                    if ticks >= 2 {
+                        TerminalController.debugLog("reconcile: CLEARING sid=\(sid.prefix(8)) after \(ticks) idle ticks")
+                        clearStatusToIdle(pi: pi, si: si, markFinished: true)
+                        footerIdleTicks[sid] = nil
+                    }
+                } else {
+                    footerIdleTicks[sid] = nil   // working / unknown → restart the debounce
+                }
+            }
+        }
+        if runningCount > 0 { TerminalController.debugLog("reconcile tick: \(runningCount) running session(s)") }
+        footerIdleTicks = footerIdleTicks.filter { active.contains($0.key) }
+    }
+
+    /// Drop a session to idle and (unless it's on screen) flag it finished & unseen,
+    /// then drop its status marker. Shared by the liveness and footer reconcilers.
+    private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool) {
+        let sid = projects[pi].sessions[si].id
+        projects[pi].sessions[si].status = .idle
+        projects[pi].sessions[si].statusText = nil
+        if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
+            projects[pi].sessions[si].finishedUnseen = true
+        }
+        try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
     }
 
     private func reconcileLiveness(markFinished: Bool = true) {
@@ -530,15 +604,9 @@ final class AppModel: ObservableObject {
                 let status = projects[pi].sessions[si].status
                 guard status == .running || status == .waiting else { continue }
                 if !liveSessions.contains(projects[pi].sessions[si].id) {
-                    let sid = projects[pi].sessions[si].id
-                    projects[pi].sessions[si].status = .idle
-                    projects[pi].sessions[si].statusText = nil
                     // The agent exited/crashed (active → idle). Flag it as finished &
                     // unseen unless you're looking at it right now.
-                    if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
-                        projects[pi].sessions[si].finishedUnseen = true
-                    }
-                    try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
+                    clearStatusToIdle(pi: pi, si: si, markFinished: markFinished)
                 }
             }
         }

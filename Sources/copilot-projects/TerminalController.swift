@@ -21,6 +21,99 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     private(set) var exited = false
 
+    /// Coarse agent activity read from the live terminal's footer.
+    enum AgentActivity { case working, idle, unknown }
+
+    /// What the Copilot CLI's own footer says it's doing. While a turn runs the
+    /// footer shows "… Working   esc cancel"; back at the prompt it shows
+    /// "/ commands · ? help · tab next tab". This is a hook-independent backstop:
+    /// a turn cancelled with Esc fires NO stop hook and leaves the agent process
+    /// alive (so neither the stop hook nor the process-liveness check can clear the
+    /// tab spinner), yet the footer still returns to its idle signature — and keeps
+    /// updating even while the tab is backgrounded, because the CLI keeps rendering
+    /// on focus-out.
+    ///
+    /// Only the bottom-most non-empty row is inspected: the CLI's footer is fixed
+    /// chrome at the bottom of the screen, so streamed output never lands there — no
+    /// risk of the agent's own text spoofing a signature. Deliberately does NOT gate
+    /// on the alternate buffer: a session resumed via dtach renders its TUI in
+    /// SwiftTerm's normal buffer (the CLI never re-emits 1049h on reattach), so an
+    /// alt-buffer check would blind this to every resumed agent. The caller scopes
+    /// this to live `running` agents, so a plain shell is never read.
+    var agentActivity: AgentActivity {
+        guard !exited else { return .idle }
+        guard let terminal = terminalView.terminal else { return .unknown }
+        let rows = terminal.rows, cols = terminal.cols
+        guard rows > 0, cols > 0 else { return .unknown }
+        // Scan from the bottom up and return the lowest row that reads as a real
+        // footer. The footer is the bottom-most chrome (content is always above it),
+        // so the first working/idle match from the bottom is the footer — while
+        // blank or scrollbar-only rows below it (a resumed session's resized buffer
+        // can leave the footer several rows up) are skipped.
+        for r in stride(from: rows - 1, through: 0, by: -1) {
+            var line = ""
+            for c in 0 ..< cols {
+                if let ch = terminal.getCharacter(col: c, row: r) { line.append(ch) }
+            }
+            let activity = Self.classifyFooter(line)
+            if activity != .unknown {
+                Self.debugLog("activity sid=\(sessionId.prefix(8)) alt=\(terminal.isCurrentBufferAlternate) row=\(r)/\(rows) -> \(activity)  [\(line.trimmingCharacters(in: .whitespaces).suffix(90))]")
+                return activity
+            }
+        }
+        Self.dumpLayoutOnce(sessionId: sessionId, terminal: terminal)
+        return .unknown
+    }
+
+    /// One-shot diagnostic dump of the bottom rows when no footer was recognized.
+    static var dumpedSessions: Set<String> = []
+    static func dumpLayoutOnce(sessionId: String, terminal: Terminal) {
+        guard FileManager.default.fileExists(atPath: "/tmp/copilot-projects-debug"),
+              !dumpedSessions.contains(sessionId) else { return }
+        dumpedSessions.insert(sessionId)
+        let rows = terminal.rows, cols = terminal.cols
+        debugLog("NO FOOTER sid=\(sessionId.prefix(8)) rows=\(rows) cols=\(cols); bottom non-empty rows:")
+        for r in max(0, rows - 40) ..< rows {
+            var line = ""
+            for c in 0 ..< cols { if let ch = terminal.getCharacter(col: c, row: r) { line.append(ch) } }
+            let trimmed = line.replacingOccurrences(of: "\u{0}", with: " ").trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty {
+                let safe = String(trimmed.unicodeScalars.map { $0.value < 32 ? "?" : Character($0) })
+                debugLog("  r\(r)| \(safe.suffix(112))")
+            }
+        }
+    }
+
+    /// Classify copilot's footer line into coarse activity. Pure/static so it can be
+    /// unit-tested against captured fixtures.
+    static func classifyFooter(_ footerLine: String) -> AgentActivity {
+        let f = footerLine.lowercased()
+        guard !f.trimmingCharacters(in: .whitespaces).isEmpty else { return .unknown }
+        if f.contains("esc cancel") || f.contains("esc to cancel")
+            || f.contains("esc interrupt") || f.contains("esc to interrupt")
+            || f.contains("working") {
+            return .working
+        }
+        if f.contains("tab next tab") || (f.contains("? help") && f.contains("/ commands")) {
+            return .idle
+        }
+        return .unknown
+    }
+
+    /// Append a diagnostic line, but only while `/tmp/copilot-projects-debug` exists
+    /// (touch it to enable, rm to disable — no relaunch needed). Off by default; the
+    /// message is `@autoclosure` so nothing is built when disabled.
+    static func debugLog(_ s: @autoclosure () -> String) {
+        guard FileManager.default.fileExists(atPath: "/tmp/copilot-projects-debug") else { return }
+        let line = "[\(Date())] \(s())\n"
+        let path = "/tmp/copilot-projects-debug.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); h.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: false, encoding: .utf8)
+        }
+    }
+
     init(sessionId: String, cwd: String, extraEnvironment: [String: String],
          dtachExecutable: String?, dtachSocket: String?, copilotSessionId: String? = nil) {
         self.sessionId = sessionId
