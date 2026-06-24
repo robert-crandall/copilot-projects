@@ -677,6 +677,15 @@ final class AppModel: ObservableObject {
     private func updateTitle(sessionId: String, title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let loc = locateIndex(sessionId) else { return }
+        // copilot sets its terminal title to "Copilot: Waiting for background agents"
+        // while its background agents run. That's a transient state, not a name, so
+        // flag it for the tab/sidebar indicator and keep the tab's real title rather
+        // than letting it clobber it.
+        let backgroundAgents = trimmed.range(of: "waiting for background agent", options: .caseInsensitive) != nil
+        if projects[loc.p].sessions[loc.s].backgroundAgentsActive != backgroundAgents {
+            projects[loc.p].sessions[loc.s].backgroundAgentsActive = backgroundAgents
+        }
+        guard !backgroundAgents else { return }
         if projects[loc.p].sessions[loc.s].title != trimmed {
             projects[loc.p].sessions[loc.s].title = trimmed
             scheduleSave()
@@ -696,6 +705,10 @@ final class AppModel: ObservableObject {
 
     private func handleExit(sessionId: String) {
         controllers[sessionId] = nil
+        // The agent is gone — it can't still be waiting on background agents.
+        if let loc = locateIndex(sessionId) {
+            projects[loc.p].sessions[loc.s].backgroundAgentsActive = false
+        }
         guard !isTerminating else { return }   // app quitting → keep for resume
 
         let socket = Paths.dtachSocketPath(sessionId: sessionId)

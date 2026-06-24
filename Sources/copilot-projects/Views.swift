@@ -178,7 +178,11 @@ struct ProjectRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            ProjectDotView(state: project.dotState)
+            if project.hasBackgroundAgents {
+                BackgroundAgentsBadge()
+            } else {
+                ProjectDotView(state: project.dotState)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(project.name).lineLimit(1)
                 Text("\(project.sessions.count) session\(project.sessions.count == 1 ? "" : "s")")
@@ -237,22 +241,26 @@ struct SessionTabIndicator: View {
     let session: Session
 
     var body: some View {
-        Group {
-            switch kind {
-            case .busy:
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.6)
-            case .dot(let color):
-                Circle()
-                    .fill(color)
-                    .overlay(Circle().stroke(.black.opacity(0.15), lineWidth: 0.5))
-            case .none:
-                Color.clear
+        if session.backgroundAgentsActive {
+            BackgroundAgentsBadge()
+        } else {
+            Group {
+                switch kind {
+                case .busy:
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                case .dot(let color):
+                    Circle()
+                        .fill(color)
+                        .overlay(Circle().stroke(.black.opacity(0.15), lineWidth: 0.5))
+                case .none:
+                    Color.clear
+                }
             }
+            .frame(width: 9, height: 9)
+            .help(help)
         }
-        .frame(width: 9, height: 9)
-        .help(help)
     }
 
     private enum Kind { case busy, dot(Color), none }
@@ -301,6 +309,20 @@ struct ProjectDotView: View {
         case .idle: return "idle"
         case .finished: return "finished — ready for you"
         }
+    }
+}
+
+/// Shown on a tab and its project's sidebar row while copilot is waiting on its own
+/// background agents. Sized to the same 9pt slot as the status dot so swapping it in
+/// doesn't shift the layout. Takes priority over the status indicator while active.
+struct BackgroundAgentsBadge: View {
+    var body: some View {
+        Image(systemName: "person.2.fill")
+            .resizable()
+            .scaledToFit()
+            .frame(width: 9, height: 9)
+            .foregroundStyle(.purple)
+            .help("background agents running")
     }
 }
 

@@ -15,6 +15,10 @@ struct Session: Identifiable, Codable, Equatable {
     /// The agent went active → idle while you weren't looking at this session, so it
     /// has finished and is waiting for you to come back. Cleared when you view it.
     var finishedUnseen: Bool = false
+    /// copilot is waiting on its own background agents (it reports this via a
+    /// "Copilot: Waiting for background agents" terminal title). Surfaced as a tab/
+    /// sidebar indicator instead of letting that title clobber the tab's real name.
+    var backgroundAgentsActive: Bool = false
 
     private enum CodingKeys: String, CodingKey { case id, title, cwd }
 
@@ -66,6 +70,7 @@ extension Project {
     var runningCount: Int { sessions.filter { $0.status == .running }.count }
     var waitingCount: Int { sessions.filter { $0.status == .waiting }.count }
     var hasUnread: Bool { sessions.contains { $0.hasUnread } }
+    var hasBackgroundAgents: Bool { sessions.contains { $0.backgroundAgentsActive } }
 }
 
 /// The sidebar status dot's meaning (see `Project.dotState`).
