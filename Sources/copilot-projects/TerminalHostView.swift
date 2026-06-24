@@ -1,20 +1,18 @@
 import SwiftUI
 import SwiftTerm
 
-/// Mounts an already-created SwiftTerm view. `makeNSView` returns the retained
-/// instance so the shell + scrollback survive project switches and re-mounts.
-/// When `isActive` becomes true the pane grabs keyboard focus (retrying until the
-/// view is actually in a window), so switching projects/tabs lands focus on the
-/// selected terminal.
+/// Mounts an already-created SwiftTerm view. Only the active session's pane is
+/// mounted (see `ProjectTerminalsView`), and `makeNSView` returns the retained
+/// instance, so the shell + scrollback survive unmount/remount across tab and
+/// project switches. On mount the pane grabs keyboard focus (retrying until it is
+/// actually in a window) and gets one conservative full-bounds repaint.
 struct TerminalHostView: NSViewRepresentable {
     let terminalView: LocalProcessTerminalView
-    var isActive: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator {
-        var didFocus = false
-        var wasActive = false
+        var didSettle = false
     }
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
@@ -23,41 +21,28 @@ struct TerminalHostView: NSViewRepresentable {
 
     func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
         let coord = context.coordinator
-        if isActive {
-            // On becoming visible, force a full repaint. A pane that received output
-            // while hidden (opacity 0 in the ZStack) can come back blank: AppKit may
-            // drop its backing store while occluded, and nothing re-triggers draw()
-            // on reveal. SwiftTerm's draw() repaints the visible buffer for the dirty
-            // rect, so invalidating the whole view (needsDisplay = true) restores it.
-            // Re-assert on the next runloop tick to catch the post-layout state.
-            if !coord.wasActive {
-                nsView.needsDisplay = true
-                DispatchQueue.main.async { [weak nsView] in nsView?.needsDisplay = true }
-            }
-            coord.wasActive = true
-            if !coord.didFocus {
-                Self.focusWhenInWindow(nsView, coordinator: coord, attemptsLeft: 8)
-            }
-        } else {
-            coord.wasActive = false
-            coord.didFocus = false
-        }
+        guard !coord.didSettle else { return }
+        Self.settleWhenReady(nsView, coordinator: coord, attemptsLeft: 8)
     }
 
-    private static func focusWhenInWindow(_ view: NSView, coordinator: Coordinator, attemptsLeft: Int) {
-        guard !coordinator.didFocus else { return }
-        if let window = view.window {
-            coordinator.didFocus = true
-            window.makeFirstResponder(view)
-            // Now that the pane is actually on-screen, force a repaint — covers the
-            // case where it was revealed before being in a window (so the earlier
-            // needsDisplay was a no-op and it would otherwise show blank).
-            view.needsDisplay = true
+    /// Once the freshly-mounted pane is in a window with a real size: focus it and
+    /// force a full-bounds repaint. AppKit already redraws a newly-inserted view in
+    /// full, but the mount can land before final layout, so this re-asserts after
+    /// layout. It runs async and only when in-window with non-empty bounds —
+    /// avoiding the "drew blank during SwiftUI reconciliation" failure mode of a
+    /// synchronous early draw.
+    private static func settleWhenReady(_ view: LocalProcessTerminalView, coordinator: Coordinator, attemptsLeft: Int) {
+        guard let window = view.window, !view.bounds.isEmpty else {
+            guard attemptsLeft > 0 else { return }
+            DispatchQueue.main.async {
+                settleWhenReady(view, coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
+            }
             return
         }
-        guard attemptsLeft > 0 else { return }
-        DispatchQueue.main.async {
-            focusWhenInWindow(view, coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
-        }
+        coordinator.didSettle = true
+        window.makeFirstResponder(view)
+        view.layoutSubtreeIfNeeded()
+        view.terminal.updateFullScreen()
+        view.setNeedsDisplay(view.bounds)
     }
 }
