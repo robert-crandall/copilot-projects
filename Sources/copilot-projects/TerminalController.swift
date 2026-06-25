@@ -45,12 +45,12 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         guard let terminal = terminalView.terminal else { return .unknown }
         let rows = terminal.rows, cols = terminal.cols
         guard rows > 0, cols > 0 else { return .unknown }
-        // Scan from the bottom up and return the lowest row that reads as a real
-        // footer. The footer is the bottom-most chrome (content is always above it),
-        // so the first working/idle match from the bottom is the footer — while
-        // blank or scrollbar-only rows below it (a resumed session's resized buffer
-        // can leave the footer several rows up) are skipped.
-        for r in stride(from: rows - 1, through: 0, by: -1) {
+        // Scan only the bottom band from the bottom up and return the lowest row that
+        // reads as a real footer. The footer is the bottom-most chrome; bounding the
+        // scan (rather than walking the whole screen) avoids matching an old idle
+        // footer or the agent's own output higher up — while still tolerating a
+        // resumed session's resized buffer, which can leave the footer a few rows up.
+        for r in stride(from: rows - 1, through: max(0, rows - 8), by: -1) {
             var line = ""
             for c in 0 ..< cols {
                 if let ch = terminal.getCharacter(col: c, row: r) { line.append(ch) }

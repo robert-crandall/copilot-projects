@@ -20,10 +20,16 @@ final class AppModel: ObservableObject {
     private var footerTimer: Timer?
 
     /// Per-session count of consecutive footer scans that read idle while the tab is
-    /// still marked running. Debounces the footer backstop (clear only after the
-    /// footer has stayed idle for a couple of scans) so a single transient read
+    /// still marked running/waiting. Debounces the footer backstop (clear only after
+    /// the footer has stayed idle for a couple of scans) so a single transient read
     /// never clears a live spinner.
     private var footerIdleTicks: [String: Int] = [:]
+
+    /// Per-session flag: have we observed the footer read `working` during the
+    /// current active epoch? The footer backstop only clears a session it has seen
+    /// go to work, so footer lag right after the hook flips a session to running
+    /// (TUI hasn't repainted "Working" yet) can't wrongly clear a live spinner.
+    private var footerSawWorking: Set<String> = []
 
     /// Sessions hosting a live agent (refreshed by the liveness reconciler). Used
     /// by scroll-wheel forwarding to keep working on resumed (desynced) sessions.
@@ -542,34 +548,45 @@ final class AppModel: ObservableObject {
     /// confirmation UI we don't want to second-guess) and acts only on a positive
     /// idle footer, so a genuine in-progress turn — whose footer reads `working` the
     /// whole time — is never cleared.
+    /// Backstop for cancelled turns. An Esc-cancel fires no stop hook and leaves the
+    /// agent alive, so neither the stop hook nor `reconcileLiveness` clears the tab
+    /// spinner — but the agent's own footer returns to its idle signature. Clear a
+    /// stale running/waiting status once the footer has read idle for a couple of
+    /// consecutive scans, but ONLY after we've actually observed the footer go
+    /// `working` in this epoch. That guard means footer lag right after the hook
+    /// flips us to running, an old idle footer scrolled into view, or a confirmation
+    /// prompt (which reads as `working`) can never clear a genuinely-active session.
+    /// Includes `waiting`, so an Esc-cancel of an ask_user/permission wait — which
+    /// also fires no stop hook — is caught too.
     private func reconcileAgentFooters() {
         var active: Set<String> = []
-        var runningCount = 0
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
-                guard projects[pi].sessions[si].status == .running else { continue }
-                runningCount += 1
+                let status = projects[pi].sessions[si].status
+                guard status == .running || status == .waiting else { continue }
                 let sid = projects[pi].sessions[si].id
-                guard let controller = controllers[sid] else {
-                    TerminalController.debugLog("reconcile: running sid=\(sid.prefix(8)) but NO controller")
-                    continue
-                }
+                guard let controller = controllers[sid] else { continue }
                 active.insert(sid)
-                if controller.agentActivity == .idle {
+                switch controller.agentActivity {
+                case .working:
+                    footerSawWorking.insert(sid)
+                    footerIdleTicks[sid] = 0
+                case .unknown:
+                    footerIdleTicks[sid] = 0
+                case .idle:
+                    guard footerSawWorking.contains(sid) else { break }
                     let ticks = (footerIdleTicks[sid] ?? 0) + 1
                     footerIdleTicks[sid] = ticks
                     if ticks >= 2 {
-                        TerminalController.debugLog("reconcile: CLEARING sid=\(sid.prefix(8)) after \(ticks) idle ticks")
                         clearStatusToIdle(pi: pi, si: si, markFinished: true)
                         footerIdleTicks[sid] = nil
+                        footerSawWorking.remove(sid)
                     }
-                } else {
-                    footerIdleTicks[sid] = nil   // working / unknown → restart the debounce
                 }
             }
         }
-        if runningCount > 0 { TerminalController.debugLog("reconcile tick: \(runningCount) running session(s)") }
         footerIdleTicks = footerIdleTicks.filter { active.contains($0.key) }
+        footerSawWorking = footerSawWorking.intersection(active)
     }
 
     /// Drop a session to idle and (unless it's on screen) flag it finished & unseen,
@@ -578,6 +595,10 @@ final class AppModel: ObservableObject {
         let sid = projects[pi].sessions[si].id
         projects[pi].sessions[si].status = .idle
         projects[pi].sessions[si].statusText = nil
+        // The agent is idle — it isn't waiting on background agents either; clear the
+        // indicator in case the title-driven clear never arrives (e.g. the CLI leaves
+        // the "Waiting for background agents" title stale).
+        projects[pi].sessions[si].backgroundAgentsActive = false
         if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
             projects[pi].sessions[si].finishedUnseen = true
         }
@@ -804,11 +825,20 @@ final class AppModel: ObservableObject {
         guard let data = rep.representation(using: .png, properties: [:]) else {
             return .failure("could not encode PNG")
         }
+        // A control client chooses this path; refuse anything that isn't a plain
+        // regular-file (or new) destination so a same-user process can't hang the
+        // main thread by aiming it at a FIFO with no reader, or follow a symlink to
+        // clobber an arbitrary file.
+        let dest = URL(fileURLWithPath: path)
+        var st = stat()
+        if lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFREG {
+            return .failure("refusing to write screenshot to a non-regular file")
+        }
         do {
             try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+                at: dest.deletingLastPathComponent(),
                 withIntermediateDirectories: true)
-            try data.write(to: URL(fileURLWithPath: path))
+            try data.write(to: dest)
             return .success(path)
         } catch {
             return .failure("write failed: \(error.localizedDescription)")

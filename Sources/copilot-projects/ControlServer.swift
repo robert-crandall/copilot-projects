@@ -137,6 +137,13 @@ final class ControlServer {
     private func handleClient(_ fd: Int32) {
         defer { close(fd) }
 
+        // Bound the read so a stuck or malicious same-user client that connects and
+        // never sends a newline can't wedge the (serial) accept loop or grow this
+        // buffer without bound: time out the read and cap the request size.
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let maxRequest = 64 * 1024
+
         var data = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
         while true {
@@ -144,6 +151,7 @@ final class ControlServer {
             if n <= 0 { break }
             data.append(contentsOf: buf[0..<n])
             if buf[0..<n].contains(0x0A) { break }
+            if data.count > maxRequest { return }   // oversized, no newline → drop
         }
         guard !data.isEmpty else { return }
 

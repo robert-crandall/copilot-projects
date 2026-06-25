@@ -40,6 +40,11 @@ public enum CopilotHooks {
     session_id="${COPILOT_PROJECTS_SESSION:-${COPILOT_MUX_SESSION:-}}"
     socket="${COPILOT_PROJECTS_SOCKET:-${COPILOT_MUX_SOCKET:-}}"
     if [ -z "$session_id" ]; then emit; exit 0; fi
+    # The session id becomes a filesystem path component below; a hostile env could
+    # otherwise path-traverse the marker writes. Accept only a bare UUID charset +
+    # length so nothing with "/" or ".." (or anything else) escapes the sessions dir.
+    case "$session_id" in *[!0-9A-Fa-f-]*) emit; exit 0 ;; esac
+    [ ${#session_id} -eq 36 ] || { emit; exit 0; }
 
     # Derive the state dir from whichever socket env is present; otherwise fall back
     # to the storage root that matches the session's vintage.
