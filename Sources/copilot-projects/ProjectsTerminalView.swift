@@ -21,16 +21,11 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
 
     /// Width SwiftTerm reserves for its (now hidden) legacy NSScroller —
     /// `getEffectiveWidth` subtracts it from the column count, which otherwise
-    /// leaves an empty margin where the scrollbar was. We inflate our frame by
-    /// this width (see `setFrameSize`) so the reserved column falls off the
-    /// host-clipped right edge and the terminal content fills the full width.
+    /// leaves an empty margin where the scrollbar was. The host container
+    /// (`TerminalsContainerView`) inflates this view's frame width by this amount so
+    /// the reserved column falls off the clipped right edge and the terminal content
+    /// fills the full visible width.
     static let reservedScrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-
-    /// Inflate the frame by the reserved scroller width so SwiftTerm sizes its
-    /// columns to the full visible width (the extra column is clipped by the host).
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(NSSize(width: newSize.width + Self.reservedScrollerWidth, height: newSize.height))
-    }
 
     /// Returns true if the wheel event was handled (and so should be consumed).
     /// Returns false to let SwiftTerm scroll its own buffer. `agentLive` is true

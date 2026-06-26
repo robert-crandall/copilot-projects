@@ -127,8 +127,11 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         // static chrome (CLI top/bottom bars) blank, because only the rows that
         // changed got redrawn. Setting this false BEFORE the first draw means the
         // .RGBA8Uint workaround is never applied, so any invalidation repaints the
-        // whole surface — the chrome self-heals on the next streamed output. Only the
-        // active pane is mounted, so the extra redraw cost is bounded to one pane.
+        // whole surface — and the container's reveal() forces one such full repaint
+        // when a tab is brought to the front. NOTE: every session's view stays mounted
+        // in the container now, so background streaming panes also full-repaint; if
+        // that ever shows up as CPU pressure with many live agents, throttle or skip
+        // redraws for covered panes (reveal already repaints them on show).
         terminalView.disableFullRedrawOnAnyChanges = false
         // Make links clickable on a plain click. `.hover` makes BOTH explicit OSC 8
         // hyperlinks AND implicitly-detected bare URLs (http(s)://…) clickable: on

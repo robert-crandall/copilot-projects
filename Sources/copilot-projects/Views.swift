@@ -350,68 +350,19 @@ struct DetailView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        if let project = model.selectedProject {
-            ProjectTerminalsView(model: model, project: project)
-        } else {
-            VStack(spacing: 12) {
-                Image(systemName: "rectangle.split.3x1")
-                    .font(.system(size: 42))
-                    .foregroundStyle(.secondary)
-                Text("No project selected").font(.title3)
-                Button("New Project…") { model.addProjectInteractive() }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-}
-
-struct ProjectTerminalsView: View {
-    @ObservedObject var model: AppModel
-    let project: Project
-
-    var body: some View {
-        Group {
-            if project.sessions.isEmpty {
-                VStack(spacing: 12) {
-                    Text("No sessions in “\(project.name)”")
-                        .foregroundStyle(.secondary)
-                    Button("New Session") { model.addSession(toProjectId: project.id) }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                terminalArea
-            }
-        }
-    }
-
-    /// All session terminals stay mounted (so each keeps the correct size and its
-    /// CLI keeps rendering + reflowing live); only the selected one is visible —
-    /// browser-tab behavior. The active pane is stacked on top with `zIndex` and the
-    /// rest stay at full opacity behind it (the active terminal's opaque background
-    /// fully covers them) rather than being hidden with `opacity(0)`: an opacity-0
-    /// layer isn't repainted by AppKit while it's hidden, so a tab that streamed in
-    /// the background showed a stale/blank pane on reveal (the repaint-on-reveal
-    /// bug). Keeping background panes rendered keeps their layers current, so the
-    /// reveal shows the live content immediately.
-    private var terminalArea: some View {
-        let active = project.selectedSessionId ?? project.sessions.first?.id
-        return ZStack {
-            ForEach(project.sessions) { session in
-                if let controller = model.controller(for: session.id) {
-                    TerminalHostView(
-                        terminalView: controller.terminalView,
-                        isActive: session.id == active
-                    )
-                    .clipped()
-                    .background(session.id == active
-                                ? Color(nsColor: controller.terminalView.nativeBackgroundColor)
-                                : .clear)
-                    .zIndex(session.id == active ? 1 : 0)
-                    .allowsHitTesting(session.id == active)
-                    .transition(.identity)
-                }
-            }
-        }
+        // One persistent AppKit container hosts every session's terminal across all
+        // projects (see TerminalsContainerView). It's created once and never
+        // unmounted, so switching projects or tabs is just a z-order change — SwiftUI
+        // never remounts the terminal NSViews, which is what caused the
+        // repaint-on-reveal flashes the old opacity/zIndex ZStack couldn't fully fix.
+        // Empty / no-project states are drawn by the container's own cover view.
+        // activeSessionId + hostedIds are passed so SwiftUI re-runs updateNSView when
+        // the selection or the set of sessions changes.
+        TerminalsContainer(
+            model: model,
+            activeSessionId: model.globalSelectedSessionId,
+            hostedIds: model.hostedTerminals.map(\.id)
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

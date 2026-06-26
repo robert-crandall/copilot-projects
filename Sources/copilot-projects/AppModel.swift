@@ -74,7 +74,9 @@ final class AppModel: ObservableObject {
         } else if selectedProjectId == nil {
             selectedProjectId = projects.first?.id
         }
-        if let sid = currentSelectedSessionId { _ = controller(for: sid) }
+        // Start the whole selected project's sessions on launch (matches the prior
+        // per-project eager start), not just the visible tab.
+        ensureSelectedProjectControllers()
     }
 
     func startServer() {
@@ -174,6 +176,52 @@ final class AppModel: ObservableObject {
         guard let sid = projects[pi].selectedSessionId ?? projects[pi].sessions.first?.id
         else { return nil }
         return controllers[sid]
+    }
+
+    // MARK: - persistent terminal container
+
+    /// Ensure the selected project's sessions all have live controllers — preserves
+    /// the prior behavior where opening a project starts its sessions. Driven from
+    /// the terminal container's update pass.
+    func ensureSelectedProjectControllers() {
+        guard let project = selectedProject else { return }
+        for session in project.sessions { controller(for: session.id) }
+    }
+
+    /// Every live terminal view keyed by session id — the full set the persistent
+    /// AppKit container hosts, so terminals are never unmounted on a project/tab
+    /// switch (only their z-order changes).
+    var hostedTerminals: [(id: String, view: ProjectsTerminalView)] {
+        controllers.map { (id: $0.key, view: $0.value.terminalView) }
+    }
+
+    func terminalView(for sessionId: String) -> ProjectsTerminalView? {
+        controllers[sessionId]?.terminalView
+    }
+
+    /// The globally selected session (selected project's selected tab, falling back
+    /// to its first tab) — the one the container brings to the front.
+    var globalSelectedSessionId: String? {
+        guard let pid = selectedProjectId, let pi = projectIndex(pid) else { return nil }
+        return projects[pi].selectedSessionId ?? projects[pi].sessions.first?.id
+    }
+
+    /// Message + button title shown by the container when nothing is selected.
+    var emptyContextHint: (message: String, button: String) {
+        if let project = selectedProject {
+            return ("No sessions in “\(project.name)”", "New Session")
+        }
+        return ("No project selected", "New Project…")
+    }
+
+    /// Backs the empty-state button: add a session to the selected project, or
+    /// create a project if there is none.
+    func newInActiveContext() {
+        if let pid = selectedProjectId {
+            addSession(toProjectId: pid)
+        } else {
+            addProjectInteractive()
+        }
     }
 
     private func environment(projectId: String, sessionId: String) -> [String: String] {
