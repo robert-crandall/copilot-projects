@@ -35,6 +35,8 @@ struct CopilotProjectsApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     private let notifications = NotificationManager()
+    private let instanceLock = AppInstanceLock()
+    private var isPrimaryInstance = false
     private var eventMonitor: Any?
     private var hintWork: DispatchWorkItem?
 
@@ -42,14 +44,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSWindow.allowsAutomaticWindowTabbing = false
 
+        guard instanceLock.acquire() else {
+            focusExistingInstance()
+            NSApp.terminate(nil)
+            return
+        }
+
         notifications.onActivate = { [weak self] projectId, sessionId in
             self?.model.focus(projectId: projectId, sessionId: sessionId)
         }
         notifications.requestAuth()
 
         model.attach(notifications: notifications)
+        guard model.startServer() else {
+            focusExistingInstance()
+            NSApp.terminate(nil)
+            return
+        }
+        isPrimaryInstance = true
         model.bootstrapIfNeeded()
-        model.startServer()
         model.startLivenessReconciler()
         // A test/isolated instance can opt out of mutating the user's CLI + hooks.
         let env = ProcessInfo.processInfo.environment
@@ -89,6 +102,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.model.markActiveSessionSeen()
                 self?.model.focusActiveTerminal()
             }
+        }
+    }
+
+    private func focusExistingInstance() {
+        // The control socket is scoped to this exact state directory, so it targets
+        // the right instance even when an isolated dev/test instance with the same
+        // bundle id is also running.
+        let request = ControlRequest(command: "focus")
+        if let response = try? ControlClient().send(request), response.ok { return }
+
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        if let existing = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .first(where: { $0.processIdentifier != currentPID }) {
+            existing.activate(options: [.activateAllWindows])
         }
     }
 
@@ -222,6 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard isPrimaryInstance else { return }
         model.beginTermination()
         model.detachAllClients()   // keep dtach masters alive for resume
         model.stopServer()

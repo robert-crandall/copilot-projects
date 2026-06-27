@@ -21,9 +21,6 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     private(set) var exited = false
 
-    /// Coarse agent activity read from the live terminal's footer.
-    enum AgentActivity { case working, idle, unknown }
-
     /// What the Copilot CLI's own footer says it's doing. While a turn runs the
     /// footer shows "… Working   esc cancel"; back at the prompt it shows
     /// "/ commands · ? help · tab next tab". This is a hook-independent backstop:
@@ -40,7 +37,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     /// SwiftTerm's normal buffer (the CLI never re-emits 1049h on reattach), so an
     /// alt-buffer check would blind this to every resumed agent. The caller scopes
     /// this to live `running` agents, so a plain shell is never read.
-    var agentActivity: AgentActivity {
+    var agentActivity: FooterActivity {
         guard !exited else { return .idle }
         guard let terminal = terminalView.terminal else { return .unknown }
         let rows = terminal.rows, cols = terminal.cols
@@ -86,7 +83,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     /// Classify copilot's footer line into coarse activity. Pure/static so it can be
     /// unit-tested against captured fixtures.
-    static func classifyFooter(_ footerLine: String) -> AgentActivity {
+    static func classifyFooter(_ footerLine: String) -> FooterActivity {
         let f = footerLine.lowercased()
         guard !f.trimmingCharacters(in: .whitespaces).isEmpty else { return .unknown }
         if f.contains("esc cancel") || f.contains("esc to cancel")
@@ -121,18 +118,6 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
         super.init()
         terminalView.processDelegate = self
-        // Force SwiftTerm to fully repaint on every change instead of its Big Sur
-        // partial-redraw optimization (disableFullRedrawOnAnyChanges + a cached
-        // .RGBA8Uint layer). That optimization left a revealed/streaming pane's
-        // static chrome (CLI top/bottom bars) blank, because only the rows that
-        // changed got redrawn. Setting this false BEFORE the first draw means the
-        // .RGBA8Uint workaround is never applied, so any invalidation repaints the
-        // whole surface — and the container's reveal() forces one such full repaint
-        // when a tab is brought to the front. NOTE: every session's view stays mounted
-        // in the container now, so background streaming panes also full-repaint; if
-        // that ever shows up as CPU pressure with many live agents, throttle or skip
-        // redraws for covered panes (reveal already repaints them on show).
-        terminalView.disableFullRedrawOnAnyChanges = false
         // Make links clickable on a plain click. `.hover` makes BOTH explicit OSC 8
         // hyperlinks AND implicitly-detected bare URLs (http(s)://…) clickable: on
         // mouseUp SwiftTerm sets the hover range to the link under the cursor, then

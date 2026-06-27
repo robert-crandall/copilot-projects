@@ -21,21 +21,22 @@ final class ControlServer {
         self.handler = handler
     }
 
-    func start() {
+    @discardableResult
+    func start() -> Bool {
         Paths.ensureStateDir()
         // Don't steal the socket from a still-running instance (possible during the
         // bundle-id transition, when macOS no longer treats old + new as one app):
         // only remove a stale socket file that nothing is listening on.
         if socketIsAlive(socketPath) {
             NSLog("copilot-projects control: another instance is already listening on \(socketPath); not starting a second control server")
-            return
+            return false
         }
         unlink(socketPath)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             NSLog("copilot-projects control: socket() failed errno \(errno)")
-            return
+            return false
         }
         // Don't let spawned children (each dtach helper, and the shells under them)
         // inherit the listening socket. Without FD_CLOEXEC every dtach we launch keeps
@@ -50,7 +51,7 @@ final class ControlServer {
         guard bytes.count < cap else {
             NSLog("copilot-projects control: socket path too long")
             close(fd)
-            return
+            return false
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { raw in
             raw.withMemoryRebound(to: CChar.self, capacity: cap) { dst in
@@ -67,14 +68,14 @@ final class ControlServer {
         guard bound == 0 else {
             NSLog("copilot-projects control: bind failed errno \(errno)")
             close(fd)
-            return
+            return false
         }
         chmod(socketPath, 0o600)
 
         guard listen(fd, 16) == 0 else {
             NSLog("copilot-projects control: listen failed errno \(errno)")
             close(fd)
-            return
+            return false
         }
 
         listenFD = fd
@@ -82,6 +83,7 @@ final class ControlServer {
         boundSocket = true
         queue.async { [weak self] in self?.acceptLoop() }
         NSLog("copilot-projects control: listening on \(socketPath)")
+        return true
     }
 
     func stop() {

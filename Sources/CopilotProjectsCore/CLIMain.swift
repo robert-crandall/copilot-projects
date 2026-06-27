@@ -19,6 +19,8 @@ public enum CLIMain {
         "attach",
         "ping",
         "screenshot",
+        "doctor",
+        "version", "--version", "-v",
         "install-cli",
         "install-hooks", "uninstall-hooks",
         "help", "--help", "-h",
@@ -26,6 +28,26 @@ public enum CLIMain {
 
     public static func isCommand(_ s: String) -> Bool {
         commands.contains(s)
+    }
+
+    public static func isCocoaLaunchArguments(_ arguments: [String]) -> Bool {
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument.hasPrefix("-psn_") {
+                index += 1
+                continue
+            }
+            if argument.hasPrefix("-NS") || argument.hasPrefix("-Apple") {
+                index += 1
+                if index < arguments.count, !arguments[index].hasPrefix("-") {
+                    index += 1
+                }
+                continue
+            }
+            return false
+        }
+        return true
     }
 
     public static func run(_ args: [String]) -> Int32 {
@@ -37,6 +59,11 @@ public enum CLIMain {
         let rest = Array(args.dropFirst())
 
         switch command {
+        case "version":
+            print(versionString)
+            return 0
+        case "doctor":
+            return doctor()
         case "help":
             printUsage()
             return 0
@@ -133,8 +160,99 @@ public enum CLIMain {
         case "projects": return "list-projects"
         case "ls": return "list-status"
         case "--help", "-h": return "help"
+        case "--version", "-v": return "version"
         default: return command
         }
+    }
+
+    public static var versionString: String {
+        let direct = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let executable = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
+            .resolvingSymlinksInPath()
+        let appURL = executable
+            .deletingLastPathComponent()   // executable -> MacOS
+            .deletingLastPathComponent()   // MacOS -> Contents
+            .deletingLastPathComponent()   // Contents -> app bundle
+        let enclosing = Bundle(url: appURL)?
+            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let version = direct ?? enclosing
+        return "Copilot Projects \(version ?? "development")"
+    }
+
+    // MARK: - diagnostics
+
+    private static func doctor() -> Int32 {
+        let fm = FileManager.default
+        let snapshot = ProcessTree.snapshot()
+        let stateSessionsPrefix = Paths.sessionsDir.path + "/"
+        let dtach = ProcessTree.dtachProcesses(in: snapshot).filter {
+            $0.socketPath?.hasPrefix(stateSessionsPrefix) == true
+        }
+        let stateSessionIds = persistedSessionIds()
+        let socketFiles = ((try? fm.contentsOfDirectory(atPath: Paths.sessionsDir.path)) ?? [])
+            .filter { $0.hasSuffix(".sock") }
+        let masters = dtach.filter(\.isMaster)
+        let clients = dtach.filter { !$0.isMaster }
+        let liveMasterSockets = Set(masters.compactMap(\.socketPath))
+        let orphanMasters = stateSessionIds.map { sessionIds in
+            masters.filter { process in
+                guard let socket = process.socketPath else { return true }
+                return !sessionIds.contains(
+                    URL(fileURLWithPath: socket).deletingPathExtension().lastPathComponent)
+            }
+        }
+        let staleSockets = socketFiles.filter {
+            !liveMasterSockets.contains(Paths.sessionsDir.appendingPathComponent($0).path)
+        }
+
+        print(versionString)
+        print("state dir: \(Paths.stateDir.path)")
+        print("state file: \(fm.fileExists(atPath: Paths.statePath.path) ? "present" : "missing")")
+        print("sessions in state: \(stateSessionIds.map { String($0.count) } ?? "unreadable")")
+        print("dtach masters: \(masters.count)")
+        print("dtach attached clients: \(clients.count)")
+        print("orphan masters (not in state): \(orphanMasters.map { String($0.count) } ?? "unknown")")
+        print("stale socket files (no master): \(staleSockets.count)")
+        let lock = instanceLockStatus()
+        print("instance lock: \(lock.held ? "held" : "not held")"
+            + (lock.pid.map { " (recorded pid \($0))" } ?? ""))
+        if let response = try? ControlClient().send(ControlRequest(command: "diagnostics")),
+           response.ok, let text = response.text {
+            print(text)
+        } else {
+            print("app control socket: unavailable")
+        }
+        if let orphanMasters, !orphanMasters.isEmpty {
+            print("warning: orphan master pids: \(orphanMasters.map { String($0.pid) }.joined(separator: ", "))")
+        }
+        if !staleSockets.isEmpty {
+            print("warning: stale sockets: \(staleSockets.joined(separator: ", "))")
+        }
+        return 0
+    }
+
+    private static func persistedSessionIds() -> Set<String>? {
+        guard FileManager.default.fileExists(atPath: Paths.statePath.path) else { return [] }
+        guard let data = try? Data(contentsOf: Paths.statePath),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let projects = root["projects"] as? [[String: Any]] else { return nil }
+        return Set(projects.flatMap { project -> [String] in
+            guard let sessions = project["sessions"] as? [[String: Any]] else { return [] }
+            return sessions.compactMap { $0["id"] as? String }
+        })
+    }
+
+    private static func instanceLockStatus() -> (pid: Int?, held: Bool) {
+        let pid = (try? String(contentsOfFile: Paths.instanceLockPath, encoding: .utf8))
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let fd = open(Paths.instanceLockPath, O_RDWR | O_CLOEXEC)
+        guard fd >= 0 else { return (pid, false) }
+        defer { close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+            _ = flock(fd, LOCK_UN)
+            return (pid, false)
+        }
+        return (pid, errno == EWOULDBLOCK || errno == EAGAIN)
     }
 
     // MARK: - attach (resume a session, incl. over SSH)
@@ -144,6 +262,7 @@ public enum CLIMain {
             fail("dtach helper not found (resumability backend missing)")
             return 1
         }
+
         let parsed = parseFlags(args)
         let fm = FileManager.default
         let dir = Paths.sessionsDir
@@ -194,12 +313,12 @@ public enum CLIMain {
 
     // MARK: - flag parsing
 
-    private struct Parsed {
+    struct Parsed {
         var positionals: [String] = []
         var flags: [String: String] = [:]
     }
 
-    private static func parseFlags(_ args: [String]) -> Parsed {
+    static func parseFlags(_ args: [String]) -> Parsed {
         var out = Parsed()
         var i = 0
         while i < args.count {
@@ -292,6 +411,8 @@ public enum CLIMain {
           copilot-projects focus                   Focus a project/session [--project ID] [--session ID]
           copilot-projects ping                    Check the app is reachable
           copilot-projects screenshot [path]       Save a PNG of the app window
+          copilot-projects doctor                  Diagnose app/session/runtime state
+          copilot-projects version                 Print the installed version
           copilot-projects install-cli [--dir D]   Symlink this binary onto your PATH
           copilot-projects install-hooks           Install Copilot CLI status hooks (~/.copilot/hooks)
           copilot-projects uninstall-hooks         Remove the Copilot CLI status hooks

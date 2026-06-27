@@ -78,6 +78,13 @@ public enum Paths {
         return stateDir.appendingPathComponent("control.sock").path
     }
 
+    /// Held exclusively by the running GUI process. This guards the terminal/session
+    /// lifecycle itself; the control socket alone is insufficient because a second
+    /// app instance can fail to bind yet continue creating dtach clients.
+    public static var instanceLockPath: String {
+        stateDir.appendingPathComponent("app.lock").path
+    }
+
     /// Persisted projects/sessions.
     public static var statePath: URL {
         stateDir.appendingPathComponent("state.json")

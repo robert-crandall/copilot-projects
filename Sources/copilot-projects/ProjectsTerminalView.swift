@@ -1,4 +1,5 @@
 import AppKit
+import MetalKit
 import SwiftTerm
 
 /// A `LocalProcessTerminalView` that makes the scroll wheel work inside
@@ -18,14 +19,60 @@ import SwiftTerm
 ///  3. Otherwise (normal shell) → let SwiftTerm scroll its own scrollback.
 final class ProjectsTerminalView: LocalProcessTerminalView {
     private var scrollAccum: CGFloat = 0
+    private(set) var rendererName = "unconfigured"
+    private var rendererConfigured = false
 
-    /// Width SwiftTerm reserves for its (now hidden) legacy NSScroller —
-    /// `getEffectiveWidth` subtracts it from the column count, which otherwise
-    /// leaves an empty margin where the scrollbar was. The host container
-    /// (`TerminalsContainerView`) inflates this view's frame width by this amount so
-    /// the reserved column falls off the clipped right edge and the terminal content
-    /// fills the full visible width.
-    static let reservedScrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        configureRendererIfNeeded()
+    }
+
+    private func configureRendererIfNeeded() {
+        guard window != nil, !rendererConfigured else { return }
+        rendererConfigured = true
+
+        let requested = ProcessInfo.processInfo.environment["COPILOT_PROJECTS_RENDERER"]?
+            .lowercased()
+        guard requested != "coregraphics" else {
+            rendererName = "coregraphics"
+            disableFullRedrawOnAnyChanges = false
+            return
+        }
+        do {
+            try setUseMetal(true)
+            rendererName = "metal"
+        } catch {
+            rendererName = "coregraphics-fallback"
+            disableFullRedrawOnAnyChanges = false
+            NSLog("copilot-projects: Metal renderer unavailable, using CoreGraphics: \(error)")
+        }
+    }
+
+    /// Ask the active surface to render its current model after being revealed.
+    /// SwiftTerm's Metal view is intentionally paused and redraws on demand.
+    func refreshSurface() {
+        configureRendererIfNeeded()
+        if isUsingMetalRenderer,
+           let metalView: MTKView = firstDescendant(of: MTKView.self) {
+            metalView.setNeedsDisplay(metalView.bounds)
+        } else {
+            terminal.updateFullScreen()
+            needsDisplay = true
+            display()
+        }
+    }
+
+    private func firstDescendant<T: NSView>(of type: T.Type) -> T? {
+        firstDescendant(of: type, below: self)
+    }
+
+    private func firstDescendant<T: NSView>(of type: T.Type, below view: NSView) -> T? {
+        for child in view.subviews {
+            if let match = child as? T { return match }
+            if let match = firstDescendant(of: type, below: child) { return match }
+        }
+        return nil
+    }
 
     /// Returns true if the wheel event was handled (and so should be consumed).
     /// Returns false to let SwiftTerm scroll its own buffer. `agentLive` is true
@@ -103,13 +150,11 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         terminal.sendEvent(buttonFlags: release, x: pos.col, y: pos.row)
     }
 
-    /// On-screen cell under the pointer. Subtracts the reserved scroller width so
-    /// the derived cell width matches SwiftTerm's (content spans bounds.width minus
-    /// that reserved column) — keeps click/scroll hit-testing aligned.
+    /// On-screen cell under the pointer.
     private func gridPosition(for event: NSEvent) -> (col: Int, row: Int) {
         guard let terminal = terminal, bounds.width > 0, bounds.height > 0 else { return (0, 0) }
         let p = convert(event.locationInWindow, from: nil)
-        let cellW = (bounds.width - Self.reservedScrollerWidth) / CGFloat(terminal.cols)
+        let cellW = bounds.width / CGFloat(terminal.cols)
         let cellH = bounds.height / CGFloat(terminal.rows)
         let col = min(max(0, Int(p.x / max(cellW, 1))), terminal.cols - 1)
         let row = min(max(0, Int((bounds.height - p.y) / max(cellH, 1))), terminal.rows - 1)

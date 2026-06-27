@@ -11,6 +11,62 @@ final class AppModel: ObservableObject {
     @Published var numberHint: NumberHint = .none
 
     private var controllers: [String: TerminalController] = [:]
+    private let stateRepository: StateRepository
+    private lazy var controlRouter = ControlCommandRouter(actions: .init(
+        listProjects: { [unowned self] in self.renderProjects() },
+        listStatus: { [unowned self] in self.renderStatus() },
+        setStatus: { [unowned self] status, text, request in
+            guard let target = self.resolve(request) else { return .failure("no target session") }
+            self.setStatus(sessionId: target.sessionId, status: status, text: text)
+            return .success()
+        },
+        notify: { [unowned self] title, body, request in
+            if let target = self.resolve(request) {
+                self.postNotification(
+                    projectId: target.projectId, sessionId: target.sessionId,
+                    title: title, body: body)
+            } else {
+                self.notifications?.post(
+                    title: title, body: body,
+                    projectId: request.projectId, sessionId: request.sessionId)
+            }
+            return .success()
+        },
+        newProject: { [unowned self] request in
+            let cwd = request.cwd ?? Paths.defaultStartupDir
+            let name = request.name
+                ?? request.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? "Project \(self.projects.count + 1)"
+            let project = self.makeProject(name: name, cwd: cwd, withSession: true)
+            self.projects.append(project)
+            self.selectProject(project.id)
+            return .success(project.id)
+        },
+        newSession: { [unowned self] request in
+            guard let pid = self.resolveProject(request) else { return .failure("no project") }
+            guard let sid = self.addSession(toProjectId: pid, cwd: request.cwd) else {
+                return .failure("unknown project: \(pid)")
+            }
+            return .success(sid)
+        },
+        renameProject: { [unowned self] name, request in
+            guard let pid = self.resolveProject(request) else { return .failure("no project") }
+            self.renameProject(pid, name: name)
+            return .success()
+        },
+        focus: { [unowned self] request in
+            self.focus(projectId: request.projectId, sessionId: request.sessionId)
+            return .success()
+        },
+        screenshot: { [unowned self] path in
+            self.captureWindow(to: path ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads/copilot-projects.png").path)
+        },
+        diagnostics: { [unowned self] in self.renderDiagnostics() }
+    ))
+    private var stateLoadFailure: String?
+    private var stateRecoveryMessage: String?
+    private var didPresentStateMessage = false
     private var server: ControlServer?
     private weak var notifications: NotificationManager?
     private var saveWork: DispatchWorkItem?
@@ -19,17 +75,7 @@ final class AppModel: ObservableObject {
     private var livenessTimer: Timer?
     private var footerTimer: Timer?
 
-    /// Per-session count of consecutive footer scans that read idle while the tab is
-    /// still marked running/waiting. Debounces the footer backstop (clear only after
-    /// the footer has stayed idle for a couple of scans) so a single transient read
-    /// never clears a live spinner.
-    private var footerIdleTicks: [String: Int] = [:]
-
-    /// Per-session flag: have we observed the footer read `working` during the
-    /// current active epoch? The footer backstop only clears a session it has seen
-    /// go to work, so footer lag right after the hook flips a session to running
-    /// (TUI hasn't repainted "Working" yet) can't wrongly clear a live spinner.
-    private var footerSawWorking: Set<String> = []
+    private var activityTracker = ActivityTracker()
 
     /// Sessions hosting a live agent (refreshed by the liveness reconciler). Used
     /// by scroll-wheel forwarding to keep working on resumed (desynced) sessions.
@@ -55,7 +101,8 @@ final class AppModel: ObservableObject {
         return (env["COPILOT_PROJECTS_LIVENESS"] ?? env["COPILOT_MUX_LIVENESS"]) != "0"
     }
 
-    init() {
+    init(stateRepository: StateRepository = StateRepository()) {
+        self.stateRepository = stateRepository
         load()
     }
 
@@ -66,6 +113,17 @@ final class AppModel: ObservableObject {
     }
 
     func bootstrapIfNeeded() {
+        if !didPresentStateMessage, let message = stateLoadFailure ?? stateRecoveryMessage {
+            didPresentStateMessage = true
+            let alert = NSAlert()
+            alert.messageText = stateLoadFailure == nil
+                ? "Workspace State Recovered"
+                : "Workspace State Could Not Be Loaded"
+            alert.informativeText = message
+            alert.alertStyle = stateLoadFailure == nil ? .informational : .critical
+            alert.runModal()
+        }
+        guard stateLoadFailure == nil else { return }
         if projects.isEmpty {
             let project = makeProject(name: "home", cwd: Paths.defaultStartupDir, withSession: true)
             projects.append(project)
@@ -79,15 +137,17 @@ final class AppModel: ObservableObject {
         ensureSelectedProjectControllers()
     }
 
-    func startServer() {
+    @discardableResult
+    func startServer() -> Bool {
         let server = ControlServer { [weak self] req in
             guard let self else { return .failure("app shutting down") }
             return DispatchQueue.main.sync {
                 MainActor.assumeIsolated { self.handle(req) }
             }
         }
-        server.start()
+        guard server.start() else { return false }
         self.server = server
+        return true
     }
 
     func stopServer() {
@@ -345,16 +405,7 @@ final class AppModel: ObservableObject {
     /// Permanently end a session: kill its dtach master (so it does not resume),
     /// remove its socket, and drop it from the model.
     private func destroySession(projectId pid: String, sessionId sid: String) {
-        let socket = Paths.dtachSocketPath(sessionId: sid)
-        if Paths.dtachExecutable != nil {
-            let snapshot = ProcessTree.snapshot()
-            if let master = ProcessTree.dtachMaster(forSocket: socket, in: snapshot) {
-                kill(master, SIGTERM)
-            }
-        }
-        try? FileManager.default.removeItem(atPath: socket)
-        try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sid))
-        try? FileManager.default.removeItem(atPath: Paths.copilotSessionMarkerPath(sessionId: sid))
+        SessionArtifacts.destroy(sessionId: sid)
         closeSession(projectId: pid, sessionId: sid)
     }
 
@@ -391,13 +442,7 @@ final class AppModel: ObservableObject {
         guard let pi = projectIndex(pid) else { return }
         let snapshot = Paths.dtachExecutable != nil ? ProcessTree.snapshot() : nil
         for session in projects[pi].sessions {
-            let socket = Paths.dtachSocketPath(sessionId: session.id)
-            if let snapshot, let master = ProcessTree.dtachMaster(forSocket: socket, in: snapshot) {
-                kill(master, SIGTERM)
-            }
-            try? FileManager.default.removeItem(atPath: socket)
-            try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: session.id))
-            try? FileManager.default.removeItem(atPath: Paths.copilotSessionMarkerPath(sessionId: session.id))
+            SessionArtifacts.destroy(sessionId: session.id, snapshot: snapshot)
             controllers[session.id]?.terminate()
             controllers[session.id] = nil
         }
@@ -542,6 +587,7 @@ final class AppModel: ObservableObject {
         guard previous != status || projects[loc.p].sessions[loc.s].statusText != text else { return }
         projects[loc.p].sessions[loc.s].status = status
         projects[loc.p].sessions[loc.s].statusText = text
+        if status == .idle { activityTracker.reset(sessionId: sessionId) }
         // The agent just went active → idle. If you're not currently looking at this
         // session, flag it as finished-and-unseen (drives the blue sidebar/tab dot).
         if status == .idle, previous == .running || previous == .waiting,
@@ -589,15 +635,6 @@ final class AppModel: ObservableObject {
 
     /// Backstop for cancelled turns. An Esc-cancel fires no stop hook and leaves the
     /// agent alive, so neither the stop hook nor `reconcileLiveness` clears the tab
-    /// spinner — but the agent's own footer returns to its idle signature (and keeps
-    /// updating even while the tab is backgrounded, since the CLI renders on
-    /// focus-out). Clear a stale `running` status once the footer has read idle for a
-    /// couple of consecutive scans. Scoped to `running` only (never `waiting`, whose
-    /// confirmation UI we don't want to second-guess) and acts only on a positive
-    /// idle footer, so a genuine in-progress turn — whose footer reads `working` the
-    /// whole time — is never cleared.
-    /// Backstop for cancelled turns. An Esc-cancel fires no stop hook and leaves the
-    /// agent alive, so neither the stop hook nor `reconcileLiveness` clears the tab
     /// spinner — but the agent's own footer returns to its idle signature. Clear a
     /// stale running/waiting status once the footer has read idle for a couple of
     /// consecutive scans, but ONLY after we've actually observed the footer go
@@ -615,32 +652,23 @@ final class AppModel: ObservableObject {
                 let sid = projects[pi].sessions[si].id
                 guard let controller = controllers[sid] else { continue }
                 active.insert(sid)
-                switch controller.agentActivity {
-                case .working:
-                    footerSawWorking.insert(sid)
-                    footerIdleTicks[sid] = 0
-                case .unknown:
-                    footerIdleTicks[sid] = 0
-                case .idle:
-                    guard footerSawWorking.contains(sid) else { break }
-                    let ticks = (footerIdleTicks[sid] ?? 0) + 1
-                    footerIdleTicks[sid] = ticks
-                    if ticks >= 2 {
-                        clearStatusToIdle(pi: pi, si: si, markFinished: true)
-                        footerIdleTicks[sid] = nil
-                        footerSawWorking.remove(sid)
-                    }
+                if activityTracker.observeFooter(
+                    sessionId: sid,
+                    currentStatus: status,
+                    activity: controller.agentActivity
+                ) {
+                    clearStatusToIdle(pi: pi, si: si, markFinished: true)
                 }
             }
         }
-        footerIdleTicks = footerIdleTicks.filter { active.contains($0.key) }
-        footerSawWorking = footerSawWorking.intersection(active)
+        activityTracker.retain(activeSessionIds: active)
     }
 
     /// Drop a session to idle and (unless it's on screen) flag it finished & unseen,
     /// then drop its status marker. Shared by the liveness and footer reconcilers.
     private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool) {
         let sid = projects[pi].sessions[si].id
+        activityTracker.reset(sessionId: sid)
         projects[pi].sessions[si].status = .idle
         projects[pi].sessions[si].statusText = nil
         // The agent is idle — it isn't waiting on background agents either; clear the
@@ -672,7 +700,10 @@ final class AppModel: ObservableObject {
             for si in projects[pi].sessions.indices {
                 let status = projects[pi].sessions[si].status
                 guard status == .running || status == .waiting else { continue }
-                if !liveSessions.contains(projects[pi].sessions[si].id) {
+                if ActivityTracker.livenessShouldDemote(
+                    currentStatus: status,
+                    hasLiveAgent: liveSessions.contains(projects[pi].sessions[si].id)
+                ) {
                     // The agent exited/crashed (active → idle). Flag it as finished &
                     // unseen unless you're looking at it right now.
                     clearStatusToIdle(pi: pi, si: si, markFinished: markFinished)
@@ -790,70 +821,28 @@ final class AppModel: ObservableObject {
 
         guard let loc = locateIndex(sessionId) else { return }
         let projectId = projects[loc.p].id
-        try? FileManager.default.removeItem(atPath: socket)
-        try? FileManager.default.removeItem(atPath: Paths.statusMarkerPath(sessionId: sessionId))
+        SessionArtifacts.removeFiles(sessionId: sessionId)
         closeSession(projectId: projectId, sessionId: sessionId)
     }
 
     // MARK: - control socket handler
 
     func handle(_ req: ControlRequest) -> ControlResponse {
-        switch req.command {
-        case "ping":
-            return .success("pong")
-        case "list-projects":
-            return .success(renderProjects())
-        case "list-status":
-            return .success(renderStatus())
-        case "set-status":
-            guard let raw = req.status,
-                  let status = SessionStatus(rawValue: raw.lowercased()) else {
-                return .failure("invalid status (use idle|running|waiting): \(req.status ?? "")")
-            }
-            guard let target = resolve(req) else { return .failure("no target session") }
-            setStatus(sessionId: target.sessionId, status: status, text: req.text)
-            return .success()
-        case "notify":
-            guard let title = req.title else { return .failure("notify requires a title") }
-            if let target = resolve(req) {
-                postNotification(projectId: target.projectId, sessionId: target.sessionId,
-                                 title: title, body: req.body)
-            } else {
-                // No session context: still surface a banner, just without unread/focus routing.
-                notifications?.post(title: title, body: req.body,
-                                    projectId: req.projectId, sessionId: req.sessionId)
-            }
-            return .success()
-        case "new-project":
-            let cwd = req.cwd ?? Paths.defaultStartupDir
-            let name = req.name
-                ?? req.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
-                ?? "Project \(projects.count + 1)"
-            let project = makeProject(name: name, cwd: cwd, withSession: true)
-            projects.append(project)
-            selectProject(project.id)
-            return .success(project.id)
-        case "new-session":
-            guard let pid = resolveProject(req) else { return .failure("no project") }
-            guard let sid = addSession(toProjectId: pid, cwd: req.cwd) else {
-                return .failure("unknown project: \(pid)")
-            }
-            return .success(sid)
-        case "rename-project":
-            guard let pid = resolveProject(req) else { return .failure("no project") }
-            guard let name = req.name else { return .failure("rename-project requires a name") }
-            renameProject(pid, name: name)
-            return .success()
-        case "focus":
-            focus(projectId: req.projectId, sessionId: req.sessionId)
-            return .success()
-        case "screenshot":
-            let path = req.path ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Downloads/copilot-projects.png").path
-            return captureWindow(to: path)
-        default:
-            return .failure("unknown command: \(req.command)")
-        }
+        controlRouter.handle(req)
+    }
+
+    private func renderDiagnostics() -> String {
+        let renderers = Dictionary(grouping: controllers.values) {
+            $0.terminalView.rendererName
+        }.mapValues(\.count)
+        let rendererText = renderers.keys.sorted().map { "\($0)=\(renderers[$0] ?? 0)" }
+            .joined(separator: ", ")
+        return [
+            "app control socket: reachable",
+            "live terminal controllers: \(controllers.count)",
+            "renderers: \(rendererText.isEmpty ? "none" : rendererText)",
+            "selected session: \(globalSelectedSessionId ?? "none")",
+        ].joined(separator: "\n")
     }
 
     /// Renders the app's own window to a PNG — the app drawing itself, so it needs
@@ -865,11 +854,29 @@ final class AppModel: ObservableObject {
             return .failure("no window to capture")
         }
         let bounds = view.bounds
-        guard bounds.width > 1, bounds.height > 1,
-              let rep = view.bitmapImageRepForCachingDisplay(in: bounds) else {
-            return .failure("could not allocate bitmap")
+        guard bounds.width > 1, bounds.height > 1 else {
+            return .failure("window has no drawable bounds")
         }
-        view.cacheDisplay(in: bounds, to: rep)
+        let rep: NSBitmapImageRep
+        if let image = CGWindowListCreateImage(
+            .null,
+            .optionIncludingWindow,
+            CGWindowID(window.windowNumber),
+            [.boundsIgnoreFraming, .bestResolution]
+        ) {
+            // cacheDisplay does not include MTKView/CAMetalLayer contents; capturing
+            // our own window through WindowServer does.
+            rep = NSBitmapImageRep(cgImage: image)
+        } else if activeController?.terminalView.isUsingMetalRenderer == true {
+            return .failure(
+                "could not capture the Metal surface; Screen Recording permission may be required"
+            )
+        } else if let fallback = view.bitmapImageRepForCachingDisplay(in: bounds) {
+            view.cacheDisplay(in: bounds, to: fallback)
+            rep = fallback
+        } else {
+            return .failure("could not capture window")
+        }
         guard let data = rep.representation(using: .png, properties: [:]) else {
             return .failure("could not encode PNG")
         }
@@ -954,8 +961,21 @@ final class AppModel: ObservableObject {
     // MARK: - persistence
 
     private func load() {
-        guard let data = try? Data(contentsOf: Paths.statePath),
-              let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
+        let state: PersistedState
+        switch stateRepository.load() {
+        case .missing:
+            return
+        case .loaded(let loaded):
+            state = loaded
+        case .recovered(let recovered, let message):
+            state = recovered
+            stateRecoveryMessage = message
+            NSLog("copilot-projects: \(message)")
+        case .failed(let message):
+            stateLoadFailure = message
+            NSLog("copilot-projects: \(message)")
+            return
+        }
         projects = state.projects
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
@@ -982,6 +1002,7 @@ final class AppModel: ObservableObject {
     }
 
     private func scheduleSave() {
+        guard stateLoadFailure == nil else { return }
         saveWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.save() }
         saveWork = work
@@ -989,9 +1010,12 @@ final class AppModel: ObservableObject {
     }
 
     func save() {
-        Paths.ensureStateDir()
+        guard stateLoadFailure == nil else { return }
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
-        guard let data = try? JSONEncoder().encode(state) else { return }
-        try? data.write(to: Paths.statePath, options: .atomic)
+        do {
+            try stateRepository.save(state)
+        } catch {
+            NSLog("copilot-projects: failed to save workspace state: \(error)")
+        }
     }
 }

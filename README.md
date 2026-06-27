@@ -8,9 +8,9 @@ and drops everything else.
 
 ![Copilot Projects — vertical project sidebar, terminal sessions as horizontal tabs](docs/screenshot.png)
 
-It replaces cmux's Ghostty integration (a GPU renderer behind several AppKit/portal
-layers) with [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), a pure-Swift terminal
-view. The result is a few Swift files instead of hundreds.
+It replaces cmux's Ghostty integration with
+[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)'s native Metal renderer,
+with a CoreGraphics fallback. The result is a few Swift files instead of hundreds.
 
 ## Features
 
@@ -20,8 +20,8 @@ view. The result is a few Swift files instead of hundreds.
   is visible at a time. Add a tab with `⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
   (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, close with `⌘W` or the tab's ✕. Background tabs keep
   running. Hold **⌘** (projects) or **⌃** (tabs) to see the number on each.
-- **Status:** each session reports `idle` / `running` / `waiting`. The sidebar dot rolls
-  up per project (orange if anything is waiting, blue if anything is running, grey if idle).
+- **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
+  counts appear in the sidebar; a blue dot marks work that finished while you were away.
   With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Notifications:** post a native macOS banner from any session; clicking it focuses the
   originating project/session. Unread sessions get a bell badge + a Dock badge count.
@@ -102,6 +102,8 @@ copilot-projects list-status
 copilot-projects new-project myapp                # name only; --cwd optional
 copilot-projects new-session --project <id> --cwd /tmp
 copilot-projects focus --session <id>             # bring app forward + select
+copilot-projects doctor                           # diagnose state/session/runtime health
+copilot-projects version                          # print installed version
 copilot-projects install-hooks                    # wire up Copilot CLI status hooks
 copilot-projects help
 ```
@@ -119,8 +121,8 @@ agent lifecycle to status:
 | --- | --- |
 | `sessionStart` | `idle` |
 | `userPromptSubmitted` | `running` |
-| `preToolUse` (tool = `ask_user`) | `waiting` |
-| `postToolUse` (tool = `ask_user`) | `running` |
+| `preToolUse` / `postToolUse` | `running` |
+| `notification` (`elicitation_dialog` / `permission_prompt`) | `waiting` |
 | `agentStop` | `idle` |
 | `sessionEnd` | `idle` |
 
@@ -129,12 +131,11 @@ coexists with other integrations (e.g. cmux) and is safe to leave installed glob
 it with `copilot-projects install-hooks` / `uninstall-hooks`. Start a new Copilot CLI session to
 pick up changes.
 
-**Liveness backstop.** Stop/exit hooks can be missed (a crash, `kill`, a closed terminal), so
-the app also reconciles: a session can only stay `running`/`waiting` while its shell actually
-hosts a live `copilot` process. The moment the agent exits, the dot drops to idle — and it is
-never cleared while the agent is genuinely working (no timing guesswork). Tune the detected
-process names with `COPILOT_PROJECTS_AGENT_PROCESSES` (comma-separated, default `copilot`) or turn
-the check off with `COPILOT_PROJECTS_LIVENESS=0`.
+**Status precedence.** Hook events are authoritative for positive transitions. A process-tree
+liveness check may only demote a stale `running`/`waiting` state after the agent exits. A bounded
+footer classifier is the final backstop for Esc-cancel, which currently fires no stop hook.
+Tune detected process names with `COPILOT_PROJECTS_AGENT_PROCESSES` (comma-separated, default
+`copilot`) or turn the liveness check off with `COPILOT_PROJECTS_LIVENESS=0`.
 
 For other agents, call the CLI from their hooks directly:
 
@@ -164,8 +165,19 @@ the only emulator.
 - **Tradeoff:** scrollback *history* doesn't survive a detach (a full-screen TUI like copilot
   repaints on reattach; a plain shell starts fresh). Live scrollback while attached is normal.
 
-Sockets live under `~/.local/state/copilot-projects/sessions/`. If the bundled dtach is missing,
-sessions fall back to plain (non-resumable) shells. Override the helper with `COPILOT_PROJECTS_DTACH`.
+Sockets live under `~/.local/state/copilot-projects/sessions/` on fresh installs. An install
+migrated from the old `copilot-mux` name intentionally keeps using
+`~/.local/state/copilot-mux/`, because live dtach masters have those socket paths baked into
+their argv. `copilot-projects doctor` prints the active path and distinguishes the normal
+master/client process pair from real orphaned masters. If the bundled dtach is missing,
+sessions fall back to plain shells. Override it with `COPILOT_PROJECTS_DTACH`.
+
+## Renderer
+
+SwiftTerm's Metal renderer is the default. Set `COPILOT_PROJECTS_RENDERER=coregraphics`
+before launching to use the fallback renderer. The dependency is pinned to an exact upstream
+revision containing fixes for stale Metal rows/cursor, window reparenting, hidden-scroller
+layout, and synchronized output.
 
 ## How it works
 
@@ -173,12 +185,14 @@ sessions fall back to plain (non-resumable) shells. Override the helper with `CO
   the CLI client; anything else launches the SwiftUI app.
 - `Sources/CopilotProjectsCore` is Foundation-only: paths, the JSON-line wire protocol, the socket
   client, and CLI parsing.
-- The app keeps value-type `Project`/`Session` state in `AppModel` and holds the live
-  SwiftTerm views **outside** the observable graph (`controllers` dictionary), so SwiftUI
-  list diffing stays cheap.
+- `AppModel` is the SwiftUI coordinator. Versioned state persistence, activity evidence,
+  control-command routing, session artifacts, and instance locking are separate components.
+  Live SwiftTerm views stay outside the observable graph.
 - `ControlServer` listens on `~/.local/state/copilot-projects/control.sock` (mode 0600 in a 0700
   dir); each connection is one JSON request → one JSON response.
 - State is persisted to `~/.local/state/copilot-projects/state.json`.
+  Existing pre-rebrand installs may use the legacy path described above. Writes are atomic,
+  preserve a known-good backup, and never overwrite unreadable state with an empty workspace.
 
 Override locations with `COPILOT_PROJECTS_SOCKET` and `COPILOT_PROJECTS_STATE_DIR` (useful for running
 an isolated instance).

@@ -93,7 +93,7 @@ public struct ControlClient {
         }
         _ = fcntl(fd, F_SETFL, savedFlags)   // back to blocking; SO_*TIMEO now apply
 
-        var payload = try Wire.encodeLine(request)
+        let payload = try Wire.encodeLine(request)
         try payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var off = 0
             let base = raw.bindMemory(to: UInt8.self).baseAddress!

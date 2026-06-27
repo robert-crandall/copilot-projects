@@ -1,19 +1,21 @@
 import Foundation
-import CopilotProjectsCore
 #if canImport(Darwin)
 import Darwin
 #endif
 
 /// Minimal read-only view of the process tree, used to decide whether a coding
 /// agent is still alive inside a session's shell.
-enum ProcessTree {
-    struct Snapshot {
-        var childrenOf: [pid_t: [pid_t]] = [:]
-        var nameOf: [pid_t: String] = [:]
+public enum ProcessTree {
+    public struct Snapshot {
+        public var childrenOf: [pid_t: [pid_t]] = [:]
+        public var parentOf: [pid_t: pid_t] = [:]
+        public var nameOf: [pid_t: String] = [:]
+
+        public init() {}
     }
 
     /// One pass over all processes: parent links + short process names.
-    static func snapshot() -> Snapshot {
+    public static func snapshot() -> Snapshot {
         var snap = Snapshot()
         let needed = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
         guard needed > 0 else { return snap }
@@ -37,13 +39,14 @@ enum ProcessTree {
                 return String(cString: base.assumingMemoryBound(to: CChar.self))
             }
             snap.childrenOf[ppid, default: []].append(pid)
+            snap.parentOf[pid] = ppid
             snap.nameOf[pid] = name
         }
         return snap
     }
 
     /// True if any descendant of `root` has a process name in `names`.
-    static func hasDescendant(under root: pid_t, named names: Set<String>, in snap: Snapshot) -> Bool {
+    public static func hasDescendant(under root: pid_t, named names: Set<String>, in snap: Snapshot) -> Bool {
         guard root > 0, !names.isEmpty else { return false }
         var stack = snap.childrenOf[root] ?? []
         var visited = Set<pid_t>()
@@ -56,7 +59,7 @@ enum ProcessTree {
     }
 
     /// argv + environment of a process via KERN_PROCARGS2 (same-uid only).
-    static func inspect(_ pid: pid_t) -> (args: [String], env: [String: String]) {
+    public static func inspect(_ pid: pid_t) -> (args: [String], env: [String: String]) {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
         if sysctl(&mib, 3, nil, &size, nil, 0) != 0 || size < MemoryLayout<Int32>.size {
@@ -103,7 +106,7 @@ enum ProcessTree {
 
     /// Sessions (by COPILOT_PROJECTS_SESSION env) that currently host a live agent
     /// process. Works regardless of how the shell is wrapped (dtach or direct).
-    static func agentSessions(agentNames: Set<String>, in snap: Snapshot) -> Set<String> {
+    public static func agentSessions(agentNames: Set<String>, in snap: Snapshot) -> Set<String> {
         var sessions = Set<String>()
         for (pid, name) in snap.nameOf where agentNames.contains(name) {
             if let sid = Env.sessionId(inspect(pid).env) {
@@ -113,11 +116,68 @@ enum ProcessTree {
         return sessions
     }
 
-    /// The dtach master process owning a given session socket (for kill).
-    static func dtachMaster(forSocket socket: String, in snap: Snapshot) -> pid_t? {
-        for (pid, name) in snap.nameOf where name == "dtach" {
-            if inspect(pid).args.contains(socket) { return pid }
+    /// The dtach master owning a given session socket (for kill). A newly-created
+    /// master is initially a child of the creating/attached dtach client; after that
+    /// client exits it is reparented to launchd (PID 1). A later reattach creates an
+    /// unrelated client. In every state the client and master share the socket argv.
+    public static func dtachMaster(forSocket socket: String, in snap: Snapshot) -> pid_t? {
+        dtachMaster(forSocket: socket, among: dtachProcesses(in: snap))
+    }
+
+    public struct DtachProcess {
+        public let pid: pid_t
+        public let parentPID: pid_t
+        public let socketPath: String?
+        public let isMaster: Bool
+
+        public init(pid: pid_t, parentPID: pid_t, socketPath: String?, isMaster: Bool) {
+            self.pid = pid
+            self.parentPID = parentPID
+            self.socketPath = socketPath
+            self.isMaster = isMaster
         }
-        return nil
+    }
+
+    public static func dtachProcesses(in snap: Snapshot) -> [DtachProcess] {
+        let raw: [DtachProcess] = snap.nameOf.compactMap { pid, name in
+            guard name == "dtach" else { return nil }
+            let args = inspect(pid).args
+            let socket = args.first {
+                $0.hasSuffix(".sock") && $0.contains("/sessions/")
+            }
+            let parent = snap.parentOf[pid] ?? 0
+            return DtachProcess(
+                pid: pid,
+                parentPID: parent,
+                socketPath: socket,
+                isMaster: false
+            )
+        }
+        return raw.map { process in
+            DtachProcess(
+                pid: process.pid,
+                parentPID: process.parentPID,
+                socketPath: process.socketPath,
+                isMaster: isDtachMaster(process, among: raw)
+            )
+        }
+    }
+
+    public static func dtachMaster(
+        forSocket socket: String,
+        among processes: [DtachProcess]
+    ) -> pid_t? {
+        let matching = processes.filter { $0.socketPath == socket }
+        return matching.first { isDtachMaster($0, among: matching) }?.pid
+    }
+
+    private static func isDtachMaster(
+        _ process: DtachProcess,
+        among processes: [DtachProcess]
+    ) -> Bool {
+        process.parentPID == 1
+            || processes.contains {
+                $0.pid == process.parentPID && $0.socketPath == process.socketPath
+            }
     }
 }

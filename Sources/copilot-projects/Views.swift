@@ -417,7 +417,6 @@ struct SessionTabBar: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
         }
-        .focusEffectDisabled()
     }
 
     private var insertionBar: some View {

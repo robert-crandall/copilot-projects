@@ -28,26 +28,11 @@ final class TerminalsContainerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        // Clip each terminal's reserved-scroller overhang (we inflate the terminal's
-        // width below so the hidden scrollbar column falls off the right edge) — the
-        // SwiftUI host used `.clipped()` for this.
         layer?.masksToBounds = true
         addSubview(cover)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
-
-    /// A terminal's frame: the container bounds inflated by the reserved scroller
-    /// width so SwiftTerm sizes its columns to the full visible width (the extra
-    /// column is clipped by `masksToBounds`). Inflating HERE — rather than in
-    /// `ProjectsTerminalView.setFrameSize` — means setting `frame = inflatedFrame` is
-    /// idempotent, so re-laying out on every state tick is a no-op instead of
-    /// re-triggering a column reflow.
-    private var inflatedFrame: NSRect {
-        NSRect(x: 0, y: 0,
-               width: bounds.width + ProjectsTerminalView.reservedScrollerWidth,
-               height: bounds.height)
-    }
 
     /// Only the visible pane (the active terminal, or the cover) needs a current
     /// frame; hidden panes are resized AND fully repainted the instant they're
@@ -55,7 +40,7 @@ final class TerminalsContainerView: NSView {
     /// every project, and covered panes burn no draw cycles.
     private func layoutVisible() {
         cover.frame = bounds
-        if let id = activeId, let view = hosted[id] { view.frame = inflatedFrame }
+        if let id = activeId, let view = hosted[id] { view.frame = bounds }
     }
 
     override func layout() {
@@ -91,7 +76,7 @@ final class TerminalsContainerView: NSView {
             if hosted[id] !== view {
                 hosted[id]?.removeFromSuperview()
                 view.isHidden = true
-                view.frame = inflatedFrame
+                view.frame = bounds
                 addSubview(view)
                 hosted[id] = view
                 inserted.insert(id)
@@ -127,19 +112,12 @@ final class TerminalsContainerView: NSView {
             + "hosted=\(hosted.count) visibleActive=\(active.flatMap { hosted[$0]?.isHidden == false } ?? false)")
     }
 
-    /// Force the just-revealed terminal to the current size and a SYNCHRONOUS,
-    /// full-bounds repaint, then focus it. SwiftTerm's draw() paints only the rows
-    /// inside the dirtyRect (AppleTerminalView.drawTerminalContents), and a pane that
-    /// was hidden accumulates no/partial dirty region — so `display()`, which marks
-    /// the whole bounds dirty and draws immediately from SwiftTerm's always-current
-    /// model, is what actually fills the surface. `setNeedsDisplay`/`displayIfNeeded`
-    /// left it blank.
+    /// Size, redraw, and focus the newly revealed terminal. SwiftTerm's Metal path
+    /// owns its invalidation contract; CoreGraphics fallback performs one full draw.
     private func reveal(_ view: ProjectsTerminalView) {
-        view.frame = inflatedFrame
+        view.frame = bounds
         view.layoutSubtreeIfNeeded()
-        view.terminal?.updateFullScreen()
-        view.needsDisplay = true
-        view.display()
+        view.refreshSurface()
         if let window, window.firstResponder !== view {
             window.makeFirstResponder(view)
         }

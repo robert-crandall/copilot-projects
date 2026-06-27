@@ -4,10 +4,15 @@ import PackageDescription
 let package = Package(
     name: "copilot-projects",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v13)
     ],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.13.0")
+        // Pinned past the post-1.13 Metal fixes for stale rows/cursor, window
+        // reparenting, synchronized output, and hidden-scroller layout.
+        .package(
+            url: "https://github.com/migueldeicaza/SwiftTerm",
+            revision: "9adb62463d2264e7403feb7a1471aaf27eaab2f4"
+        )
     ],
     targets: [
         .target(
@@ -21,6 +26,11 @@ let package = Package(
                 .product(name: "SwiftTerm", package: "SwiftTerm")
             ],
             path: "Sources/copilot-projects"
+        ),
+        .testTarget(
+            name: "CopilotProjectsTests",
+            dependencies: ["CopilotProjectsCore", "copilot-projects"],
+            path: "Tests"
         )
     ]
 )
