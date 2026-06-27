@@ -619,7 +619,7 @@ final class AppModel: ObservableObject {
         // spinner clear, independent of the heavier process snapshot.
         reconcileAgentFooters()
         let footer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.reconcileAgentFooters() }
+            Task { @MainActor [weak self] in self?.reconcileAgentFooters() }
         }
         RunLoop.main.add(footer, forMode: .common)
         footerTimer = footer
@@ -627,7 +627,7 @@ final class AppModel: ObservableObject {
         guard livenessEnabled else { return }
         reconcileLiveness(markFinished: false)   // startup: clear dead statuses without flagging them as "finished while away"
         let timer = Timer(timeInterval: 8, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.reconcileLiveness() }
+            Task { @MainActor [weak self] in self?.reconcileLiveness() }
         }
         RunLoop.main.add(timer, forMode: .common)
         livenessTimer = timer

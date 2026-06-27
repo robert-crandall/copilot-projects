@@ -7,7 +7,10 @@ import CopilotProjectsCore
 /// Accepts one-shot JSON-line requests on a Unix domain socket and replies with
 /// one JSON-line response. The handler runs on the server's background queue;
 /// it is responsible for any main-actor hop it needs.
-final class ControlServer {
+// The accept loop is confined to `queue`; start/stop run on the main actor and
+// shutdown crosses the boundary only by closing the listening fd, which wakes
+// `accept`. The class owns those synchronization rules explicitly.
+final class ControlServer: @unchecked Sendable {
     private let socketPath: String
     private let handler: (ControlRequest) -> ControlResponse
     private var listenFD: Int32 = -1

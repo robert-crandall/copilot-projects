@@ -228,7 +228,7 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
     /// whitespace margin separating it from content. Requires a >=2-space margin
     /// (or an otherwise-blank line) so single-space-padded table borders and
     /// `git log --graph` `│` are left intact.
-    static func strippingScrollbarGutter(_ text: String, bars: Set<Character>) -> String {
+    nonisolated static func strippingScrollbarGutter(_ text: String, bars: Set<Character>) -> String {
         text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
             var tail = line.endIndex
             while tail > line.startIndex {

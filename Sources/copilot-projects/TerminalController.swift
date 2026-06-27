@@ -5,7 +5,8 @@ import CopilotProjectsCore
 /// Owns a single SwiftTerm terminal + its child shell, and republishes the
 /// process-delegate callbacks as plain closures. Deliberately NOT an
 /// ObservableObject: the live NSView is kept out of the SwiftUI observation graph.
-final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
+@MainActor
+final class TerminalController: NSObject, @preconcurrency LocalProcessTerminalViewDelegate {
     let sessionId: String
     let terminalView: ProjectsTerminalView
 
@@ -37,7 +38,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     /// SwiftTerm's normal buffer (the CLI never re-emits 1049h on reattach), so an
     /// alt-buffer check would blind this to every resumed agent. The caller scopes
     /// this to live `running` agents, so a plain shell is never read.
-    var agentActivity: FooterActivity {
+    @MainActor var agentActivity: FooterActivity {
         guard !exited else { return .idle }
         guard let terminal = terminalView.terminal else { return .unknown }
         let rows = terminal.rows, cols = terminal.cols
@@ -63,8 +64,8 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     }
 
     /// One-shot diagnostic dump of the bottom rows when no footer was recognized.
-    static var dumpedSessions: Set<String> = []
-    static func dumpLayoutOnce(sessionId: String, terminal: Terminal) {
+    @MainActor static var dumpedSessions: Set<String> = []
+    @MainActor static func dumpLayoutOnce(sessionId: String, terminal: Terminal) {
         guard FileManager.default.fileExists(atPath: "/tmp/copilot-projects-debug"),
               !dumpedSessions.contains(sessionId) else { return }
         dumpedSessions.insert(sessionId)
@@ -83,7 +84,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     /// Classify copilot's footer line into coarse activity. Pure/static so it can be
     /// unit-tested against captured fixtures.
-    static func classifyFooter(_ footerLine: String) -> FooterActivity {
+    nonisolated static func classifyFooter(_ footerLine: String) -> FooterActivity {
         let f = footerLine.lowercased()
         guard !f.trimmingCharacters(in: .whitespaces).isEmpty else { return .unknown }
         if f.contains("esc cancel") || f.contains("esc to cancel")
@@ -100,7 +101,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     /// Append a diagnostic line, but only while `/tmp/copilot-projects-debug` exists
     /// (touch it to enable, rm to disable — no relaunch needed). Off by default; the
     /// message is `@autoclosure` so nothing is built when disabled.
-    static func debugLog(_ s: @autoclosure () -> String) {
+    nonisolated static func debugLog(_ s: @autoclosure () -> String) {
         guard FileManager.default.fileExists(atPath: "/tmp/copilot-projects-debug") else { return }
         let line = "[\(Date())] \(s())\n"
         let path = "/tmp/copilot-projects-debug.log"
@@ -228,14 +229,14 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     /// hook writes and the form `copilot --resume` expects). Rejects anything else
     /// before it's interpolated into the shell command — defense-in-depth alongside
     /// the hook's own validation.
-    static func isSafeSessionId(_ s: String) -> Bool {
+    nonisolated static func isSafeSessionId(_ s: String) -> Bool {
         UUID(uuidString: s) != nil
     }
 
     /// POSIX single-quote a string for safe interpolation into a shell command:
     /// wrap in single quotes, and emit any embedded quote as `'\''`. Used for the
     /// shell path in the resume command so spaces or apostrophes can't break it.
-    static func shellSingleQuote(_ s: String) -> String {
+    nonisolated static func shellSingleQuote(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
