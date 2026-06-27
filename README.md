@@ -76,8 +76,12 @@ copilot-projects ping            # -> pong
 
 ### Cutting a release
 
-`scripts/release.sh` builds the optimized `.app`, packages a drag-to-Applications DMG, and
-(with `--publish`) creates the GitHub release + tag:
+The primary release path is **Actions → Release → Run workflow**. Enter an `X.Y.Z`
+version while dispatching from `main`; the workflow validates the version/tag, runs the
+tests on an Apple Silicon runner, builds the app and DMG, and publishes the GitHub release.
+
+`scripts/release.sh` is the local fallback. It builds the optimized `.app`, packages a
+drag-to-Applications DMG, and (with `--publish`) creates the GitHub release + tag:
 
 ```bash
 ./scripts/release.sh 0.1.0             # -> dist/Copilot-Projects-0.1.0.dmg (local only)

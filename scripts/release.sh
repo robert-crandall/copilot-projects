@@ -15,7 +15,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-REPO="sirfergy/copilot-projects"
+REPO="${GITHUB_REPOSITORY:-sirfergy/copilot-projects}"
 APP_NAME="Copilot Projects"
 
 VERSION=""
@@ -29,6 +29,10 @@ for arg in "$@"; do
 done
 [ -n "$VERSION" ] || { echo "usage: scripts/release.sh <version> [--publish]" >&2; exit 1; }
 VERSION="${VERSION#v}"   # accept either 0.1.0 or v0.1.0
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "error: version must be X.Y.Z (optionally prefixed with v)" >&2
+  exit 1
+}
 TAG="v$VERSION"
 
 # SwiftPM + git need this when the user's global git sets safe.bareRepository=explicit.
@@ -45,7 +49,19 @@ APP="$ROOT/dist/$APP_NAME.app"
 echo "==> packaging DMG"
 DMG="$ROOT/dist/Copilot-Projects-$VERSION.dmg"
 STAGING="$(mktemp -d)"
-trap 'rm -rf "$STAGING"' EXIT
+NOTES_FILE=""
+RELEASE_CREATED=0
+cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$RELEASE_CREATED" = "1" ]; then
+    cleanup_partial_release
+  fi
+  rm -rf "$STAGING"
+  [ -z "$NOTES_FILE" ] || rm -f "$NOTES_FILE"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"   # drag-to-install target
 rm -f "$DMG"
@@ -63,7 +79,6 @@ command -v gh >/dev/null || { echo "error: gh CLI not found" >&2; exit 1; }
 echo "==> publishing GitHub release $TAG to $REPO"
 SHA="$(git rev-parse HEAD)"
 NOTES_FILE="$(mktemp)"
-trap 'rm -rf "$STAGING" "$NOTES_FILE"' EXIT
 cat > "$NOTES_FILE" <<NOTES
 ## Install
 
@@ -78,10 +93,29 @@ cat > "$NOTES_FILE" <<NOTES
 Requires macOS 13+. Apple Silicon (arm64).
 NOTES
 
-gh release create "$TAG" "$DMG" \
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  echo "error: release $TAG already exists" >&2
+  exit 1
+fi
+if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+  echo "error: tag $TAG already exists in $REPO" >&2
+  exit 1
+fi
+
+cleanup_partial_release() {
+  if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+    gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
+  fi
+}
+RELEASE_CREATED=1
+gh release create "$TAG" \
   --repo "$REPO" \
   --target "$SHA" \
   --title "Copilot Projects $VERSION" \
-  --notes-file "$NOTES_FILE"
+  --notes-file "$NOTES_FILE" \
+  --draft
+gh release upload "$TAG" "$DMG" --repo "$REPO"
+gh release edit "$TAG" --repo "$REPO" --draft=false
+RELEASE_CREATED=0
 
 echo "==> done: https://github.com/$REPO/releases/tag/$TAG"
