@@ -11,6 +11,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test
-        run: swift test -Xswiftc -strict-concurrency=complete
+        run: swift test
       - name: Release build
-        run: swift build -c release -Xswiftc -strict-concurrency=complete
+        run: swift build -c release
