@@ -5,8 +5,7 @@ import CopilotProjectsCore
 /// Owns a single SwiftTerm terminal + its child shell, and republishes the
 /// process-delegate callbacks as plain closures. Deliberately NOT an
 /// ObservableObject: the live NSView is kept out of the SwiftUI observation graph.
-@MainActor
-final class TerminalController: NSObject, @preconcurrency LocalProcessTerminalViewDelegate {
+final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     let sessionId: String
     let terminalView: ProjectsTerminalView
 
