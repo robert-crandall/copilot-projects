@@ -17,7 +17,13 @@ final class AppModel: ObservableObject {
         listStatus: { [unowned self] in self.renderStatus() },
         setStatus: { [unowned self] status, text, request in
             guard let target = self.resolve(request) else { return .failure("no target session") }
-            self.setStatus(sessionId: target.sessionId, status: status, text: text)
+            self.setStatus(
+                sessionId: target.sessionId,
+                status: status,
+                text: text,
+                timestamp: request.timestamp,
+                source: request.source
+            )
             return .success()
         },
         notify: { [unowned self] title, body, request in
@@ -76,6 +82,7 @@ final class AppModel: ObservableObject {
     private var footerTimer: Timer?
 
     private var activityTracker = ActivityTracker()
+    private var statusEventClock = StatusEventClock()
 
     /// Sessions hosting a live agent (refreshed by the liveness reconciler). Used
     /// by scroll-wheel forwarding to keep working on resumed (desynced) sessions.
@@ -371,6 +378,7 @@ final class AppModel: ObservableObject {
         guard let pi = projectIndex(pid) else { return }
         controllers[sid]?.terminate()
         controllers[sid] = nil
+        statusEventClock.reset(sessionId: sid)
         let closedIndex = projects[pi].sessions.firstIndex { $0.id == sid }
         let wasSelected = projects[pi].selectedSessionId == sid
         projects[pi].sessions.removeAll { $0.id == sid }
@@ -581,13 +589,31 @@ final class AppModel: ObservableObject {
 
     // MARK: - status / notifications (driven by the CLI)
 
-    func setStatus(sessionId: String, status: SessionStatus, text: String?) {
+    func setStatus(
+        sessionId: String,
+        status: SessionStatus,
+        text: String?,
+        timestamp: Int64? = nil,
+        source: String? = nil
+    ) {
         guard let loc = locateIndex(sessionId) else { return }
+        guard statusEventClock.shouldApply(sessionId: sessionId, timestamp: timestamp) else { return }
         let previous = projects[loc.p].sessions[loc.s].status
-        guard previous != status || projects[loc.p].sessions[loc.s].statusText != text else { return }
+        let clearsBackgroundAgents = status == .idle
+            && source == "session-idle"
+            && projects[loc.p].sessions[loc.s].backgroundAgentsActive
+        guard previous != status
+                || projects[loc.p].sessions[loc.s].statusText != text
+                || clearsBackgroundAgents
+        else { return }
         projects[loc.p].sessions[loc.s].status = status
         projects[loc.p].sessions[loc.s].statusText = text
-        if status == .idle { activityTracker.reset(sessionId: sessionId) }
+        if status == .idle {
+            activityTracker.reset(sessionId: sessionId)
+            if source == "session-idle" {
+                projects[loc.p].sessions[loc.s].backgroundAgentsActive = false
+            }
+        }
         // The agent just went active → idle. If you're not currently looking at this
         // session, flag it as finished-and-unseen (drives the blue sidebar/tab dot).
         if status == .idle, previous == .running || previous == .waiting,
@@ -651,6 +677,12 @@ final class AppModel: ObservableObject {
                 guard status == .running || status == .waiting else { continue }
                 let sid = projects[pi].sessions[si].id
                 guard let controller = controllers[sid] else { continue }
+                if FileManager.default.fileExists(
+                    atPath: Paths.sessionIdleHookMarkerPath(sessionId: sid)
+                ) {
+                    activityTracker.reset(sessionId: sid)
+                    continue
+                }
                 active.insert(sid)
                 if activityTracker.observeFooter(
                     sessionId: sid,
@@ -984,6 +1016,10 @@ final class AppModel: ObservableObject {
                 // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.
                 projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
                 projects[pi].sessions[si].status = restoredStatus(forSession: projects[pi].sessions[si].id)
+                statusEventClock.seed(
+                    sessionId: projects[pi].sessions[si].id,
+                    timestamp: restoredStatusTimestamp(forSession: projects[pi].sessions[si].id)
+                )
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false
             }
@@ -999,6 +1035,12 @@ final class AppModel: ObservableObject {
             if let status = SessionStatus(rawValue: trimmed) { return status }
         }
         return .idle
+    }
+
+    private func restoredStatusTimestamp(forSession sessionId: String) -> Int64? {
+        let path = Paths.statusTimestampMarkerPath(sessionId: sessionId)
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func scheduleSave() {

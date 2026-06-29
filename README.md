@@ -129,17 +129,20 @@ agent lifecycle to status:
 | `notification` (`elicitation_dialog` / `permission_prompt`) | `waiting` |
 | `agentStop` | `idle` |
 | `sessionEnd` | `idle` |
+| `notification` (`session_idle`, supported by newer CLI versions) | authoritative `idle` after background work drains |
 
 The hook no-ops outside a copilot-projects terminal (it checks `COPILOT_PROJECTS_SESSION`), so it
 coexists with other integrations (e.g. cmux) and is safe to leave installed globally. Manage
 it with `copilot-projects install-hooks` / `uninstall-hooks`. Start a new Copilot CLI session to
 pick up changes.
 
-**Status precedence.** Hook events are authoritative for positive transitions. A process-tree
-liveness check may only demote a stale `running`/`waiting` state after the agent exits. A bounded
-footer classifier is the final backstop for Esc-cancel, which currently fires no stop hook.
-Tune detected process names with `COPILOT_PROJECTS_AGENT_PROCESSES` (comma-separated, default
-`copilot`) or turn the liveness check off with `COPILOT_PROJECTS_LIVENESS=0`.
+**Status precedence.** Hook events are authoritative. Newer CLI versions emit `session_idle`
+only after the root turn and all background work drain, including `aborted: true` for Esc-cancel.
+After a session proves it supports that signal, Copilot Projects disables footer scraping for
+that CLI process. Older versions keep the bounded footer classifier as a compatibility fallback;
+the process-tree check remains a crash fallback. Tune detected process names with
+`COPILOT_PROJECTS_AGENT_PROCESSES` (comma-separated, default `copilot`) or disable the liveness
+check with `COPILOT_PROJECTS_LIVENESS=0`.
 
 For other agents, call the CLI from their hooks directly:
 

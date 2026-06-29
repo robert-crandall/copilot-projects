@@ -28,6 +28,76 @@ final class AppLogicTests: XCTestCase {
             sessionId: sessionId, currentStatus: .running, activity: .idle))
     }
 
+    func testStatusEventClockRejectsLateHookEvents() {
+        let sessionId = UUID().uuidString
+        var clock = StatusEventClock()
+        XCTAssertTrue(clock.shouldApply(sessionId: sessionId, timestamp: 200))
+        XCTAssertFalse(clock.shouldApply(sessionId: sessionId, timestamp: 100))
+        XCTAssertTrue(clock.shouldApply(sessionId: sessionId, timestamp: 300))
+        XCTAssertTrue(clock.shouldApply(sessionId: sessionId, timestamp: nil))
+    }
+
+    func testCopilotHookHandlesSessionIdleAndCapabilityLifecycle() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hookURL = root.appendingPathComponent("copilot-projects-hook.sh")
+        try CopilotHooks.script.write(to: hookURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hookURL.path)
+
+        let capture = root.appendingPathComponent("cli-args.txt")
+        let fakeCLI = bin.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "$CAPTURE_FILE"
+        """.write(to: fakeCLI, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
+
+        let tabId = UUID().uuidString
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        let capability = sessions.appendingPathComponent("\(tabId).session-idle-hook")
+
+        try runHook(
+            hookURL: hookURL,
+            action: "notify",
+            payload: #"{"timestamp":200,"notification_type":"session_idle","aborted":true}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: capability.path))
+        XCTAssertEqual(
+            try String(contentsOf: sessions.appendingPathComponent("\(tabId).status"), encoding: .utf8),
+            "idle"
+        )
+        XCTAssertEqual(
+            try String(
+                contentsOf: sessions.appendingPathComponent("\(tabId).status-timestamp"),
+                encoding: .utf8
+            ),
+            "200"
+        )
+        XCTAssertTrue(
+            try String(contentsOf: capture, encoding: .utf8)
+                .contains("set-status idle --timestamp 200 --source session-idle")
+        )
+
+        try runHook(
+            hookURL: hookURL,
+            action: "start",
+            payload: #"{"timestamp":300}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: capability.path))
+    }
+
     func testScrollbarGutterStrippingKeepsAdjacentContent() {
         let bars: Set<Character> = ["┃"]
         XCTAssertEqual(
@@ -122,5 +192,34 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(router.handle(ControlRequest(command: "set-status")).ok)
         XCTAssertFalse(didSetStatus)
         XCTAssertFalse(router.handle(ControlRequest(command: "unknown")).ok)
+    }
+
+    private func runHook(
+        hookURL: URL,
+        action: String,
+        payload: String,
+        tabId: String,
+        root: URL,
+        bin: URL,
+        capture: URL
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [hookURL.path, action]
+        var environment = ProcessInfo.processInfo.environment
+        environment["COPILOT_PROJECTS_SESSION"] = tabId
+        environment["COPILOT_PROJECTS_SOCKET"] = root.appendingPathComponent("control.sock").path
+        environment["CAPTURE_FILE"] = capture.path
+        environment["PATH"] = "\(bin.path):/usr/bin:/bin"
+        process.environment = environment
+        let input = Pipe()
+        process.standardInput = input
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        input.fileHandleForWriting.write(Data(payload.utf8))
+        try input.fileHandleForWriting.close()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
     }
 }

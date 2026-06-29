@@ -23,6 +23,7 @@ struct ActivityTracker {
             reset(sessionId: sessionId)
             return false
         }
+
         switch activity {
         case .working:
             footerSawWorking.insert(sessionId)
@@ -38,6 +39,7 @@ struct ActivityTracker {
                 return true
             }
         }
+
         return false
     }
 
@@ -56,5 +58,27 @@ struct ActivityTracker {
         hasLiveAgent: Bool
     ) -> Bool {
         (currentStatus == .running || currentStatus == .waiting) && !hasLiveAgent
+    }
+}
+
+struct StatusEventClock {
+    private var latestTimestamp: [String: Int64] = [:]
+
+    mutating func shouldApply(sessionId: String, timestamp: Int64?) -> Bool {
+        guard let timestamp else { return true }
+        if let latest = latestTimestamp[sessionId], timestamp < latest {
+            return false
+        }
+        latestTimestamp[sessionId] = timestamp
+        return true
+    }
+
+    mutating func seed(sessionId: String, timestamp: Int64?) {
+        guard let timestamp else { return }
+        latestTimestamp[sessionId] = max(latestTimestamp[sessionId] ?? timestamp, timestamp)
+    }
+
+    mutating func reset(sessionId: String) {
+        latestTimestamp[sessionId] = nil
     }
 }

@@ -106,6 +106,14 @@ public enum CLIMain {
             }
             req.status = status
             req.text = parsed.flags["text"]
+            if let rawTimestamp = parsed.flags["timestamp"] {
+                guard let timestamp = Int64(rawTimestamp) else {
+                    fail("--timestamp must be an integer")
+                    return 1
+                }
+                req.timestamp = timestamp
+            }
+            req.source = parsed.flags["source"]
         case "notify":
             req.title = parsed.flags["title"] ?? parsed.positionals.first
             req.body = parsed.flags["body"]
@@ -399,7 +407,7 @@ public enum CLIMain {
           copilot-projects                         Launch the app
           copilot-projects set-status <state>      Set status of the current session
                                               state: idle | running | waiting
-              [--text "..."] [--session ID] [--project ID]
+              [--text "..."] [--timestamp MS] [--source NAME] [--session ID] [--project ID]
           copilot-projects notify <title> [body]   Post a macOS notification
               [--title T] [--body B] [--session ID] [--project ID]
           copilot-projects list-projects           List projects and their status

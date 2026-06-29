@@ -66,17 +66,34 @@ public enum CopilotHooks {
     status() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true
       printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
+      if [ -n "${2:-}" ]; then
+        printf '%s' "$2" > "$state_dir/sessions/$session_id.status-timestamp" 2>/dev/null || true
+      fi
       # Synchronous (not backgrounded) so rapid transitions — e.g. running→waiting —
       # reach the app in order; backgrounding let them race and the "waiting" dot get
       # overwritten by a late "running". The CLI bounds this call with a socket
       # timeout, so a hung app can't block the hook past its deny-triggering timeout.
-      [ -n "$cli" ] && "$cli" set-status "$1" >/dev/null 2>&1 || true
+      if [ -n "$cli" ]; then
+        args=(set-status "$1")
+        [ -z "${2:-}" ] || args+=(--timestamp "$2")
+        [ -z "${3:-}" ] || args+=(--source "$3")
+        "$cli" "${args[@]}" >/dev/null 2>&1 || true
+      fi
+    }
+    payload_timestamp() {
+      printf '%s' "$1" \
+        | grep -oE '"timestamp"[[:space:]]*:[[:space:]]*[0-9]+' \
+        | head -1 \
+        | sed -E 's/.*:[[:space:]]*//'
     }
     # The agent is blocked on the user when the CLI raises an elicitation
     # (the ask_user tool) or a permission prompt. Those don't fire tool hooks —
     # they arrive via the `notification` hook, tagged with a notification_type.
     is_input_wait() {
       printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"(elicitation_dialog|permission_prompt)"'
+    }
+    is_session_idle() {
+      printf '%s' "$1" | grep -qE '"notification_type"[[:space:]]*:[[:space:]]*"session_idle"'
     }
     # Record the Copilot CLI session id (carried by tool/notification payloads as
     # "sessionId") so the app can auto-resume THIS exact agent session after a
@@ -104,23 +121,51 @@ public enum CopilotHooks {
     }
 
     case "${1:-}" in
-      running) status running ;;
-      idle)    status idle ;;
-      pre)  record_cli_session "$(cat 2>/dev/null || true)"; status running ;;   # a tool call ⇒ working
-      post) record_cli_session "$(cat 2>/dev/null || true)"; status running ;;
+      start)
+        payload="$(cat 2>/dev/null || true)"
+        rm -f "$state_dir/sessions/$session_id.session-idle-hook" 2>/dev/null || true
+        status idle "$(payload_timestamp "$payload")"
+        ;;
+      running)
+        payload="$(cat 2>/dev/null || true)"
+        status running "$(payload_timestamp "$payload")"
+        ;;
+      idle)
+        payload="$(cat 2>/dev/null || true)"
+        status idle "$(payload_timestamp "$payload")"
+        ;;
+      pre)
+        payload="$(cat 2>/dev/null || true)"
+        record_cli_session "$payload"
+        status running "$(payload_timestamp "$payload")"
+        ;;
+      post)
+        payload="$(cat 2>/dev/null || true)"
+        record_cli_session "$payload"
+        status running "$(payload_timestamp "$payload")"
+        ;;
       notify)
         payload="$(cat 2>/dev/null || true)"
         record_cli_session "$payload"
-        if is_input_wait "$payload"; then status waiting; fi
+        timestamp="$(payload_timestamp "$payload")"
+        if is_session_idle "$payload"; then
+          mkdir -p "$state_dir/sessions" 2>/dev/null || true
+          : > "$state_dir/sessions/$session_id.session-idle-hook"
+          status idle "$timestamp" session-idle
+        elif is_input_wait "$payload"; then
+          status waiting "$timestamp"
+        fi
         ;;
       end)
+        payload="$(cat 2>/dev/null || true)"
         # The agent session ENDED (user exited) — drop the resume marker so the tab
         # doesn't boot back into a session the user already left ("zombie resume").
         # Only sessionEnd maps here; agentStop (between-turn idle, session alive) uses
         # `idle` and must NOT clear it. If a reboot kills the agent mid-session, this
         # never fires, so the marker survives and the session resumes — as intended.
         rm -f "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null || true
-        status idle
+        rm -f "$state_dir/sessions/$session_id.session-idle-hook" 2>/dev/null || true
+        status idle "$(payload_timestamp "$payload")"
         ;;
     esac
     emit
@@ -137,7 +182,7 @@ public enum CopilotHooks {
       "version": 1,
       "hooks": {
         "sessionStart": [
-          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-projects-hook.sh\" idle", "timeoutSec": 5 }
+          { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-projects-hook.sh\" start", "timeoutSec": 5 }
         ],
         "userPromptSubmitted": [
           { "type": "command", "bash": "\"$HOME/.copilot/hooks/copilot-projects-hook.sh\" running", "timeoutSec": 5 }

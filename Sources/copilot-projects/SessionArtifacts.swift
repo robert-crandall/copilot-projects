@@ -23,6 +23,8 @@ enum SessionArtifacts {
         for path in [
             Paths.dtachSocketPath(sessionId: sessionId),
             Paths.statusMarkerPath(sessionId: sessionId),
+            Paths.statusTimestampMarkerPath(sessionId: sessionId),
+            Paths.sessionIdleHookMarkerPath(sessionId: sessionId),
             Paths.copilotSessionMarkerPath(sessionId: sessionId),
         ] {
             try? fm.removeItem(atPath: path)
