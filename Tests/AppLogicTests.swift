@@ -109,7 +109,11 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             ProjectsTerminalView.strippingScrollbarGutter("table ┃", bars: bars),
-            "table ┃"
+            "table"
+        )
+        XCTAssertEqual(
+            ProjectsTerminalView.strippingScrollbarGutter("table┃", bars: bars),
+            "table┃"
         )
     }
 

@@ -225,9 +225,9 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
     }
 
     /// Remove a trailing scrollbar gutter from each line: the bar glyph plus the
-    /// whitespace margin separating it from content. Requires a >=2-space margin
-    /// (or an otherwise-blank line) so single-space-padded table borders and
-    /// `git log --graph` `│` are left intact.
+    /// whitespace margin separating it from content. Requires at least one space
+    /// (or an otherwise-blank line); a bar directly adjacent to content is kept.
+    /// Light/double table borders are excluded from `scrollbarGlyphs` above.
     nonisolated static func strippingScrollbarGutter(_ text: String, bars: Set<Character>) -> String {
         text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
             var tail = line.endIndex
@@ -245,7 +245,7 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
                 let p = line.index(before: content)
                 if line[p] == " " || line[p] == "\t" { margin += 1; content = p } else { break }
             }
-            if content == line.startIndex || margin >= 2 {
+            if content == line.startIndex || margin >= 1 {
                 return line[line.startIndex ..< content]                 // strip the gutter + margin
             }
             return line                                                  // bar adjacent to content -> keep
