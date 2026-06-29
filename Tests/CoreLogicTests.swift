@@ -1,5 +1,8 @@
 import XCTest
 @testable import CopilotProjectsCore
+#if canImport(Darwin)
+import Darwin
+#endif
 
 final class CoreLogicTests: XCTestCase {
     func testNormalizedDirectoryDecodesFileURL() {
@@ -8,6 +11,25 @@ final class CoreLogicTests: XCTestCase {
             "/Users/example/My Project"
         )
         XCTAssertEqual(Paths.normalizedDirectory("/tmp/plain"), "/tmp/plain")
+    }
+
+    func testSuppressSigPipeReturnsEPIPEAfterPeerCloses() {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer {
+            if sockets[0] >= 0 { close(sockets[0]) }
+            if sockets[1] >= 0 { close(sockets[1]) }
+        }
+        XCTAssertTrue(SocketOptions.suppressSigPipe(on: sockets[0]))
+        close(sockets[1])
+        sockets[1] = -1
+
+        var byte: UInt8 = 1
+        let result = withUnsafeBytes(of: &byte) {
+            Darwin.write(sockets[0], $0.baseAddress, $0.count)
+        }
+        XCTAssertEqual(result, -1)
+        XCTAssertEqual(errno, EPIPE)
     }
 
     func testCLIFlagParsing() {

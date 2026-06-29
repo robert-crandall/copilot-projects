@@ -32,6 +32,9 @@ public struct ControlClient {
             throw ControlClientError.cannotConnect("socket() failed (errno \(errno))")
         }
         defer { close(fd) }
+        guard SocketOptions.suppressSigPipe(on: fd) else {
+            throw ControlClientError.cannotConnect("SO_NOSIGPIPE failed (errno \(errno))")
+        }
 
         // Bound every phase so a slow/hung app can never block the caller. This
         // client runs inside the Copilot status hook; a hook that blocks past its
@@ -99,6 +102,7 @@ public struct ControlClient {
             let base = raw.bindMemory(to: UInt8.self).baseAddress!
             while off < raw.count {
                 let n = write(fd, base + off, raw.count - off)
+                if n < 0, errno == EINTR { continue }
                 if n <= 0 { throw ControlClientError.io("write failed (errno \(errno))") }
                 off += n
             }
@@ -108,6 +112,7 @@ public struct ControlClient {
         var buf = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = read(fd, &buf, buf.count)
+            if n < 0, errno == EINTR { continue }
             if n < 0 { throw ControlClientError.io("read failed (errno \(errno))") }
             if n == 0 { break }
             response.append(contentsOf: buf[0..<n])

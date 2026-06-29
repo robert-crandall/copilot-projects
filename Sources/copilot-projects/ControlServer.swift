@@ -41,6 +41,11 @@ final class ControlServer: @unchecked Sendable {
             NSLog("copilot-projects control: socket() failed errno \(errno)")
             return false
         }
+        guard SocketOptions.suppressSigPipe(on: fd) else {
+            NSLog("copilot-projects control: listener SO_NOSIGPIPE failed errno \(errno)")
+            close(fd)
+            return false
+        }
         // Don't let spawned children (each dtach helper, and the shells under them)
         // inherit the listening socket. Without FD_CLOEXEC every dtach we launch keeps
         // a copy of this fd open, leaking one descriptor per session/relaunch and
@@ -127,11 +132,24 @@ final class ControlServer: @unchecked Sendable {
     }
 
     private func acceptLoop() {
-        while running {
+        acceptLoop: while running {
             let clientFD = accept(listenFD, nil, nil)
             if clientFD < 0 {
-                if errno == EINTR { continue }
-                break
+                let code = errno
+                if !running { break }
+                switch code {
+                case EINTR, ECONNABORTED:
+                    continue
+                case EMFILE, ENFILE, ENOBUFS, ENOMEM:
+                    usleep(100_000)
+                    continue
+                case EBADF, EINVAL:
+                    break acceptLoop
+                default:
+                    NSLog("copilot-projects control: accept failed errno \(code)")
+                    usleep(100_000)
+                    continue
+                }
             }
             // Spawned children must not inherit live client connections either.
             _ = fcntl(clientFD, F_SETFD, FD_CLOEXEC)
@@ -147,12 +165,14 @@ final class ControlServer: @unchecked Sendable {
         // buffer without bound: time out the read and cap the request size.
         var tv = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         let maxRequest = 64 * 1024
 
         var data = Data()
         var buf = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = read(fd, &buf, buf.count)
+            if n < 0, errno == EINTR { continue }
             if n <= 0 { break }
             data.append(contentsOf: buf[0..<n])
             if buf[0..<n].contains(0x0A) { break }
@@ -177,7 +197,17 @@ final class ControlServer: @unchecked Sendable {
             var off = 0
             while off < raw.count {
                 let n = write(fd, base + off, raw.count - off)
-                if n <= 0 { break }
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    if errno != EPIPE
+                        && errno != ECONNRESET
+                        && errno != EAGAIN
+                        && errno != EWOULDBLOCK {
+                        NSLog("copilot-projects control: response write failed errno \(errno)")
+                    }
+                    break
+                }
+                if n == 0 { break }
                 off += n
             }
         }

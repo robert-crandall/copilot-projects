@@ -1,6 +1,9 @@
 import XCTest
 @testable import copilot_projects
 import CopilotProjectsCore
+#if canImport(Darwin)
+import Darwin
+#endif
 
 final class AppLogicTests: XCTestCase {
     func testFooterClassification() {
@@ -194,6 +197,33 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(router.handle(ControlRequest(command: "unknown")).ok)
     }
 
+    func testControlServerSurvivesClientDisconnectBeforeResponse() throws {
+        let socketPath = "/tmp/cp-\(UUID().uuidString.prefix(8)).sock"
+        let server = ControlServer(socketPath: socketPath) { request in
+            if request.command == "slow" { usleep(100_000) }
+            return .success(request.command)
+        }
+        XCTAssertTrue(server.start())
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        let fd = try connectUnixSocket(path: socketPath)
+        let request = ControlRequest(command: "slow")
+        let payload = try Wire.encodeLine(request)
+        _ = payload.withUnsafeBytes {
+            Darwin.write(fd, $0.baseAddress, $0.count)
+        }
+        close(fd)
+
+        Thread.sleep(forTimeInterval: 0.5)
+        let response = try ControlClient(socketPath: socketPath)
+            .send(ControlRequest(command: "ping"))
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.text, "ping")
+    }
+
     private func runHook(
         hookURL: URL,
         action: String,
@@ -221,5 +251,37 @@ final class AppLogicTests: XCTestCase {
         try input.fileHandleForWriting.close()
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0)
+    }
+
+    private func connectUnixSocket(path: String) throws -> Int32 {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard bytes.count < capacity else {
+            close(fd)
+            throw POSIXError(.ENAMETOOLONG)
+        }
+        withUnsafeMutablePointer(to: &address.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: capacity) { destination in
+                for (index, byte) in bytes.enumerated() {
+                    destination[index] = CChar(bitPattern: byte)
+                }
+                destination[bytes.count] = 0
+            }
+        }
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard result == 0 else {
+            let code = errno
+            close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .ECONNREFUSED)
+        }
+        return fd
     }
 }
