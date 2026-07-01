@@ -292,9 +292,9 @@ final class AppModel: ObservableObject {
     }
 
     /// Environment injected into a session's shell. Besides the `COPILOT_PROJECTS_*`
-    /// coordinates, this writes the project's per-project Copilot instructions to
-    /// disk (see `ProjectInstructions`) and points the Copilot CLI at them via
-    /// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`, preserving any inherited value.
+    /// coordinates, this writes the session's per-project Copilot instructions to disk
+    /// (see `ProjectInstructions`) and points the Copilot CLI at that session's
+    /// directory via `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`, preserving any inherited value.
     private func environment(for project: Project, sessionId: String) -> [String: String] {
         var env = [
             "COPILOT_PROJECTS": "1",
@@ -302,9 +302,13 @@ final class AppModel: ObservableObject {
             "COPILOT_PROJECTS_PROJECT": project.id,
             "COPILOT_PROJECTS_SESSION": sessionId,
         ]
-        let root = ProjectInstructions.sync(projectId: project.id, instructions: project.instructions)
+        // Keep the durable per-project backup and this session's advertised delivery
+        // file in sync with the project's current instructions before the shell starts.
+        ProjectInstructions.syncProjectBackup(projectId: project.id, instructions: project.instructions)
+        let root = ProjectInstructions.syncSession(sessionId: sessionId, instructions: project.instructions)
         let inherited = ProcessInfo.processInfo.environment[ProjectInstructions.dirsEnvKey]
-        if let dirs = ProjectInstructions.customInstructionsDirsValue(projectRoot: root, inherited: inherited) {
+        if let dirs = ProjectInstructions.customInstructionsDirsValue(
+            sessionRoot: root, inherited: inherited, managedSessionsRoot: ProjectInstructions.sessionsRoot()) {
             env[ProjectInstructions.dirsEnvKey] = dirs
         }
         return env
@@ -465,7 +469,7 @@ final class AppModel: ObservableObject {
             controllers[session.id] = nil
         }
         projects.remove(at: pi)
-        ProjectInstructions.remove(projectId: pid)
+        ProjectInstructions.removeProject(projectId: pid)
         if selectedProjectId == pid {
             selectedProjectId = projects.first?.id
             if let sid = currentSelectedSessionId { controller(for: sid) }
@@ -493,15 +497,20 @@ final class AppModel: ObservableObject {
         renameProject(pid, name: name)
     }
 
-    /// Set a project's per-project Copilot instructions and refresh the on-disk file
-    /// so the next Copilot session in this project picks them up. Passing an empty
-    /// string clears them.
+    /// Set a project's per-project Copilot instructions and refresh the on-disk files
+    /// so the next Copilot session in this project — including ones whose shell is
+    /// already open — picks them up. Passing an empty string clears them.
     func setProjectInstructions(_ pid: String, _ text: String) {
         guard let pi = projectIndex(pid) else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard projects[pi].instructions != trimmed else { return }
         projects[pi].instructions = trimmed
-        ProjectInstructions.sync(projectId: pid, instructions: trimmed)
+        ProjectInstructions.syncProjectBackup(projectId: pid, instructions: trimmed)
+        // Rewrite each of the project's sessions' advertised delivery files so an
+        // already-open shell's next `copilot` sees the change.
+        for session in projects[pi].sessions {
+            ProjectInstructions.syncSession(sessionId: session.id, instructions: trimmed)
+        }
         save()
     }
 
@@ -633,6 +642,11 @@ final class AppModel: ObservableObject {
         }
         projects[tpi].sessions.append(session)
         projects[tpi].selectedSessionId = session.id
+        // The session's shell keeps running with the *source* project's env, but the
+        // app can still repoint its instructions: rewrite this session's advertised
+        // delivery file to the destination project's instructions so the next
+        // `copilot` in that shell uses the new project's guidance, not the old one.
+        ProjectInstructions.syncSession(sessionId: sid, instructions: projects[tpi].instructions)
         updateDockBadge()
         save()
         return true
@@ -1076,10 +1090,10 @@ final class AppModel: ObservableObject {
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
             // Recover instructions that a downgrade round-trip may have stripped from
-            // state.json: the on-disk instruction file is an independent copy, so
+            // state.json: the per-project on-disk backup is an independent copy, so
             // backfill from it when state carries none.
             if projects[pi].instructions.isEmpty,
-               let restored = ProjectInstructions.readInstructions(projectId: projects[pi].id) {
+               let restored = ProjectInstructions.readProjectBackup(projectId: projects[pi].id) {
                 projects[pi].instructions = restored
             }
             for si in projects[pi].sessions.indices {

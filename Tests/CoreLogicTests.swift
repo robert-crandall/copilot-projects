@@ -82,78 +82,92 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(contents.hasSuffix("Always run swift build.\n"))
     }
 
-    func testProjectInstructionsSyncWritesAndRemoves() throws {
+    func testSyncSessionWritesAndRemovesDeliveryFile() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let projectId = UUID().uuidString
-        let file = ProjectInstructions.instructionsFile(projectId: projectId, stateDir: root)
-        let expectedRoot = ProjectInstructions.rootDirectory(projectId: projectId, stateDir: root)
+        let sessionId = UUID().uuidString
+        let file = ProjectInstructions.sessionInstructionsFile(sessionId: sessionId, stateDir: root)
+        let expectedRoot = ProjectInstructions.sessionRoot(sessionId: sessionId, stateDir: root)
 
-        // Non-empty → writes the file and always returns the (advertised) root dir.
-        let dir = ProjectInstructions.sync(
-            projectId: projectId, instructions: "Prefer tabs.", stateDir: root)
+        // Non-empty → writes the delivery file (with frontmatter) and always returns
+        // the advertised session root.
+        let dir = ProjectInstructions.syncSession(
+            sessionId: sessionId, instructions: "Prefer tabs.", stateDir: root)
         XCTAssertEqual(dir, expectedRoot)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
-        XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("Prefer tabs."))
+        let written = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertTrue(written.contains("applyTo: \"**\""))
+        XCTAssertTrue(written.contains("Prefer tabs."))
 
         // Empty → removes the file but still returns the root (it stays advertised so
         // instructions saved into an already-open session are picked up next launch).
-        let cleared = ProjectInstructions.sync(
-            projectId: projectId, instructions: "   ", stateDir: root)
+        let cleared = ProjectInstructions.syncSession(
+            sessionId: sessionId, instructions: "   ", stateDir: root)
         XCTAssertEqual(cleared, expectedRoot)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
     }
 
-    func testProjectInstructionsReadBackRoundTrips() throws {
+    func testProjectBackupRoundTrips() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
         let projectId = UUID().uuidString
-        // Missing file → nil.
-        XCTAssertNil(ProjectInstructions.readInstructions(projectId: projectId, stateDir: root))
+        // Missing → nil.
+        XCTAssertNil(ProjectInstructions.readProjectBackup(projectId: projectId, stateDir: root))
 
-        // A body that itself contains a "---" line still round-trips (only the leading
-        // frontmatter block is stripped).
+        // Backup is plain text, so any body (including one containing "---") round-trips.
         let original = "Line one.\n---\nLine two."
-        ProjectInstructions.sync(projectId: projectId, instructions: original, stateDir: root)
+        ProjectInstructions.syncProjectBackup(projectId: projectId, instructions: original, stateDir: root)
         XCTAssertEqual(
-            ProjectInstructions.readInstructions(projectId: projectId, stateDir: root),
+            ProjectInstructions.readProjectBackup(projectId: projectId, stateDir: root),
             original
         )
 
         // Cleared → nil again.
-        ProjectInstructions.sync(projectId: projectId, instructions: "", stateDir: root)
-        XCTAssertNil(ProjectInstructions.readInstructions(projectId: projectId, stateDir: root))
+        ProjectInstructions.syncProjectBackup(projectId: projectId, instructions: "", stateDir: root)
+        XCTAssertNil(ProjectInstructions.readProjectBackup(projectId: projectId, stateDir: root))
     }
 
-    func testCustomInstructionsDirsValuePreservesInherited() {
-        let root = URL(fileURLWithPath: "/state/projects/abc", isDirectory: true)
-        // Project dir is placed first, inherited values kept and de-duplicated.
+    func testCustomInstructionsDirsValuePreservesInheritedButStripsOtherSessions() {
+        let stateDir = URL(fileURLWithPath: "/state", isDirectory: true)
+        let sessionsRoot = ProjectInstructions.sessionsRoot(stateDir: stateDir)
+        let mine = ProjectInstructions.sessionRoot(sessionId: "mine", stateDir: stateDir)
+        let other = ProjectInstructions.sessionRoot(sessionId: "other", stateDir: stateDir)
+
+        // Session dir placed first; user/global inherited dirs preserved and de-duped.
         XCTAssertEqual(
             ProjectInstructions.customInstructionsDirsValue(
-                projectRoot: root, inherited: "/one, /two"),
-            "/state/projects/abc,/one,/two"
+                sessionRoot: mine, inherited: "/one, /two", managedSessionsRoot: sessionsRoot),
+            "\(mine.path),/one,/two"
         )
-        // No project dir → inherited passes through unchanged.
+        // Another session's app-managed root leaking in via the inherited env is
+        // stripped, so its applyTo:"**" file can't apply here.
         XCTAssertEqual(
-            ProjectInstructions.customInstructionsDirsValue(projectRoot: nil, inherited: "/one"),
+            ProjectInstructions.customInstructionsDirsValue(
+                sessionRoot: mine, inherited: "\(other.path),/user/global",
+                managedSessionsRoot: sessionsRoot),
+            "\(mine.path),/user/global"
+        )
+        // My own root arriving via inherited isn't duplicated.
+        XCTAssertEqual(
+            ProjectInstructions.customInstructionsDirsValue(
+                sessionRoot: mine, inherited: mine.path, managedSessionsRoot: sessionsRoot),
+            mine.path
+        )
+        // No session dir → inherited (non-managed) passes through unchanged.
+        XCTAssertEqual(
+            ProjectInstructions.customInstructionsDirsValue(
+                sessionRoot: nil, inherited: "/one", managedSessionsRoot: sessionsRoot),
             "/one"
         )
-        // Already-present project dir isn't duplicated.
-        XCTAssertEqual(
+        // Nothing to set → nil.
+        XCTAssertNil(
             ProjectInstructions.customInstructionsDirsValue(
-                projectRoot: root, inherited: "/state/projects/abc"),
-            "/state/projects/abc"
-        )
-        // Nothing to set → nil, so the caller leaves the environment untouched.
-        XCTAssertNil(
-            ProjectInstructions.customInstructionsDirsValue(projectRoot: nil, inherited: nil))
-        XCTAssertNil(
-            ProjectInstructions.customInstructionsDirsValue(projectRoot: nil, inherited: "  ,  "))
+                sessionRoot: nil, inherited: nil, managedSessionsRoot: sessionsRoot))
     }
 }

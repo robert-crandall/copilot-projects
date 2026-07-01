@@ -165,24 +165,31 @@ Instructions…**, type your guidance, and save. Projects with instructions show
 document icon in the sidebar; leave the editor empty to clear them.
 
 The instructions are delivered non-invasively — nothing is written into your repositories.
-The app keeps a per-project file under its state dir:
+For each session the app maintains a small file under its state dir, holding the current
+project's instructions:
 
 ```
-~/.local/state/copilot-projects/projects/<projectId>/.github/instructions/project.instructions.md
+~/.local/state/copilot-projects/sessions/<sessionId>.instructions/.github/instructions/project.instructions.md
 ```
 
-and points the Copilot CLI at that directory for each session via
+and points the Copilot CLI at that directory via
 [`COPILOT_CUSTOM_INSTRUCTIONS_DIRS`](https://docs.github.com/copilot). The file carries
 `applyTo: "**"` front matter, so the CLI treats it as an always-applied instruction
 regardless of the session's working directory. Any `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` you
-already set in your environment is preserved (the project's directory is prepended).
+already set in your own environment is preserved (your session's directory is prepended);
+other sessions' app-managed directories are filtered out so one project's instructions can't
+leak into another. A plain-text copy is also kept at
+`~/.local/state/copilot-projects/projects/<projectId>/instructions.md` purely as a durable
+backup, so your instructions survive a downgrade-then-upgrade round-trip.
 
-Because the Copilot CLI reads custom instructions once at startup, edits take effect the
-**next time you launch `copilot`** — including in shells that were already open, since the app
-advertises the project's instructions directory to every session up front. A `copilot`
-process that is already running won't see the change until it restarts. The instructions add
-to — they don't replace — your global `~/.copilot/copilot-instructions.md` and any repo-level
-`.github/copilot-instructions.md` / `AGENTS.md`.
+Because the delivery directory is keyed by session, the app can keep it in sync with whatever
+project the session belongs to: editing a project's instructions rewrites the files for all of
+its sessions, and dragging a session into another project switches it to that project's
+instructions. Since the Copilot CLI reads custom instructions once at startup, changes take
+effect the **next time you launch `copilot`** in the session (a `copilot` already running won't
+see them until it restarts). The instructions add to — they don't replace — your global
+`~/.copilot/copilot-instructions.md` and any repo-level `.github/copilot-instructions.md` /
+`AGENTS.md`.
 
 ## Resumability & SSH reattach
 

@@ -29,5 +29,7 @@ enum SessionArtifacts {
         ] {
             try? fm.removeItem(atPath: path)
         }
+        // The session's advertised Copilot-instructions directory.
+        ProjectInstructions.removeSession(sessionId: sessionId)
     }
 }
