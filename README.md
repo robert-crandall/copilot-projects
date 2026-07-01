@@ -16,6 +16,9 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 
 - **Projects (vertical sidebar):** a project is just a named group of sessions. Create one
   with `⌘N` (name it; no folder required). Jump to one with **`⌘1`–`⌘9`**.
+- **Per-project instructions:** attach extra Copilot instructions to a project (right-click a
+  project → **Project Instructions…**). Every Copilot session started in that project picks
+  them up automatically — see [Per-project Copilot instructions](#per-project-copilot-instructions).
 - **Sessions (browser-style tabs):** each project shows a horizontal tab strip; one terminal
   is visible at a time. Add a tab with `⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
   (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, close with `⌘W` or the tab's ✕. Background tabs keep
@@ -152,6 +155,32 @@ copilot-projects set-status waiting --text "needs approval"
 copilot-projects notify "Agent needs input"
 copilot-projects set-status idle
 ```
+
+## Per-project Copilot instructions
+
+Each project can carry extra Copilot instructions that apply to every Copilot session
+started inside it — handy for repo-specific conventions, house style, or standing reminders
+you don't want to retype. Right-click a project in the sidebar and choose **Project
+Instructions…**, type your guidance, and save. Projects with instructions show a small
+document icon in the sidebar; leave the editor empty to clear them.
+
+The instructions are delivered non-invasively — nothing is written into your repositories.
+The app keeps a per-project file under its state dir:
+
+```
+~/.local/state/copilot-projects/projects/<projectId>/.github/instructions/project.instructions.md
+```
+
+and points the Copilot CLI at that directory for each session via
+[`COPILOT_CUSTOM_INSTRUCTIONS_DIRS`](https://docs.github.com/copilot). The file carries
+`applyTo: "**"` front matter, so the CLI treats it as an always-applied instruction
+regardless of the session's working directory. Any `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` you
+already set in your environment is preserved (the project's directory is prepended).
+
+Because the Copilot CLI reads custom instructions once at startup, edits take effect for the
+**next** Copilot session you start in the project, not sessions already running. The
+instructions add to — they don't replace — your global `~/.copilot/copilot-instructions.md`
+and any repo-level `.github/copilot-instructions.md` / `AGENTS.md`.
 
 ## Resumability & SSH reattach
 

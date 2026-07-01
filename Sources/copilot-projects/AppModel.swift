@@ -224,7 +224,7 @@ final class AppModel: ObservableObject {
         let c = TerminalController(
             sessionId: sessionId,
             cwd: session.cwd,
-            extraEnvironment: environment(projectId: project.id, sessionId: sessionId),
+            extraEnvironment: environment(for: project, sessionId: sessionId),
             dtachExecutable: dtach,
             dtachSocket: socket,
             copilotSessionId: (recordedCopilot?.isEmpty == false) ? recordedCopilot : nil
@@ -291,13 +291,23 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func environment(projectId: String, sessionId: String) -> [String: String] {
-        [
+    /// Environment injected into a session's shell. Besides the `COPILOT_PROJECTS_*`
+    /// coordinates, this writes the project's per-project Copilot instructions to
+    /// disk (see `ProjectInstructions`) and points the Copilot CLI at them via
+    /// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`, preserving any inherited value.
+    private func environment(for project: Project, sessionId: String) -> [String: String] {
+        var env = [
             "COPILOT_PROJECTS": "1",
             "COPILOT_PROJECTS_SOCKET": Paths.socketPath,
-            "COPILOT_PROJECTS_PROJECT": projectId,
+            "COPILOT_PROJECTS_PROJECT": project.id,
             "COPILOT_PROJECTS_SESSION": sessionId,
         ]
+        let root = ProjectInstructions.sync(projectId: project.id, instructions: project.instructions)
+        let inherited = ProcessInfo.processInfo.environment[ProjectInstructions.dirsEnvKey]
+        if let dirs = ProjectInstructions.customInstructionsDirsValue(projectRoot: root, inherited: inherited) {
+            env[ProjectInstructions.dirsEnvKey] = dirs
+        }
+        return env
     }
 
     // MARK: - project / session mutations
@@ -455,6 +465,7 @@ final class AppModel: ObservableObject {
             controllers[session.id] = nil
         }
         projects.remove(at: pi)
+        ProjectInstructions.remove(projectId: pid)
         if selectedProjectId == pid {
             selectedProjectId = projects.first?.id
             if let sid = currentSelectedSessionId { controller(for: sid) }
@@ -480,6 +491,59 @@ final class AppModel: ObservableObject {
             initialText: projects[pi].name
         ) else { return }
         renameProject(pid, name: name)
+    }
+
+    /// Set a project's per-project Copilot instructions and refresh the on-disk file
+    /// so the next Copilot session in this project picks them up. Passing an empty
+    /// string clears them.
+    func setProjectInstructions(_ pid: String, _ text: String) {
+        guard let pi = projectIndex(pid) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard projects[pi].instructions != trimmed else { return }
+        projects[pi].instructions = trimmed
+        ProjectInstructions.sync(projectId: pid, instructions: trimmed)
+        save()
+    }
+
+    func editProjectInstructionsInteractive(_ pid: String) {
+        guard let pi = projectIndex(pid) else { return }
+        let name = projects[pi].name
+        guard let text = promptForMultilineText(
+            title: "Project Instructions",
+            message: "Extra Copilot instructions applied to every Copilot session in "
+                + "“\(name)”. Takes effect for new sessions. Leave empty to clear.",
+            confirmTitle: "Save",
+            initialText: projects[pi].instructions
+        ) else { return }
+        setProjectInstructions(pid, text)
+    }
+
+    /// Multi-line variant of `promptForText`. Returns the (possibly empty) text, or
+    /// nil if cancelled — an empty string is a valid result here (clears the field),
+    /// so it isn't collapsed to nil the way the single-line prompt is.
+    private func promptForMultilineText(title: String, message: String,
+                                        confirmTitle: String, initialText: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 440, height: 200))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.string = initialText
+        textView.isRichText = false
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.autoresizingMask = [.width, .height]
+        scroll.documentView = textView
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = textView
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return textView.string
     }
 
     func selectProject(_ id: String?) {

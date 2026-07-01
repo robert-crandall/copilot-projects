@@ -73,4 +73,61 @@ final class CoreLogicTests: XCTestCase {
         ]
         XCTAssertEqual(ProcessTree.dtachMaster(forSocket: socket, among: processes), 202)
     }
+
+    func testProjectInstructionsFileHasApplyToFrontmatter() {
+        let contents = ProjectInstructions.fileContents("  Always run swift build.  ")
+        XCTAssertTrue(contents.hasPrefix("---\napplyTo: \"**\"\n---\n"))
+        XCTAssertTrue(contents.contains("Always run swift build."))
+        // Body is trimmed and newline-terminated.
+        XCTAssertTrue(contents.hasSuffix("Always run swift build.\n"))
+    }
+
+    func testProjectInstructionsSyncWritesAndRemoves() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let projectId = UUID().uuidString
+        let file = ProjectInstructions.instructionsFile(projectId: projectId, stateDir: root)
+
+        // Non-empty → writes the file and returns the root dir to expose.
+        let dir = ProjectInstructions.sync(
+            projectId: projectId, instructions: "Prefer tabs.", stateDir: root)
+        XCTAssertEqual(dir, ProjectInstructions.rootDirectory(projectId: projectId, stateDir: root))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("Prefer tabs."))
+
+        // Empty → removes the file and returns nil.
+        let cleared = ProjectInstructions.sync(
+            projectId: projectId, instructions: "   ", stateDir: root)
+        XCTAssertNil(cleared)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testCustomInstructionsDirsValuePreservesInherited() {
+        let root = URL(fileURLWithPath: "/state/projects/abc", isDirectory: true)
+        // Project dir is placed first, inherited values kept and de-duplicated.
+        XCTAssertEqual(
+            ProjectInstructions.customInstructionsDirsValue(
+                projectRoot: root, inherited: "/one, /two"),
+            "/state/projects/abc,/one,/two"
+        )
+        // No project dir → inherited passes through unchanged.
+        XCTAssertEqual(
+            ProjectInstructions.customInstructionsDirsValue(projectRoot: nil, inherited: "/one"),
+            "/one"
+        )
+        // Already-present project dir isn't duplicated.
+        XCTAssertEqual(
+            ProjectInstructions.customInstructionsDirsValue(
+                projectRoot: root, inherited: "/state/projects/abc"),
+            "/state/projects/abc"
+        )
+        // Nothing to set → nil, so the caller leaves the environment untouched.
+        XCTAssertNil(
+            ProjectInstructions.customInstructionsDirsValue(projectRoot: nil, inherited: nil))
+        XCTAssertNil(
+            ProjectInstructions.customInstructionsDirsValue(projectRoot: nil, inherited: "  ,  "))
+    }
 }

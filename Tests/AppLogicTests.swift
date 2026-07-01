@@ -123,6 +123,21 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(TerminalController.shellSingleQuote("a'b"), "'a'\\''b'")
     }
 
+    func testProjectInstructionsCodableRoundTripAndBackwardCompat() throws {
+        // Round-trips the new field.
+        let project = Project(name: "test", cwd: "/tmp", instructions: "Be terse.")
+        let data = try JSONEncoder().encode(project)
+        let decoded = try JSONDecoder().decode(Project.self, from: data)
+        XCTAssertEqual(decoded.instructions, "Be terse.")
+        XCTAssertTrue(decoded.hasInstructions)
+
+        // Old state.json (no `instructions` key) still decodes, defaulting to "".
+        let legacy = Data(#"{"id":"p1","name":"n","cwd":"/tmp","sessions":[]}"#.utf8)
+        let legacyProject = try JSONDecoder().decode(Project.self, from: legacy)
+        XCTAssertEqual(legacyProject.instructions, "")
+        XCTAssertFalse(legacyProject.hasInstructions)
+    }
+
     func testStateRepositoryRecoversBackupAndNormalizesSelection() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

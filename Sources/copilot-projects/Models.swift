@@ -36,17 +36,38 @@ struct Project: Identifiable, Codable, Equatable {
     var cwd: String
     var sessions: [Session]
     var selectedSessionId: String?
+    /// Extra Copilot instructions applied to every Copilot session started in this
+    /// project (see `ProjectInstructions`). Empty means "no per-project instructions".
+    var instructions: String
 
     init(id: String = UUID().uuidString,
          name: String,
          cwd: String,
          sessions: [Session] = [],
-         selectedSessionId: String? = nil) {
+         selectedSessionId: String? = nil,
+         instructions: String = "") {
         self.id = id
         self.name = name
         self.cwd = cwd
         self.sessions = sessions
         self.selectedSessionId = selectedSessionId
+        self.instructions = instructions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, cwd, sessions, selectedSessionId, instructions
+    }
+
+    // Decode `instructions` leniently so state written by older versions (which
+    // lacks the key) still loads. Encoding stays synthesized from CodingKeys.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        cwd = try c.decode(String.self, forKey: .cwd)
+        sessions = try c.decodeIfPresent([Session].self, forKey: .sessions) ?? []
+        selectedSessionId = try c.decodeIfPresent(String.self, forKey: .selectedSessionId)
+        instructions = try c.decodeIfPresent(String.self, forKey: .instructions) ?? ""
     }
 }
 
@@ -71,6 +92,11 @@ extension Project {
     var waitingCount: Int { sessions.filter { $0.status == .waiting }.count }
     var hasUnread: Bool { sessions.contains { $0.hasUnread } }
     var hasBackgroundAgents: Bool { sessions.contains { $0.backgroundAgentsActive } }
+
+    /// Whether this project carries any per-project Copilot instructions.
+    var hasInstructions: Bool {
+        !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 /// The sidebar status dot's meaning (see `Project.dotState`).

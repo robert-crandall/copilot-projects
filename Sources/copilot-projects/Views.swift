@@ -147,6 +147,9 @@ struct SidebarView: View {
                     .contextMenu {
                         Button("New Session") { model.addSession(toProjectId: project.id) }
                         Button("Rename…") { model.renameProjectInteractive(project.id) }
+                        Button("Project Instructions…") {
+                            model.editProjectInstructionsInteractive(project.id)
+                        }
                         Divider()
                         Button("Close Project", role: .destructive) {
                             model.closeProject(project.id)
@@ -194,6 +197,12 @@ struct ProjectRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
+            if project.hasInstructions {
+                Image(systemName: "doc.text")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+                    .help("Has project instructions")
+            }
             if showNumber, let number {
                 NumberBadge(number: number)
             } else if project.hasUnread {
