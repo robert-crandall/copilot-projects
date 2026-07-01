@@ -177,10 +177,12 @@ and points the Copilot CLI at that directory for each session via
 regardless of the session's working directory. Any `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` you
 already set in your environment is preserved (the project's directory is prepended).
 
-Because the Copilot CLI reads custom instructions once at startup, edits take effect for the
-**next** Copilot session you start in the project, not sessions already running. The
-instructions add to — they don't replace — your global `~/.copilot/copilot-instructions.md`
-and any repo-level `.github/copilot-instructions.md` / `AGENTS.md`.
+Because the Copilot CLI reads custom instructions once at startup, edits take effect the
+**next time you launch `copilot`** — including in shells that were already open, since the app
+advertises the project's instructions directory to every session up front. A `copilot`
+process that is already running won't see the change until it restarts. The instructions add
+to — they don't replace — your global `~/.copilot/copilot-instructions.md` and any repo-level
+`.github/copilot-instructions.md` / `AGENTS.md`.
 
 ## Resumability & SSH reattach
 

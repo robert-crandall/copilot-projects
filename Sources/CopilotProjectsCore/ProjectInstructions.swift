@@ -17,7 +17,9 @@ import Foundation
 /// the user's `git status`.
 ///
 /// The Copilot CLI reads custom instructions once at startup, so edits take effect
-/// for the *next* Copilot session, not sessions already running.
+/// the next time `copilot` is launched — including in already-open shells, because
+/// `AppModel` advertises this directory to every session up front, even before any
+/// instruction file exists.
 public enum ProjectInstructions {
     /// Environment variable the Copilot CLI reads for extra instruction directories.
     public static let dirsEnvKey = "COPILOT_CUSTOM_INSTRUCTIONS_DIRS"
@@ -45,19 +47,29 @@ public enum ProjectInstructions {
     }
 
     /// Write (or, for empty instructions, remove) the project's instruction file to
-    /// match `instructions`. Returns the root directory to expose via
-    /// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` when instructions are present, or nil when
-    /// they are empty (nothing to add).
+    /// match `instructions`, and return the root directory to advertise via
+    /// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`.
+    ///
+    /// The directory is always returned (and always advertised by callers) even when
+    /// there are currently no instructions: the Copilot CLI tolerates a missing/empty
+    /// extra dir, and advertising it up front means instructions saved *after* a shell
+    /// is already open are picked up by the next `copilot` launched in that shell.
     @discardableResult
     public static func sync(projectId: String,
                             instructions: String,
-                            stateDir: URL = Paths.stateDir) -> URL? {
+                            stateDir: URL = Paths.stateDir) -> URL {
         let fm = FileManager.default
-        let file = instructionsFile(projectId: projectId, stateDir: stateDir)
         let root = rootDirectory(projectId: projectId, stateDir: stateDir)
+        let file = instructionsFile(projectId: projectId, stateDir: stateDir)
         guard !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            try? fm.removeItem(at: file)
-            return nil
+            if fm.fileExists(atPath: file.path) {
+                do {
+                    try fm.removeItem(at: file)
+                } catch {
+                    NSLog("copilot-projects: failed to clear project instructions at \(file.path): \(error)")
+                }
+            }
+            return root
         }
         do {
             try fm.createDirectory(
@@ -66,10 +78,32 @@ public enum ProjectInstructions {
                 attributes: [.posixPermissions: 0o700]
             )
             try Data(fileContents(instructions).utf8).write(to: file, options: .atomic)
-            return root
         } catch {
-            return nil
+            NSLog("copilot-projects: failed to write project instructions at \(file.path): \(error)")
         }
+        return root
+    }
+
+    /// Read a project's instructions back from disk, stripping the `applyTo`
+    /// frontmatter. Returns nil when the file is missing or empty. Used to recover
+    /// instructions that a downgrade-then-upgrade round-trip dropped from state.json
+    /// (the on-disk file is an independent, durable copy).
+    public static func readInstructions(projectId: String,
+                                        stateDir: URL = Paths.stateDir) -> String? {
+        let file = instructionsFile(projectId: projectId, stateDir: stateDir)
+        guard let raw = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        let body = strippingFrontmatter(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? nil : body
+    }
+
+    /// Drop a leading `---` … `---` YAML frontmatter block (the shape `fileContents`
+    /// writes). Returns the input unchanged when it isn't present.
+    static func strippingFrontmatter(_ raw: String) -> String {
+        var lines = raw.components(separatedBy: "\n")
+        guard lines.first == "---" else { return raw }
+        lines.removeFirst()
+        guard let close = lines.firstIndex(of: "---") else { return raw }
+        return lines[(close + 1)...].joined(separator: "\n")
     }
 
     /// Delete a project's instructions directory entirely (used when the project is

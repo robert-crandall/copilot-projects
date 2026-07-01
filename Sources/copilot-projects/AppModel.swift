@@ -1075,6 +1075,13 @@ final class AppModel: ObservableObject {
         projects = state.projects
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
+            // Recover instructions that a downgrade round-trip may have stripped from
+            // state.json: the on-disk instruction file is an independent copy, so
+            // backfill from it when state carries none.
+            if projects[pi].instructions.isEmpty,
+               let restored = ProjectInstructions.readInstructions(projectId: projects[pi].id) {
+                projects[pi].instructions = restored
+            }
             for si in projects[pi].sessions.indices {
                 // Migrate any legacy `file://host/path` cwds (stored before OSC 7 was
                 // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.

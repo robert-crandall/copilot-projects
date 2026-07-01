@@ -90,19 +90,45 @@ final class CoreLogicTests: XCTestCase {
 
         let projectId = UUID().uuidString
         let file = ProjectInstructions.instructionsFile(projectId: projectId, stateDir: root)
+        let expectedRoot = ProjectInstructions.rootDirectory(projectId: projectId, stateDir: root)
 
-        // Non-empty → writes the file and returns the root dir to expose.
+        // Non-empty → writes the file and always returns the (advertised) root dir.
         let dir = ProjectInstructions.sync(
             projectId: projectId, instructions: "Prefer tabs.", stateDir: root)
-        XCTAssertEqual(dir, ProjectInstructions.rootDirectory(projectId: projectId, stateDir: root))
+        XCTAssertEqual(dir, expectedRoot)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
         XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("Prefer tabs."))
 
-        // Empty → removes the file and returns nil.
+        // Empty → removes the file but still returns the root (it stays advertised so
+        // instructions saved into an already-open session are picked up next launch).
         let cleared = ProjectInstructions.sync(
             projectId: projectId, instructions: "   ", stateDir: root)
-        XCTAssertNil(cleared)
+        XCTAssertEqual(cleared, expectedRoot)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testProjectInstructionsReadBackRoundTrips() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let projectId = UUID().uuidString
+        // Missing file → nil.
+        XCTAssertNil(ProjectInstructions.readInstructions(projectId: projectId, stateDir: root))
+
+        // A body that itself contains a "---" line still round-trips (only the leading
+        // frontmatter block is stripped).
+        let original = "Line one.\n---\nLine two."
+        ProjectInstructions.sync(projectId: projectId, instructions: original, stateDir: root)
+        XCTAssertEqual(
+            ProjectInstructions.readInstructions(projectId: projectId, stateDir: root),
+            original
+        )
+
+        // Cleared → nil again.
+        ProjectInstructions.sync(projectId: projectId, instructions: "", stateDir: root)
+        XCTAssertNil(ProjectInstructions.readInstructions(projectId: projectId, stateDir: root))
     }
 
     func testCustomInstructionsDirsValuePreservesInherited() {
