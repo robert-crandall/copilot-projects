@@ -747,7 +747,9 @@ final class AppModel: ObservableObject {
             projects[loc.p].sessions[loc.s].finishedUnseen = false
             projects[loc.p].sessions[loc.s].turnCompleted = false
             backgroundAgentsSuppressed.remove(sessionId)
-            completionPending.remove(sessionId)
+            if Self.shouldClearPendingCompletion(status: status, source: source) {
+                completionPending.remove(sessionId)
+            }
         }
         if hasCompletionSignal {
             completionPending.insert(sessionId)
@@ -859,10 +861,18 @@ final class AppModel: ObservableObject {
                 let status = projects[pi].sessions[si].status
                 let sid = projects[pi].sessions[si].id
                 guard let controller = controllers[sid] else { continue }
+                let activity = controller.agentActivity
+                let supportsSessionIdleHook = FileManager.default.fileExists(
+                    atPath: Paths.sessionIdleHookMarkerPath(sessionId: sid)
+                )
+                if status == .idle, activity == .idle {
+                    postCompletionIfReady(sessionId: sid)
+                }
                 if status == .idle {
                     guard ActivityTracker.canPromoteIdleFromFooter(
                         backgroundAgentsActive: projects[pi].sessions[si].backgroundAgentsActive,
-                        hasLiveAgent: liveAgentSessions.contains(sid)
+                        hasLiveAgent: liveAgentSessions.contains(sid),
+                        supportsSessionIdleHook: supportsSessionIdleHook
                     ) else {
                         activityTracker.reset(sessionId: sid)
                         continue
@@ -871,7 +881,7 @@ final class AppModel: ObservableObject {
                     if activityTracker.shouldPromoteFromFooter(
                         sessionId: sid,
                         currentStatus: status,
-                        activity: controller.agentActivity
+                        activity: activity
                     ) {
                         setStatus(
                             sessionId: sid,
@@ -882,9 +892,7 @@ final class AppModel: ObservableObject {
                     }
                     continue
                 }
-                if FileManager.default.fileExists(
-                    atPath: Paths.sessionIdleHookMarkerPath(sessionId: sid)
-                ) {
+                if supportsSessionIdleHook {
                     activityTracker.reset(sessionId: sid)
                     continue
                 }
@@ -892,9 +900,10 @@ final class AppModel: ObservableObject {
                 if activityTracker.observeFooter(
                     sessionId: sid,
                     currentStatus: status,
-                    activity: controller.agentActivity
+                    activity: activity
                 ) {
                     clearStatusToIdle(pi: pi, si: si, markFinished: true)
+                    postCompletionIfReady(sessionId: sid)
                 }
             }
         }
@@ -993,6 +1002,11 @@ final class AppModel: ObservableObject {
             completionPending.remove(sessionId)
             return
         }
+        let activity = controllers[sessionId]?.agentActivity
+        guard Self.canPostCompletion(
+            status: projects[loc.p].sessions[loc.s].status,
+            activity: activity
+        ) else { return }
         guard !projects[loc.p].sessions[loc.s].backgroundAgentsActive else { return }
         completionPending.remove(sessionId)
 
@@ -1035,6 +1049,23 @@ final class AppModel: ObservableObject {
         appIsActive
             && selectedProjectId == projectId
             && selectedSessionId == sessionId
+    }
+
+    nonisolated static func canPostCompletion(
+        status: SessionStatus,
+        activity: FooterActivity?
+    ) -> Bool {
+        // Footer scraping is advisory: only affirmative working evidence blocks an
+        // otherwise-authoritative idle hook. Unknown/unattached footers must not
+        // strand completion forever.
+        status == .idle && activity != .working
+    }
+
+    nonisolated static func shouldClearPendingCompletion(
+        status: SessionStatus,
+        source: String?
+    ) -> Bool {
+        (status == .running || status == .waiting) && source != "footer"
     }
 
     func focus(projectId: String?, sessionId: String?) {

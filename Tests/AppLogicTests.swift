@@ -50,15 +50,23 @@ final class AppLogicTests: XCTestCase {
     func testFooterDoesNotPromoteWhileBackgroundAgentsAreActive() {
         XCTAssertFalse(ActivityTracker.canPromoteIdleFromFooter(
             backgroundAgentsActive: true,
-            hasLiveAgent: true
+            hasLiveAgent: true,
+            supportsSessionIdleHook: false
         ))
         XCTAssertTrue(ActivityTracker.canPromoteIdleFromFooter(
             backgroundAgentsActive: false,
-            hasLiveAgent: true
+            hasLiveAgent: true,
+            supportsSessionIdleHook: false
         ))
         XCTAssertFalse(ActivityTracker.canPromoteIdleFromFooter(
             backgroundAgentsActive: false,
-            hasLiveAgent: false
+            hasLiveAgent: false,
+            supportsSessionIdleHook: false
+        ))
+        XCTAssertFalse(ActivityTracker.canPromoteIdleFromFooter(
+            backgroundAgentsActive: false,
+            hasLiveAgent: true,
+            supportsSessionIdleHook: true
         ))
     }
 
@@ -791,6 +799,14 @@ final class AppLogicTests: XCTestCase {
             selectedSessionId: "session",
             sessionId: "session"
         ))
+        XCTAssertFalse(AppModel.canPostCompletion(status: .running, activity: .idle))
+        XCTAssertFalse(AppModel.canPostCompletion(status: .idle, activity: .working))
+        XCTAssertTrue(AppModel.canPostCompletion(status: .idle, activity: .idle))
+        XCTAssertTrue(AppModel.canPostCompletion(status: .idle, activity: .unknown))
+        XCTAssertTrue(AppModel.canPostCompletion(status: .idle, activity: nil))
+        XCTAssertFalse(AppModel.shouldClearPendingCompletion(status: .running, source: "footer"))
+        XCTAssertTrue(AppModel.shouldClearPendingCompletion(status: .running, source: nil))
+        XCTAssertTrue(AppModel.shouldClearPendingCompletion(status: .waiting, source: "hook"))
     }
 
     func testScrollbarGutterStrippingKeepsAdjacentContent() {
