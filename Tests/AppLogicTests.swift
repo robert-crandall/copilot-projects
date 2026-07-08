@@ -47,6 +47,21 @@ final class AppLogicTests: XCTestCase {
             sessionId: sessionId, currentStatus: .running, activity: .idle))
     }
 
+    func testFooterDoesNotPromoteWhileBackgroundAgentsAreActive() {
+        XCTAssertFalse(ActivityTracker.canPromoteIdleFromFooter(
+            backgroundAgentsActive: true,
+            hasLiveAgent: true
+        ))
+        XCTAssertTrue(ActivityTracker.canPromoteIdleFromFooter(
+            backgroundAgentsActive: false,
+            hasLiveAgent: true
+        ))
+        XCTAssertFalse(ActivityTracker.canPromoteIdleFromFooter(
+            backgroundAgentsActive: false,
+            hasLiveAgent: false
+        ))
+    }
+
     func testStatusEventClockRejectsLateHookEvents() {
         let sessionId = UUID().uuidString
         var clock = StatusEventClock()
@@ -73,11 +88,15 @@ final class AppLogicTests: XCTestCase {
             selectedProjectId: selectedProject.id
         ))
 
-        let model = AppModel(stateRepository: repository)
+        let model = AppModel(
+            stateRepository: repository,
+            completionNotificationDelayNanoseconds: 10_000_000
+        )
         model.setStatus(sessionId: targetSession.id, status: .running, text: nil, timestamp: 100)
         model.setStatus(sessionId: targetSession.id, status: .idle, text: nil, timestamp: 200)
 
         XCTAssertTrue(model.projects[0].sessions[0].finishedUnseen)
+        XCTAssertFalse(model.projects[0].sessions[0].hasUnread)
         XCTAssertEqual(model.totalReady, 1)
 
         model.setStatus(sessionId: targetSession.id, status: .running, text: nil, timestamp: 300)
@@ -92,6 +111,235 @@ final class AppLogicTests: XCTestCase {
 
         XCTAssertFalse(model.projects[0].sessions[0].finishedUnseen)
         XCTAssertEqual(model.totalReady, 0)
+    }
+
+    @MainActor
+    func testCompletionNotificationUsesAgentStopAndWaitsForBackgroundAgents() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let immediateSession = Session(title: "immediate", cwd: "/tmp")
+        let backgroundSession = Session(title: "background", cwd: "/tmp")
+        let targetProject = Project(
+            name: "target",
+            cwd: "/tmp",
+            sessions: [immediateSession, backgroundSession]
+        )
+        let selectedProject = Project(name: "selected", cwd: "/tmp")
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [targetProject, selectedProject],
+            selectedProjectId: selectedProject.id
+        ))
+
+        let model = AppModel(
+            stateRepository: repository,
+            completionNotificationDelayNanoseconds: 10_000_000
+        )
+        let notifications = NotificationSpy()
+        let immediateCompletion = expectation(description: "agentStop posts completion")
+        notifications.onPost = { call in
+            if call.sessionId == immediateSession.id {
+                immediateCompletion.fulfill()
+            }
+        }
+        model.attach(notifications: notifications)
+        model.setStatus(
+            sessionId: immediateSession.id,
+            status: .running,
+            text: nil,
+            timestamp: 100
+        )
+        model.setStatus(
+            sessionId: immediateSession.id,
+            status: .idle,
+            text: nil,
+            timestamp: 200,
+            source: "agent-stop"
+        )
+        await fulfillment(of: [immediateCompletion], timeout: 1)
+        XCTAssertTrue(model.projects[0].sessions[0].hasUnread)
+        XCTAssertEqual(notifications.calls, [
+            NotificationSpy.Call(
+                title: StatusNotificationKind.completed.title,
+                subtitle: "target · immediate",
+                body: nil,
+                projectId: targetProject.id,
+                sessionId: immediateSession.id
+            )
+        ])
+
+        let prematureCompletion = expectation(description: "background agents suppress completion")
+        prematureCompletion.isInverted = true
+        notifications.onPost = { call in
+            if call.sessionId == backgroundSession.id {
+                prematureCompletion.fulfill()
+            }
+        }
+        model.setBackgroundAgentsActive(sessionId: backgroundSession.id, active: true)
+        model.setStatus(
+            sessionId: backgroundSession.id,
+            status: .running,
+            text: nil,
+            timestamp: 300
+        )
+        model.setStatus(
+            sessionId: backgroundSession.id,
+            status: .idle,
+            text: nil,
+            timestamp: 400,
+            source: "agent-stop"
+        )
+        await fulfillment(of: [prematureCompletion], timeout: 0.1)
+        XCTAssertFalse(model.projects[0].sessions[1].hasUnread)
+        XCTAssertEqual(notifications.calls.count, 1)
+
+        notifications.onPost = nil
+        model.setBackgroundAgentsActive(sessionId: backgroundSession.id, active: false)
+        XCTAssertTrue(model.projects[0].sessions[1].hasUnread)
+        XCTAssertEqual(notifications.calls, [
+            NotificationSpy.Call(
+                title: StatusNotificationKind.completed.title,
+                subtitle: "target · immediate",
+                body: nil,
+                projectId: targetProject.id,
+                sessionId: immediateSession.id
+            ),
+            NotificationSpy.Call(
+                title: StatusNotificationKind.completed.title,
+                subtitle: "target · background",
+                body: nil,
+                projectId: targetProject.id,
+                sessionId: backgroundSession.id
+            )
+        ])
+    }
+
+    @MainActor
+    func testCompletionSignalsSurviveEitherTimestampArrivalOrder() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let agentStopFirst = Session(title: "agent-stop-first", cwd: "/tmp")
+        let sessionIdleFirst = Session(title: "session-idle-first", cwd: "/tmp")
+        let targetProject = Project(
+            name: "target",
+            cwd: "/tmp",
+            sessions: [agentStopFirst, sessionIdleFirst]
+        )
+        let selectedProject = Project(name: "selected", cwd: "/tmp")
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [targetProject, selectedProject],
+            selectedProjectId: selectedProject.id
+        ))
+
+        let model = AppModel(
+            stateRepository: repository,
+            completionNotificationDelayNanoseconds: 10_000_000
+        )
+        let notifications = NotificationSpy()
+        model.attach(notifications: notifications)
+        model.setStatus(
+            sessionId: agentStopFirst.id,
+            status: .running,
+            text: nil,
+            timestamp: 100
+        )
+        model.setStatus(
+            sessionId: agentStopFirst.id,
+            status: .idle,
+            text: nil,
+            timestamp: 110,
+            source: "agent-stop"
+        )
+        model.setStatus(
+            sessionId: agentStopFirst.id,
+            status: .idle,
+            text: nil,
+            timestamp: 111,
+            source: "session-idle",
+            notification: .completed
+        )
+
+        model.setStatus(
+            sessionId: sessionIdleFirst.id,
+            status: .running,
+            text: nil,
+            timestamp: 200
+        )
+        model.setStatus(
+            sessionId: sessionIdleFirst.id,
+            status: .idle,
+            text: nil,
+            timestamp: 211,
+            source: "session-idle",
+            notification: .completed
+        )
+        model.setStatus(
+            sessionId: sessionIdleFirst.id,
+            status: .idle,
+            text: nil,
+            timestamp: 210,
+            source: "agent-stop"
+        )
+
+        XCTAssertTrue(model.projects[0].sessions[0].hasUnread)
+        XCTAssertTrue(model.projects[0].sessions[1].hasUnread)
+        XCTAssertEqual(notifications.calls, [
+            NotificationSpy.Call(
+                title: StatusNotificationKind.completed.title,
+                subtitle: "target · agent-stop-first",
+                body: nil,
+                projectId: targetProject.id,
+                sessionId: agentStopFirst.id
+            ),
+            NotificationSpy.Call(
+                title: StatusNotificationKind.completed.title,
+                subtitle: "target · session-idle-first",
+                body: nil,
+                projectId: targetProject.id,
+                sessionId: sessionIdleFirst.id
+            )
+        ])
+    }
+
+    @MainActor
+    private final class NotificationSpy: NotificationPosting {
+        struct Call: Equatable {
+            let title: String
+            let subtitle: String?
+            let body: String?
+            let projectId: String?
+            let sessionId: String?
+        }
+
+        private(set) var calls: [Call] = []
+        var onPost: ((Call) -> Void)?
+
+        func post(
+            title: String,
+            subtitle: String?,
+            body: String?,
+            projectId: String?,
+            sessionId: String?
+        ) {
+            let call = Call(
+                title: title,
+                subtitle: subtitle,
+                body: body,
+                projectId: projectId,
+                sessionId: sessionId
+            )
+            calls.append(call)
+            onPost?(call)
+        }
     }
 
     func testFocusDeepLinkParsing() throws {
@@ -259,10 +507,12 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
-        var cliCalls = try String(contentsOf: capture, encoding: .utf8)
-        XCTAssertTrue(cliCalls.contains(
-            "set-status waiting --timestamp 120 --notification elicitation"
-        ))
+        var cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(cliCalls, [
+            "set-status idle --timestamp 100",
+            "set-status idle --timestamp 110 --source session-idle",
+            "set-status waiting --timestamp 120 --notification elicitation",
+        ])
 
         try runHook(
             hookURL: hookURL,
@@ -273,8 +523,8 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
-        cliCalls = try String(contentsOf: capture, encoding: .utf8)
-        XCTAssertFalse(cliCalls.contains("--notification permission"))
+        cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(cliCalls.last, "set-status waiting --timestamp 125")
 
         try runHook(
             hookURL: hookURL,
@@ -294,6 +544,11 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
+        cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(cliCalls.suffix(2), [
+            "set-status running --timestamp 130",
+            "set-status idle --timestamp 135 --source agent-stop",
+        ])
         try runHook(
             hookURL: hookURL,
             action: "notify",
@@ -303,13 +558,12 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
-        cliCalls = try String(contentsOf: capture, encoding: .utf8)
-        XCTAssertTrue(cliCalls.contains(
+        cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(
+            cliCalls.last,
             "set-status idle --timestamp 140 --source session-idle --notification completed"
-        ))
-        let completedNotificationCount = cliCalls.components(
-            separatedBy: "--notification completed"
-        ).count - 1
+        )
+        XCTAssertEqual(completionSignals(in: cliCalls), 2)
 
         try runHook(
             hookURL: hookURL,
@@ -323,17 +577,138 @@ final class AppLogicTests: XCTestCase {
         try runHook(
             hookURL: hookURL,
             action: "notify",
-            payload: #"{"timestamp":160,"notification_type":"session_idle","unaborted":true,"aborted":true}"#,
+            payload: #"{"timestamp":160,"notification_type":"session_idle","aborted":false}"#,
             tabId: tabId,
             root: root,
             bin: bin,
             capture: capture
         )
-        cliCalls = try String(contentsOf: capture, encoding: .utf8)
+        cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(
-            cliCalls.components(separatedBy: "--notification completed").count - 1,
-            completedNotificationCount
+            cliCalls.last,
+            "set-status idle --timestamp 160 --source session-idle --notification completed"
         )
+        let completionSignalCount = completionSignals(in: cliCalls)
+        XCTAssertEqual(completionSignalCount, 3)
+
+        try runHook(
+            hookURL: hookURL,
+            action: "running",
+            payload: #"{"timestamp":170}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        try runHook(
+            hookURL: hookURL,
+            action: "notify",
+            payload: #"{"timestamp":180,"notification_type":"session_idle","unaborted":true,"aborted":true}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(completionSignals(in: cliCalls), completionSignalCount)
+        XCTAssertEqual(
+            cliCalls.last,
+            "set-status idle --timestamp 180 --source session-idle"
+        )
+
+        try runHook(
+            hookURL: hookURL,
+            action: "running",
+            payload: #"{"timestamp":190}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        try runHook(
+            hookURL: hookURL,
+            action: "idle",
+            payload: #"{"timestamp":195,"aborted":true}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(completionSignals(in: cliCalls), completionSignalCount)
+        XCTAssertEqual(cliCalls.suffix(2), [
+            "set-status running --timestamp 190",
+            "set-status idle --timestamp 195",
+        ])
+        XCTAssertEqual(cliCalls.count, 13)
+    }
+
+    func testAgentStopAndSessionIdleAtomicallyClaimCompletion() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hookURL = root.appendingPathComponent("copilot-projects-hook.sh")
+        try CopilotHooks.script.write(to: hookURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hookURL.path)
+
+        let capture = root.appendingPathComponent("cli-args.txt")
+        let fakeCLI = bin.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "$CAPTURE_FILE"
+        """.write(to: fakeCLI, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
+
+        let tabId = UUID().uuidString
+        try runHook(
+            hookURL: hookURL,
+            action: "running",
+            payload: #"{"timestamp":100}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+
+        let agentStop = try startHook(
+            hookURL: hookURL,
+            action: "idle",
+            payload: #"{"timestamp":110}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        let sessionIdle = try startHook(
+            hookURL: hookURL,
+            action: "notify",
+            payload: #"{"timestamp":111,"notification_type":"session_idle","aborted":false}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        agentStop.waitUntilExit()
+        sessionIdle.waitUntilExit()
+        XCTAssertEqual(agentStop.terminationStatus, 0)
+        XCTAssertEqual(sessionIdle.terminationStatus, 0)
+
+        let cliCalls = try cliCallLines(in: capture)
+        XCTAssertEqual(cliCalls.count, 3)
+        XCTAssertTrue(cliCalls.contains("set-status running --timestamp 100"))
+        XCTAssertEqual(cliCalls.filter { $0.contains("--timestamp 110") }.count, 1)
+        XCTAssertEqual(cliCalls.filter { $0.contains("--timestamp 111") }.count, 1)
+        XCTAssertTrue((1...2).contains(completionSignals(in: cliCalls)))
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: sessions.appendingPathComponent("\(tabId).active-turn").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: sessions.appendingPathComponent("\(tabId).agent-stop-completion").path
+        ))
     }
 
     func testStatusNotificationTitlesDescribeWhyCopilotNeedsAttention() {
@@ -415,6 +790,14 @@ final class AppLogicTests: XCTestCase {
             sessionsDirectory: root
         ))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testCompletionCoordinationStateIsNotPersisted() throws {
+        let session = Session(title: "test", cwd: "/tmp")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any]
+        )
+        XCTAssertEqual(Set(object.keys), ["id", "title", "cwd"])
     }
 
     func testStateRepositoryRecoversBackupAndNormalizesSelection() throws {
@@ -559,6 +942,28 @@ final class AppLogicTests: XCTestCase {
         bin: URL,
         capture: URL
     ) throws {
+        let process = try startHook(
+            hookURL: hookURL,
+            action: action,
+            payload: payload,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+    }
+
+    private func startHook(
+        hookURL: URL,
+        action: String,
+        payload: String,
+        tabId: String,
+        root: URL,
+        bin: URL,
+        capture: URL
+    ) throws -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [hookURL.path, action]
@@ -575,8 +980,19 @@ final class AppLogicTests: XCTestCase {
         try process.run()
         input.fileHandleForWriting.write(Data(payload.utf8))
         try input.fileHandleForWriting.close()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0)
+        return process
+    }
+
+    private func cliCallLines(in capture: URL) throws -> [String] {
+        try String(contentsOf: capture, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+    }
+
+    private func completionSignals(in calls: [String]) -> Int {
+        calls.filter {
+            $0.contains("--source agent-stop") || $0.contains("--notification completed")
+        }.count
     }
 
     private func connectUnixSocket(path: String) throws -> Int32 {
