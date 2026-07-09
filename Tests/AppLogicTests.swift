@@ -2,6 +2,7 @@ import XCTest
 @testable import copilot_projects
 import CopilotProjectsCore
 import AppKit
+import Security
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -1244,11 +1245,428 @@ final class AppLogicTests: XCTestCase {
             renameProject: { _, _ in .success() },
             focus: { _ in .success() },
             screenshot: { _ in .success() },
-            diagnostics: { "" }
+            diagnostics: { "" },
+            remote: { _ in .success() }
         ))
         XCTAssertFalse(router.handle(ControlRequest(command: "set-status")).ok)
         XCTAssertFalse(didSetStatus)
         XCTAssertFalse(router.handle(ControlRequest(command: "unknown")).ok)
+    }
+
+    func testCloudflareAccessVerifierValidatesSignatureAndClaims() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { now },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+
+        let claims: [String: Any] = [
+            "iss": config.issuer,
+            "aud": [config.audTag],
+            "email": "USER@example.com",
+            "exp": now.timeIntervalSince1970 + 3_600,
+            "nbf": now.timeIntervalSince1970 - 60,
+        ]
+        let validToken = try accessToken(
+            kid: "test-key", claims: claims, privateKey: privateKey
+        )
+        XCTAssertTrue(verifier.verify(token: validToken))
+        XCTAssertEqual(
+            verifier.verifiedExpiration(token: validToken),
+            Date(timeIntervalSince1970: now.timeIntervalSince1970 + 3_600)
+        )
+
+        var wrongAudience = claims
+        wrongAudience["aud"] = ["wrong"]
+        XCTAssertFalse(verifier.verify(token: try accessToken(
+            kid: "test-key", claims: wrongAudience, privateKey: privateKey
+        )))
+
+        var wrongEmail = claims
+        wrongEmail["email"] = "attacker@example.com"
+        XCTAssertFalse(verifier.verify(token: try accessToken(
+            kid: "test-key", claims: wrongEmail, privateKey: privateKey
+        )))
+
+        var expired = claims
+        expired["exp"] = now.timeIntervalSince1970
+        XCTAssertFalse(verifier.verify(token: try accessToken(
+            kid: "test-key", claims: expired, privateKey: privateKey
+        )))
+
+        var notYetValid = claims
+        notYetValid["nbf"] = now.timeIntervalSince1970 + 60
+        XCTAssertFalse(verifier.verify(token: try accessToken(
+            kid: "test-key", claims: notYetValid, privateKey: privateKey
+        )))
+
+        let (otherPrivateKey, _) = try makeRSAKeyPair()
+        XCTAssertFalse(verifier.verify(token: try accessToken(
+            kid: "test-key", claims: claims, privateKey: otherPrivateKey
+        )))
+        XCTAssertFalse(verifier.verify(token: try accessToken(
+            kid: "unknown-key", claims: claims, privateKey: privateKey
+        )))
+        XCTAssertFalse(verifier.verify(token: String(repeating: "x", count: 16_385)))
+    }
+
+    func testRemoteRequestAuthFailsClosed() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { now },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": now.timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+        let auth = RemoteRequestAuth(
+            expectedHost: "projects.example.com",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier
+        )
+
+        XCTAssertTrue(auth.authorize(
+            host: "projects.example.com",
+            token: token,
+            origin: "https://projects.example.com",
+            originPolicy: .requireMatch
+        ))
+        XCTAssertTrue(auth.authorize(
+            host: "PROJECTS.EXAMPLE.COM",
+            token: token,
+            origin: "HTTPS://PROJECTS.EXAMPLE.COM",
+            originPolicy: .requireMatch
+        ))
+        XCTAssertFalse(auth.authorize(
+            host: "projects.example.com",
+            token: nil,
+            origin: "https://projects.example.com",
+            originPolicy: .requireMatch
+        ))
+        XCTAssertFalse(auth.authorize(
+            host: "evil.example.com",
+            token: token,
+            origin: "https://projects.example.com",
+            originPolicy: .requireMatch
+        ))
+        XCTAssertFalse(auth.authorize(
+            host: "projects.example.com",
+            token: token,
+            origin: "https://evil.example.com",
+            originPolicy: .requireMatch
+        ))
+        XCTAssertFalse(auth.authorize(
+            host: "projects.example.com",
+            token: token,
+            origin: nil,
+            originPolicy: .requireMatch
+        ))
+        XCTAssertTrue(auth.authorize(
+            host: "projects.example.com",
+            token: token,
+            origin: nil,
+            originPolicy: .matchIfPresent
+        ))
+        XCTAssertEqual(auth.normalizedPath("/events?s=session%2Fid"), "/events")
+        XCTAssertEqual(auth.normalizedPath("/app.js"), "/app.js")
+        XCTAssertNil(auth.normalizedPath("app.js"))
+    }
+
+    func testRemoteAccessConfigurationRequiresAllSettings() throws {
+        let suiteName = "RemoteAccessConfigurationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertNil(RemoteAccessConfiguration.load(defaults: defaults))
+        defaults.set("projects.example.com", forKey: RemoteAccessConfiguration.hostnameKey)
+        defaults.set(
+            "team.cloudflareaccess.com",
+            forKey: RemoteAccessConfiguration.teamDomainKey
+        )
+        defaults.set("audience", forKey: RemoteAccessConfiguration.audienceKey)
+        XCTAssertNil(RemoteAccessConfiguration.load(defaults: defaults))
+
+        defaults.set("user@example.com", forKey: RemoteAccessConfiguration.allowedEmailKey)
+        let configuration = try XCTUnwrap(
+            RemoteAccessConfiguration.load(defaults: defaults)
+        )
+        XCTAssertEqual(configuration.hostname, "projects.example.com")
+        XCTAssertEqual(configuration.localPort, 49_271)
+        XCTAssertEqual(configuration.access.teamDomain, "team.cloudflareaccess.com")
+        XCTAssertEqual(configuration.access.audTag, "audience")
+        XCTAssertEqual(configuration.access.allowedEmail, "user@example.com")
+
+        defaults.set("%", forKey: RemoteAccessConfiguration.teamDomainKey)
+        XCTAssertNil(RemoteAccessConfiguration.load(defaults: defaults))
+    }
+
+    @MainActor
+    func testRemoteGatewayRoutesFailClosed() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [], selectedProjectId: nil))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { Date() },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0
+        )
+        do {
+            let missingToken = try await remoteHTTPStatus(port: port, path: "/")
+            XCTAssertEqual(missingToken, 403)
+            let invalidToken = try await remoteHTTPStatus(
+                port: port,
+                path: "/",
+                token: "invalid"
+            )
+            XCTAssertEqual(invalidToken, 403)
+            let allowedAsset = try await remoteHTTPResponse(
+                port: port,
+                path: "/app.js",
+                token: token
+            )
+            XCTAssertEqual(allowedAsset.statusCode, 200)
+            XCTAssertEqual(
+                allowedAsset.value(forHTTPHeaderField: "Content-Security-Policy"),
+                "default-src 'self'; connect-src 'self'; style-src 'self'; "
+                    + "script-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+            )
+            let missingPath = try await remoteHTTPStatus(
+                port: port,
+                path: "/missing",
+                token: token
+            )
+            XCTAssertEqual(missingPath, 404)
+            let wrongGetOrigin = try await remoteHTTPStatus(
+                port: port,
+                path: "/app.js",
+                token: token,
+                origin: "https://evil.example.com"
+            )
+            XCTAssertEqual(wrongGetOrigin, 403)
+            let controlBody = try JSONEncoder().encode(RemoteClientMessage(
+                type: "acquire",
+                clientId: "phone",
+                sessionId: "session",
+                data: nil
+            ))
+            let missingPostOrigin = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                body: controlBody
+            )
+            XCTAssertEqual(missingPostOrigin, 403)
+            let allowedControl = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: controlBody
+            )
+            XCTAssertEqual(allowedControl, 204)
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
+    }
+
+    @MainActor
+    func testRemoteWorkspaceSnapshotPreservesModelContract() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let waiting = Session(id: "session-1", title: "waiting", cwd: "/one")
+        let completed = Session(id: "session-2", title: "completed", cwd: "/two")
+        let selected = Project(
+            id: "project-1",
+            name: "selected",
+            cwd: "/one",
+            sessions: [waiting, completed],
+            selectedSessionId: waiting.id
+        )
+        let other = Project(id: "project-2", name: "other", cwd: "/other")
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [selected, other],
+            selectedProjectId: selected.id
+        ))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+        model.setStatus(
+            sessionId: waiting.id,
+            status: .waiting,
+            text: "needs input",
+            timestamp: 100,
+            source: "scheduled-start"
+        )
+        model.setStatus(
+            sessionId: completed.id,
+            status: .running,
+            text: "working",
+            timestamp: 100
+        )
+        model.setStatus(
+            sessionId: completed.id,
+            status: .idle,
+            text: nil,
+            timestamp: 200
+        )
+
+        XCTAssertEqual(model.remoteWorkspaceSnapshot(), RemoteWorkspaceSnapshot(
+            projects: [
+                RemoteProjectSnapshot(
+                    id: selected.id,
+                    name: selected.name,
+                    selectedSessionId: waiting.id,
+                    sessions: [
+                        RemoteSessionSnapshot(
+                            id: waiting.id,
+                            title: waiting.title,
+                            status: SessionStatus.waiting.rawValue,
+                            statusText: "needs input",
+                            unread: false,
+                            ready: false,
+                            background: true,
+                            scheduled: false
+                        ),
+                        RemoteSessionSnapshot(
+                            id: completed.id,
+                            title: completed.title,
+                            status: SessionStatus.idle.rawValue,
+                            statusText: nil,
+                            unread: false,
+                            ready: true,
+                            background: false,
+                            scheduled: false
+                        ),
+                    ]
+                ),
+                RemoteProjectSnapshot(
+                    id: other.id,
+                    name: other.name,
+                    selectedSessionId: nil,
+                    sessions: []
+                ),
+            ],
+            selectedProjectId: selected.id
+        ))
+    }
+
+    func testRemoteTerminalScreenCaptureNormalizesCells() {
+        let cells: [[Character?]] = [
+            ["A", "\u{0}"],
+            [nil, "B"],
+        ]
+        XCTAssertEqual(RemoteTerminalScreen.capture(
+            sessionId: "session",
+            cols: 2,
+            rows: 2,
+            characterAt: { cells[$1][$0] }
+        ), RemoteTerminalScreen(
+            sessionId: "session",
+            cols: 2,
+            rows: 2,
+            lines: ["A ", " B"]
+        ))
+    }
+
+    func testRemoteWebCommandInputHasAccessibleName() {
+        XCTAssertTrue(RemoteWebAssets.html.contains("aria-label=\"Command input\""))
+    }
+
+    func testRemoteWebInputRequeuesAfterNetworkFailure() {
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "pendingInput = data + pendingInput;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "setTimeout(flushInput, 1000);"
+        ))
+    }
+
+    func testRemoteQueryItemsParsesSession() {
+        let items = RemoteRequestAuth.queryItems("/events?s=session%2Fid")
+        XCTAssertEqual(items["s"], "session/id")
+    }
+
+    func testRemoteWriterLeaseTakeoverGivesControlToLatestClient() {
+        let leases = RemoteWriterLeases()
+        leases.acquire(sessionId: "session", clientId: "phone")
+        XCTAssertTrue(leases.holds(sessionId: "session", clientId: "phone"))
+        XCTAssertFalse(leases.holds(sessionId: "session", clientId: "laptop"))
+        // A second device takes over by acquiring; the previous holder loses it.
+        leases.acquire(sessionId: "session", clientId: "laptop")
+        XCTAssertTrue(leases.holds(sessionId: "session", clientId: "laptop"))
+        XCTAssertFalse(leases.holds(sessionId: "session", clientId: "phone"))
+        // Leases are scoped per session.
+        leases.acquire(sessionId: "other", clientId: "phone")
+        XCTAssertTrue(leases.holds(sessionId: "other", clientId: "phone"))
+        XCTAssertTrue(leases.holds(sessionId: "session", clientId: "laptop"))
     }
 
     func testCLIParsesStatusNotificationFlagIntoControlRequest() throws {
@@ -1366,6 +1784,112 @@ final class AppLogicTests: XCTestCase {
         calls.filter {
             $0.contains("--source agent-stop") || $0.contains("--notification completed")
         }.count
+    }
+
+    private func makeRSAKeyPair() throws -> (privateKey: SecKey, publicKey: SecKey) {
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeySizeInBits as String: 2_048,
+        ]
+        var creationError: Unmanaged<CFError>?
+        guard let privateKey = SecKeyCreateRandomKey(
+            attributes as CFDictionary,
+            &creationError
+        ), let publicKey = SecKeyCopyPublicKey(privateKey) else {
+            if let creationError {
+                throw creationError.takeRetainedValue() as Error
+            }
+            throw NSError(domain: "CloudflareAccessTests", code: 1)
+        }
+        return (privateKey, publicKey)
+    }
+
+    private func accessToken(
+        kid: String,
+        claims: [String: Any],
+        privateKey: SecKey
+    ) throws -> String {
+        let header: [String: Any] = ["alg": "RS256", "kid": kid, "typ": "JWT"]
+        let headerData = try JSONSerialization.data(
+            withJSONObject: header,
+            options: [.sortedKeys]
+        )
+        let claimsData = try JSONSerialization.data(
+            withJSONObject: claims,
+            options: [.sortedKeys]
+        )
+        let signingInput = "\(base64URL(headerData)).\(base64URL(claimsData))"
+        var signingError: Unmanaged<CFError>?
+        guard let signature = SecKeyCreateSignature(
+            privateKey,
+            .rsaSignatureMessagePKCS1v15SHA256,
+            Data(signingInput.utf8) as CFData,
+            &signingError
+        ) as Data? else {
+            if let signingError {
+                throw signingError.takeRetainedValue() as Error
+            }
+            throw NSError(domain: "CloudflareAccessTests", code: 2)
+        }
+        return "\(signingInput).\(base64URL(signature))"
+    }
+
+    private func base64URL(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func remoteHTTPStatus(
+        port: Int,
+        path: String,
+        method: String = "GET",
+        token: String? = nil,
+        origin: String? = nil,
+        body: Data? = nil
+    ) async throws -> Int {
+        let response = try await remoteHTTPResponse(
+            port: port,
+            path: path,
+            method: method,
+            token: token,
+            origin: origin,
+            body: body
+        )
+        return response.statusCode
+    }
+
+    private func remoteHTTPResponse(
+        port: Int,
+        path: String,
+        method: String = "GET",
+        token: String? = nil,
+        origin: String? = nil,
+        body: Data? = nil
+    ) async throws -> HTTPURLResponse {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 5
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)\(path)"))
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = body
+        request.setValue("close", forHTTPHeaderField: "Connection")
+        if let token {
+            request.setValue(token, forHTTPHeaderField: "Cf-Access-Jwt-Assertion")
+        }
+        if let origin {
+            request.setValue(origin, forHTTPHeaderField: "Origin")
+        }
+        if body != nil {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        let (_, response) = try await session.data(for: request)
+        return try XCTUnwrap(response as? HTTPURLResponse)
     }
 
     private func connectUnixSocket(path: String) throws -> Int32 {
