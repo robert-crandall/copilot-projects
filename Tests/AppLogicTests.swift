@@ -1361,7 +1361,7 @@ final class AppLogicTests: XCTestCase {
         Paths.ensureStateDir()
         let data = Data("""
         {
-          "schemaVersion": 2,
+          "schemaVersion": 3,
           "updatedAt": "2026-07-12T03:09:00.123Z",
           "copilotSessionId": "copilot-session",
           "turns": [{
@@ -1418,7 +1418,7 @@ final class AppLogicTests: XCTestCase {
         )
         let currentData = Data("""
         {
-          "schemaVersion": 2,
+          "schemaVersion": 3,
           "updatedAt": "2026-07-12T03:09:00.123Z",
           "copilotSessionId": "copilot-session",
           "turns": []
@@ -1436,7 +1436,7 @@ final class AppLogicTests: XCTestCase {
 
         let legacyData = Data("""
         {
-          "schemaVersion": 1,
+          "schemaVersion": 2,
           "updatedAt": "2026-07-12T03:10:00.123Z",
           "copilotSessionId": "legacy-copilot-session",
           "turns": [{
@@ -1460,21 +1460,29 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(controller.snapshot)
 
         let remote = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
-        XCTAssertEqual(remote.schemaVersion, 2)
+        XCTAssertEqual(remote.schemaVersion, 3)
         XCTAssertTrue(remote.copilotSessionId.isEmpty)
         XCTAssertTrue(remote.turns.isEmpty)
     }
 
-    func testSessionArtifactCleanupRemovesTranscriptSnapshot() throws {
+    func testSessionArtifactCleanupRemovesTranscriptArtifacts() throws {
         let sessionId = UUID().uuidString
         Paths.ensureStateDir()
-        let path = Paths.transcriptSnapshotPath(sessionId: sessionId)
-        try Data("{}".utf8).write(to: URL(fileURLWithPath: path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        let paths = [
+            Paths.transcriptSnapshotPath(sessionId: sessionId),
+            Paths.transcriptOwnerPath(sessionId: sessionId),
+            Paths.transcriptOwnerLockPath(sessionId: sessionId),
+        ]
+        for path in paths {
+            try Data("{}".utf8).write(to: URL(fileURLWithPath: path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        }
 
         SessionArtifacts.removeFiles(sessionId: sessionId)
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        for path in paths {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        }
     }
 
     @MainActor
@@ -1817,7 +1825,7 @@ final class AppLogicTests: XCTestCase {
         )
 
         let mockSnapshot = TranscriptSnapshot(
-            schemaVersion: 2,
+            schemaVersion: 3,
             updatedAt: Date(),
             copilotSessionId: "test-copilot",
             turns: []
