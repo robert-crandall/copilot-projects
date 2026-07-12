@@ -1361,7 +1361,7 @@ final class AppLogicTests: XCTestCase {
         Paths.ensureStateDir()
         let data = Data("""
         {
-          "schemaVersion": 1,
+          "schemaVersion": 2,
           "updatedAt": "2026-07-12T03:09:00.123Z",
           "copilotSessionId": "copilot-session",
           "turns": [{
@@ -1408,6 +1408,63 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(remote, loaded)
     }
 
+    @MainActor
+    func testTranscriptControllerRejectsLegacySchemaForDesktopAndRemote() async throws {
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        Paths.ensureStateDir()
+        let snapshotURL = URL(
+            fileURLWithPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
+        )
+        let currentData = Data("""
+        {
+          "schemaVersion": 2,
+          "updatedAt": "2026-07-12T03:09:00.123Z",
+          "copilotSessionId": "copilot-session",
+          "turns": []
+        }
+        """.utf8)
+        try currentData.write(to: snapshotURL, options: .atomic)
+
+        let controller = TranscriptController(sessionId: sessionId)
+        controller.start()
+        for _ in 0 ..< 50 {
+            if controller.snapshot != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNotNil(controller.snapshot)
+
+        let legacyData = Data("""
+        {
+          "schemaVersion": 1,
+          "updatedAt": "2026-07-12T03:10:00.123Z",
+          "copilotSessionId": "legacy-copilot-session",
+          "turns": [{
+            "id": "legacy-turn",
+            "startedAt": "2026-07-12T03:10:01Z",
+            "endedAt": "2026-07-12T03:10:02Z",
+            "kind": "foreground",
+            "userContent": "legacy transcript content",
+            "assistantMessages": [],
+            "tools": [],
+            "isAborted": false
+          }]
+        }
+        """.utf8)
+        try legacyData.write(to: snapshotURL, options: .atomic)
+
+        for _ in 0 ..< 120 {
+            if controller.snapshot == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNil(controller.snapshot)
+
+        let remote = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
+        XCTAssertEqual(remote.schemaVersion, 2)
+        XCTAssertTrue(remote.copilotSessionId.isEmpty)
+        XCTAssertTrue(remote.turns.isEmpty)
+    }
+
     func testSessionArtifactCleanupRemovesTranscriptSnapshot() throws {
         let sessionId = UUID().uuidString
         Paths.ensureStateDir()
@@ -1418,6 +1475,36 @@ final class AppLogicTests: XCTestCase {
         SessionArtifacts.removeFiles(sessionId: sessionId)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    }
+
+    @MainActor
+    func testTranscriptDrawerRequiresExplicitOpen() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = Session(title: "shell", cwd: "/tmp")
+        let project = Project(
+            name: "test",
+            cwd: "/tmp",
+            sessions: [session],
+            selectedSessionId: session.id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [project],
+            selectedProjectId: project.id
+        ))
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root
+        )
+
+        XCTAssertFalse(model.isTranscriptDrawerOpen(sessionId: session.id))
+        model.openTranscriptDrawer(sessionId: session.id)
+        XCTAssertTrue(model.isTranscriptDrawerOpen(sessionId: session.id))
+        model.closeTranscriptDrawer(sessionId: session.id)
+        XCTAssertFalse(model.isTranscriptDrawerOpen(sessionId: session.id))
     }
 
     func testCompletionCoordinationStateIsNotPersisted() throws {
@@ -1730,7 +1817,7 @@ final class AppLogicTests: XCTestCase {
         )
 
         let mockSnapshot = TranscriptSnapshot(
-            schemaVersion: 1,
+            schemaVersion: 2,
             updatedAt: Date(),
             copilotSessionId: "test-copilot",
             turns: []

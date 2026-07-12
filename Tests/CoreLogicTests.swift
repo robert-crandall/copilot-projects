@@ -72,6 +72,10 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(CopilotExtension.script.contains(#"case "tool.execution_complete":"#))
         XCTAssertTrue(CopilotExtension.script.contains("isAborted"))
         XCTAssertTrue(CopilotExtension.script.contains(".transcript.json"))
+        XCTAssertTrue(CopilotExtension.script.contains("parentAgentTaskId"))
+        XCTAssertTrue(CopilotExtension.script.contains("suppressedInteractionIds"))
+        XCTAssertTrue(CopilotExtension.script.contains("suppressedTurnIds"))
+        XCTAssertTrue(CopilotExtension.script.contains("schemaVersion: 2"))
         XCTAssertTrue(CopilotExtension.script.contains("publishTranscript();"))
         XCTAssertTrue(CopilotExtension.script.contains("removeFile(temporaryPath)"))
         XCTAssertTrue(CopilotExtension.script.contains("setScheduledTurnMarker(false)"))
@@ -153,6 +157,62 @@ final class CoreLogicTests: XCTestCase {
           {
             id:"hidden-idle",type:"session.idle",timestamp:"2026-07-12T02:59:02.333Z",
             data:{aborted:false}
+          },
+          {
+            id:"classifier-user",type:"user.message",
+            timestamp:"2026-07-12T02:59:02.400Z",
+            data:{
+              source:null,
+              content:"internal classifier prompt",
+              interactionId:"classifier-interaction",
+              parentAgentTaskId:"parent-task"
+            }
+          },
+          {
+            id:"classifier-system",type:"user.message",
+            timestamp:"2026-07-12T02:59:02.450Z",
+            data:{
+              source:"system",
+              content:"",
+              interactionId:"classifier-interaction"
+            }
+          },
+          {
+            id:"classifier-turn-start",type:"assistant.turn_start",
+            timestamp:"2026-07-12T02:59:02.500Z",
+            data:{interactionId:"classifier-interaction",turnId:"classifier-turn"}
+          },
+          {
+            id:"classifier-assistant",type:"assistant.message",
+            timestamp:"2026-07-12T02:59:02.550Z",
+            data:{
+              messageId:"classifier-message",
+              interactionId:"classifier-interaction",
+              content:"internal classifier result"
+            }
+          },
+          {
+            id:"classifier-tool-start",type:"tool.execution_start",
+            timestamp:"2026-07-12T02:59:02.570Z",
+            data:{
+              turnId:"classifier-turn",
+              toolCallId:"classifier-tool",
+              toolName:"bash"
+            }
+          },
+          {
+            id:"classifier-tool-complete",type:"tool.execution_complete",
+            timestamp:"2026-07-12T02:59:02.580Z",
+            data:{
+              turnId:"classifier-turn",
+              toolCallId:"classifier-tool",
+              success:true
+            }
+          },
+          {
+            id:"classifier-turn-end",type:"assistant.turn_end",
+            timestamp:"2026-07-12T02:59:02.600Z",
+            data:{turnId:"classifier-turn"}
           },
           {
             id:"scheduled-user",type:"user.message",timestamp:"2026-07-12T02:59:03.444Z",
@@ -246,6 +306,16 @@ final class CoreLogicTests: XCTestCase {
         const snapshot = JSON.parse(encodedSnapshot);
         const find = (id) => snapshot.turns.find((turn) => turn.id === id);
         const hidden = find("hidden-user");
+        const classifierPayloadPresent = snapshot.turns.some((turn) =>
+          turn.userContent === "internal classifier prompt"
+            || turn.assistantMessages.some((message) =>
+              message.id === "classifier-message"
+                || message.content === "internal classifier result"
+            )
+        );
+        const classifierToolPresent = snapshot.turns.some((turn) =>
+          turn.tools.some((tool) => tool.id === "classifier-tool")
+        );
         const scheduled = find("scheduled-user");
         const overlap = find("overlap-user");
         const live = find("live-user");
@@ -254,6 +324,8 @@ final class CoreLogicTests: XCTestCase {
           firstId: snapshot.turns[0]?.id,
           hiddenKind: hidden?.kind,
           hiddenUserContent: hidden?.userContent,
+          classifierPayloadPresent,
+          classifierToolPresent,
           scheduledKind: scheduled?.kind,
           scheduledAborted: scheduled?.isAborted,
           overlapAssistantCount: overlap?.assistantMessages.length,
@@ -310,6 +382,8 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertEqual(summary?["firstId"] as? String, "filler-user-2")
         XCTAssertEqual(summary?["hiddenKind"] as? String, "automated")
         XCTAssertEqual(summary?["hiddenUserContent"] as? String, "")
+        XCTAssertEqual(summary?["classifierPayloadPresent"] as? Bool, false)
+        XCTAssertEqual(summary?["classifierToolPresent"] as? Bool, false)
         XCTAssertEqual(summary?["scheduledKind"] as? String, "scheduled")
         XCTAssertEqual(summary?["scheduledAborted"] as? Bool, true)
         XCTAssertEqual(summary?["overlapAssistantCount"] as? Int, 1)
@@ -334,6 +408,24 @@ final class CoreLogicTests: XCTestCase {
     }
 
     func testCopilotExtensionPreservesMatchingSnapshotWhenHistoryFails() throws {
+        let summary = try copilotExtensionHistoryFailureSummary(schemaVersion: 2)
+
+        XCTAssertEqual(summary["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(summary["copilotSessionId"] as? String, "copilot-session")
+        XCTAssertEqual(summary["turnIds"] as? [String], ["preserved-turn"])
+    }
+
+    func testCopilotExtensionRejectsLegacySnapshotWhenHistoryFails() throws {
+        let summary = try copilotExtensionHistoryFailureSummary(schemaVersion: 1)
+
+        XCTAssertEqual(summary["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(summary["copilotSessionId"] as? String, "copilot-session")
+        XCTAssertEqual(summary["turnIds"] as? [String], [])
+    }
+
+    private func copilotExtensionHistoryFailureSummary(
+        schemaVersion: Int
+    ) throws -> [String: Any] {
         try requireNodeForJavaScriptTests()
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(".build/copilot-extension-history-\(UUID().uuidString)")
@@ -344,7 +436,7 @@ final class CoreLogicTests: XCTestCase {
         let snapshotURL = sessions.appendingPathComponent("\(appSessionId).transcript.json")
         try Data("""
         {
-          "schemaVersion": 1,
+          "schemaVersion": \(schemaVersion),
           "updatedAt": "2026-07-12T03:00:00.000Z",
           "copilotSessionId": "copilot-session",
           "turns": [{
@@ -385,6 +477,7 @@ final class CoreLogicTests: XCTestCase {
           "utf8"
         ));
         console.log(JSON.stringify({
+          schemaVersion: snapshot.schemaVersion,
           copilotSessionId: snapshot.copilotSessionId,
           turnIds: snapshot.turns.map((turn) => turn.id)
         }));
@@ -419,9 +512,9 @@ final class CoreLogicTests: XCTestCase {
             String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
         )
         let output = stdout.fileHandleForReading.readDataToEndOfFile()
-        let summary = try JSONSerialization.jsonObject(with: output) as? [String: Any]
-        XCTAssertEqual(summary?["copilotSessionId"] as? String, "copilot-session")
-        XCTAssertEqual(summary?["turnIds"] as? [String], ["preserved-turn"])
+        return try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
     }
 
     func testStatusNotificationKindRoundTripsOverControlProtocol() throws {
