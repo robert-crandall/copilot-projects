@@ -310,6 +310,152 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionEndClearsResumeMarkerOnlyWhileAppIsRunning() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = Session(title: "target", cwd: "/tmp")
+        let project = Project(name: "target", cwd: "/tmp", sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        let marker = sessions.appendingPathComponent("\(session.id).copilot-session")
+        try FileManager.default.createDirectory(
+            at: marker.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: marker) }
+
+        let model = AppModel(
+            stateRepository: repository,
+            resumeMarkerDirectory: sessions
+        )
+        let firstCopilotSession = UUID().uuidString
+        try Data(firstCopilotSession.utf8).write(to: marker)
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 100,
+            source: "session-end",
+            copilotSessionId: firstCopilotSession
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+
+        let powerOffCopilotSession = UUID().uuidString
+        try Data(powerOffCopilotSession.utf8).write(to: marker)
+        model.prepareForSystemPowerOff()
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 150,
+            source: "session-end",
+            copilotSessionId: powerOffCopilotSession
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+
+        model.beginTermination()
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 200,
+            source: "session-end",
+            copilotSessionId: powerOffCopilotSession
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @MainActor
+    func testStaleSessionEndDoesNotClearResumeMarkers() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = Session(title: "target", cwd: "/tmp")
+        let project = Project(name: "target", cwd: "/tmp", sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let markers = ["copilot-session", "copilot-allow-all"].map {
+            sessions.appendingPathComponent("\(session.id).\($0)")
+        }
+        let ownerCopilotSession = UUID().uuidString
+        for marker in markers {
+            try Data(ownerCopilotSession.utf8).write(to: marker)
+        }
+
+        let model = AppModel(
+            stateRepository: repository,
+            resumeMarkerDirectory: sessions
+        )
+        model.setStatus(sessionId: session.id, status: .running, text: nil, timestamp: 200)
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 100,
+            source: "session-end",
+            copilotSessionId: ownerCopilotSession
+        )
+
+        for marker in markers {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        }
+
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 300,
+            source: "session-end",
+            copilotSessionId: UUID().uuidString
+        )
+
+        for marker in markers {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        }
+    }
+
+    @MainActor
+    func testPowerOffProtectionExpiresAfterCancelledShutdown() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let model = AppModel(
+            stateRepository: StateRepository(path: root.appendingPathComponent("state.json"))
+        )
+        model.prepareForSystemPowerOff(protectionInterval: 0)
+        XCTAssertTrue(model.isPoweringOff)
+        XCTAssertTrue(AppModel.shouldPreserveSessionAfterTerminalExit(
+            isTerminating: false,
+            isPoweringOff: true
+        ))
+        XCTAssertTrue(AppModel.shouldPreserveSessionAfterTerminalExit(
+            isTerminating: true,
+            isPoweringOff: false
+        ))
+        XCTAssertFalse(AppModel.shouldPreserveSessionAfterTerminalExit(
+            isTerminating: false,
+            isPoweringOff: false
+        ))
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(model.isPoweringOff)
+    }
+
+    @MainActor
     func testCompletionNotificationUsesAgentStopAndWaitsForBackgroundAgents() async throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory
@@ -599,6 +745,7 @@ final class AppLogicTests: XCTestCase {
 
     private actor WebPushSenderSpy: WebPushSending {
         private(set) var payloads: [Data] = []
+        private(set) var endpoints: [URL] = []
 
         func send(
             data: Data,
@@ -606,24 +753,304 @@ final class AppLogicTests: XCTestCase {
             eventID: UUID
         ) async throws {
             payloads.append(data)
+            endpoints.append(subscriber.endpoint)
         }
 
         func firstPayload() -> Data? { payloads.first }
+        func sentPayloads() -> [Data] { payloads }
+        func sentEndpoints() -> [URL] { endpoints }
     }
 
     private actor APNsSenderSpy: APNsSending {
         private(set) var devices: [StoredAPNsDevice] = []
+        private(set) var payloads: [RemoteNotificationPayload] = []
         var result: APNsDelivery = .delivered
+        var showDelayNanoseconds: UInt64 = 0
 
         func send(
             payload: RemoteNotificationPayload,
             device: StoredAPNsDevice
         ) async -> APNsDelivery {
+            if payload.action == .show, showDelayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: showDelayNanoseconds)
+            }
             devices.append(device)
+            payloads.append(payload)
             return result
         }
 
+        func setShowDelayNanoseconds(_ value: UInt64) {
+            showDelayNanoseconds = value
+        }
+
         func firstDevice() -> StoredAPNsDevice? { devices.first }
+        func sentPayloads() -> [RemoteNotificationPayload] { payloads }
+        func sentDevices() -> [StoredAPNsDevice] { devices }
+    }
+
+    func testDesktopActivityUsesTwoMinuteThreshold() {
+        XCTAssertTrue(DesktopActivity.wasRecentlyActive(
+            secondsSinceLastInput: { 119.9 }
+        ))
+        XCTAssertFalse(DesktopActivity.wasRecentlyActive(
+            secondsSinceLastInput: { 120 }
+        ))
+    }
+
+    func testRemoteNotificationPayloadDecodesLegacyShowPayloads() throws {
+        let id = UUID()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let payload = try decoder.decode(RemoteNotificationPayload.self, from: Data("""
+        {
+          "id": "\(id.uuidString)",
+          "kind": "completed",
+          "title": "Complete",
+          "body": "Done",
+          "projectId": "project",
+          "sessionId": "session",
+          "sentAt": "2026-07-13T05:45:00Z"
+        }
+        """.utf8))
+
+        XCTAssertEqual(payload.action, .show)
+        XCTAssertEqual(payload.id, id)
+    }
+
+    @MainActor
+    func testRoutedNotificationsSuppressRemoteDeliveryWhileDesktopIsActive() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let webStore = WebPushSubscriptionStore(
+            url: root.appendingPathComponent("subscriptions.json")
+        )
+        try webStore.add(JSONDecoder().decode(
+            WebPushRegistration.self,
+            from: webPushRegistrationData(
+                endpoint: "https://wns2-by3p.notify.windows.com/sub/active"
+            )
+        ))
+        let webSender = WebPushSenderSpy()
+        let webPush = WebPushService(
+            publicKey: VAPID.Key().id.description,
+            store: webStore,
+            sender: webSender
+        )
+
+        let apnsStore = APNsDeviceStore(url: root.appendingPathComponent("devices.json"))
+        try apnsStore.add(APNsRegistration(
+            token: String(repeating: "ab", count: 32),
+            environment: .sandbox,
+            label: "Phone"
+        ))
+        let apnsSender = APNsSenderSpy()
+        let apns = APNsService(store: apnsStore, provider: apnsSender)
+        let sync = NotificationSyncService(
+            ledger: NotificationLedger(url: root.appendingPathComponent("ledger.json")),
+            webPushService: webPush,
+            apnsService: apns
+        )
+        let native = NotificationSpy()
+        var active = true
+        let router = RoutedNotificationPoster(
+            native: native,
+            sync: sync,
+            isDesktopRecentlyActive: { active }
+        )
+
+        router.post(NotificationEvent(
+            kind: .completed,
+            title: "Complete",
+            subtitle: "Project · Session",
+            body: nil,
+            projectId: "project",
+            sessionId: "session"
+        ))
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(native.events.count, 1)
+        let suppressedWebPayload = await webSender.firstPayload()
+        let suppressedAPNsPayloads = await apnsSender.sentPayloads()
+        XCTAssertNil(suppressedWebPayload)
+        XCTAssertTrue(suppressedAPNsPayloads.isEmpty)
+
+        active = false
+        router.post(NotificationEvent(
+            kind: .permission,
+            title: "Permission",
+            subtitle: "Project · Session",
+            body: nil,
+            projectId: "project",
+            sessionId: "session"
+        ))
+        for _ in 0 ..< 25 {
+            if await webSender.firstPayload() != nil,
+               await apnsSender.sentPayloads().count >= 1 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(native.events.count, 2)
+        let firstWebPayload = await webSender.firstPayload()
+        let webPayload = try XCTUnwrap(firstWebPayload)
+        let sentAPNsPayloads = await apnsSender.sentPayloads()
+        let payloadDecoder = JSONDecoder()
+        payloadDecoder.dateDecodingStrategy = .iso8601
+        XCTAssertEqual(
+            try payloadDecoder.decode(RemoteNotificationPayload.self, from: webPayload).action,
+            .show
+        )
+        XCTAssertEqual(sentAPNsPayloads.map(\.action), [.show])
+    }
+
+    func testNotificationDismissalFansOutOnceAndExcludesOriginDevice() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let firstToken = String(repeating: "ab", count: 32)
+        let secondToken = String(repeating: "cd", count: 32)
+        let apnsStore = APNsDeviceStore(url: root.appendingPathComponent("devices.json"))
+        for token in [firstToken, secondToken] {
+            try apnsStore.add(APNsRegistration(
+                token: token,
+                environment: .sandbox,
+                label: token == firstToken ? "First" : "Second"
+            ))
+        }
+        let sender = APNsSenderSpy()
+        let apns = APNsService(store: apnsStore, provider: sender)
+        let sync = NotificationSyncService(
+            ledger: NotificationLedger(url: root.appendingPathComponent("ledger.json")),
+            webPushService: nil,
+            apnsService: apns
+        )
+        let event = NotificationEvent(
+            kind: .elicitation,
+            title: "Question",
+            subtitle: "Project · Session",
+            body: nil,
+            projectId: "project",
+            sessionId: "session"
+        )
+        sync.post(event, sendRemote: true)
+
+        let request = NotificationDismissRequest(
+            id: event.id,
+            apnsToken: firstToken,
+            apnsEnvironment: .sandbox
+        )
+        sync.dismiss(request)
+        sync.dismiss(request)
+        for _ in 0 ..< 25 {
+            if await sender.sentPayloads().count >= 3 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        let payloads = await sender.sentPayloads()
+        let devices = await sender.sentDevices()
+        XCTAssertEqual(payloads.map(\.action), [.show, .show, .clear])
+        XCTAssertEqual(devices.last?.token, secondToken)
+        XCTAssertEqual(sync.dismissalSnapshot().ids, [event.id])
+    }
+
+    func testNotificationDismissalFansOutWebPushClear() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let webStore = WebPushSubscriptionStore(
+            url: root.appendingPathComponent("subscriptions.json")
+        )
+        try webStore.add(JSONDecoder().decode(
+            WebPushRegistration.self,
+            from: webPushRegistrationData(
+                endpoint: "https://wns2-by3p.notify.windows.com/sub/clear"
+            )
+        ))
+        let webSender = WebPushSenderSpy()
+        let webPush = WebPushService(
+            publicKey: VAPID.Key().id.description,
+            store: webStore,
+            sender: webSender
+        )
+        let sync = NotificationSyncService(
+            ledger: NotificationLedger(url: root.appendingPathComponent("ledger.json")),
+            webPushService: webPush,
+            apnsService: nil
+        )
+        let event = NotificationEvent(
+            kind: .permission,
+            title: "Permission",
+            subtitle: "Project · Session",
+            body: nil,
+            projectId: "project",
+            sessionId: "session"
+        )
+
+        sync.post(event, sendRemote: true)
+        sync.dismiss(NotificationDismissRequest(id: event.id))
+        for _ in 0 ..< 25 {
+            if await webSender.sentPayloads().count >= 2 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let webPayloads = await webSender.sentPayloads()
+        let actions = try webPayloads.map {
+            try decoder.decode(RemoteNotificationPayload.self, from: $0).action
+        }
+        XCTAssertEqual(actions, [.show, .clear])
+    }
+
+    func testNotificationDismissalWaitsForInFlightShow() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let token = String(repeating: "ab", count: 32)
+        let apnsStore = APNsDeviceStore(url: root.appendingPathComponent("devices.json"))
+        try apnsStore.add(APNsRegistration(
+            token: token,
+            environment: .sandbox,
+            label: "Phone"
+        ))
+        let sender = APNsSenderSpy()
+        await sender.setShowDelayNanoseconds(100_000_000)
+        let apns = APNsService(store: apnsStore, provider: sender)
+        let sync = NotificationSyncService(
+            ledger: NotificationLedger(url: root.appendingPathComponent("ledger.json")),
+            webPushService: nil,
+            apnsService: apns
+        )
+        let event = NotificationEvent(
+            kind: .elicitation,
+            title: "Question",
+            subtitle: "Project · Session",
+            body: nil,
+            projectId: "project",
+            sessionId: "session"
+        )
+
+        sync.post(event, sendRemote: true)
+        sync.dismiss(NotificationDismissRequest(
+            id: event.id,
+            apnsToken: nil,
+            apnsEnvironment: nil
+        ))
+        for _ in 0 ..< 20 {
+            if await sender.sentPayloads().count >= 2 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        let payloads = await sender.sentPayloads()
+        XCTAssertEqual(payloads.map(\.action), [.show, .clear])
     }
 
     func testFocusDeepLinkParsing() throws {
@@ -741,6 +1168,110 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: capability.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: backgroundAgents.path))
+    }
+
+    func testCopilotHookDelegatesSessionEndResumeCleanupToApp() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hookURL = root.appendingPathComponent("copilot-projects-hook.sh")
+        try CopilotHooks.script.write(to: hookURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: hookURL.path
+        )
+
+        let capture = root.appendingPathComponent("cli-args.txt")
+        let fakeCLI = bin.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "$CAPTURE_FILE"
+        """.write(to: fakeCLI, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeCLI.path
+        )
+
+        let tabId = UUID().uuidString
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let marker = sessions.appendingPathComponent("\(tabId).copilot-session")
+        try Data(UUID().uuidString.utf8).write(to: marker)
+
+        try runHook(
+            hookURL: hookURL,
+            action: "end",
+            payload: #"{"timestamp":200,"reason":"user_exit"}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(
+            try cliCallLines(in: capture),
+            ["set-status idle --timestamp 200 --source session-end"]
+        )
+
+        let copilotSessionId = UUID().uuidString
+        try runHook(
+            hookURL: hookURL,
+            action: "end",
+            payload: #"{"timestamp":210,"reason":"user_exit","sessionId":"\#(copilotSessionId)"}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(
+            try cliCallLines(in: capture).last,
+            "set-status idle --timestamp 210 --source session-end --copilot-session \(copilotSessionId)"
+        )
+    }
+
+    func testCopilotHookDoesNotOverwriteResumeMarkerFromInheritedHelper() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hookURL = root.appendingPathComponent("copilot-projects-hook.sh")
+        try CopilotHooks.script.write(to: hookURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hookURL.path)
+
+        let capture = root.appendingPathComponent("cli-args.txt")
+        let fakeCLI = bin.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "$CAPTURE_FILE"
+        """.write(to: fakeCLI, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
+
+        let tabId = UUID().uuidString
+        let ownerCopilotSession = UUID().uuidString
+        let helperCopilotSession = UUID().uuidString
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let marker = sessions.appendingPathComponent("\(tabId).copilot-session")
+        try Data(ownerCopilotSession.utf8).write(to: marker)
+
+        try runHook(
+            hookURL: hookURL,
+            action: "pre",
+            payload: #"{"timestamp":200,"sessionId":"\#(helperCopilotSession)"}"#,
+            tabId: tabId,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), ownerCopilotSession)
     }
 
     func testCopilotHookRoutesNativeNotificationsForWaitingAndCompletedTurns() throws {
@@ -1082,6 +1613,186 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testAnswerUserInputEnforcesChoiceFreeformSizeAndSession() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = Session(id: "session-ui", title: "target", cwd: "/tmp")
+        let project = Project(name: "target", cwd: "/tmp", sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+
+        let snapshotURL = directory.appendingPathComponent("\(session.id).agent-activity.json")
+        let responseURL = directory
+            .appendingPathComponent("\(session.id).user-input-response.json")
+        let markerURL = directory.appendingPathComponent("\(session.id).copilot-session")
+
+        func writeSnapshot(updatedAt: Date) throws {
+            let snapshot = AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: ISO8601DateFormatter().string(from: updatedAt),
+                foregroundTurnActive: false,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: 0,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil,
+                trackedUserInputs: [
+                    TrackedUserInput(
+                        requestId: "req-choice",
+                        question: "Deploy?",
+                        choices: ["Yes, deploy", "No"],
+                        allowFreeform: false,
+                        requestedAt: ISO8601DateFormatter().string(from: updatedAt),
+                        agentId: nil
+                    ),
+                    TrackedUserInput(
+                        requestId: "req-free",
+                        question: "Name it",
+                        choices: [],
+                        allowFreeform: true,
+                        requestedAt: ISO8601DateFormatter().string(from: updatedAt),
+                        agentId: "agent-2"
+                    ),
+                ]
+            )
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        }
+        try writeSnapshot(updatedAt: Date())
+        try Data("copilot-session".utf8).write(to: markerURL)
+
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: directory,
+            resumeMarkerDirectory: directory
+        )
+
+        // Unknown request id → no valid question.
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "missing", answer: "Yes, deploy", wasFreeform: false
+                )
+            ),
+            .invalid
+        )
+        // A selectable answer must match a choice verbatim.
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-choice", answer: "yes, deploy", wasFreeform: false
+                )
+            ),
+            .invalid
+        )
+        // Freeform is rejected when the request does not allow it.
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-choice", answer: "Yes, deploy", wasFreeform: true
+                )
+            ),
+            .invalid
+        )
+        // Oversized answers are rejected.
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-free",
+                    answer: String(repeating: "a", count: 8_193),
+                    wasFreeform: true
+                )
+            ),
+            .invalid
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: responseURL.path))
+
+        // A valid verbatim-choice answer is accepted and atomically written 0600.
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-choice", answer: "Yes, deploy", wasFreeform: false
+                )
+            ),
+            .accepted
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: responseURL.path))
+        let attributes = try FileManager.default.attributesOfItem(atPath: responseURL.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        let written = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: responseURL))
+                as? [String: Any]
+        )
+        XCTAssertEqual(written["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(written["copilotSessionId"] as? String, "copilot-session")
+        XCTAssertEqual(written["requestId"] as? String, "req-choice")
+        XCTAssertEqual(written["answer"] as? String, "Yes, deploy")
+        XCTAssertEqual(written["wasFreeform"] as? Bool, false)
+
+        // A second answer conflicts while the prior response is still awaiting pickup.
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-free", answer: "hello", wasFreeform: true
+                )
+            ),
+            .conflict
+        )
+
+        // Once the extension consumes the response, a fresh freeform answer is accepted.
+        try FileManager.default.removeItem(at: responseURL)
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-free", answer: "hello", wasFreeform: true
+                )
+            ),
+            .accepted
+        )
+        try FileManager.default.removeItem(at: responseURL)
+
+        // A stale heartbeat can no longer be answered.
+        try writeSnapshot(updatedAt: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-choice", answer: "Yes, deploy", wasFreeform: false
+                )
+            ),
+            .invalid
+        )
+
+        // Without a live Copilot session marker the answer cannot be bound to context.
+        try writeSnapshot(updatedAt: Date())
+        try FileManager.default.removeItem(at: markerURL)
+        XCTAssertEqual(
+            model.answerUserInput(
+                sessionId: session.id,
+                answer: RemoteUserInputAnswer(
+                    requestId: "req-choice", answer: "Yes, deploy", wasFreeform: false
+                )
+            ),
+            .invalid
+        )
+    }
+
+    @MainActor
     func testScheduledIdleTurnDoesNotPostCompletionNotification() async throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory
@@ -1203,7 +1914,10 @@ final class AppLogicTests: XCTestCase {
             timestamp: 200,
             source: "agent-stop"
         )
-        try await Task.sleep(nanoseconds: 50_000_000)
+        for _ in 0 ..< 50 {
+            if notifications.calls.count == 1 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
 
         XCTAssertEqual(notifications.calls.count, 1)
         XCTAssertEqual(
@@ -1329,9 +2043,30 @@ final class AppLogicTests: XCTestCase {
     }
 
     func testSessionIdAndShellQuoting() {
-        XCTAssertTrue(TerminalController.isSafeSessionId(UUID().uuidString))
+        let sessionId = UUID().uuidString
+        XCTAssertTrue(TerminalController.isSafeSessionId(sessionId))
         XCTAssertFalse(TerminalController.isSafeSessionId("../../bad"))
         XCTAssertEqual(TerminalController.shellSingleQuote("a'b"), "'a'\\''b'")
+        XCTAssertEqual(
+            TerminalController.resumeCommand(sessionId: sessionId, allowAll: false),
+            "copilot --resume=\(sessionId)"
+        )
+        XCTAssertEqual(
+            TerminalController.resumeCommand(sessionId: sessionId, allowAll: true),
+            "copilot --allow-all --resume=\(sessionId)"
+        )
+        XCTAssertTrue(AppModel.shouldResumeWithAllowAll(
+            copilotSessionId: sessionId,
+            allowAllSessionId: sessionId
+        ))
+        XCTAssertFalse(AppModel.shouldResumeWithAllowAll(
+            copilotSessionId: sessionId,
+            allowAllSessionId: UUID().uuidString
+        ))
+        XCTAssertFalse(AppModel.shouldResumeWithAllowAll(
+            copilotSessionId: nil,
+            allowAllSessionId: sessionId
+        ))
     }
 
     func testSessionStatusMarkersPersistAsAPair() throws {
@@ -1802,6 +2537,215 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteGatewayAnswerUserInputRequiresLeaseAndReportsStatuses() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        let sessionId = "session-answer"
+        let session = Session(id: sessionId, title: "Test Session", cwd: "/")
+        let project = Project(id: "pid", name: "Project", cwd: "/", sessions: [session])
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { Date() },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0
+        )
+
+        func answerBody(
+            requestId: String,
+            answer: String,
+            wasFreeform: Bool,
+            rawData: String? = nil
+        ) throws -> Data {
+            let payload: String
+            if let rawData {
+                payload = rawData
+            } else {
+                payload = String(
+                    decoding: try JSONEncoder().encode(RemoteUserInputAnswer(
+                        requestId: requestId, answer: answer, wasFreeform: wasFreeform
+                    )),
+                    as: UTF8.self
+                )
+            }
+            return try JSONEncoder().encode(RemoteClientMessage(
+                type: "answer-user-input",
+                clientId: "phone",
+                sessionId: sessionId,
+                data: payload
+            ))
+        }
+
+        do {
+            // No writer lease yet → forbidden.
+            let withoutLease = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(requestId: "req-1", answer: "Go", wasFreeform: false)
+            )
+            XCTAssertEqual(withoutLease, 403)
+
+            let acquire = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try JSONEncoder().encode(RemoteClientMessage(
+                    type: "acquire", clientId: "phone", sessionId: sessionId, data: nil
+                ))
+            )
+            XCTAssertEqual(acquire, 204)
+
+            // Malformed answer payload → bad request.
+            let malformed = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "", answer: "", wasFreeform: false, rawData: "{"
+                )
+            )
+            XCTAssertEqual(malformed, 400)
+
+            // No live question yet → unprocessable.
+            let noQuestion = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(requestId: "req-1", answer: "Go", wasFreeform: false)
+            )
+            XCTAssertEqual(noQuestion, 422)
+
+            // Publish a fresh question and Copilot-session marker.
+            let snapshot = AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: ISO8601DateFormatter().string(from: Date()),
+                foregroundTurnActive: false,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: 0,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil,
+                trackedUserInputs: [
+                    TrackedUserInput(
+                        requestId: "req-1",
+                        question: "Ready?",
+                        choices: ["Go", "Wait"],
+                        allowFreeform: false,
+                        requestedAt: ISO8601DateFormatter().string(from: Date()),
+                        agentId: nil
+                    ),
+                    TrackedUserInput(
+                        requestId: "req-escaped",
+                        question: "Explain?",
+                        choices: [],
+                        allowFreeform: true,
+                        requestedAt: ISO8601DateFormatter().string(from: Date()),
+                        agentId: nil
+                    ),
+                ]
+            )
+            try JSONEncoder().encode(snapshot).write(
+                to: root.appendingPathComponent("\(sessionId).agent-activity.json")
+            )
+            try Data("copilot-session".utf8).write(
+                to: root.appendingPathComponent("\(sessionId).copilot-session")
+            )
+
+            let escapedAnswer = String(repeating: "\u{1}", count: 8_192)
+            let escapedAnswerBody = try answerBody(
+                requestId: "req-escaped",
+                answer: escapedAnswer,
+                wasFreeform: true
+            )
+            XCTAssertGreaterThan(escapedAnswerBody.count, 24 * 1_024)
+            let escapedAccepted = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: escapedAnswerBody
+            )
+            XCTAssertEqual(escapedAccepted, 204)
+            try FileManager.default.removeItem(
+                at: root.appendingPathComponent("\(sessionId).user-input-response.json")
+            )
+
+            let accepted = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(requestId: "req-1", answer: "Go", wasFreeform: false)
+            )
+            XCTAssertEqual(accepted, 204)
+
+            // A second answer while the response awaits pickup → conflict.
+            let conflict = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(requestId: "req-1", answer: "Wait", wasFreeform: false)
+            )
+            XCTAssertEqual(conflict, 409)
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
+        SessionArtifacts.removeFiles(sessionId: sessionId)
+    }
+
+    @MainActor
     func testRemoteGatewayTranscriptSuccess() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1943,6 +2887,11 @@ final class AppLogicTests: XCTestCase {
             ),
             provider: APNsSenderSpy()
         )
+        let notificationSync = NotificationSyncService(
+            ledger: NotificationLedger(url: root.appendingPathComponent("ledger.json")),
+            webPushService: webPushService,
+            apnsService: apnsService
+        )
 
         let gateway = RemoteGateway()
         let port = try gateway.start(
@@ -1952,7 +2901,8 @@ final class AppLogicTests: XCTestCase {
             verifier: verifier,
             port: 0,
             webPushService: webPushService,
-            apnsService: apnsService
+            apnsService: apnsService,
+            notificationSync: notificationSync
         )
         do {
             let missingToken = try await remoteHTTPStatus(port: port, path: "/")
@@ -2035,6 +2985,28 @@ final class AppLogicTests: XCTestCase {
                 body: controlBody
             )
             XCTAssertEqual(allowedControl, 204)
+            let notificationID = UUID()
+            let dismissalBody = try JSONEncoder().encode(
+                NotificationDismissRequest(id: notificationID)
+            )
+            let missingDismissOrigin = try await remoteHTTPStatus(
+                port: port,
+                path: "/\(NotificationSyncContract.dismissPath)",
+                method: "POST",
+                token: token,
+                body: dismissalBody
+            )
+            XCTAssertEqual(missingDismissOrigin, 403)
+            let dismissalStatus = try await remoteHTTPStatus(
+                port: port,
+                path: "/\(NotificationSyncContract.dismissPath)",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: dismissalBody
+            )
+            XCTAssertEqual(dismissalStatus, 204)
+            XCTAssertEqual(notificationSync.dismissalSnapshot().ids, [notificationID])
             let promptBody = try JSONEncoder().encode(RemoteClientMessage(
                 type: "prompt",
                 clientId: "phone",
@@ -2364,6 +3336,41 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(snapshot.promptable)
     }
 
+    func testRemoteSessionSnapshotDecodesWithoutPendingUserInputs() throws {
+        let data = Data("""
+        {
+          "id":"session",
+          "title":"shell",
+          "status":"idle",
+          "unread":false,
+          "ready":false,
+          "background":false,
+          "scheduled":false,
+          "promptable":true
+        }
+        """.utf8)
+        let snapshot = try JSONDecoder().decode(RemoteSessionSnapshot.self, from: data)
+        XCTAssertNil(snapshot.pendingUserInputs)
+    }
+
+    func testRemoteUserInputRequestPreservesVerbatimChoices() throws {
+        let request = RemoteUserInputRequest(
+            requestId: "req-1",
+            question: "Deploy to production?",
+            choices: ["Yes, deploy", "No — keep the current build"],
+            allowFreeform: true,
+            requestedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            agentId: "agent-3"
+        )
+        let decoded = try JSONDecoder().decode(
+            RemoteUserInputRequest.self,
+            from: JSONEncoder().encode(request)
+        )
+        XCTAssertEqual(decoded, request)
+        XCTAssertEqual(decoded.id, "req-1")
+        XCTAssertEqual(decoded.choices, ["Yes, deploy", "No — keep the current build"])
+    }
+
     func testRemoteWebCommandInputHasAccessibleName() {
         XCTAssertTrue(RemoteWebAssets.html.contains("aria-label=\"Command input\""))
         XCTAssertTrue(RemoteWebAssets.html.contains("aria-label=\"Message Copilot\""))
@@ -2404,6 +3411,60 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "if (selected !== id || selectionGeneration !== submittedGeneration) return;"
         ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if ((state?.pendingUserInputs || []).length > 0) return;"
+        ))
+    }
+
+    func testRemoteWebSurfacesUserInputCardsSafely() {
+        XCTAssertTrue(RemoteWebAssets.html.contains(#"id="user-input""#))
+        // Untrusted question/choice text is only ever set via textContent.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "question.textContent = request.question;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("button.textContent = choice;"))
+        // Choice buttons submit the exact choice with wasFreeform = false.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "submitUserInput(request.requestId, choice, false)"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "submitUserInput(request.requestId, value, true)"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("type: 'answer-user-input'"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "data: JSON.stringify({ requestId, answer, wasFreeform })"
+        ))
+        // Composer is suppressed while questions are pending.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "promptForm.classList.toggle('hidden', hasQuestions)"
+        ))
+        // Retry/removal semantics: 15s fallback, snapshot-driven removal, error codes.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("}, 15000);"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "sessionHasUserInput(submittedSession, requestId)"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("if (!ids.has(requestId)) {"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("entry.token !== token"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "latestUserInputAttempts.get(requestId) !== token"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 403"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (!selected || !writable || submittingUserInputs.has(requestId)) return;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("aria-labelledby"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("aria-describedby"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("refreshUserInputCardStates();"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 409"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 422"))
+    }
+
+    func testRemoteServiceWorkerClearsSyncedNotifications() {
+        XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("payload.action === 'clear'"))
+        XCTAssertTrue(RemoteWebAssets.serviceWorker.contains(
+            "self.registration.getNotifications"
+        ))
+        XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("notification.close()"))
     }
 
     func testRemoteWebSessionPivotMirrorsIOS() {
@@ -2571,6 +3632,48 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(service.status().lastError)
     }
 
+    func testWebPushClearSkipsLegacySubscriptionsWithoutCapability() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WebPushSubscriptionStore(
+            url: root.appendingPathComponent("subscriptions.json")
+        )
+        try store.add(JSONDecoder().decode(
+            WebPushRegistration.self,
+            from: webPushRegistrationData(
+                endpoint: "https://wns2-by3p.notify.windows.com/sub/capable"
+            )
+        ))
+        try store.add(JSONDecoder().decode(
+            WebPushRegistration.self,
+            from: webPushRegistrationData(
+                endpoint: "https://wns2-by3p.notify.windows.com/sub/legacy",
+                supportsClearAction: false
+            )
+        ))
+        let sender = WebPushSenderSpy()
+        let service = WebPushService(
+            publicKey: VAPID.Key().id.description,
+            store: store,
+            sender: sender
+        )
+
+        await service.sendDismissal(id: UUID())
+
+        let payloads = await sender.sentPayloads()
+        let endpoints = await sender.sentEndpoints()
+        XCTAssertEqual(payloads.count, 1)
+        XCTAssertEqual(endpoints.map(\.lastPathComponent), ["capable"])
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        XCTAssertEqual(
+            try decoder.decode(RemoteNotificationPayload.self, from: payloads[0]).action,
+            .clear
+        )
+    }
+
     func testAPNsProviderTokenUsesRawES256Signature() async throws {
         let key = P256.Signing.PrivateKey()
         let configuration = APNsConfiguration(
@@ -2626,8 +3729,10 @@ final class AppLogicTests: XCTestCase {
             sessionId: "session"
         ))
         let device = await sender.firstDevice()
+        let payloads = await sender.sentPayloads()
         XCTAssertEqual(device?.environment, .production)
         XCTAssertEqual(device?.token, String(repeating: "ab", count: 32))
+        XCTAssertEqual(payloads.first?.action, .show)
         let permissions = try FileManager.default.attributesOfItem(
             atPath: root.appendingPathComponent("devices.json").path
         )[.posixPermissions] as? NSNumber
@@ -2642,6 +3747,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "registerSubscription(subscription, applicationServerKey)"
         ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("capabilities: ['clear-action']"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("rel = 'noopener noreferrer'"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("push/subscribe"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("type: 'prompt'"))
@@ -2651,6 +3757,12 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 409"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 422"))
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("notificationclick"))
+        XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("notificationclose"))
+        XCTAssertTrue(RemoteWebAssets.serviceWorker.contains(
+            NotificationSyncContract.dismissPath
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("dismissed-notifications"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("clearDismissedNotifications"))
     }
 
     func testRemoteQueryItemsParsesSession() {
@@ -2805,10 +3917,12 @@ final class AppLogicTests: XCTestCase {
             "set-status", "waiting",
             "--notification", "permission",
             "--session", "session-1",
+            "--copilot-session", "copilot-session-1",
         ], environment: environment), 0)
         XCTAssertEqual(received?.status, "waiting")
         XCTAssertEqual(received?.notification, .permission)
         XCTAssertEqual(received?.sessionId, "session-1")
+        XCTAssertEqual(received?.copilotSessionId, "copilot-session-1")
     }
 
     func testControlServerSurvivesClientDisconnectBeforeResponse() throws {
@@ -2955,9 +4069,12 @@ final class AppLogicTests: XCTestCase {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    private func webPushRegistrationData(endpoint: String) throws -> Data {
+    private func webPushRegistrationData(
+        endpoint: String,
+        supportsClearAction: Bool = true
+    ) throws -> Data {
         let key = VAPID.Key().id.description
-        return try JSONSerialization.data(withJSONObject: [
+        var registration: [String: Any] = [
             "subscription": [
                 "endpoint": endpoint,
                 "keys": [
@@ -2967,7 +4084,11 @@ final class AppLogicTests: XCTestCase {
                 "applicationServerKey": key,
             ],
             "label": "Test Browser",
-        ])
+        ]
+        if supportsClearAction {
+            registration["capabilities"] = ["clear-action"]
+        }
+        return try JSONSerialization.data(withJSONObject: registration)
     }
 
     private func remoteHTTPStatus(

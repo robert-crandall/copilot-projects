@@ -78,6 +78,7 @@ public enum CopilotHooks {
         [ -z "${2:-}" ] || args+=(--timestamp "$2")
         [ -z "${3:-}" ] || args+=(--source "$3")
         [ -z "${4:-}" ] || args+=(--notification "$4")
+        [ -z "${5:-}" ] || args+=(--copilot-session "$5")
         "$cli" "${args[@]}" >/dev/null 2>&1 || true
       fi
     }
@@ -122,28 +123,19 @@ public enum CopilotHooks {
       printf '%s' "$1" | grep -qE '\[Scheduled prompt #[0-9]+\]'
     }
     scheduled_turn="$state_dir/sessions/$session_id.scheduled-turn"
-    # Record the Copilot CLI session id (carried by tool/notification payloads as
-    # "sessionId") so the app can auto-resume THIS exact agent session after a
-    # reboot — copilot --resume=<id> — instead of guessing per tab. Best-effort;
-    # validates the id charset so nothing unsafe lands in the marker.
-    record_cli_session() {
+    # Extract the Copilot CLI session id (carried by hook payloads as "sessionId")
+    # so sessionEnd can only clear resume markers for the process that owns them.
+    payload_session_id() {
       # Match only a UUID-shaped value and take the leftmost: this relies on the
       # CLI emitting the real top-level "sessionId" first (escaped occurrences inside
-      # tool args/results don't match the unescaped pattern). Captured only on
-      # tool/notification events, so a pure-chat session that never calls a tool
-      # isn't recorded — best-effort.
+      # tool args/results don't match the unescaped pattern).
       cid="$(printf '%s' "$1" \
         | grep -oE '"sessionId"[[:space:]]*:[[:space:]]*"[0-9A-Fa-f-]{36}"' \
         | head -1 \
         | sed -E 's/.*"([0-9A-Fa-f-]{36})"$/\1/')"
       case "$cid" in
-        ""|*[!0-9A-Fa-f-]*) : ;;   # empty or non-UUID charset -> skip
-        *) mkdir -p "$state_dir/sessions" 2>/dev/null || true
-           # Write atomically (tmp + mv) so the app never reads a half-truncated marker.
-           tmp="$state_dir/sessions/.$session_id.copilot-session.$$"
-           if printf '%s' "$cid" > "$tmp" 2>/dev/null; then
-             mv -f "$tmp" "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null || rm -f "$tmp" 2>/dev/null
-           fi || true ;;
+        ""|*[!0-9A-Fa-f-]*) printf '' ;;
+        *) printf '%s' "$cid" ;;
       esac
     }
 
@@ -192,7 +184,6 @@ public enum CopilotHooks {
         ;;
       pre)
         payload="$(cat 2>/dev/null || true)"
-        record_cli_session "$payload"
         if [ -f "$scheduled_turn" ]; then
           : > "$scheduled_turn"
           status idle "$(payload_timestamp "$payload")" scheduled-active
@@ -203,7 +194,6 @@ public enum CopilotHooks {
         ;;
       post)
         payload="$(cat 2>/dev/null || true)"
-        record_cli_session "$payload"
         if [ -f "$scheduled_turn" ]; then
           : > "$scheduled_turn"
           status idle "$(payload_timestamp "$payload")" scheduled-active
@@ -214,7 +204,6 @@ public enum CopilotHooks {
         ;;
       notify)
         payload="$(cat 2>/dev/null || true)"
-        record_cli_session "$payload"
         timestamp="$(payload_timestamp "$payload")"
         if is_session_idle "$payload"; then
           if [ -f "$scheduled_turn" ]; then
@@ -252,18 +241,16 @@ public enum CopilotHooks {
         ;;
       end)
         payload="$(cat 2>/dev/null || true)"
-        # The agent session ENDED (user exited) — drop the resume marker so the tab
-        # doesn't boot back into a session the user already left ("zombie resume").
-        # Only sessionEnd maps here; agentStop (between-turn idle, session alive) uses
-        # `idle` and must NOT clear it. If a reboot kills the agent mid-session, this
-        # never fires, so the marker survives and the session resumes — as intended.
-        rm -f "$state_dir/sessions/$session_id.copilot-session" 2>/dev/null || true
+        # Copilot reports both an explicit exit and a graceful macOS shutdown as
+        # sessionEnd(reason=user_exit). Let the live app clear the resume marker only
+        # when it is not terminating; if the app is shutting down or unreachable, the
+        # marker survives for post-reboot resume.
         rm -f "$state_dir/sessions/$session_id.session-idle-hook" 2>/dev/null || true
         rm -f "$state_dir/sessions/$session_id.background-agents" 2>/dev/null || true
         rm -f "$state_dir/sessions/$session_id.active-turn" 2>/dev/null || true
         rm -f "$state_dir/sessions/$session_id.agent-stop-completion" 2>/dev/null || true
         rm -f "$scheduled_turn" 2>/dev/null || true
-        status idle "$(payload_timestamp "$payload")"
+        status idle "$(payload_timestamp "$payload")" session-end "" "$(payload_session_id "$payload")"
         ;;
     esac
     emit
@@ -274,7 +261,7 @@ public enum CopilotHooks {
     /// to idle so a fresh agent never reads as running; tool events keep it running;
     /// the notification hook surfaces "waiting" when the agent raises an ask_user /
     /// permission prompt (which fire no tool hook); sessionEnd (`end`) resets to idle
-    /// AND drops the resume marker so an exited session isn't auto-resumed on reboot.
+    /// and asks the live app to clear the resume marker unless the app is terminating.
     public static let config = #"""
     {
       "version": 1,

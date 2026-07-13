@@ -16,7 +16,7 @@ public enum CopilotExtension {
 
     public static let script = #"""
     import { dirname, join } from "node:path";
-    import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+    import { mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from "node:fs";
     import { joinSession } from "@github/copilot-sdk/extension";
 
     const appSessionId = process.env.COPILOT_PROJECTS_SESSION
@@ -26,6 +26,10 @@ public enum CopilotExtension {
     const validSessionId = /^[0-9A-Fa-f-]{36}$/.test(appSessionId || "");
 
     const session = await joinSession();
+    const copilotSessionId = typeof session.sessionId === "string"
+        ? session.sessionId
+        : "";
+    const validCopilotSessionId = /^[0-9A-Fa-f-]{36}$/.test(copilotSessionId);
 
     if (validSessionId && socketPath) {
         const sessionsDir = join(dirname(socketPath), "sessions");
@@ -34,7 +38,18 @@ public enum CopilotExtension {
         const transcriptOwnerPath = join(sessionsDir, `${appSessionId}.transcript-owner.json`);
         const transcriptOwnerLockPath = `${transcriptOwnerPath}.lock`;
         const scheduledTurnPath = join(sessionsDir, `${appSessionId}.scheduled-turn`);
+        const copilotSessionPath = join(sessionsDir, `${appSessionId}.copilot-session`);
+        const allowAllPath = join(sessionsDir, `${appSessionId}.copilot-allow-all`);
+        const userInputResponsePath = join(
+            sessionsDir, `${appSessionId}.user-input-response.json`
+        );
+        const userInputResponseName = `${appSessionId}.user-input-response.json`;
         const activeSubagents = new Map();
+        // All outstanding structured questions (root and subagent), keyed by
+        // requestId. Starts empty every launch: stale question state is never
+        // resurrected from disk, only rebuilt from live events.
+        const pendingUserInputs = new Map();
+        const inFlightUserInputResponses = new Set();
         let foregroundTurnActive = false;
         let scheduledTurnActive = false;
         let currentTurnKind = null;
@@ -48,6 +63,9 @@ public enum CopilotExtension {
         let pendingTranscriptTurn = null;
         let transcriptInitialized = false;
         let transcriptPublishTimer = null;
+        let sharedFilesOwnershipInitializedFor = null;
+        let allowAllRefreshQueued = false;
+        let allowAllUpdateGeneration = 0;
 
         const MAX_TRANSCRIPT_TURNS = 200;
         const MAX_TRANSCRIPT_BYTES = 5 * 1024 * 1024;
@@ -56,6 +74,13 @@ public enum CopilotExtension {
         const MAX_TRANSCRIPT_ASSISTANT_MESSAGES = 250;
         const MAX_TRANSCRIPT_TOOLS = 400;
         const TRANSCRIPT_PUBLISH_THROTTLE_MS = 400;
+
+        const MAX_USER_INPUT_QUESTION_BYTES = 16_384;
+        const MAX_USER_INPUT_CHOICE_BYTES = 8_192;
+        const MAX_USER_INPUT_CHOICES = 50;
+        const MAX_USER_INPUT_TOTAL_BYTES = 32_768;
+        const MAX_USER_INPUT_ANSWER_BYTES = 8_192;
+        const MAX_USER_INPUTS = 50;
 
         function truncatedText(value, maximumLength) {
             const text = typeof value === "string" ? value : "";
@@ -199,16 +224,25 @@ public enum CopilotExtension {
             for (let attempt = 0; attempt < 3; attempt += 1) {
                 const owner = recordedOwner();
                 if (owner) {
-                    if (ownerMatchesCurrentProcess(owner)) return true;
+                    if (ownerMatchesCurrentProcess(owner)) {
+                        activateSharedFilesOwnership();
+                        return true;
+                    }
                     if (processAlive(owner.pid)) return false;
-                    if (reclaimDeadOwner(owner)) return true;
+                    if (reclaimDeadOwner(owner)) {
+                        activateSharedFilesOwnership(true);
+                        return true;
+                    }
                 } else if (writeOwnerMarker()) {
+                    activateSharedFilesOwnership(true);
                     return true;
                 } else {
                     // Lost the create race; re-read and re-evaluate.
                 }
             }
-            return ownerMatchesCurrentProcess(recordedOwner());
+            const owns = ownerMatchesCurrentProcess(recordedOwner());
+            if (owns) activateSharedFilesOwnership();
+            return owns;
         }
 
         function normalizedTimestamp(value) {
@@ -222,6 +256,43 @@ public enum CopilotExtension {
             try {
                 rmSync(path, { force: true });
             } catch {}
+        }
+
+        function writeMarker(path, value) {
+            const temporaryPath = `${path}.${process.pid}.tmp`;
+            try {
+                writeFileSync(temporaryPath, value);
+                renameSync(temporaryPath, path);
+            } catch {
+                removeFile(temporaryPath);
+            }
+        }
+
+        function refreshAllowAllSoon() {
+            if (allowAllRefreshQueued) return;
+            allowAllRefreshQueued = true;
+            Promise.resolve()
+                .then(() => refreshAllowAll())
+                .catch(() => {})
+                .finally(() => { allowAllRefreshQueued = false; });
+        }
+
+        function activateSharedFilesOwnership(force = false) {
+            const ownershipKey = `${copilotSessionId}:${process.pid}`;
+            if (!force && sharedFilesOwnershipInitializedFor === ownershipKey) return;
+            sharedFilesOwnershipInitializedFor = ownershipKey;
+            if (validCopilotSessionId) {
+                writeMarker(copilotSessionPath, copilotSessionId);
+            }
+            refreshAllowAllSoon();
+        }
+
+        function applyAllowAllMarker(enabled) {
+            if (!ownsSharedFiles()) return;
+            removeFile(allowAllPath);
+            if (enabled && validCopilotSessionId) {
+                writeMarker(allowAllPath, copilotSessionId);
+            }
         }
 
         function setScheduledTurnMarker(active) {
@@ -238,6 +309,9 @@ public enum CopilotExtension {
         try {
             mkdirSync(sessionsDir, { recursive: true });
         } catch {}
+        if (validCopilotSessionId && ownsSharedFiles()) {
+            writeMarker(copilotSessionPath, copilotSessionId);
+        }
 
         function publish(error) {
             if (!ownsSharedFiles()) return;
@@ -251,14 +325,141 @@ public enum CopilotExtension {
                 idleGeneration,
                 lastIdleAborted,
                 lastIdleTurnKind,
+                trackedUserInputs: [...pendingUserInputs.values()],
                 ...(error ? { error: String(error) } : {}),
             };
             const temporaryPath = `${snapshotPath}.${process.pid}.tmp`;
             try {
-                writeFileSync(temporaryPath, JSON.stringify(snapshot));
+                // Mode 0600 because the snapshot now carries question text.
+                writeFileSync(temporaryPath, JSON.stringify(snapshot), { mode: 0o600 });
                 renameSync(temporaryPath, snapshotPath);
             } catch {
                 removeFile(temporaryPath);
+            }
+        }
+
+        function userInputByteLength(value) {
+            return typeof value === "string" ? Buffer.byteLength(value) : Infinity;
+        }
+
+        // Build a bounded, verbatim question record or return null to reject remote
+        // exposure entirely — never truncating a selectable choice, so the terminal
+        // fallback stays exact.
+        function userInputEntry(event) {
+            const data = event?.data;
+            if (!data || typeof data !== "object") return null;
+            const requestId = data.requestId;
+            if (typeof requestId !== "string" || !requestId
+                    || requestId.length > 200) return null;
+            const question = data.question;
+            if (typeof question !== "string") return null;
+            let totalBytes = userInputByteLength(question);
+            if (totalBytes > MAX_USER_INPUT_QUESTION_BYTES) return null;
+            const choices = [];
+            if (data.choices != null) {
+                if (!Array.isArray(data.choices)) return null;
+                if (data.choices.length > MAX_USER_INPUT_CHOICES) return null;
+                for (const choice of data.choices) {
+                    if (typeof choice !== "string") return null;
+                    const bytes = userInputByteLength(choice);
+                    if (bytes > MAX_USER_INPUT_CHOICE_BYTES) return null;
+                    totalBytes += bytes;
+                    if (totalBytes > MAX_USER_INPUT_TOTAL_BYTES) return null;
+                    choices.push(choice);
+                }
+            }
+            const agentId = typeof event.agentId === "string" && event.agentId
+                ? boundedMetadataText(event.agentId)
+                : null;
+            return {
+                requestId,
+                question,
+                choices,
+                allowFreeform: data.allowFreeform !== false,
+                requestedAt: normalizedTimestamp(event.timestamp),
+                agentId,
+            };
+        }
+
+        function boundPendingUserInputs() {
+            while (pendingUserInputs.size > MAX_USER_INPUTS) {
+                pendingUserInputs.delete(pendingUserInputs.keys().next().value);
+            }
+        }
+
+        // Answer a pending question from the host-written response file. Invalid or
+        // stale responses only remove the response file; the pending question and its
+        // exact terminal fallback are preserved. `user_input.completed` stays
+        // authoritative for removing a question.
+        async function processUserInputResponse() {
+            // Only the owner reconciles remote answers: a spawned classifier helper
+            // shares this session dir and would otherwise delete the owner's pending
+            // response (its session id / pending set won't match), stranding the
+            // answer and forcing the terminal fallback.
+            if (!ownsSharedFiles()) return;
+            let encoded;
+            try {
+                encoded = readFileSync(userInputResponsePath, "utf8");
+            } catch {
+                return;
+            }
+            let response;
+            try {
+                response = JSON.parse(encoded);
+            } catch {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            if (!response || typeof response !== "object"
+                    || response.schemaVersion !== 1
+                    || typeof response.requestId !== "string") {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            const requestId = response.requestId;
+            if (inFlightUserInputResponses.has(requestId)) return;
+            if (response.copilotSessionId !== session.sessionId) {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            const pending = pendingUserInputs.get(requestId);
+            if (!pending) {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            const answer = response.answer;
+            if (typeof answer !== "string"
+                    || userInputByteLength(answer) > MAX_USER_INPUT_ANSWER_BYTES) {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            const wasFreeform = response.wasFreeform === true;
+            if (wasFreeform && !pending.allowFreeform) {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            if (!wasFreeform && !pending.choices.includes(answer)) {
+                removeFile(userInputResponsePath);
+                return;
+            }
+            inFlightUserInputResponses.add(requestId);
+            try {
+                const result = await session.rpc.ui.handlePendingUserInput({
+                    requestId,
+                    response: { answer, wasFreeform },
+                });
+                if (result?.success === true) {
+                    pendingUserInputs.delete(requestId);
+                    removeFile(userInputResponsePath);
+                    publish();
+                } else {
+                    // Keep the question retryable; drop only the rejected response.
+                    removeFile(userInputResponsePath);
+                }
+            } catch {
+                removeFile(userInputResponsePath);
+            } finally {
+                inFlightUserInputResponses.delete(requestId);
             }
         }
 
@@ -558,6 +759,20 @@ public enum CopilotExtension {
             }
         }
 
+        async function refreshAllowAll() {
+            if (!ownsSharedFiles()) return;
+            const generation = ++allowAllUpdateGeneration;
+            // Fail closed if the RPC is unavailable: a stale marker must never grant
+            // full permissions to a different session in the same tab.
+            removeFile(allowAllPath);
+            try {
+                const result = await session.rpc.permissions.getAllowAll();
+                if (generation === allowAllUpdateGeneration) {
+                    applyAllowAllMarker(result.enabled === true);
+                }
+            } catch {}
+        }
+
         session.on("user.message", (event) => {
             if (event.agentId) return;
             lastIdleTurnKind = null;
@@ -595,6 +810,16 @@ public enum CopilotExtension {
             setTimeout(() => setScheduledTurnMarker(false), 5_000);
         });
 
+        session.on("session.permissions_changed", (event) => {
+            if (event.agentId) return;
+            const mode = event.data.allowAllPermissionMode;
+            allowAllUpdateGeneration += 1;
+            applyAllowAllMarker(
+                mode === "on"
+                    || (mode == null && event.data.allowAllPermissions === true)
+            );
+        });
+
         session.on("subagent.started", (event) => {
             const id = event.agentId || event.data.toolCallId;
             activeSubagents.set(id, {
@@ -622,6 +847,39 @@ public enum CopilotExtension {
         session.on("subagent.completed", finishSubagent);
         session.on("subagent.failed", finishSubagent);
 
+        // Clear stale answer state before any new question can be published, and
+        // establish the watcher before exposing questions so the first host answer
+        // cannot be stranded during startup.
+        if (ownsSharedFiles()) {
+            removeFile(userInputResponsePath);
+        }
+        let userInputWatcher = null;
+        try {
+            userInputWatcher = watch(sessionsDir, (_eventType, filename) => {
+                if (!filename || filename === userInputResponseName) {
+                    processUserInputResponse();
+                }
+            });
+        } catch {}
+
+        session.on("user_input.requested", (event) => {
+            const entry = userInputEntry(event);
+            // A rejected entry is never exposed remotely; the terminal keeps the
+            // exact prompt so nothing is lost.
+            if (!entry) return;
+            pendingUserInputs.set(entry.requestId, entry);
+            boundPendingUserInputs();
+            publish();
+        });
+
+        session.on("user_input.completed", (event) => {
+            const requestId = event.data?.requestId;
+            if (typeof requestId === "string" && pendingUserInputs.delete(requestId)) {
+                publish();
+            }
+        });
+
+        await refreshAllowAll();
         // Keep this Copilot session's last good drawer visible while history is
         // fetched, but clear a snapshot left by a different Copilot session.
         const preservedTranscriptTurns = restoreMatchingTranscript()
@@ -648,11 +906,21 @@ public enum CopilotExtension {
         publishTranscript();
 
         await refreshSchedules();
-        const timer = setInterval(refreshSchedules, 5_000);
+
+        processUserInputResponse();
+
+        const timer = setInterval(() => {
+            refreshSchedules();
+            processUserInputResponse();
+        }, 5_000);
 
         function cleanup() {
             clearInterval(timer);
             clearTimeout(transcriptPublishTimer);
+            if (userInputWatcher) {
+                try { userInputWatcher.close(); } catch {}
+                userInputWatcher = null;
+            }
             // Use the read-only ownership check (never claim during cleanup) so an
             // exiting spawned helper can't wipe a live interactive session's
             // markers. The owner flushes any progress buffered behind the publish
@@ -662,6 +930,7 @@ public enum CopilotExtension {
                 removeFile(snapshotPath);
                 removeFile(scheduledTurnPath);
                 removeFile(transcriptOwnerPath);
+                removeFile(userInputResponsePath);
             }
         }
         process.once("SIGTERM", cleanup);

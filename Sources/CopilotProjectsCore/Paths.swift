@@ -132,12 +132,24 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).copilot-session").path
     }
 
+    /// Per-tab marker containing the Copilot session id whose full allow-all
+    /// permission mode should be restored with that session.
+    public static func copilotAllowAllMarkerPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).copilot-allow-all").path
+    }
+
     public static func scheduledTurnMarkerPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).scheduled-turn").path
     }
 
     public static func agentActivitySnapshotPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).agent-activity.json").path
+    }
+
+    /// Response file the host atomically writes to answer a structured `ask_user`
+    /// question; the extension watches for it, replies over RPC, then removes it.
+    public static func userInputResponsePath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).user-input-response.json").path
     }
 
     public static func transcriptSnapshotPath(sessionId: String) -> String {

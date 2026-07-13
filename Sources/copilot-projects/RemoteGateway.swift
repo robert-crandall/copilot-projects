@@ -89,6 +89,13 @@ final class RemoteModelBridge: @unchecked Sendable {
     func sendPrompt(sessionId: String, value: String) -> RemotePromptResult {
         model?.sendRemotePrompt(sessionId: sessionId, value: value) ?? .invalid
     }
+
+    func answerUserInput(
+        sessionId: String,
+        answer: RemoteUserInputAnswer
+    ) -> RemoteUserInputResult {
+        model?.answerUserInput(sessionId: sessionId, answer: answer) ?? .invalid
+    }
 }
 
 /// Writer leases ensure only one remote client injects input into a given
@@ -180,7 +187,8 @@ final class RemoteGateway: @unchecked Sendable {
         verifier: CloudflareAccessVerifier,
         port: Int,
         webPushService: WebPushService? = nil,
-        apnsService: APNsService? = nil
+        apnsService: APNsService? = nil,
+        notificationSync: NotificationSyncService? = nil
     ) throws -> Int {
         if let boundPort = channel?.localAddress?.port { return boundPort }
         let auth = RemoteRequestAuth(
@@ -206,7 +214,8 @@ final class RemoteGateway: @unchecked Sendable {
                             bridge: bridge,
                             leases: leases,
                             webPushService: webPushService,
-                            apnsService: apnsService
+                            apnsService: apnsService,
+                            notificationSync: notificationSync
                         )
                     )
                 }
@@ -354,7 +363,10 @@ private let remoteCSP =
     "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; "
     + "worker-src 'self'; manifest-src 'self'; img-src 'self'; "
     + "frame-ancestors 'none'; base-uri 'none'"
-private let remoteMaxBodyBytes = 24 * 1_024
+// Remote answers are nested JSON; an 8 KiB raw answer can expand substantially
+// when control characters are escaped in the inner payload and outer envelope.
+private let remoteMaxBodyBytes = 80 * 1_024
+private let remoteMaxEncodedUserInputAnswerBytes = 64 * 1_024
 private let remoteWorkspaceRefreshInterval: TimeInterval = 2
 
 private final class RemoteHTTPHandler:
@@ -368,6 +380,7 @@ private final class RemoteHTTPHandler:
     private let leases: RemoteWriterLeases
     private let webPushService: WebPushService?
     private let apnsService: APNsService?
+    private let notificationSync: NotificationSyncService?
 
     private var head: HTTPRequestHead?
     private var body: [UInt8] = []
@@ -383,6 +396,7 @@ private final class RemoteHTTPHandler:
     private var lastScreenRevision: RemoteTerminalRevision?
     private var lastScreen: RemoteTerminalScreen?
     private var lastHistoryEndLine: Int?
+    private var lastDismissalSnapshot: NotificationDismissalSnapshot?
     private var lastTranscriptRevision: RemoteTranscriptRevision?
 
     init(
@@ -390,13 +404,15 @@ private final class RemoteHTTPHandler:
         bridge: RemoteModelBridge,
         leases: RemoteWriterLeases,
         webPushService: WebPushService?,
-        apnsService: APNsService?
+        apnsService: APNsService?,
+        notificationSync: NotificationSyncService?
     ) {
         self.auth = auth
         self.bridge = bridge
         self.leases = leases
         self.webPushService = webPushService
         self.apnsService = apnsService
+        self.notificationSync = notificationSync
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -448,6 +464,8 @@ private final class RemoteHTTPHandler:
                 handleAPNsRegistration(context: context, subscribe: true)
             case "/apns/unsubscribe":
                 handleAPNsRegistration(context: context, subscribe: false)
+            case "/\(NotificationSyncContract.dismissPath)":
+                handleNotificationDismissal(context: context)
             default:
                 respond(context: context, method: head.method, status: .notFound,
                         contentType: "text/plain", body: "Not found")
@@ -646,6 +664,7 @@ private final class RemoteHTTPHandler:
                     contentType: "text/plain", body: "too large")
             return
         }
+
         guard let apnsService else {
             respond(context: context, method: .POST, status: .serviceUnavailable,
                     contentType: "text/plain", body: "APNs unavailable")
@@ -666,6 +685,26 @@ private final class RemoteHTTPHandler:
             respond(context: context, method: .POST, status: .serviceUnavailable,
                     contentType: "text/plain", body: "APNs unavailable")
         }
+    }
+
+    private func handleNotificationDismissal(context: ChannelHandlerContext) {
+        guard !bodyTooLarge else {
+            respond(context: context, method: .POST, status: .payloadTooLarge,
+                    contentType: "text/plain", body: "too large")
+            return
+        }
+        guard let notificationSync,
+              let request = try? JSONDecoder().decode(
+                NotificationDismissRequest.self,
+                from: Data(body)
+              ) else {
+            respond(context: context, method: .POST, status: .badRequest,
+                    contentType: "text/plain", body: "Bad request")
+            return
+        }
+        notificationSync.dismiss(request)
+        respond(context: context, method: .POST, status: .noContent,
+                contentType: "text/plain", body: "")
     }
 
     private func handleControl(context: ChannelHandlerContext) {
@@ -725,6 +764,53 @@ private final class RemoteHTTPHandler:
                         response = (.conflict, "Copilot is still working")
                     case .noLiveCopilot:
                         response = (.unprocessableEntity, "Copilot is not ready")
+                    }
+                    self.respond(
+                        channel: channel,
+                        method: .POST,
+                        status: response.0,
+                        contentType: "text/plain",
+                        body: Data(response.1.utf8)
+                    )
+                }
+            }
+        case "answer-user-input":
+            guard let payload = message.data,
+                  payload.utf8.count <= remoteMaxEncodedUserInputAnswerBytes,
+                  let answer = try? JSONDecoder().decode(
+                    RemoteUserInputAnswer.self, from: Data(payload.utf8)
+                  ),
+                  answer.requestId.utf8.count <= 200,
+                  answer.answer.utf8.count <= 8_192 else {
+                respond(context: context, method: .POST, status: .badRequest,
+                        contentType: "text/plain", body: "Bad request")
+                return
+            }
+            guard leases.holds(sessionId: sessionId, clientId: clientId) else {
+                respond(context: context, method: .POST, status: .forbidden,
+                        contentType: "text/plain", body: "view only")
+                return
+            }
+            let channel = context.channel
+            let leases = self.leases
+            Task { @MainActor in
+                let result = leases.withHeldLease(
+                    sessionId: sessionId,
+                    clientId: clientId
+                ) {
+                    self.bridge.answerUserInput(sessionId: sessionId, answer: answer)
+                }
+                channel.eventLoop.execute {
+                    let response: (HTTPResponseStatus, String)
+                    switch result {
+                    case .some(.accepted):
+                        response = (.noContent, "")
+                    case .some(.conflict):
+                        response = (.conflict, "Another answer is still processing")
+                    case .some(.invalid):
+                        response = (.unprocessableEntity, "Answer was not accepted")
+                    case .none:
+                        response = (.forbidden, "view only")
                     }
                     self.respond(
                         channel: channel,
@@ -853,6 +939,7 @@ private final class RemoteHTTPHandler:
             let previousTranscriptRevision = self.lastTranscriptRevision
             let lastHistoryEndLine = self.lastHistoryEndLine
             let bridge = self.bridge
+            let dismissalSnapshot = self.notificationSync?.dismissalSnapshot()
             Task.detached {
                 let transcriptSessionId = await MainActor.run {
                     streamSessionId.flatMap {
@@ -907,6 +994,16 @@ private final class RemoteHTTPHandler:
                             guard self.emit(
                                 type: "workspace",
                                 value: workspace,
+                                channel: channel,
+                                authorizationExpiresAt: authorizationExpiresAt
+                            ) else { return }
+                        }
+                        if let dismissalSnapshot,
+                           dismissalSnapshot != self.lastDismissalSnapshot {
+                            self.lastDismissalSnapshot = dismissalSnapshot
+                            guard self.emit(
+                                type: "dismissed-notifications",
+                                value: dismissalSnapshot,
                                 channel: channel,
                                 authorizationExpiresAt: authorizationExpiresAt
                             ) else { return }

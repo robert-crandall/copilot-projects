@@ -63,10 +63,14 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertEqual(parsed.positionals, ["first", "--literal"])
     }
 
-    func testCopilotExtensionTracksSchedulesAndSubagentsWithoutTools() {
+    func testCopilotExtensionTracksSchedulesAndSubagentsWithoutTools() throws {
         XCTAssertTrue(CopilotExtension.script.contains("session.rpc.schedule.list()"))
         XCTAssertTrue(CopilotExtension.script.contains(#"session.on("subagent.started""#))
         XCTAssertTrue(CopilotExtension.script.contains(#"session.on("session.idle""#))
+        XCTAssertTrue(CopilotExtension.script.contains("session.rpc.permissions.getAllowAll()"))
+        XCTAssertTrue(CopilotExtension.script.contains(#"session.on("session.permissions_changed""#))
+        XCTAssertTrue(CopilotExtension.script.contains("writeMarker(copilotSessionPath, copilotSessionId)"))
+        XCTAssertTrue(CopilotExtension.script.contains("writeMarker(allowAllPath, copilotSessionId)"))
         XCTAssertTrue(CopilotExtension.script.contains("await session.getEvents()"))
         XCTAssertTrue(CopilotExtension.script.contains(#"case "assistant.message":"#))
         XCTAssertTrue(CopilotExtension.script.contains(#"case "tool.execution_complete":"#))
@@ -77,10 +81,43 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(CopilotExtension.script.contains("transcript-owner.json"))
         XCTAssertTrue(CopilotExtension.script.contains("transcriptOwnerLockPath"))
         XCTAssertTrue(CopilotExtension.script.contains("owner.pid === process.pid"))
+        XCTAssertTrue(CopilotExtension.script.contains("const copilotSessionId = typeof session.sessionId"))
         XCTAssertTrue(CopilotExtension.script.contains("schemaVersion: 3"))
         XCTAssertTrue(CopilotExtension.script.contains("publishTranscript();"))
         XCTAssertTrue(CopilotExtension.script.contains("removeFile(temporaryPath)"))
         XCTAssertTrue(CopilotExtension.script.contains("setScheduledTurnMarker(false)"))
+        XCTAssertTrue(CopilotExtension.script.contains(
+            #"session.on("user_input.requested""#
+        ))
+        XCTAssertTrue(CopilotExtension.script.contains(
+            #"session.on("user_input.completed""#
+        ))
+        XCTAssertTrue(CopilotExtension.script.contains(
+            "session.rpc.ui.handlePendingUserInput"
+        ))
+        XCTAssertTrue(CopilotExtension.script.contains(
+            "trackedUserInputs: [...pendingUserInputs.values()]"
+        ))
+        XCTAssertTrue(CopilotExtension.script.contains(".user-input-response.json"))
+        XCTAssertTrue(CopilotExtension.script.contains("watch(sessionsDir"))
+        // The heartbeat now carries question text, so it must be written 0600.
+        XCTAssertTrue(CopilotExtension.script.contains(
+            "JSON.stringify(snapshot), { mode: 0o600 }"
+        ))
+        XCTAssertTrue(CopilotExtension.script.contains(
+            "removeFile(userInputResponsePath)"
+        ))
+        let cleanupRange = try XCTUnwrap(CopilotExtension.script.range(
+            of: "Clear stale answer state before any new question can be published"
+        ))
+        let watcherRange = try XCTUnwrap(CopilotExtension.script.range(
+            of: "watch(sessionsDir"
+        ))
+        let listenerRange = try XCTUnwrap(CopilotExtension.script.range(
+            of: #"session.on("user_input.requested""#
+        ))
+        XCTAssertLessThan(cleanupRange.lowerBound, listenerRange.lowerBound)
+        XCTAssertLessThan(watcherRange.lowerBound, listenerRange.lowerBound)
         // The transcript turn must span a whole request, not stop at the first
         // agentic-loop turn end, and must not key suppression off parentAgentTaskId
         // (that field is present on genuine human input too).
@@ -89,6 +126,7 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertFalse(CopilotExtension.script.contains("scheduleTranscriptTurnEndFallback"))
         XCTAssertFalse(CopilotExtension.script.contains("schemaVersion: 2"))
         XCTAssertFalse(CopilotExtension.script.contains("joinSession({"))
+        XCTAssertFalse(CopilotExtension.script.contains("process.env.SESSION_ID"))
         XCTAssertFalse(CopilotExtension.script.contains("removeFile(transcriptPath)"))
     }
 
@@ -431,6 +469,221 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertEqual(summary?["firstUserContent"] as? String, "OWNED")
     }
 
+    func testCopilotExtensionRefreshesSessionMarkersWhenReclaimingOwnership() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-reclaim-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+        let copilotSessionId = "11111111-1111-4111-8111-111111111111"
+
+        let prelude = #"""
+        const namedListeners = new Map();
+        let allowAllChecks = 0;
+        const fakeSession = {
+          sessionId: "__COPILOT_SESSION_ID__",
+          rpc: {
+            schedule: { list: async () => ({entries:[]}) },
+            permissions: {
+              getAllowAll: async () => {
+                allowAllChecks += 1;
+                return { enabled: true };
+              }
+            }
+          },
+          on(name, handler) {
+            if (typeof name !== "function") namedListeners.set(name, handler);
+          },
+          async getEvents() { return []; }
+        };
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: "const joinSession = async () => fakeSession;"
+        )
+        let epilogue = #"""
+
+        const sessionsDir = `${process.env.COPILOT_PROJECTS_ROOT}/sessions`;
+        const base = `${sessionsDir}/${process.env.COPILOT_PROJECTS_SESSION}`;
+        const ownerPath = `${base}.transcript-owner.json`;
+        const copilotSessionPath = `${base}.copilot-session`;
+        const allowAllPath = `${base}.copilot-allow-all`;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        writeFileSync(copilotSessionPath, "old-session");
+        writeFileSync(allowAllPath, "old-session");
+        writeFileSync(ownerPath, JSON.stringify({
+          copilotSessionId: "old-session",
+          pid: 0
+        }));
+
+        namedListeners.get("assistant.turn_start")({
+          id: "turn",
+          type: "assistant.turn_start",
+          timestamp: "2026-07-12T04:00:00.000Z",
+          data: {}
+        });
+
+        let waited = 0;
+        while (waited < 4000) {
+          let sessionMarker = "";
+          let allowAllMarker = "";
+          try { sessionMarker = readFileSync(copilotSessionPath, "utf8"); } catch {}
+          try { allowAllMarker = readFileSync(allowAllPath, "utf8"); } catch {}
+          if (sessionMarker === "__COPILOT_SESSION_ID__"
+              && allowAllMarker === "__COPILOT_SESSION_ID__") break;
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+
+        const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+        console.log(JSON.stringify({
+          ownerSessionId: owner.copilotSessionId,
+          ownerPidIsCurrent: owner.pid === process.pid,
+          copilotSessionMarker: readFileSync(copilotSessionPath, "utf8"),
+          allowAllMarker: readFileSync(allowAllPath, "utf8"),
+          allowAllChecks
+        }));
+        process.exit(0);
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let scriptURL = root.appendingPathComponent("reclaim.mjs")
+        try (prelude + extensionScript + epilogue).write(
+            to: scriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        XCTAssertEqual(summary["ownerSessionId"] as? String, copilotSessionId)
+        XCTAssertEqual(summary["ownerPidIsCurrent"] as? Bool, true)
+        XCTAssertEqual(summary["copilotSessionMarker"] as? String, copilotSessionId)
+        XCTAssertEqual(summary["allowAllMarker"] as? String, copilotSessionId)
+        XCTAssertGreaterThan(summary["allowAllChecks"] as? Int ?? 0, 0)
+    }
+
+    func testCopilotExtensionDiscardsStaleAllowAllRefreshResult() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-allowall-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+        let copilotSessionId = "22222222-2222-4222-8222-222222222222"
+        try Data("old-session".utf8).write(
+            to: sessions.appendingPathComponent("\(appSessionId).copilot-allow-all")
+        )
+
+        let prelude = #"""
+        const namedListeners = new Map();
+        let allowAllChecks = 0;
+        let permissionsEvents = 0;
+        const fakeSession = {
+          sessionId: "__COPILOT_SESSION_ID__",
+          rpc: {
+            schedule: { list: async () => ({entries:[]}) },
+            permissions: {
+              getAllowAll: async () => {
+                allowAllChecks += 1;
+                const listener = namedListeners.get("session.permissions_changed");
+                if (listener) {
+                  permissionsEvents += 1;
+                  listener({
+                    id: `permissions-off-${allowAllChecks}`,
+                    type: "session.permissions_changed",
+                    data: { allowAllPermissionMode: "off" }
+                  });
+                }
+                return { enabled: true };
+              }
+            }
+          },
+          on(name, handler) {
+            if (typeof name !== "function") namedListeners.set(name, handler);
+          },
+          async getEvents() { return []; }
+        };
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: "const joinSession = async () => fakeSession;"
+        )
+        let epilogue = #"""
+
+        const { existsSync } = await import("node:fs");
+        const allowAllPath = `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
+          + `${process.env.COPILOT_PROJECTS_SESSION}.copilot-allow-all`;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        console.log(JSON.stringify({
+          allowAllExists: existsSync(allowAllPath),
+          allowAllChecks,
+          permissionsEvents
+        }));
+        process.exit(0);
+        """#
+        let scriptURL = root.appendingPathComponent("allowall.mjs")
+        try (prelude + extensionScript + epilogue).write(
+            to: scriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        XCTAssertEqual(summary["allowAllExists"] as? Bool, false)
+        XCTAssertGreaterThan(summary["allowAllChecks"] as? Int ?? 0, 0)
+        XCTAssertGreaterThan(summary["permissionsEvents"] as? Int ?? 0, 0)
+    }
+
     func testCopilotExtensionTranscriptByteBudgetPreservesForeground() throws {
         try requireNodeForJavaScriptTests()
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -635,6 +888,209 @@ final class CoreLogicTests: XCTestCase {
         return try XCTUnwrap(
             JSONSerialization.jsonObject(with: output) as? [String: Any]
         )
+    }
+
+    func testCopilotExtensionTracksBoundsAndAnswersUserInput() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-userinput-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+
+        let prelude = #"""
+        let transcriptListener = null;
+        const namedListeners = new Map();
+        const handledUserInputCalls = [];
+        const fakeSession = {
+          sessionId: "copilot-session",
+          rpc: {
+            schedule: { list: async () => ({entries:[]}) },
+            permissions: { getAllowAll: async () => ({enabled:false}) },
+            ui: {
+              handlePendingUserInput: async (payload) => {
+                handledUserInputCalls.push(payload);
+                return { success: true };
+              },
+            },
+          },
+          on(name, handler) {
+            if (typeof name === "function") { transcriptListener = name; return; }
+            namedListeners.set(name, handler);
+          },
+          emit(event) {
+            const named = namedListeners.get(event.type);
+            if (named) named(event);
+            if (transcriptListener) transcriptListener(event);
+          },
+          async getEvents() { return []; }
+        };
+        globalThis.__fakeSession = fakeSession;
+        """#
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: "const joinSession = async () => fakeSession;"
+        )
+        let epilogue = #"""
+
+        const { existsSync, statSync } = await import("node:fs");
+        const sessionsDir = `${process.env.COPILOT_PROJECTS_ROOT}/sessions`;
+        const base = `${sessionsDir}/${process.env.COPILOT_PROJECTS_SESSION}`;
+        const snapshotPath = `${base}.agent-activity.json`;
+        const responsePath = `${base}.user-input-response.json`;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        __fakeSession.emit({
+          id:"ui-root",type:"user_input.requested",
+          timestamp:"2026-07-12T03:00:01.000Z",
+          data:{requestId:"req-root",question:"Proceed with deploy?",
+            choices:["Yes, deploy","No, cancel"],allowFreeform:false}
+        });
+        __fakeSession.emit({
+          id:"ui-sub",type:"user_input.requested",agentId:"agent-7",
+          timestamp:"2026-07-12T03:00:02.000Z",
+          data:{requestId:"req-sub",question:"Name it",choices:[],allowFreeform:true}
+        });
+        __fakeSession.emit({
+          id:"ui-default-freeform",type:"user_input.requested",
+          timestamp:"2026-07-12T03:00:02.500Z",
+          data:{requestId:"req-default",question:"Omitted allowFreeform?",choices:[]}
+        });
+        // Oversized choice: rejected entirely, never truncated or exposed.
+        __fakeSession.emit({
+          id:"ui-big",type:"user_input.requested",
+          timestamp:"2026-07-12T03:00:03.000Z",
+          data:{requestId:"req-big",question:"x",choices:["y".repeat(9000)]}
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const firstSnapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+        const pendingBefore = firstSnapshot.trackedUserInputs.map((u) => u.requestId);
+        const rootRequest = firstSnapshot.trackedUserInputs.find(
+          (u) => u.requestId === "req-root"
+        );
+        const subRequest = firstSnapshot.trackedUserInputs.find(
+          (u) => u.requestId === "req-sub"
+        );
+        const defaultRequest = firstSnapshot.trackedUserInputs.find(
+          (u) => u.requestId === "req-default"
+        );
+        const snapshotMode = (statSync(snapshotPath).mode & 0o777).toString(8);
+
+        // A stale/foreign-session response is dropped without answering.
+        writeFileSync(responsePath, JSON.stringify({
+          schemaVersion:1,copilotSessionId:"other-session",
+          requestId:"req-root",answer:"Yes, deploy",wasFreeform:false
+        }));
+        let waited = 0;
+        while (waited < 6000 && existsSync(responsePath)) {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+        const staleHandled = handledUserInputCalls.length;
+        const staleStillPending = JSON.parse(readFileSync(snapshotPath, "utf8"))
+          .trackedUserInputs.some((u) => u.requestId === "req-root");
+
+        // A valid verbatim-choice response is delivered over RPC and clears the
+        // question from the heartbeat.
+        writeFileSync(responsePath, JSON.stringify({
+          schemaVersion:1,copilotSessionId:"copilot-session",
+          requestId:"req-root",answer:"Yes, deploy",wasFreeform:false
+        }));
+        waited = 0;
+        while (waited < 6000 && handledUserInputCalls.length === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+        // Give the extension a moment to remove the response and republish.
+        waited = 0;
+        while (waited < 3000 && existsSync(responsePath)) {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+        // A question answered through the terminal clears via the SDK's
+        // user_input.completed event shape.
+        __fakeSession.emit({
+          id:"ui-sub-complete",type:"user_input.completed",agentId:"agent-7",
+          timestamp:"2026-07-12T03:00:04.000Z",
+          data:{requestId:"req-sub",answer:"A name",wasFreeform:true}
+        });
+        __fakeSession.emit({
+          id:"ui-default-complete",type:"user_input.completed",
+          timestamp:"2026-07-12T03:00:05.000Z",
+          data:{requestId:"req-default",answer:"Done",wasFreeform:true}
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        const afterSnapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+
+        console.log(JSON.stringify({
+          pendingBefore,
+          rejectedBigChoice: pendingBefore.includes("req-big"),
+          rootChoices: rootRequest?.choices,
+          rootAllowFreeform: rootRequest?.allowFreeform,
+          subAgentId: subRequest?.agentId,
+          defaultAllowFreeform: defaultRequest?.allowFreeform,
+          snapshotMode,
+          staleHandled,
+          staleStillPending,
+          handledPayload: handledUserInputCalls[0],
+          pendingAfter: afterSnapshot.trackedUserInputs.map((u) => u.requestId),
+          responseRemoved: existsSync(responsePath) === false
+        }));
+        process.exit(0);
+        """#
+        let scriptURL = root.appendingPathComponent("user-input.mjs")
+        try (prelude + extensionScript + epilogue).write(
+            to: scriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (summary["pendingBefore"] as? [String])?.sorted(),
+            ["req-default", "req-root", "req-sub"]
+        )
+        XCTAssertEqual(summary["rejectedBigChoice"] as? Bool, false)
+        XCTAssertEqual(summary["rootChoices"] as? [String], ["Yes, deploy", "No, cancel"])
+        XCTAssertEqual(summary["rootAllowFreeform"] as? Bool, false)
+        XCTAssertEqual(summary["subAgentId"] as? String, "agent-7")
+        XCTAssertEqual(summary["defaultAllowFreeform"] as? Bool, true)
+        XCTAssertEqual(summary["snapshotMode"] as? String, "600")
+        XCTAssertEqual(summary["staleHandled"] as? Int, 0)
+        XCTAssertEqual(summary["staleStillPending"] as? Bool, true)
+        let handledPayload = summary["handledPayload"] as? [String: Any]
+        XCTAssertEqual(handledPayload?["requestId"] as? String, "req-root")
+        let handledResponse = handledPayload?["response"] as? [String: Any]
+        XCTAssertEqual(handledResponse?["answer"] as? String, "Yes, deploy")
+        XCTAssertEqual(handledResponse?["wasFreeform"] as? Bool, false)
+        XCTAssertEqual(summary["pendingAfter"] as? [String], [])
+        XCTAssertEqual(summary["responseRemoved"] as? Bool, true)
     }
 
     func testStatusNotificationKindRoundTripsOverControlProtocol() throws {

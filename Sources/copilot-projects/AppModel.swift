@@ -42,6 +42,27 @@ enum RemotePromptResult: Equatable {
     case noLiveCopilot
 }
 
+/// Outcome of accepting a remote answer to a structured `ask_user` question.
+enum RemoteUserInputResult: Equatable {
+    /// The answer passed validation and a response file was written for the extension.
+    case accepted
+    /// A response for this tab is already awaiting the extension, or the question
+    /// context changed underneath the answer.
+    case conflict
+    /// No matching live question, or the answer failed the choice/freeform/size rules.
+    case invalid
+}
+
+/// On-disk shape of the host-written user-input response file. The extension
+/// validates every field again before replying over RPC.
+private struct UserInputResponseFile: Codable {
+    let schemaVersion: Int
+    let copilotSessionId: String
+    let requestId: String
+    let answer: String
+    let wasFreeform: Bool
+}
+
 struct RemotePromptTarget {
     let activity: FooterActivity
     let send: (String) -> Bool
@@ -134,6 +155,7 @@ final class AppModel: ObservableObject {
                 text: text,
                 timestamp: request.timestamp,
                 source: request.source,
+                copilotSessionId: request.copilotSessionId,
                 notification: request.notification
             )
             return .success()
@@ -209,6 +231,9 @@ final class AppModel: ObservableObject {
     private let completionNotificationDelayNanoseconds: UInt64
     private let isAppActive: @MainActor () -> Bool
     private let agentActivityDirectory: URL
+    private let resumeMarkerDirectory: URL
+    private var powerOffProtectionGeneration = 0
+    private(set) var isPoweringOff = false
     private let remotePromptLiveSessions: ((Set<String>) -> Set<String>)?
     private let remotePromptTarget: ((String) -> RemotePromptTarget?)?
 
@@ -241,20 +266,24 @@ final class AppModel: ObservableObject {
         completionNotificationDelayNanoseconds: UInt64 = 1_000_000_000,
         isAppActive: @escaping @MainActor () -> Bool = { NSApp.isActive },
         agentActivityDirectory: URL = Paths.sessionsDir,
+        resumeMarkerDirectory: URL = Paths.sessionsDir,
         remotePromptLiveSessions: ((Set<String>) -> Set<String>)? = nil,
         remotePromptTarget: ((String) -> RemotePromptTarget?)? = nil,
         webPushService: WebPushService? = nil,
-        apnsService: APNsService? = nil
+        apnsService: APNsService? = nil,
+        notificationSync: NotificationSyncService? = nil
     ) {
         self.stateRepository = stateRepository
         self.completionNotificationDelayNanoseconds = completionNotificationDelayNanoseconds
         self.isAppActive = isAppActive
         self.agentActivityDirectory = agentActivityDirectory
+        self.resumeMarkerDirectory = resumeMarkerDirectory
         self.remotePromptLiveSessions = remotePromptLiveSessions
         self.remotePromptTarget = remotePromptTarget
         remoteAccess = RemoteAccessController(
             webPushService: webPushService,
-            apnsService: apnsService
+            apnsService: apnsService,
+            notificationSync: notificationSync
         )
         load()
     }
@@ -380,16 +409,26 @@ final class AppModel: ObservableObject {
         // Last Copilot session id seen in this tab (written by the hook). If the
         // shell is created fresh after a reboot, the controller resumes this exact
         // agent session; on a normal relaunch dtach reattaches and ignores it.
-        let recordedCopilot = (try? String(contentsOfFile:
-            Paths.copilotSessionMarkerPath(sessionId: sessionId), encoding: .utf8))?
+        let recordedCopilot = (try? String(contentsOf:
+            resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-session"),
+            encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowAllCopilot = (try? String(contentsOf:
+            resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-allow-all"),
+            encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resumeWithAllowAll = Self.shouldResumeWithAllowAll(
+            copilotSessionId: recordedCopilot,
+            allowAllSessionId: allowAllCopilot
+        )
         let c = TerminalController(
             sessionId: sessionId,
             cwd: session.cwd,
             extraEnvironment: environment(projectId: project.id, sessionId: sessionId),
             dtachExecutable: dtach,
             dtachSocket: socket,
-            copilotSessionId: (recordedCopilot?.isEmpty == false) ? recordedCopilot : nil
+            copilotSessionId: (recordedCopilot?.isEmpty == false) ? recordedCopilot : nil,
+            copilotSessionAllowAll: resumeWithAllowAll
         )
         c.onTitle = { [weak self] title in self?.updateTitle(sessionId: sessionId, title: title) }
         c.onDirectory = { [weak self] dir in self?.updateCwd(sessionId: sessionId, dir: dir) }
@@ -628,13 +667,27 @@ final class AppModel: ObservableObject {
     }
 
     func beginTermination() {
+        guard !isTerminating else { return }
         isTerminating = true
+        powerOffProtectionGeneration += 1
         footerTimer?.invalidate()
         livenessTimer?.invalidate()
         agentActivityTimer?.invalidate()
         agentActivitySource?.cancel()
         agentActivitySource = nil
         remoteAccess.stopGateway()
+    }
+
+    func prepareForSystemPowerOff(protectionInterval: TimeInterval = 300) {
+        isPoweringOff = true
+        powerOffProtectionGeneration += 1
+        let generation = powerOffProtectionGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + protectionInterval) { [weak self] in
+            guard let self,
+                  !self.isTerminating,
+                  self.powerOffProtectionGeneration == generation else { return }
+            self.isPoweringOff = false
+        }
     }
 
     func startRemoteAccessIfEnabled() {
@@ -684,7 +737,9 @@ final class AppModel: ObservableObject {
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
-                            ) == .sent
+                            ) == .sent,
+                            pendingUserInputs: session.agentActivity?
+                                .remoteUserInputRequests()
                         )
                     }
                 )
@@ -799,6 +854,87 @@ final class AppModel: ObservableObject {
         guard status == .idle, !hasBackgroundWork else { return .busy }
         guard hasLiveAgent, footerActivity == .idle else { return .noLiveCopilot }
         return .sent
+    }
+
+    /// Accept a remote answer to a structured `ask_user` question and hand it to the
+    /// extension via an atomically-written response file. Validation re-reads the
+    /// fresh heartbeat snapshot from disk (never trusting in-memory state) so a stale
+    /// or superseded question can't be answered, and the exact choice/freeform/size
+    /// rules are enforced host-side before anything is written.
+    func answerUserInput(
+        sessionId: String,
+        answer: RemoteUserInputAnswer,
+        now: Date = Date()
+    ) -> RemoteUserInputResult {
+        guard locateIndex(sessionId) != nil else { return .invalid }
+
+        let snapshotURL = agentActivityDirectory
+            .appendingPathComponent("\(sessionId).agent-activity.json")
+        guard let data = try? Data(contentsOf: snapshotURL),
+              let snapshot = try? JSONDecoder().decode(
+                AgentActivitySnapshot.self, from: data
+              ),
+              snapshot.isFresh(at: now),
+              let request = snapshot.trackedUserInputs?
+                .first(where: { $0.requestId == answer.requestId })
+        else { return .invalid }
+
+        guard answer.answer.utf8.count <= 8_192 else { return .invalid }
+        if answer.wasFreeform {
+            guard request.allowFreeform else { return .invalid }
+        } else {
+            guard request.choices.contains(answer.answer) else { return .invalid }
+        }
+
+        // Bind the answer to the tab's live Copilot session so a response written for
+        // an old (pre-resume) agent session is rejected by the extension.
+        let markerURL = resumeMarkerDirectory
+            .appendingPathComponent("\(sessionId).copilot-session")
+        guard let copilotSessionId = (try? String(contentsOf: markerURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !copilotSessionId.isEmpty else { return .invalid }
+
+        // One outstanding response per tab: refuse while a prior answer is still being
+        // consumed by the extension, which serializes retries.
+        let responseURL = agentActivityDirectory
+            .appendingPathComponent("\(sessionId).user-input-response.json")
+        if FileManager.default.fileExists(atPath: responseURL.path) { return .conflict }
+
+        let payload = UserInputResponseFile(
+            schemaVersion: 1,
+            copilotSessionId: copilotSessionId,
+            requestId: request.requestId,
+            answer: answer.answer,
+            wasFreeform: answer.wasFreeform
+        )
+        guard let encoded = try? JSONEncoder().encode(payload),
+              Self.atomicallyWrite0600(encoded, to: responseURL) else {
+            return .invalid
+        }
+        return .accepted
+    }
+
+    /// Atomically publish `data` at `url` with 0600 permissions by writing a private
+    /// temp file and renaming it into place.
+    private static func atomicallyWrite0600(_ data: Data, to url: URL) -> Bool {
+        let directory = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let temporary = directory
+            .appendingPathComponent(".\(UUID().uuidString).user-input.tmp")
+        guard FileManager.default.createFile(
+            atPath: temporary.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else { return false }
+        if rename(temporary.path, url.path) != 0 {
+            try? FileManager.default.removeItem(at: temporary)
+            return false
+        }
+        return true
     }
 
     func closeProject(_ pid: String) {
@@ -962,10 +1098,21 @@ final class AppModel: ObservableObject {
         text: String?,
         timestamp: Int64? = nil,
         source: String? = nil,
+        copilotSessionId: String? = nil,
         notification: StatusNotificationKind? = nil
     ) {
         guard let loc = locateIndex(sessionId) else { return }
         guard statusEventClock.shouldApply(sessionId: sessionId, timestamp: timestamp) else { return }
+        // sessionEnd is also emitted during graceful macOS shutdown. Only a live,
+        // non-terminating app can treat it as an explicit user exit.
+        if source == "session-end", !isTerminating, !isPoweringOff,
+           shouldClearResumeMarkers(sessionId: sessionId, copilotSessionId: copilotSessionId) {
+            for suffix in ["copilot-session", "copilot-allow-all"] {
+                try? FileManager.default.removeItem(
+                    at: resumeMarkerDirectory.appendingPathComponent("\(sessionId).\(suffix)")
+                )
+            }
+        }
         let previous = projects[loc.p].sessions[loc.s].status
         let startsScheduledTurn = source == "scheduled-start" || source == "scheduled-active"
         let endsScheduledTurn = source == "scheduled-idle"
@@ -1062,6 +1209,24 @@ final class AppModel: ObservableObject {
                 body: nil
             )
         }
+    }
+
+    private func shouldClearResumeMarkers(
+        sessionId: String,
+        copilotSessionId: String?
+    ) -> Bool {
+        guard let copilotSessionId, !copilotSessionId.isEmpty else { return false }
+        let recorded = resumeMarkerValue(sessionId: sessionId, suffix: "copilot-session")
+        let allowAll = resumeMarkerValue(sessionId: sessionId, suffix: "copilot-allow-all")
+        return recorded == copilotSessionId
+            || (recorded == nil && allowAll == copilotSessionId)
+    }
+
+    private func resumeMarkerValue(sessionId: String, suffix: String) -> String? {
+        (try? String(
+            contentsOf: resumeMarkerDirectory.appendingPathComponent("\(sessionId).\(suffix)"),
+            encoding: .utf8
+        ))?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Whether a session is the one on screen right now (app active + its project and
@@ -1501,7 +1666,10 @@ final class AppModel: ObservableObject {
 
     private func handleExit(sessionId: String) {
         controllers[sessionId] = nil
-        guard !isTerminating else { return }   // app quitting → keep for resume
+        guard !Self.shouldPreserveSessionAfterTerminalExit(
+            isTerminating: isTerminating,
+            isPoweringOff: isPoweringOff
+        ) else { return }
 
         let socket = Paths.dtachSocketPath(sessionId: sessionId)
         // If a live dtach master still owns the socket, the shell is alive and
@@ -1517,6 +1685,21 @@ final class AppModel: ObservableObject {
         let projectId = projects[loc.p].id
         SessionArtifacts.removeFiles(sessionId: sessionId)
         closeSession(projectId: projectId, sessionId: sessionId)
+    }
+
+    nonisolated static func shouldPreserveSessionAfterTerminalExit(
+        isTerminating: Bool,
+        isPoweringOff: Bool
+    ) -> Bool {
+        isTerminating || isPoweringOff
+    }
+
+    nonisolated static func shouldResumeWithAllowAll(
+        copilotSessionId: String?,
+        allowAllSessionId: String?
+    ) -> Bool {
+        guard let copilotSessionId, !copilotSessionId.isEmpty else { return false }
+        return allowAllSessionId == copilotSessionId
     }
 
     // MARK: - control socket handler
