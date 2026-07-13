@@ -63,6 +63,16 @@ private struct UserInputResponseFile: Codable {
     let wasFreeform: Bool
 }
 
+/// On-disk shape of the host-written elicitation response file. The extension
+/// re-validates against the live pending elicitation before replying over RPC.
+private struct ElicitationResponseFile: Codable {
+    let schemaVersion: Int
+    let copilotSessionId: String
+    let requestId: String
+    let action: String
+    let content: [String: RemoteJSONValue]?
+}
+
 struct RemotePromptTarget {
     let activity: FooterActivity
     let send: (String) -> Bool
@@ -874,7 +884,9 @@ final class AppModel: ObservableObject {
                                     ?? .unknown
                             ) == .sent,
                             pendingUserInputs: session.agentActivity?
-                                .remoteUserInputRequests()
+                                .remoteUserInputRequests(),
+                            pendingElicitations: session.agentActivity?
+                                .remoteElicitationRequests()
                         )
                     }
                 )
@@ -1049,7 +1061,225 @@ final class AppModel: ObservableObject {
         return .accepted
     }
 
-    /// Atomically publish `data` at `url` with 0600 permissions by writing a private
+    /// Submit a remote answer to a pending elicitation. Mirrors `answerUserInput`:
+    /// re-reads the fresh heartbeat snapshot from disk, validates the request is
+    /// still live, binds to the tab's Copilot session, and writes an atomic
+    /// single-outstanding response file the extension consumes over RPC.
+    func answerElicitation(
+        sessionId: String,
+        answer: RemoteElicitationAnswer,
+        now: Date = Date()
+    ) -> RemoteUserInputResult {
+        guard locateIndex(sessionId) != nil else { return .invalid }
+
+        let snapshotURL = agentActivityDirectory
+            .appendingPathComponent("\(sessionId).agent-activity.json")
+        guard let data = try? Data(contentsOf: snapshotURL),
+              let snapshot = try? JSONDecoder().decode(
+                AgentActivitySnapshot.self, from: data
+              ),
+              snapshot.isFresh(at: now),
+              let request = snapshot.trackedElicitations?
+                .first(where: { $0.requestId == answer.requestId })
+        else { return .invalid }
+
+        // Accept must carry content; decline/cancel must not.
+        switch answer.action {
+        case .accept:
+            if request.mode == "url" || request.url != nil {
+                guard answer.content == nil else { return .invalid }
+            } else {
+                guard let content = answer.content,
+                      Self.isValidElicitationContent(content),
+                      Self.elicitationContent(content, satisfies: request.schema),
+                      let encoded = try? JSONEncoder().encode(content),
+                      encoded.count <= 32_768 else { return .invalid }
+            }
+        case .decline, .cancel:
+            guard answer.content == nil else { return .invalid }
+        }
+
+        let markerURL = resumeMarkerDirectory
+            .appendingPathComponent("\(sessionId).copilot-session")
+        guard let copilotSessionId = (try? String(contentsOf: markerURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !copilotSessionId.isEmpty else { return .invalid }
+
+        let responseURL = agentActivityDirectory
+            .appendingPathComponent("\(sessionId).elicitation-response.json")
+        if FileManager.default.fileExists(atPath: responseURL.path) { return .conflict }
+
+        let payload = ElicitationResponseFile(
+            schemaVersion: 1,
+            copilotSessionId: copilotSessionId,
+            requestId: answer.requestId,
+            action: answer.action.rawValue,
+            content: answer.action == .accept ? answer.content : nil
+        )
+        guard let encoded = try? JSONEncoder().encode(payload),
+              Self.atomicallyWrite0600(encoded, to: responseURL) else {
+            return .invalid
+        }
+        return .accepted
+    }
+
+    private static func isValidElicitationContent(_ content: [String: RemoteJSONValue]) -> Bool {
+        content.values.allSatisfy { value in
+            switch value {
+            case .bool, .string:
+                return true
+            case .number(let number):
+                return number.isFinite
+            case .array(let values):
+                return values.allSatisfy {
+                    if case .string = $0 { return true }
+                    return false
+                }
+            case .null, .object:
+                return false
+            }
+        }
+    }
+
+    private static func elicitationContent(
+        _ content: [String: RemoteJSONValue],
+        satisfies schema: RemoteJSONValue?
+    ) -> Bool {
+        guard let schema else { return true }
+        guard case .object(let root) = schema else { return false }
+        if let type = jsonString(root["type"]), type != "object" { return false }
+        guard let propertiesValue = root["properties"],
+              case .object(let properties) = propertiesValue else { return content.isEmpty }
+        let required = jsonStringArray(root["required"]) ?? []
+        guard required.allSatisfy({ content[$0] != nil }) else { return false }
+        for (key, value) in content {
+            guard let fieldSchema = properties[key],
+                  elicitationValue(value, satisfies: fieldSchema) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func elicitationValue(
+        _ value: RemoteJSONValue,
+        satisfies schema: RemoteJSONValue
+    ) -> Bool {
+        guard case .object(let schema) = schema else { return true }
+        if let alternatives = jsonArray(schema["oneOf"]) ?? jsonArray(schema["anyOf"]) {
+            guard alternatives.contains(where: { alternative in
+                guard case .object(let option) = alternative,
+                      let expected = option["const"] else { return false }
+                return expected == value
+            }) else { return false }
+        }
+        if let enumValues = jsonArray(schema["enum"]),
+           !enumValues.contains(value) {
+            return false
+        }
+        guard let type = jsonString(schema["type"]) else { return true }
+        switch type {
+        case "string":
+            guard case .string(let string) = value else { return false }
+            if let minimum = jsonNumber(schema["minLength"]),
+               Double(string.unicodeScalars.count) < minimum { return false }
+            if let maximum = jsonNumber(schema["maxLength"]),
+               Double(string.unicodeScalars.count) > maximum { return false }
+            if let format = jsonString(schema["format"]),
+               !stringMatchesFormat(string, format: format) { return false }
+            return true
+        case "number":
+            guard case .number(let number) = value else { return false }
+            return numberSatisfiesBounds(number, schema: schema)
+        case "integer":
+            guard case .number(let number) = value,
+                  number.rounded() == number else { return false }
+            return numberSatisfiesBounds(number, schema: schema)
+        case "boolean":
+            guard case .bool = value else { return false }
+            return true
+        case "array":
+            guard case .array(let values) = value else { return false }
+            if let minimum = jsonNumber(schema["minItems"]),
+               Double(values.count) < minimum { return false }
+            if let maximum = jsonNumber(schema["maxItems"]),
+               Double(values.count) > maximum { return false }
+            if let items = schema["items"] {
+                return values.allSatisfy { elicitationValue($0, satisfies: items) }
+            }
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func numberSatisfiesBounds(
+        _ number: Double,
+        schema: [String: RemoteJSONValue]
+    ) -> Bool {
+        if let minimum = jsonNumber(schema["minimum"]), number < minimum { return false }
+        if let maximum = jsonNumber(schema["maximum"]), number > maximum { return false }
+        return true
+    }
+
+    private static func stringMatchesFormat(_ string: String, format: String) -> Bool {
+        switch format {
+        case "email":
+            return string.range(
+                of: #"^[^@\s]+@[^@\s]+\.[^@\s]+$"#,
+                options: .regularExpression
+            ) != nil
+        case "uri":
+            guard let components = URLComponents(string: string),
+                  let scheme = components.scheme,
+                  !scheme.isEmpty else { return false }
+            return true
+        case "date":
+            let formatter = DateFormatter()
+            formatter.calendar = Calendar(identifier: .iso8601)
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyy-MM-dd"
+            formatter.isLenient = false
+            return formatter.date(from: string) != nil
+        case "date-time":
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return fractional.date(from: string) != nil
+                || ISO8601DateFormatter().date(from: string) != nil
+        default:
+            return true
+        }
+    }
+
+    private static func jsonString(_ value: RemoteJSONValue?) -> String? {
+        guard let value else { return nil }
+        if case .string(let string) = value { return string }
+        return nil
+    }
+
+    private static func jsonNumber(_ value: RemoteJSONValue?) -> Double? {
+        guard let value else { return nil }
+        if case .number(let number) = value { return number }
+        return nil
+    }
+
+    private static func jsonArray(_ value: RemoteJSONValue?) -> [RemoteJSONValue]? {
+        guard let value else { return nil }
+        if case .array(let values) = value { return values }
+        return nil
+    }
+
+    private static func jsonStringArray(_ value: RemoteJSONValue?) -> [String]? {
+        guard let value, case .array(let values) = value else { return nil }
+        var strings: [String] = []
+        for value in values {
+            guard case .string(let string) = value else { return nil }
+            strings.append(string)
+        }
+        return strings
+    }
+
     /// temp file and renaming it into place.
     private static func atomicallyWrite0600(_ data: Data, to url: URL) -> Bool {
         let directory = url.deletingLastPathComponent()

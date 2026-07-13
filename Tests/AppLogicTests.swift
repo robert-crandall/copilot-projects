@@ -1793,6 +1793,319 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testAnswerElicitationValidatesActionContentAndSession() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let directory = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = Session(id: "session-elicit", title: "target", cwd: "/tmp")
+        let project = Project(name: "target", cwd: "/tmp", sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+
+        let snapshotURL = directory.appendingPathComponent("\(session.id).agent-activity.json")
+        let responseURL = directory
+            .appendingPathComponent("\(session.id).elicitation-response.json")
+        let markerURL = directory.appendingPathComponent("\(session.id).copilot-session")
+
+        func writeSnapshot(updatedAt: Date) throws {
+            let snapshot = AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: ISO8601DateFormatter().string(from: updatedAt),
+                foregroundTurnActive: false,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: 0,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil,
+                trackedUserInputs: nil,
+                trackedElicitations: [
+                    TrackedElicitation(
+                        requestId: "req-form",
+                        message: "Pick a fruit",
+                        mode: "form",
+                        url: nil,
+                        schema: .object([
+                            "type": .string("object"),
+                            "required": .array([.string("fruit")]),
+                            "properties": .object([
+                                "fruit": .object([
+                                    "type": .string("string"),
+                                    "oneOf": .array([
+                                        .object([
+                                            "const": .string("apple"),
+                                            "title": .string("Apple"),
+                                        ]),
+                                        .object([
+                                            "const": .string("pear"),
+                                            "title": .string("Pear"),
+                                        ]),
+                                    ]),
+                                ]),
+                                "ripe": .object(["type": .string("boolean")]),
+                                "count": .object([
+                                    "type": .string("number"),
+                                    "minimum": .number(1),
+                                    "maximum": .number(3),
+                                ]),
+                                "colors": .object([
+                                    "type": .string("array"),
+                                    "items": .object([
+                                        "anyOf": .array([
+                                            .object(["const": .string("red")]),
+                                            .object(["const": .string("green")]),
+                                        ]),
+                                    ]),
+                                ]),
+                                "nickname": .object([
+                                    "type": .string("string"),
+                                    "minLength": .number(1e300),
+                                ]),
+                                "emojiCodepoints": .object([
+                                    "type": .string("string"),
+                                    "minLength": .number(2),
+                                ]),
+                                "email": .object([
+                                    "type": .string("string"),
+                                    "format": .string("email"),
+                                ]),
+                                "uri": .object([
+                                    "type": .string("string"),
+                                    "format": .string("uri"),
+                                ]),
+                                "date": .object([
+                                    "type": .string("string"),
+                                    "format": .string("date"),
+                                ]),
+                                "dateTime": .object([
+                                    "type": .string("string"),
+                                    "format": .string("date-time"),
+                                ]),
+                                "tokens": .object([
+                                    "type": .string("array"),
+                                    "minItems": .number(1e300),
+                                ]),
+                            ]),
+                        ]),
+                        elicitationSource: nil,
+                        requestedAt: ISO8601DateFormatter().string(from: updatedAt),
+                        agentId: nil
+                    ),
+                    TrackedElicitation(
+                        requestId: "req-url",
+                        message: "Open this URL?",
+                        mode: nil,
+                        url: "https://example.com/elicit",
+                        schema: nil,
+                        elicitationSource: nil,
+                        requestedAt: ISO8601DateFormatter().string(from: updatedAt),
+                        agentId: nil
+                    )
+                ]
+            )
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        }
+        try writeSnapshot(updatedAt: Date())
+        try Data("copilot-session".utf8).write(to: markerURL)
+
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: directory,
+            resumeMarkerDirectory: directory
+        )
+
+        // Unknown request id → invalid.
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(
+                    requestId: "missing", action: .accept,
+                    content: ["fruit": .string("apple")]
+                )
+            ),
+            .invalid
+        )
+        // accept without content → invalid.
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(requestId: "req-form", action: .accept)
+            ),
+            .invalid
+        )
+        // decline WITH content → invalid.
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(
+                    requestId: "req-form", action: .decline,
+                    content: ["fruit": .string("apple")]
+                )
+            ),
+            .invalid
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: responseURL.path))
+
+        let unsupportedContents: [[String: RemoteJSONValue]] = [
+            ["fruit": .null],
+            ["fruit": .number(2)],
+            ["fruit": .string("banana")],
+            ["fruit": .object(["name": .string("apple")])],
+            ["fruit": .array([.number(1)])],
+            ["fruit": .array([.array([.string("apple")])])],
+            ["ripe": .bool(true)],
+            ["fruit": .string("apple"), "count": .number(4)],
+            ["fruit": .string("apple"), "colors": .array([.string("blue")])],
+            ["fruit": .string("apple"), "nickname": .string("a")],
+            ["fruit": .string("apple"), "tokens": .array([])],
+            ["fruit": .string("apple"), "email": .string("not an email")],
+            ["fruit": .string("apple"), "uri": .string("not a uri")],
+            ["fruit": .string("apple"), "date": .string("2026-99-99")],
+            ["fruit": .string("apple"), "dateTime": .string("tomorrow")],
+            ["fruit": .string("apple"), "extra": .string("x")],
+        ]
+        for unsupportedContent in unsupportedContents {
+            XCTAssertEqual(
+                model.answerElicitation(
+                    sessionId: session.id,
+                    answer: RemoteElicitationAnswer(
+                        requestId: "req-form", action: .accept,
+                        content: unsupportedContent
+                    )
+                ),
+                .invalid
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: responseURL.path))
+
+        // Valid accept with content is written 0600 with the expected payload.
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(
+                    requestId: "req-form", action: .accept,
+                    content: [
+                        "fruit": .string("apple"),
+                        "ripe": .bool(true),
+                        "count": .number(2),
+                        "colors": .array([.string("red"), .string("green")]),
+                        "emojiCodepoints": .string("👨‍👩‍👧‍👦"),
+                        "email": .string("user@example.com"),
+                        "uri": .string("https://example.com/elicit"),
+                        "date": .string("2026-07-13"),
+                        "dateTime": .string("2026-07-13T21:00:00.123Z"),
+                    ]
+                )
+            ),
+            .accepted
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: responseURL.path))
+        let attributes = try FileManager.default.attributesOfItem(atPath: responseURL.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        let written = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: responseURL))
+                as? [String: Any]
+        )
+        XCTAssertEqual(written["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(written["copilotSessionId"] as? String, "copilot-session")
+        XCTAssertEqual(written["requestId"] as? String, "req-form")
+        XCTAssertEqual(written["action"] as? String, "accept")
+        XCTAssertEqual((written["content"] as? [String: Any])?["fruit"] as? String, "apple")
+        XCTAssertEqual((written["content"] as? [String: Any])?["ripe"] as? Bool, true)
+        XCTAssertEqual((written["content"] as? [String: Any])?["count"] as? Double, 2)
+        XCTAssertEqual(
+            (written["content"] as? [String: Any])?["colors"] as? [String],
+            ["red", "green"]
+        )
+        XCTAssertEqual(
+            (written["content"] as? [String: Any])?["emojiCodepoints"] as? String,
+            "👨‍👩‍👧‍👦"
+        )
+        XCTAssertEqual((written["content"] as? [String: Any])?["email"] as? String,
+                       "user@example.com")
+        XCTAssertEqual((written["content"] as? [String: Any])?["uri"] as? String,
+                       "https://example.com/elicit")
+        XCTAssertEqual((written["content"] as? [String: Any])?["date"] as? String,
+                       "2026-07-13")
+        XCTAssertEqual((written["content"] as? [String: Any])?["dateTime"] as? String,
+                       "2026-07-13T21:00:00.123Z")
+
+        // A second answer conflicts while the prior response awaits pickup.
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(requestId: "req-form", action: .cancel)
+            ),
+            .conflict
+        )
+
+        // After the extension consumes it, a decline (no content) is accepted.
+        try FileManager.default.removeItem(at: responseURL)
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(requestId: "req-form", action: .decline)
+            ),
+            .accepted
+        )
+        try FileManager.default.removeItem(at: responseURL)
+
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(
+                    requestId: "req-url", action: .accept,
+                    content: ["ignored": .string("value")]
+                )
+            ),
+            .invalid
+        )
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(requestId: "req-url", action: .accept)
+            ),
+            .accepted
+        )
+        let writtenURLAccept = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: responseURL))
+                as? [String: Any]
+        )
+        XCTAssertEqual(writtenURLAccept["requestId"] as? String, "req-url")
+        XCTAssertEqual(writtenURLAccept["action"] as? String, "accept")
+        XCTAssertNil(writtenURLAccept["content"])
+        try FileManager.default.removeItem(at: responseURL)
+
+        // A stale heartbeat can no longer be answered.
+        try writeSnapshot(updatedAt: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(requestId: "req-form", action: .cancel)
+            ),
+            .invalid
+        )
+
+        // Without a live Copilot session marker the answer cannot be bound.
+        try writeSnapshot(updatedAt: Date())
+        try FileManager.default.removeItem(at: markerURL)
+        XCTAssertEqual(
+            model.answerElicitation(
+                sessionId: session.id,
+                answer: RemoteElicitationAnswer(requestId: "req-form", action: .cancel)
+            ),
+            .invalid
+        )
+    }
+
+    @MainActor
     func testScheduledIdleTurnDoesNotPostCompletionNotification() async throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory
@@ -2349,6 +2662,25 @@ final class AppLogicTests: XCTestCase {
         }
     }
 
+    func testSessionArtifactCleanupRemovesResponseArtifacts() throws {
+        let sessionId = UUID().uuidString
+        Paths.ensureStateDir()
+        let paths = [
+            Paths.userInputResponsePath(sessionId: sessionId),
+            Paths.elicitationResponsePath(sessionId: sessionId),
+        ]
+        for path in paths {
+            try Data("{}".utf8).write(to: URL(fileURLWithPath: path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        }
+
+        SessionArtifacts.removeFiles(sessionId: sessionId)
+
+        for path in paths {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        }
+    }
+
     @MainActor
     func testTranscriptDrawerRequiresExplicitOpen() throws {
         let root = FileManager.default.temporaryDirectory
@@ -2835,6 +3167,252 @@ final class AppLogicTests: XCTestCase {
                 token: token,
                 origin: "https://projects.example.com",
                 body: try answerBody(requestId: "req-1", answer: "Wait", wasFreeform: false)
+            )
+            XCTAssertEqual(conflict, 409)
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
+        SessionArtifacts.removeFiles(sessionId: sessionId)
+    }
+
+    @MainActor
+    func testRemoteGatewayAnswerElicitationRequiresLeaseAndReportsStatuses() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        let sessionId = "session-elicit-gateway"
+        let session = Session(id: sessionId, title: "Test Session", cwd: "/")
+        let project = Project(id: "pid", name: "Project", cwd: "/", sessions: [session])
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { Date() },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0
+        )
+
+        func answerBody(
+            requestId: String,
+            action: RemoteElicitationAction,
+            content: [String: RemoteJSONValue]? = nil,
+            rawData: String? = nil
+        ) throws -> Data {
+            let payload: String
+            if let rawData {
+                payload = rawData
+            } else {
+                payload = String(
+                    decoding: try JSONEncoder().encode(RemoteElicitationAnswer(
+                        requestId: requestId, action: action, content: content
+                    )),
+                    as: UTF8.self
+                )
+            }
+            return try JSONEncoder().encode(RemoteClientMessage(
+                type: "answer-elicitation",
+                clientId: "phone",
+                sessionId: sessionId,
+                data: payload
+            ))
+        }
+
+        do {
+            // No writer lease yet → forbidden.
+            let withoutLease = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "req-form", action: .accept,
+                    content: ["fruit": .string("apple")]
+                )
+            )
+            XCTAssertEqual(withoutLease, 403)
+
+            let acquire = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try JSONEncoder().encode(RemoteClientMessage(
+                    type: "acquire", clientId: "phone", sessionId: sessionId, data: nil
+                ))
+            )
+            XCTAssertEqual(acquire, 204)
+
+            // Malformed answer payload → bad request.
+            let malformed = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "req-form", action: .accept, rawData: "{"
+                )
+            )
+            XCTAssertEqual(malformed, 400)
+
+            // No live elicitation yet → unprocessable.
+            let noQuestion = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "req-form", action: .accept,
+                    content: ["fruit": .string("apple")]
+                )
+            )
+            XCTAssertEqual(noQuestion, 422)
+
+            let snapshot = AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: ISO8601DateFormatter().string(from: Date()),
+                foregroundTurnActive: false,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: 0,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil,
+                trackedUserInputs: nil,
+                trackedElicitations: [
+                    TrackedElicitation(
+                        requestId: "req-form",
+                        message: "Pick a fruit",
+                        mode: "form",
+                        url: nil,
+                        schema: .object([
+                            "type": .string("object"),
+                            "properties": .object([
+                                "fruit": .object(["type": .string("string")])
+                            ]),
+                        ]),
+                        elicitationSource: nil,
+                        requestedAt: ISO8601DateFormatter().string(from: Date()),
+                        agentId: nil
+                    ),
+                    TrackedElicitation(
+                        requestId: "req-url",
+                        message: "Open this URL?",
+                        mode: nil,
+                        url: "https://example.com/elicit",
+                        schema: nil,
+                        elicitationSource: nil,
+                        requestedAt: ISO8601DateFormatter().string(from: Date()),
+                        agentId: nil
+                    )
+                ]
+            )
+            try JSONEncoder().encode(snapshot).write(
+                to: root.appendingPathComponent("\(sessionId).agent-activity.json")
+            )
+            try Data("copilot-session".utf8).write(
+                to: root.appendingPathComponent("\(sessionId).copilot-session")
+            )
+
+            let unsupportedContent = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "req-form", action: .accept,
+                    content: ["fruit": .number(2)]
+                )
+            )
+            XCTAssertEqual(unsupportedContent, 422)
+
+            let urlWithContent = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "req-url", action: .accept,
+                    content: ["ignored": .string("value")]
+                )
+            )
+            XCTAssertEqual(urlWithContent, 422)
+
+            let urlAccepted = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(requestId: "req-url", action: .accept)
+            )
+            XCTAssertEqual(urlAccepted, 204)
+            try FileManager.default.removeItem(
+                at: root.appendingPathComponent("\(sessionId).elicitation-response.json")
+            )
+
+            let accepted = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(
+                    requestId: "req-form", action: .accept,
+                    content: ["fruit": .string("apple")]
+                )
+            )
+            XCTAssertEqual(accepted, 204)
+
+            // A second answer while the response awaits pickup → conflict.
+            let conflict = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: try answerBody(requestId: "req-form", action: .cancel)
             )
             XCTAssertEqual(conflict, 409)
         } catch {

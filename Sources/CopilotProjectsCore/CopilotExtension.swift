@@ -44,12 +44,21 @@ public enum CopilotExtension {
             sessionsDir, `${appSessionId}.user-input-response.json`
         );
         const userInputResponseName = `${appSessionId}.user-input-response.json`;
+        const elicitationResponsePath = join(
+            sessionsDir, `${appSessionId}.elicitation-response.json`
+        );
+        const elicitationResponseName = `${appSessionId}.elicitation-response.json`;
         const activeSubagents = new Map();
         // All outstanding structured questions (root and subagent), keyed by
         // requestId. Starts empty every launch: stale question state is never
         // resurrected from disk, only rebuilt from live events.
         const pendingUserInputs = new Map();
         const inFlightUserInputResponses = new Set();
+        // Outstanding elicitations (schema-form / url questions), keyed by
+        // requestId. Same lifecycle as pendingUserInputs: rebuilt from live
+        // events, never resurrected from disk.
+        const pendingElicitations = new Map();
+        const inFlightElicitationResponses = new Set();
         let foregroundTurnActive = false;
         let scheduledTurnActive = false;
         let currentTurnKind = null;
@@ -81,6 +90,13 @@ public enum CopilotExtension {
         const MAX_USER_INPUT_TOTAL_BYTES = 32_768;
         const MAX_USER_INPUT_ANSWER_BYTES = 8_192;
         const MAX_USER_INPUTS = 50;
+
+        const MAX_ELICITATION_MESSAGE_BYTES = 16_384;
+        const MAX_ELICITATION_SCHEMA_BYTES = 32_768;
+        const MAX_ELICITATION_SCHEMA_DEPTH = 8;
+        const MAX_ELICITATION_URL_BYTES = 4_096;
+        const MAX_ELICITATION_CONTENT_BYTES = 32_768;
+        const MAX_ELICITATIONS = 50;
 
         function truncatedText(value, maximumLength) {
             const text = typeof value === "string" ? value : "";
@@ -326,6 +342,7 @@ public enum CopilotExtension {
                 lastIdleAborted,
                 lastIdleTurnKind,
                 trackedUserInputs: [...pendingUserInputs.values()],
+                trackedElicitations: [...pendingElicitations.values()],
                 ...(error ? { error: String(error) } : {}),
             };
             const temporaryPath = `${snapshotPath}.${process.pid}.tmp`;
@@ -460,6 +477,179 @@ public enum CopilotExtension {
                 removeFile(userInputResponsePath);
             } finally {
                 inFlightUserInputResponses.delete(requestId);
+            }
+        }
+
+        // Build a bounded elicitation record or return null to reject remote
+        // exposure (the terminal keeps handling it). The requestedSchema is passed
+        // through verbatim within a byte budget so the client renders exactly what
+        // the agent asked; oversized/complex schemas fall back to the terminal.
+        function jsonDepth(value, limit = MAX_ELICITATION_SCHEMA_DEPTH + 1) {
+            if (limit <= 0) return Infinity;
+            if (Array.isArray(value)) {
+                let max = 0;
+                for (const item of value) {
+                    max = Math.max(max, jsonDepth(item, limit - 1));
+                    if (max === Infinity) return Infinity;
+                }
+                return max + 1;
+            }
+            if (value && typeof value === "object") {
+                let max = 0;
+                for (const key of Object.keys(value)) {
+                    max = Math.max(max, jsonDepth(value[key], limit - 1));
+                    if (max === Infinity) return Infinity;
+                }
+                return max + 1;
+            }
+            return 0;
+        }
+
+        function elicitationEntry(event) {
+            const data = event?.data;
+            if (!data || typeof data !== "object") return null;
+            const requestId = data.requestId;
+            if (typeof requestId !== "string" || !requestId
+                    || requestId.length > 200) return null;
+            const message = data.message;
+            if (typeof message !== "string") return null;
+            if (userInputByteLength(message) > MAX_ELICITATION_MESSAGE_BYTES) return null;
+            const mode = typeof data.mode === "string" ? data.mode : null;
+            let url = null;
+            if (data.url != null) {
+                if (typeof data.url !== "string") return null;
+                if (userInputByteLength(data.url) > MAX_ELICITATION_URL_BYTES) return null;
+                url = data.url;
+            }
+            let schema = null;
+            if (data.requestedSchema != null) {
+                if (typeof data.requestedSchema !== "object") return null;
+                let serialized;
+                try {
+                    serialized = JSON.stringify(data.requestedSchema);
+                } catch {
+                    return null;
+                }
+                if (Buffer.byteLength(serialized) > MAX_ELICITATION_SCHEMA_BYTES) return null;
+                // Reject pathologically nested schemas: they can pass the byte
+                // budget yet exceed the host JSON decoder's nesting limit, which
+                // would fail the whole heartbeat decode and drop every pending
+                // question. The remote form only renders a flat schema anyway.
+                if (jsonDepth(data.requestedSchema) > MAX_ELICITATION_SCHEMA_DEPTH) return null;
+                schema = data.requestedSchema;
+            }
+            // A form-mode elicitation with neither a schema nor a url isn't
+            // remotely answerable; leave it to the terminal.
+            if (!schema && !url) return null;
+            const agentId = typeof event.agentId === "string" && event.agentId
+                ? boundedMetadataText(event.agentId)
+                : null;
+            return {
+                requestId,
+                message,
+                mode,
+                url,
+                schema,
+                elicitationSource: typeof data.elicitationSource === "string"
+                    ? boundedMetadataText(data.elicitationSource)
+                    : null,
+                requestedAt: normalizedTimestamp(event.timestamp),
+                agentId,
+            };
+        }
+
+        function boundPendingElicitations() {
+            while (pendingElicitations.size > MAX_ELICITATIONS) {
+                pendingElicitations.delete(pendingElicitations.keys().next().value);
+            }
+        }
+
+        // Answer a pending elicitation from the host-written response file. Mirrors
+        // processUserInputResponse: owner-only, validates against the pending record,
+        // and keeps the elicitation retryable when a response is rejected.
+        async function processElicitationResponse() {
+            if (!ownsSharedFiles()) return;
+            let encoded;
+            try {
+                encoded = readFileSync(elicitationResponsePath, "utf8");
+            } catch {
+                return;
+            }
+            let response;
+            try {
+                response = JSON.parse(encoded);
+            } catch {
+                removeFile(elicitationResponsePath);
+                return;
+            }
+            if (!response || typeof response !== "object"
+                    || response.schemaVersion !== 1
+                    || typeof response.requestId !== "string") {
+                removeFile(elicitationResponsePath);
+                return;
+            }
+            const requestId = response.requestId;
+            if (inFlightElicitationResponses.has(requestId)) return;
+            if (response.copilotSessionId !== session.sessionId) {
+                removeFile(elicitationResponsePath);
+                return;
+            }
+            const pending = pendingElicitations.get(requestId);
+            if (!pending) {
+                removeFile(elicitationResponsePath);
+                return;
+            }
+            const action = response.action;
+            if (action !== "accept" && action !== "decline" && action !== "cancel") {
+                removeFile(elicitationResponsePath);
+                return;
+            }
+            const result = { action };
+            if (action === "accept") {
+                if (pending.mode === "url" || typeof pending.url === "string") {
+                    if (response.content != null) {
+                        removeFile(elicitationResponsePath);
+                        return;
+                    }
+                } else {
+                    const content = response.content;
+                    if (!content || typeof content !== "object" || Array.isArray(content)) {
+                        removeFile(elicitationResponsePath);
+                        return;
+                    }
+                    let serialized;
+                    try {
+                        serialized = JSON.stringify(content);
+                    } catch {
+                        removeFile(elicitationResponsePath);
+                        return;
+                    }
+                    if (Buffer.byteLength(serialized) > MAX_ELICITATION_CONTENT_BYTES) {
+                        removeFile(elicitationResponsePath);
+                        return;
+                    }
+                    result.content = content;
+                }
+            }
+            inFlightElicitationResponses.add(requestId);
+            try {
+                const rpcResult = await session.rpc.ui.handlePendingElicitation({
+                    requestId,
+                    result,
+                });
+                if (rpcResult?.success === true) {
+                    pendingElicitations.delete(requestId);
+                    removeFile(elicitationResponsePath);
+                    publish();
+                } else {
+                    // Resolved elsewhere (terminal / another client) or expired;
+                    // drop only the response. elicitation.completed clears the card.
+                    removeFile(elicitationResponsePath);
+                }
+            } catch {
+                removeFile(elicitationResponsePath);
+            } finally {
+                inFlightElicitationResponses.delete(requestId);
             }
         }
 
@@ -852,6 +1042,7 @@ public enum CopilotExtension {
         // cannot be stranded during startup.
         if (ownsSharedFiles()) {
             removeFile(userInputResponsePath);
+            removeFile(elicitationResponsePath);
         }
         let userInputWatcher = null;
         try {
@@ -859,8 +1050,98 @@ public enum CopilotExtension {
                 if (!filename || filename === userInputResponseName) {
                     processUserInputResponse();
                 }
+                if (!filename || filename === elicitationResponseName) {
+                    processElicitationResponse();
+                }
             });
         } catch {}
+
+        const eventInterestHandles = [];
+        const inFlightEventInterestRegistrations = new Set();
+        let timer = null;
+
+        async function releaseEventInterests() {
+            const handles = [...eventInterestHandles];
+            for (const handle of handles) {
+                let released = false;
+                for (let attempt = 0; attempt < 2 && !released; attempt += 1) {
+                    try {
+                        const result = await session.rpc.eventLog.releaseInterest({ handle });
+                        if (result?.success === true) {
+                            released = true;
+                        } else {
+                            throw new Error("releaseInterest returned unsuccessful result");
+                        }
+                    } catch (error) {
+                        if (attempt === 1) {
+                            console.error(
+                                "[copilot-projects] failed to release event interest:",
+                                error
+                            );
+                        }
+                    }
+                }
+                if (released) {
+                    const index = eventInterestHandles.indexOf(handle);
+                    if (index !== -1) eventInterestHandles.splice(index, 1);
+                }
+            }
+        }
+
+        async function registerEventInterest(eventType) {
+            let registration = null;
+            try {
+                registration = session.rpc.eventLog.registerInterest({ eventType });
+                inFlightEventInterestRegistrations.add(registration);
+                const interest = await registration;
+                if (interest?.handle) eventInterestHandles.push(interest.handle);
+            } catch (error) {
+                console.error(
+                    "[copilot-projects] failed to register interest in " + eventType + ":",
+                    error
+                );
+            } finally {
+                if (registration) inFlightEventInterestRegistrations.delete(registration);
+            }
+        }
+
+        async function awaitEventInterestRegistrations() {
+            const registrations = [...inFlightEventInterestRegistrations];
+            if (registrations.length > 0) await Promise.allSettled(registrations);
+        }
+
+        function cleanupSharedFiles() {
+            if (timer) clearInterval(timer);
+            clearTimeout(transcriptPublishTimer);
+            if (userInputWatcher) {
+                try { userInputWatcher.close(); } catch {}
+                userInputWatcher = null;
+            }
+            // Use the read-only ownership check (never claim during cleanup) so an
+            // exiting spawned helper can't wipe a live interactive session's
+            // markers. The owner flushes any progress buffered behind the publish
+            // throttle before releasing the shared files.
+            if (isRecordedOwner()) {
+                writeTranscriptSnapshot();
+                removeFile(snapshotPath);
+                removeFile(scheduledTurnPath);
+                removeFile(transcriptOwnerPath);
+                removeFile(userInputResponsePath);
+                removeFile(elicitationResponsePath);
+            }
+        }
+        let shuttingDown = false;
+        async function shutdown(signal) {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            cleanupSharedFiles();
+            await awaitEventInterestRegistrations();
+            await releaseEventInterests();
+            process.exit(signal === "SIGINT" ? 130 : 143);
+        }
+        process.once("SIGTERM", () => { shutdown("SIGTERM").catch(() => process.exit(143)); });
+        process.once("SIGINT", () => { shutdown("SIGINT").catch(() => process.exit(130)); });
+        process.once("exit", cleanupSharedFiles);
 
         session.on("user_input.requested", (event) => {
             const entry = userInputEntry(event);
@@ -878,6 +1159,30 @@ public enum CopilotExtension {
                 publish();
             }
         });
+
+        session.on("elicitation.requested", (event) => {
+            const entry = elicitationEntry(event);
+            if (!entry) return;
+            pendingElicitations.set(entry.requestId, entry);
+            boundPendingElicitations();
+            publish();
+        });
+
+        session.on("elicitation.completed", (event) => {
+            const requestId = event.data?.requestId;
+            if (typeof requestId === "string" && pendingElicitations.delete(requestId)) {
+                publish();
+            }
+        });
+
+        // Both user_input.requested and elicitation.requested are gated events: the
+        // runtime only delivers them to consumers that register interest, otherwise
+        // it keeps its default terminal-only handling. Register AFTER attaching the
+        // listeners so a question dispatched immediately can't slip past them.
+        for (const eventType of ["user_input.requested", "elicitation.requested"]) {
+            if (shuttingDown) break;
+            await registerEventInterest(eventType);
+        }
 
         await refreshAllowAll();
         // Keep this Copilot session's last good drawer visible while history is
@@ -908,34 +1213,13 @@ public enum CopilotExtension {
         await refreshSchedules();
 
         processUserInputResponse();
+        processElicitationResponse();
 
-        const timer = setInterval(() => {
+        timer = setInterval(() => {
             refreshSchedules();
             processUserInputResponse();
+            processElicitationResponse();
         }, 5_000);
-
-        function cleanup() {
-            clearInterval(timer);
-            clearTimeout(transcriptPublishTimer);
-            if (userInputWatcher) {
-                try { userInputWatcher.close(); } catch {}
-                userInputWatcher = null;
-            }
-            // Use the read-only ownership check (never claim during cleanup) so an
-            // exiting spawned helper can't wipe a live interactive session's
-            // markers. The owner flushes any progress buffered behind the publish
-            // throttle before releasing the shared files.
-            if (isRecordedOwner()) {
-                writeTranscriptSnapshot();
-                removeFile(snapshotPath);
-                removeFile(scheduledTurnPath);
-                removeFile(transcriptOwnerPath);
-                removeFile(userInputResponsePath);
-            }
-        }
-        process.once("SIGTERM", cleanup);
-        process.once("SIGINT", cleanup);
-        process.once("exit", cleanup);
     }
     """#
 
