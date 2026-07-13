@@ -27,7 +27,67 @@ APP_NAME="Copilot Projects"
 # notification authorization to the bundle id, so it re-prompts once.
 BUNDLE_ID="com.obvioussean.copilot-projects"
 EXE_NAME="copilot-projects"
-VERSION="${VERSION:-0.1.0}"
+
+# SwiftPM, and the version derivation below, need this when the user's global
+# git sets safe.bareRepository=explicit.
+GIT_CONFIG_INDEX="${GIT_CONFIG_COUNT:-0}"
+export "GIT_CONFIG_KEY_$GIT_CONFIG_INDEX=safe.bareRepository"
+export "GIT_CONFIG_VALUE_$GIT_CONFIG_INDEX=all"
+export GIT_CONFIG_COUNT="$((GIT_CONFIG_INDEX + 1))"
+
+git_describe_version_tag() {
+  local tag describe commits best_describe="" best_commits=""
+
+  while IFS= read -r tag; do
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    describe="$(git describe --tags --long --match "$tag" 2>/dev/null)" || continue
+    commits="${describe#*-}"
+    commits="${commits%%-*}"
+    [[ "$commits" =~ ^[0-9]+$ ]] || continue
+
+    if [ -z "$best_commits" ] || [ "$commits" -lt "$best_commits" ]; then
+      best_describe="$describe"
+      best_commits="$commits"
+    fi
+  done < <(git for-each-ref --merged HEAD --sort=-creatordate --format='%(refname:short)' refs/tags 2>/dev/null)
+
+  [ -n "$best_describe" ] || return 1
+  printf '%s\n' "$best_describe"
+}
+
+git_worktree_is_dirty() {
+  [ -n "$(git status --porcelain --untracked-files=normal --ignore-submodules 2>/dev/null)" ]
+}
+
+# Version: an explicit VERSION (e.g. from release.sh) wins for both strings.
+# Otherwise derive from the latest git tag so local/dev builds are versioned
+# correctly instead of silently falling back to 0.1.0. The marketing string is
+# the tag; the build string uses Apple's development suffix so a dev build off
+# a release is distinguishable from the tagged release itself.
+if [ -n "${VERSION:-}" ]; then
+  SHORT_VERSION="$VERSION"
+  BUILD_VERSION="$VERSION"
+elif DESCRIBE="$(git_describe_version_tag)"; then
+  SHORT_VERSION="${DESCRIBE#v}"; SHORT_VERSION="${SHORT_VERSION%%-*}"   # e.g. 0.8.3
+  COMMITS="${DESCRIBE#*-}"; COMMITS="${COMMITS%%-*}"                    # e.g. 3
+  DIRTY_OFFSET=0
+  if git_worktree_is_dirty; then
+    DIRTY_OFFSET=1
+  fi
+  DEV_COUNT=$((COMMITS + DIRTY_OFFSET))
+  if [ "${DEV_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+    if [ "$DEV_COUNT" -gt 255 ]; then
+      echo "error: $DEV_COUNT development versions since v$SHORT_VERSION exceeds CFBundleVersion's development suffix limit; set VERSION explicitly." >&2
+      exit 1
+    fi
+    BUILD_VERSION="${SHORT_VERSION}d${DEV_COUNT}"                      # e.g. 0.8.3d3
+  else
+    BUILD_VERSION="$SHORT_VERSION"
+  fi
+else
+  SHORT_VERSION="0.1.0"
+  BUILD_VERSION="0.1.0"
+fi
 
 # macOS keys granted permissions (TCC: Accessibility, Automation, Notifications,
 # …) on the app's designated requirement, which includes the signing identity.
@@ -41,12 +101,6 @@ if [ -z "${CODESIGN_IDENTITY:-}" ]; then
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
   CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 fi
-
-# SwiftPM needs this when the user's global git sets safe.bareRepository=explicit.
-GIT_CONFIG_INDEX="${GIT_CONFIG_COUNT:-0}"
-export "GIT_CONFIG_KEY_$GIT_CONFIG_INDEX=safe.bareRepository"
-export "GIT_CONFIG_VALUE_$GIT_CONFIG_INDEX=all"
-export GIT_CONFIG_COUNT="$((GIT_CONFIG_INDEX + 1))"
 
 echo "==> swift build -c $CONFIG"
 swift build -c "$CONFIG"
@@ -121,8 +175,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>$EXE_NAME</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT_VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_VERSION</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHighResolutionCapable</key><true/>
@@ -140,8 +194,8 @@ cat > "$HELPER_CONTENTS/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>copilot-projects-link</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID.link</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT_VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_VERSION</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>LSUIElement</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
