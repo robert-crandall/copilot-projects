@@ -92,6 +92,10 @@ final class RemoteModelBridge: @unchecked Sendable {
         model?.markSessionRead(sessionId: sessionId)
     }
 
+    func closeSession(sessionId: String) -> Bool {
+        model?.closeRemoteSession(sessionId: sessionId) ?? false
+    }
+
     nonisolated func transcriptRevision(sessionId: String) -> RemoteTranscriptRevision {
         TranscriptController.remoteRevision(sessionId: sessionId)
     }
@@ -822,6 +826,35 @@ private final class RemoteHTTPHandler:
             }
             respond(context: context, method: .POST, status: .noContent,
                     contentType: "text/plain", body: "")
+        case "close-session":
+            let channel = context.channel
+            let leases = self.leases
+            Task { @MainActor in
+                let closed = leases.withHeldLease(
+                    sessionId: sessionId,
+                    clientId: clientId
+                ) {
+                    self.bridge.closeSession(sessionId: sessionId)
+                }
+                channel.eventLoop.execute {
+                    let response: (HTTPResponseStatus, String)
+                    switch closed {
+                    case .some(true):
+                        response = (.noContent, "")
+                    case .some(false):
+                        response = (.notFound, "Session not found")
+                    case .none:
+                        response = (.forbidden, "view only")
+                    }
+                    self.respond(
+                        channel: channel,
+                        method: .POST,
+                        status: response.0,
+                        contentType: "text/plain",
+                        body: Data(response.1.utf8)
+                    )
+                }
+            }
         case "prompt":
             guard let value = message.data,
                   value.utf8.count <= 8_192,
