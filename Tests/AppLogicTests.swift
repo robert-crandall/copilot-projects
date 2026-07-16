@@ -225,6 +225,37 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(sentValues, ["hello", "not sent"])
     }
 
+    @MainActor
+    func testRemoteCloseSessionRemovesTab() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = Session(title: "close", cwd: root.path)
+        defer { SessionArtifacts.removeFiles(sessionId: session.id) }
+        let project = Project(
+            name: "project",
+            cwd: root.path,
+            sessions: [session],
+            selectedSessionId: session.id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [project],
+            selectedProjectId: project.id
+        ))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+
+        XCTAssertTrue(model.closeRemoteSession(sessionId: session.id))
+        XCTAssertFalse(model.closeRemoteSession(sessionId: session.id))
+        XCTAssertTrue(model.projects[0].sessions.isEmpty)
+        XCTAssertNil(model.projects[0].selectedSessionId)
+    }
+
     func testActivityTrackerRequiresObservedWorkAndTwoIdleTicks() {
         let sessionId = UUID().uuidString
         var tracker = ActivityTracker()
@@ -3708,8 +3739,19 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
+        let session = Session(title: "remote-close", cwd: root.path)
+        defer { SessionArtifacts.removeFiles(sessionId: session.id) }
+        let project = Project(
+            name: "project",
+            cwd: root.path,
+            sessions: [session],
+            selectedSessionId: session.id
+        )
         let repository = StateRepository(path: root.appendingPathComponent("state.json"))
-        try repository.save(PersistedState(projects: [], selectedProjectId: nil))
+        try repository.save(PersistedState(
+            projects: [project],
+            selectedProjectId: project.id
+        ))
         let model = AppModel(
             stateRepository: repository,
             isAppActive: { false },
@@ -3847,6 +3889,54 @@ final class AppLogicTests: XCTestCase {
                 body: controlBody
             )
             XCTAssertEqual(allowedControl, 204)
+            let closeBody = try JSONEncoder().encode(RemoteClientMessage(
+                type: "close-session",
+                clientId: "phone",
+                sessionId: session.id,
+                data: nil
+            ))
+            let closeWithoutLease = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: closeBody
+            )
+            XCTAssertEqual(closeWithoutLease, 403)
+            let closeAcquireBody = try JSONEncoder().encode(RemoteClientMessage(
+                type: "acquire",
+                clientId: "phone",
+                sessionId: session.id,
+                data: nil
+            ))
+            let closeAcquireStatus = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: closeAcquireBody
+            )
+            XCTAssertEqual(closeAcquireStatus, 204)
+            let closeStatus = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: closeBody
+            )
+            XCTAssertEqual(closeStatus, 204)
+            let closedAgainStatus = try await remoteHTTPStatus(
+                port: port,
+                path: "/control",
+                method: "POST",
+                token: token,
+                origin: "https://projects.example.com",
+                body: closeBody
+            )
+            XCTAssertEqual(closedAgainStatus, 404)
             let notificationID = UUID()
             let dismissalBody = try JSONEncoder().encode(
                 NotificationDismissRequest(id: notificationID)

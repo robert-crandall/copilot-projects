@@ -792,6 +792,15 @@ final class AppModel: ObservableObject {
         requestCloseSession(projectId: pid, sessionId: sid)
     }
 
+    func closeRemoteSession(sessionId: String) -> Bool {
+        guard let location = locateIndex(sessionId) else { return false }
+        requestCloseSession(
+            projectId: projects[location.p].id,
+            sessionId: sessionId
+        )
+        return true
+    }
+
     /// User-initiated close (⌘W / tab ✕). Ends the session immediately with no
     /// confirmation — an explicit close is intentional, and app restarts resume
     /// sessions, so there's nothing to protect against here.
