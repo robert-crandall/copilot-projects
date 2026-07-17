@@ -657,6 +657,12 @@ enum RemoteWebAssets {
           appendNode(document.createTextNode(text.slice(plainStart, end)));
         }
       };
+      // CommonMark only treats a lone "_" as emphasis when it isn't nestled
+      // between two word characters, so identifiers like "snake_case_id"
+      // stay literal while " _italic_ " still renders as emphasis.
+      const isWordCharacter = (char) => char !== undefined && /[A-Za-z0-9]/.test(char);
+      const isIntrawordUnderscore = (openStart, closeStart, markerLength) =>
+        isWordCharacter(text[openStart - 1]) && isWordCharacter(text[closeStart + markerLength]);
 
       while (cursor < text.length) {
         if (budget.remaining <= 0) break;
@@ -735,13 +741,15 @@ enum RemoteWebAssets {
           ['**', 'strong'],
           ['__', 'strong'],
           ['~~', 'del'],
-          ['*', 'em']
+          ['*', 'em'],
+          ['_', 'em']
         ];
         let matched = false;
         for (const [marker, tag] of pairedMarkers) {
           if (!text.startsWith(marker, cursor)) continue;
           const close = boundedIndexOf(text, marker, cursor + marker.length);
           if (close <= cursor + marker.length) continue;
+          if (marker === '_' && isIntrawordUnderscore(cursor, close, marker.length)) continue;
           flushPlain(cursor);
           const element = document.createElement(tag);
           appendMarkdownInline(

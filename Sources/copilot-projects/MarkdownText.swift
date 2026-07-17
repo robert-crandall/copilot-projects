@@ -31,12 +31,14 @@ enum MarkdownParser {
     private static let maximumRenderedBytes = 256 * 1_024
     private static let maximumRenderedLines = 500
     private static let maximumRenderedPipes = 1_000
+    private static let maximumInlineMarkers = 2_000
 
     static func isWithinRenderingLimits(_ text: String) -> Bool {
         guard text.utf8.count <= maximumRenderedBytes else { return false }
         let normalized = normalizeLineEndings(text)
         var lines = 1
         var pipes = 0
+        var inlineMarkers = 0
         for character in normalized {
             if character == "\n" {
                 lines += 1
@@ -44,6 +46,16 @@ enum MarkdownParser {
             } else if character == "|" {
                 pipes += 1
                 if pipes > maximumRenderedPipes { return false }
+            } else if character == "*" || character == "_" || character == "~" || character == "`" {
+                // Bounds inline-formatting complexity (bold/italic/strikethrough/code
+                // spans). Without this, a large run of tiny delimited spans (e.g.
+                // "**x** " repeated tens of thousands of times) stays under the byte,
+                // line, and pipe caps yet still expands into tens of thousands of
+                // AttributedString formatting runs, which can stall the desktop
+                // drawer. Falling back to the plain-text renderer here matches the
+                // bounded remote web renderer's inline node/scan budget.
+                inlineMarkers += 1
+                if inlineMarkers > maximumInlineMarkers { return false }
             }
         }
         return true

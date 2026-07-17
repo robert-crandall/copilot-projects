@@ -4867,6 +4867,17 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
             String(repeating: "a", count: 256 * 1_024 + 1)
         ))
+        // A single-line, pipe-free input with tens of thousands of tiny
+        // inline formatting spans stays under the byte/line/pipe caps but
+        // must still be rejected so the native renderer falls back to plain
+        // text instead of expanding into tens of thousands of
+        // AttributedString formatting runs.
+        XCTAssertTrue(MarkdownParser.isWithinRenderingLimits(
+            "A paragraph with **bold**, *italic*, `code`, and _emphasis_ text."
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "**x** ", count: 40_000).joined()
+        ))
     }
 
     func testRemoteWebUsesMarkdownOnlyForTranscriptMessages() {
@@ -5048,6 +5059,21 @@ final class AppLogicTests: XCTestCase {
           adversarialDuration < 5000,
           `expected adversarial render under 5s, got ${adversarialDuration}ms`
         );
+
+        // Single-underscore emphasis parity-matches the native AttributedString
+        // renderer, but intraword underscores (e.g. identifiers) stay literal.
+        const underscoreEmphasis = document.createElement('div');
+        appendMarkdownInline(underscoreEmphasis, 'this is _italic_ text');
+        assert.equal(underscoreEmphasis.findAll('em')[0].textContent, 'italic');
+
+        const underscoreIntraword = document.createElement('div');
+        appendMarkdownInline(underscoreIntraword, 'snake_case_identifier stays literal');
+        assert.equal(underscoreIntraword.findAll('em').length, 0);
+        assert.equal(underscoreIntraword.textContent, 'snake_case_identifier stays literal');
+
+        const doubleUnderscoreBold = document.createElement('div');
+        appendMarkdownInline(doubleUnderscoreBold, '__bold__ still works');
+        assert.equal(doubleUnderscoreBold.findAll('strong')[0].textContent, 'bold');
         """#
         try harness.write(to: script, atomically: true, encoding: .utf8)
         let process = Process()
