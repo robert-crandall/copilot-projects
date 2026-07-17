@@ -144,11 +144,7 @@ private struct TranscriptTurnCard: View {
     }
 
     private func transcriptText(_ text: String) -> some View {
-        let attributed = (try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(text)
-        return Text(attributed)
+        MarkdownText(text: text)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }

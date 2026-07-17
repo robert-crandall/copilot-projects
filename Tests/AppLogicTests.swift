@@ -4796,6 +4796,301 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 422"))
     }
 
+    func testMarkdownParserSplitsCommonBlockStructure() {
+        let markdown = """
+        # Heading
+
+        A paragraph with **bold** text.
+
+        3. third
+        4. fourth
+            - nested
+
+        > a quote
+
+        ```swift
+        let x = 1
+        ```
+
+        | Name | Count |
+        |:-----|------:|
+        | apple | 3 |
+        """
+
+        XCTAssertEqual(MarkdownParser.blocks(from: markdown), [
+            .heading(level: 1, text: "Heading"),
+            .paragraph("A paragraph with **bold** text."),
+            .list([
+                MarkdownListItem(marker: "3.", text: "third", depth: 0),
+                MarkdownListItem(marker: "4.", text: "fourth", depth: 0),
+                MarkdownListItem(marker: "\u{2022}", text: "nested", depth: 2),
+            ]),
+            .quote("a quote"),
+            .codeBlock("let x = 1"),
+            .table(MarkdownTable(
+                header: ["Name", "Count"],
+                alignments: [.leading, .trailing],
+                rows: [["apple", "3"]]
+            )),
+        ])
+    }
+
+    func testMarkdownParserKeepsAmbiguousTextReadable() {
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "some | text\n---"),
+            [.paragraph("some | text\n---")]
+        )
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "#not a heading\n1.2 is a version"),
+            [.paragraph("#not a heading\n1.2 is a version")]
+        )
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "```\nunterminated"),
+            [.codeBlock("unterminated")]
+        )
+    }
+
+    func testMarkdownRenderingLimitsPreventStructuralAmplification() {
+        XCTAssertTrue(MarkdownParser.isWithinRenderingLimits("# Heading\n\nBody"))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "- item", count: 501).joined(separator: "\n")
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "- item", count: 501).joined(separator: "\r\n")
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "- item", count: 501).joined(separator: "\r")
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "|", count: 1_001)
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "a", count: 256 * 1_024 + 1)
+        ))
+        // A single-line, pipe-free input with tens of thousands of tiny
+        // inline formatting spans stays under the byte/line/pipe caps but
+        // must still be rejected so the native renderer falls back to plain
+        // text instead of expanding into tens of thousands of
+        // AttributedString formatting runs.
+        XCTAssertTrue(MarkdownParser.isWithinRenderingLimits(
+            "A paragraph with **bold**, *italic*, `code`, and _emphasis_ text."
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "**x** ", count: 40_000).joined()
+        ))
+    }
+
+    func testRemoteWebUsesMarkdownOnlyForTranscriptMessages() {
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "appendMarkdown(container, text);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "appendLinkedText(row, line);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "document.createElement(`h${block.level}`)"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "url.protocol !== 'https:' && url.protocol !== 'http:'"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "appendLinkedText(paragraph, text);"
+        ))
+        XCTAssertFalse(RemoteWebAssets.javascript.contains("innerHTML"))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".markdown-table-wrap"))
+    }
+
+    func testRemoteMarkdownParserBehavior() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("markdown-test.js")
+        let harness = RemoteWebAssets.markdownJavascript + #"""
+
+        const assert = require('node:assert/strict');
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('# Heading\n\n- first\n  continued\n\n```\ncode\n```'),
+          [
+            {type:'heading', level:1, text:'Heading'},
+            {type:'list', items:[{marker:'\u2022', text:'first continued', depth:0}]},
+            {type:'code', text:'code'}
+          ]
+        );
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('| Name | Count |\n|:-----|------:|\n| apple | 3 |'),
+          [{
+            type:'table',
+            header:['Name', 'Count'],
+            alignments:['left', 'right'],
+            rows:[['apple', '3']]
+          }]
+        );
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('some | text\n---'),
+          [{type:'paragraph', text:'some | text\n---'}]
+        );
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('```\nunterminated'),
+          [{type:'code', text:'unterminated'}]
+        );
+        assert.equal(markdownWithinRenderingLimits('# Heading\n\nBody'), true);
+        assert.equal(
+          markdownWithinRenderingLimits(Array(501).fill('- item').join('\n')),
+          false
+        );
+        assert.equal(
+          markdownWithinRenderingLimits(Array(501).fill('- item').join('\r\n')),
+          false
+        );
+        assert.equal(
+          markdownWithinRenderingLimits(Array(501).fill('- item').join('\r')),
+          false
+        );
+        assert.equal(markdownWithinRenderingLimits('|'.repeat(1001)), false);
+        assert.equal(markdownWithinRenderingLimits('a'.repeat(256 * 1024 + 1)), false);
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Markdown JavaScript test failed"
+        )
+    }
+
+    /// Exercises `appendMarkdown`/`appendMarkdownInline` themselves (not just the
+    /// block parser) against a minimal DOM shim, so the DOM construction, inline
+    /// formatting, unsafe-link rejection, and the inline node/complexity budget
+    /// are actually executed rather than only asserted via source-string checks.
+    func testRemoteMarkdownDOMRenderingExecutesAppendMarkdown() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("markdown-dom-test.js")
+        let domShim = #"""
+        class FakeNode {
+          constructor(tagName) {
+            this.tagName = tagName;
+            this.children = [];
+            this.attributes = {};
+            this.style = { setProperty() {} };
+            this.className = '';
+            this._text = undefined;
+          }
+          append(...nodes) { for (const n of nodes) this.children.push(n); }
+          setAttribute(name, value) { this.attributes[name] = value; }
+          get textContent() {
+            if (this._text !== undefined) return this._text;
+            return this.children.map((c) => c.textContent).join('');
+          }
+          set textContent(value) { this._text = value; this.children = []; }
+          countNodes() {
+            return 1 + this.children.reduce((sum, c) => sum + (c.countNodes ? c.countNodes() : 1), 0);
+          }
+          findAll(tag) {
+            let results = this.tagName === tag ? [this] : [];
+            for (const c of this.children) {
+              if (c.findAll) results = results.concat(c.findAll(tag));
+            }
+            return results;
+          }
+        }
+        class FakeTextNode {
+          constructor(text) { this._text = text; }
+          get textContent() { return this._text; }
+          countNodes() { return 1; }
+        }
+        globalThis.document = {
+          createElement(tag) { return new FakeNode(tag); },
+          createTextNode(text) { return new FakeTextNode(text); },
+        };
+
+        """#
+        let harness = domShim + RemoteWebAssets.markdownJavascript + #"""
+
+        const assert = require('node:assert/strict');
+
+        // DOM construction: heading, bold, and a safe link are actually rendered.
+        const root = document.createElement('div');
+        appendMarkdown(root, '# Heading\n\nA paragraph with **bold** text and a [link](https://example.com).');
+        assert.equal(root.findAll('h1')[0].textContent, 'Heading');
+        assert.equal(root.findAll('strong')[0].textContent, 'bold');
+        const anchor = root.findAll('a')[0];
+        assert.equal(anchor.href, 'https://example.com/');
+        assert.equal(anchor.textContent, 'link');
+
+        // Unsafe link protocols are rejected and rendered as literal text.
+        const unsafe = document.createElement('div');
+        appendMarkdownInline(unsafe, '[bad](javascript:alert(1))');
+        assert.equal(unsafe.findAll('a').length, 0);
+        assert.equal(unsafe.textContent, '[bad](javascript:alert(1))');
+
+        // The inline node budget bounds DOM amplification from repeated markers.
+        const amplified = document.createElement('div');
+        const amplifiedStart = Date.now();
+        appendMarkdownInline(amplified, '**x**'.repeat(50000));
+        const amplifiedDuration = Date.now() - amplifiedStart;
+        assert.ok(
+          amplified.countNodes() < 20000,
+          `expected bounded node count, got ${amplified.countNodes()}`
+        );
+        assert.ok(
+          amplifiedDuration < 5000,
+          `expected amplified render under 5s, got ${amplifiedDuration}ms`
+        );
+
+        // A long run of unmatched delimiters must not degrade to quadratic scans.
+        const adversarial = document.createElement('div');
+        const adversarialStart = Date.now();
+        appendMarkdownInline(adversarial, '['.repeat(256 * 1024));
+        const adversarialDuration = Date.now() - adversarialStart;
+        assert.ok(
+          adversarialDuration < 5000,
+          `expected adversarial render under 5s, got ${adversarialDuration}ms`
+        );
+
+        // Single-underscore emphasis parity-matches the native AttributedString
+        // renderer, but intraword underscores (e.g. identifiers) stay literal.
+        const underscoreEmphasis = document.createElement('div');
+        appendMarkdownInline(underscoreEmphasis, 'this is _italic_ text');
+        assert.equal(underscoreEmphasis.findAll('em')[0].textContent, 'italic');
+
+        const underscoreIntraword = document.createElement('div');
+        appendMarkdownInline(underscoreIntraword, 'snake_case_identifier stays literal');
+        assert.equal(underscoreIntraword.findAll('em').length, 0);
+        assert.equal(underscoreIntraword.textContent, 'snake_case_identifier stays literal');
+
+        const doubleUnderscoreBold = document.createElement('div');
+        appendMarkdownInline(doubleUnderscoreBold, '__bold__ still works');
+        assert.equal(doubleUnderscoreBold.findAll('strong')[0].textContent, 'bold');
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Markdown DOM rendering test failed"
+        )
+    }
+
     func testRemoteServiceWorkerClearsSyncedNotifications() {
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("payload.action === 'clear'"))
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains(

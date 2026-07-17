@@ -24,8 +24,8 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   counts appear in the sidebar; a blue dot on the session tab marks work that finished
   while you were away. With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Completed-turn drawer:** Copilot CLI remains the native interactive terminal, while a
-  collapsible drawer overlays its right edge with independently scrollable completed turns.
-  Live work, permissions, shortcuts, and input stay entirely in the CLI.
+  collapsible drawer overlays its right edge with independently scrollable completed turns
+  rendered as Markdown. Live work, permissions, shortcuts, and input stay entirely in the CLI.
 - **Schedules + background work:** queued scheduled prompts show a clock with cadence/next-run
   details; active scheduled turns and subagents use a separate background indicator instead of
   making the foreground session look busy.
@@ -150,12 +150,12 @@ expected host and same-origin POSTs. Direct requests to the localhost origin wit
 Access token are rejected.
 
 The mobile web client can list projects, select a terminal, and acquire the single remote writer
-lease. Its completed-turn pane mirrors the desktop drawer and includes a message composer. Sending
-is enabled only when a fresh server-side check confirms Copilot is alive, fully idle, and has no
-scheduled/background work; it clears any unsent desktop draft before submitting the message
-through the native CLI input path. The full terminal remains available for permissions and other
-TUI interactions. Remote clients do not resize the PTY because dtach shares one terminal size with
-the desktop.
+lease. Its Markdown-rendered completed-turn pane mirrors the desktop drawer and includes a message
+composer. Sending is enabled only when a fresh server-side check confirms Copilot is alive, fully
+idle, and has no scheduled/background work; it clears any unsent desktop draft before submitting
+the message through the native CLI input path. The full terminal remains available for permissions
+and other TUI interactions. Remote clients do not resize the PTY because dtach shares one terminal
+size with the desktop.
 
 The header's **New Session** button creates a session in the host's currently selected project
 (and only there, so it never steals the Mac's selected tab). Creation is idempotent: the client
