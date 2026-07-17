@@ -5126,6 +5126,167 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("function setViewMode(mode"))
     }
 
+    func testRemoteWebMirrorsIOSInputParity() {
+        XCTAssertTrue(RemoteWebAssets.html.contains(
+            #"<button data-key="enter" aria-label="Enter" title="Enter">⏎</button>"#
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            #"'enter': 'enter'"#
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (previousSession) {"
+        ))
+        // Always restore, including an empty draft, so text cannot leak into
+        // a newly selected session that has no saved composer input.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "prompt.value = draftForSession(id);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "setPromptDraft(selected, prompt.value);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "setPromptDraft(selected, '');"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "prunePromptDrafts(new Set(sessionState.keys()));"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "window.addEventListener('pagehide', persistPromptDrafts);"
+        ))
+    }
+
+    func testRemoteWebDraftPersistenceBehavior() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let helper = root.appendingPathComponent("draft-helper.js")
+        try RemoteWebAssets.draftJavascript.write(
+            to: helper,
+            atomically: true,
+            encoding: .utf8
+        )
+        let script = root.appendingPathComponent("draft-test.js")
+        let harness = #"""
+        const assert = require('node:assert/strict');
+        const fs = require('node:fs');
+        const vm = require('node:vm');
+        const source = fs.readFileSync(process.argv[2], 'utf8');
+        const storageKey = 'copilot-projects-prompt-drafts-v1';
+
+        function makeStorage(initialValue = null) {
+          const values = new Map();
+          if (initialValue !== null) values.set(storageKey, initialValue);
+          return {
+            values,
+            getCalls: 0,
+            setCalls: 0,
+            removeCalls: 0,
+            getItem(key) {
+              this.getCalls += 1;
+              return this.values.has(key) ? this.values.get(key) : null;
+            },
+            setItem(key, value) {
+              this.setCalls += 1;
+              this.values.set(key, value);
+            },
+            removeItem(key) {
+              this.removeCalls += 1;
+              this.values.delete(key);
+            },
+          };
+        }
+
+        function createContext(storage, warnings = []) {
+          let timer = null;
+          const context = {
+            localStorage: storage,
+            console: { warn(...args) { warnings.push(args); } },
+            setTimeout(callback) { timer = callback; return 1; },
+            clearTimeout() { timer = null; },
+          };
+          vm.createContext(context);
+          vm.runInContext(source, context);
+          return {
+            context,
+            flushTimer() {
+              const callback = timer;
+              timer = null;
+              if (callback) callback();
+            },
+          };
+        }
+
+        const storage = makeStorage();
+        const first = createContext(storage);
+        first.context.setPromptDraft('s1', 'half-typed message');
+        assert.equal(first.context.draftForSession('s1'), 'half-typed message');
+        assert.equal(storage.setCalls, 0, 'writes should be debounced');
+        first.context.persistPromptDrafts();
+        assert.equal(storage.setCalls, 1);
+
+        const restarted = createContext(storage);
+        assert.equal(restarted.context.draftForSession('s1'), 'half-typed message');
+        restarted.context.setPromptDraft('s2', 'x'.repeat(9000));
+        assert.equal(restarted.context.draftForSession('s2').length, 8192);
+        restarted.context.setPromptDraft('gone', 'stale');
+        restarted.context.setPromptDraft('live', 'keep');
+        restarted.context.persistPromptDrafts();
+        restarted.context.prunePromptDrafts(new Set(['live']));
+        restarted.context.persistPromptDrafts();
+        assert.deepEqual(
+          JSON.parse(storage.values.get(storageKey)),
+          { live: 'keep' }
+        );
+
+        restarted.context.setPromptDraft('live', '');
+        restarted.context.persistPromptDrafts();
+        assert.equal(storage.values.has(storageKey), false);
+        assert.ok(storage.removeCalls > 0);
+
+        const boundedStorage = makeStorage();
+        const bounded = createContext(boundedStorage);
+        for (let index = 0; index < 101; index += 1) {
+          bounded.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        bounded.context.persistPromptDrafts();
+        const boundedDrafts = JSON.parse(boundedStorage.values.get(storageKey));
+        assert.equal(Object.keys(boundedDrafts).length, 100);
+        assert.equal(boundedDrafts.s0, undefined);
+        assert.equal(boundedDrafts.s100, 'draft 100');
+
+        const warnings = [];
+        const failingStorage = {
+          getItem() { throw new Error('storage unavailable'); },
+          setItem() { throw new Error('storage unavailable'); },
+          removeItem() { throw new Error('storage unavailable'); },
+        };
+        const failed = createContext(failingStorage, warnings);
+        failed.context.setPromptDraft('s1', 'memory only');
+        failed.context.persistPromptDrafts();
+        failed.context.persistPromptDrafts();
+        assert.equal(failed.context.draftForSession('s1'), 'memory only');
+        assert.equal(warnings.length, 1, 'storage failures should warn once');
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path, helper.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Draft JavaScript test failed"
+        )
+    }
+
     func testRemoteWebPromptSubmitsOnEnter() {
         // Enter sends the Copilot prompt; Shift+Enter keeps inserting a newline.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(

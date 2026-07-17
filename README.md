@@ -151,11 +151,12 @@ Access token are rejected.
 
 The mobile web client can list projects, select a terminal, and acquire the single remote writer
 lease. Its Markdown-rendered completed-turn pane mirrors the desktop drawer and includes a message
-composer. Sending is enabled only when a fresh server-side check confirms Copilot is alive, fully
-idle, and has no scheduled/background work; it clears any unsent desktop draft before submitting
-the message through the native CLI input path. The full terminal remains available for permissions
-and other TUI interactions. Remote clients do not resize the PTY because dtach shares one terminal
-size with the desktop.
+composer with per-session drafts that survive session switches and reloads. Sending is enabled only
+when a fresh server-side check confirms Copilot is alive, fully idle, and has no
+scheduled/background work; it clears any unsent desktop draft before submitting the message through
+the native CLI input path. The full terminal remains available for permissions and other TUI
+interactions, with an on-screen Enter key alongside the other terminal controls. Remote clients do
+not resize the PTY because dtach shares one terminal size with the desktop.
 
 The header's **New Session** button creates a session in the host's currently selected project
 (and only there, so it never steals the Mac's selected tab). Creation is idempotent: the client

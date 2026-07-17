@@ -66,6 +66,7 @@ enum RemoteWebAssets {
               <button data-key="esc">Esc</button>
               <button data-key="ctrl-c">Ctrl-C</button>
               <button data-key="tab">Tab</button>
+              <button data-key="enter" aria-label="Enter" title="Enter">⏎</button>
               <button data-key="up">↑</button>
               <button data-key="down">↓</button>
               <span id="lease">view only</span>
@@ -864,7 +865,123 @@ enum RemoteWebAssets {
     }
     """#
 
-    static let javascript = markdownJavascript + #"""
+    static let draftJavascript = #"""
+    const PROMPT_DRAFT_STORAGE_KEY = 'copilot-projects-prompt-drafts-v1';
+    const PROMPT_DRAFT_MAX_LENGTH = 8192;
+    const PROMPT_DRAFT_MAX_SESSIONS = 100;
+    const PROMPT_DRAFT_SAVE_DELAY = 200;
+    const promptDrafts = new Map();
+    let promptDraftSaveTimer = null;
+    let promptDraftStorageWarningShown = false;
+
+    function warnPromptDraftStorage(error) {
+      if (promptDraftStorageWarningShown) return;
+      promptDraftStorageWarningShown = true;
+      console.warn('Copilot Projects could not persist message drafts.', error);
+    }
+
+    function loadPromptDrafts() {
+      let raw = null;
+      try {
+        raw = localStorage.getItem(PROMPT_DRAFT_STORAGE_KEY);
+      } catch (error) {
+        warnPromptDraftStorage(error);
+        return;
+      }
+      if (!raw) return;
+
+      let decoded = null;
+      try {
+        decoded = JSON.parse(raw);
+      } catch (error) {
+        warnPromptDraftStorage(error);
+        return;
+      }
+      if (!decoded || Array.isArray(decoded) || typeof decoded !== 'object') {
+        warnPromptDraftStorage(new Error('Stored message drafts are invalid.'));
+        return;
+      }
+
+      let needsRewrite = false;
+      for (const [sessionId, value] of Object.entries(decoded)) {
+        if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
+          needsRewrite = true;
+          break;
+        }
+        if (typeof value !== 'string' || !value) {
+          needsRewrite = true;
+          continue;
+        }
+        const normalized = value.slice(0, PROMPT_DRAFT_MAX_LENGTH);
+        if (normalized !== value) needsRewrite = true;
+        promptDrafts.set(sessionId, normalized);
+      }
+      if (needsRewrite) schedulePromptDraftPersistence();
+    }
+
+    function persistPromptDrafts() {
+      if (promptDraftSaveTimer !== null) {
+        clearTimeout(promptDraftSaveTimer);
+        promptDraftSaveTimer = null;
+      }
+      try {
+        if (promptDrafts.size) {
+          localStorage.setItem(
+            PROMPT_DRAFT_STORAGE_KEY,
+            JSON.stringify(Object.fromEntries(promptDrafts))
+          );
+        } else {
+          localStorage.removeItem(PROMPT_DRAFT_STORAGE_KEY);
+        }
+      } catch (error) {
+        warnPromptDraftStorage(error);
+      }
+    }
+
+    function schedulePromptDraftPersistence() {
+      if (promptDraftSaveTimer !== null) clearTimeout(promptDraftSaveTimer);
+      promptDraftSaveTimer = setTimeout(
+        persistPromptDrafts,
+        PROMPT_DRAFT_SAVE_DELAY
+      );
+    }
+
+    function draftForSession(sessionId) {
+      return sessionId ? (promptDrafts.get(sessionId) || '') : '';
+    }
+
+    function setPromptDraft(sessionId, value) {
+      if (!sessionId) return;
+      const normalized = String(value ?? '').slice(0, PROMPT_DRAFT_MAX_LENGTH);
+      if (!normalized) {
+        if (!promptDrafts.delete(sessionId)) return;
+        schedulePromptDraftPersistence();
+        return;
+      }
+      if (promptDrafts.get(sessionId) === normalized) return;
+      if (promptDrafts.has(sessionId)) {
+        promptDrafts.delete(sessionId);
+      } else if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
+        promptDrafts.delete(promptDrafts.keys().next().value);
+      }
+      promptDrafts.set(sessionId, normalized);
+      schedulePromptDraftPersistence();
+    }
+
+    function prunePromptDrafts(activeSessionIds) {
+      let changed = false;
+      for (const sessionId of promptDrafts.keys()) {
+        if (activeSessionIds.has(sessionId)) continue;
+        promptDrafts.delete(sessionId);
+        changed = true;
+      }
+      if (changed) schedulePromptDraftPersistence();
+    }
+
+    loadPromptDrafts();
+    """#
+
+    static let javascript = markdownJavascript + draftJavascript + #"""
     const sessions = document.querySelector('#sessions');
     const terminal = document.querySelector('#terminal');
     const connection = document.querySelector('#connection');
@@ -907,7 +1024,8 @@ enum RemoteWebAssets {
     }
     const clientId = newUUID();
     const TOOLBAR_KEYS = {
-      'esc': 'escape', 'tab': 'tab', 'up': 'up', 'down': 'down'
+      'esc': 'escape', 'tab': 'tab', 'enter': 'enter',
+      'up': 'up', 'down': 'down'
     };
     let stream = null;
     let selected = null;
@@ -1128,7 +1246,13 @@ enum RemoteWebAssets {
       }
     }
     function selectSession(id) {
+      const previousSession = selected;
+      if (previousSession) {
+        setPromptDraft(previousSession, prompt.value);
+        persistPromptDrafts();
+      }
       selected = id;
+      prompt.value = draftForSession(id);
       writable = false;
       pendingActions.length = 0;
       pendingScroll = 0;
@@ -1377,6 +1501,7 @@ enum RemoteWebAssets {
           sessions.append(button);
         });
       });
+      prunePromptDrafts(new Set(sessionState.keys()));
       updateNewSessionState();
       // Select a just-created session once the host's snapshot includes it, without
       // ever changing the host Mac's own selection.
@@ -1904,14 +2029,23 @@ enum RemoteWebAssets {
         promptForm.requestSubmit();
       }
     });
-    prompt.addEventListener('input', () => updatePromptState());
+    prompt.addEventListener('input', () => {
+      setPromptDraft(selected, prompt.value);
+      updatePromptState();
+    });
     promptForm.onsubmit = (event) => {
       event.preventDefault();
       if (enqueuePrompt(prompt.value)) {
         prompt.value = '';
+        setPromptDraft(selected, '');
+        persistPromptDrafts();
         updatePromptState();
       }
     };
+    window.addEventListener('pagehide', persistPromptDrafts);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') persistPromptDrafts();
+    });
 
     function base64URLToBytes(value) {
       const padded = value.replace(/-/g, '+').replace(/_/g, '/')
