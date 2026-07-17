@@ -4796,6 +4796,166 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 422"))
     }
 
+    func testMarkdownParserSplitsCommonBlockStructure() {
+        let markdown = """
+        # Heading
+
+        A paragraph with **bold** text.
+
+        3. third
+        4. fourth
+            - nested
+
+        > a quote
+
+        ```swift
+        let x = 1
+        ```
+
+        | Name | Count |
+        |:-----|------:|
+        | apple | 3 |
+        """
+
+        XCTAssertEqual(MarkdownParser.blocks(from: markdown), [
+            .heading(level: 1, text: "Heading"),
+            .paragraph("A paragraph with **bold** text."),
+            .list([
+                MarkdownListItem(marker: "3.", text: "third", depth: 0),
+                MarkdownListItem(marker: "4.", text: "fourth", depth: 0),
+                MarkdownListItem(marker: "\u{2022}", text: "nested", depth: 2),
+            ]),
+            .quote("a quote"),
+            .codeBlock("let x = 1"),
+            .table(MarkdownTable(
+                header: ["Name", "Count"],
+                alignments: [.leading, .trailing],
+                rows: [["apple", "3"]]
+            )),
+        ])
+    }
+
+    func testMarkdownParserKeepsAmbiguousTextReadable() {
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "some | text\n---"),
+            [.paragraph("some | text\n---")]
+        )
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "#not a heading\n1.2 is a version"),
+            [.paragraph("#not a heading\n1.2 is a version")]
+        )
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "```\nunterminated"),
+            [.codeBlock("unterminated")]
+        )
+    }
+
+    func testMarkdownRenderingLimitsPreventStructuralAmplification() {
+        XCTAssertTrue(MarkdownParser.isWithinRenderingLimits("# Heading\n\nBody"))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "- item", count: 501).joined(separator: "\n")
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "- item", count: 501).joined(separator: "\r\n")
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: "- item", count: 501).joined(separator: "\r")
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "|", count: 1_001)
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "a", count: 256 * 1_024 + 1)
+        ))
+    }
+
+    func testRemoteWebUsesMarkdownOnlyForTranscriptMessages() {
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "appendMarkdown(container, text);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "appendLinkedText(row, line);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "document.createElement(`h${block.level}`)"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "url.protocol !== 'https:' && url.protocol !== 'http:'"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "appendLinkedText(paragraph, text);"
+        ))
+        XCTAssertFalse(RemoteWebAssets.javascript.contains("innerHTML"))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".markdown-table-wrap"))
+    }
+
+    func testRemoteMarkdownParserBehavior() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("markdown-test.js")
+        let harness = RemoteWebAssets.markdownJavascript + #"""
+
+        const assert = require('node:assert/strict');
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('# Heading\n\n- first\n  continued\n\n```\ncode\n```'),
+          [
+            {type:'heading', level:1, text:'Heading'},
+            {type:'list', items:[{marker:'\u2022', text:'first continued', depth:0}]},
+            {type:'code', text:'code'}
+          ]
+        );
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('| Name | Count |\n|:-----|------:|\n| apple | 3 |'),
+          [{
+            type:'table',
+            header:['Name', 'Count'],
+            alignments:['left', 'right'],
+            rows:[['apple', '3']]
+          }]
+        );
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('some | text\n---'),
+          [{type:'paragraph', text:'some | text\n---'}]
+        );
+        assert.deepStrictEqual(
+          parseMarkdownBlocks('```\nunterminated'),
+          [{type:'code', text:'unterminated'}]
+        );
+        assert.equal(markdownWithinRenderingLimits('# Heading\n\nBody'), true);
+        assert.equal(
+          markdownWithinRenderingLimits(Array(501).fill('- item').join('\n')),
+          false
+        );
+        assert.equal(
+          markdownWithinRenderingLimits(Array(501).fill('- item').join('\r\n')),
+          false
+        );
+        assert.equal(
+          markdownWithinRenderingLimits(Array(501).fill('- item').join('\r')),
+          false
+        );
+        assert.equal(markdownWithinRenderingLimits('|'.repeat(1001)), false);
+        assert.equal(markdownWithinRenderingLimits('a'.repeat(256 * 1024 + 1)), false);
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Markdown JavaScript test failed"
+        )
+    }
+
     func testRemoteServiceWorkerClearsSyncedNotifications() {
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("payload.action === 'clear'"))
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains(
