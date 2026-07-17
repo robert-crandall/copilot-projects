@@ -351,6 +351,8 @@ struct MarkdownText: View {
                 .fontWeight(.semibold)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityHeading(accessibilityHeadingLevel(for: level))
         case let .paragraph(text):
             Text(inline(text))
                 .fixedSize(horizontal: false, vertical: true)
@@ -472,6 +474,17 @@ struct MarkdownText: View {
         case 2: .title3
         case 3: .headline
         default: .subheadline
+        }
+    }
+
+    private func accessibilityHeadingLevel(for level: Int) -> AccessibilityHeadingLevel {
+        switch level {
+        case 1: .h1
+        case 2: .h2
+        case 3: .h3
+        case 4: .h4
+        case 5: .h5
+        default: .h6
         }
     }
 
