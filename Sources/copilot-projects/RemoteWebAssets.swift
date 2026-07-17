@@ -378,6 +378,8 @@ enum RemoteWebAssets {
     const MARKDOWN_MAX_LINES = 500;
     const MARKDOWN_MAX_PIPES = 1000;
     const MARKDOWN_INLINE_MAX_DEPTH = 12;
+    const MARKDOWN_INLINE_MAX_NODES = 5000;
+    const MARKDOWN_INLINE_SEARCH_WINDOW = 500;
 
     function normalizeMarkdownLineEndings(text) {
       return text.replace(/\r\n?/g, '\n');
@@ -625,26 +627,44 @@ enum RemoteWebAssets {
       return anchor;
     }
 
-    function appendMarkdownInline(parent, value, depth = 0) {
+    // Finds `needle` within a bounded window starting at `start` so a single
+    // delimiter search never scans more than MARKDOWN_INLINE_SEARCH_WINDOW
+    // characters. Without this, adversarial input (e.g. a long run of `[`
+    // with no closing `](`) makes every cursor position rescan the rest of
+    // the string, which is quadratic in the input length.
+    function boundedIndexOf(text, needle, start) {
+      if (start >= text.length) return -1;
+      const end = Math.min(text.length, start + MARKDOWN_INLINE_SEARCH_WINDOW);
+      const found = text.slice(start, end).indexOf(needle);
+      return found === -1 ? -1 : start + found;
+    }
+
+    function appendMarkdownInline(parent, value, depth = 0, budget = { remaining: MARKDOWN_INLINE_MAX_NODES }) {
       const text = String(value ?? '');
-      if (depth >= MARKDOWN_INLINE_MAX_DEPTH) {
+      if (depth >= MARKDOWN_INLINE_MAX_DEPTH || budget.remaining <= 0) {
         parent.append(document.createTextNode(text));
         return;
       }
 
       let cursor = 0;
       let plainStart = 0;
+      const appendNode = (node) => {
+        parent.append(node);
+        budget.remaining -= 1;
+      };
       const flushPlain = (end) => {
         if (end > plainStart) {
-          parent.append(document.createTextNode(text.slice(plainStart, end)));
+          appendNode(document.createTextNode(text.slice(plainStart, end)));
         }
       };
 
       while (cursor < text.length) {
+        if (budget.remaining <= 0) break;
+
         if (text[cursor] === '\\' && cursor + 1 < text.length
             && '\\`*[]()_~'.includes(text[cursor + 1])) {
           flushPlain(cursor);
-          parent.append(document.createTextNode(text[cursor + 1]));
+          appendNode(document.createTextNode(text[cursor + 1]));
           cursor += 2;
           plainStart = cursor;
           continue;
@@ -654,12 +674,12 @@ enum RemoteWebAssets {
           let ticks = 1;
           while (text[cursor + ticks] === '`') ticks += 1;
           const marker = '`'.repeat(ticks);
-          const close = text.indexOf(marker, cursor + ticks);
+          const close = boundedIndexOf(text, marker, cursor + ticks);
           if (close >= 0) {
             flushPlain(cursor);
             const code = document.createElement('code');
             code.textContent = text.slice(cursor + ticks, close);
-            parent.append(code);
+            appendNode(code);
             cursor = close + ticks;
             plainStart = cursor;
             continue;
@@ -667,11 +687,11 @@ enum RemoteWebAssets {
         }
 
         if (text.startsWith('![', cursor)) {
-          const labelEnd = text.indexOf('](', cursor + 2);
-          const urlEnd = labelEnd >= 0 ? text.indexOf(')', labelEnd + 2) : -1;
+          const labelEnd = boundedIndexOf(text, '](', cursor + 2);
+          const urlEnd = labelEnd >= 0 ? boundedIndexOf(text, ')', labelEnd + 2) : -1;
           if (labelEnd >= 0 && urlEnd >= 0) {
             flushPlain(cursor);
-            parent.append(document.createTextNode(
+            appendNode(document.createTextNode(
               `[Image: ${text.slice(cursor + 2, labelEnd)}]`
             ));
             cursor = urlEnd + 1;
@@ -681,14 +701,14 @@ enum RemoteWebAssets {
         }
 
         if (text[cursor] === '[') {
-          const labelEnd = text.indexOf('](', cursor + 1);
-          const urlEnd = labelEnd >= 0 ? text.indexOf(')', labelEnd + 2) : -1;
+          const labelEnd = boundedIndexOf(text, '](', cursor + 1);
+          const urlEnd = labelEnd >= 0 ? boundedIndexOf(text, ')', labelEnd + 2) : -1;
           if (labelEnd >= 0 && urlEnd >= 0) {
             const label = text.slice(cursor + 1, labelEnd);
             const anchor = markdownAnchor(text.slice(labelEnd + 2, urlEnd), label);
             if (anchor) {
               flushPlain(cursor);
-              parent.append(anchor);
+              appendNode(anchor);
               cursor = urlEnd + 1;
               plainStart = cursor;
               continue;
@@ -704,7 +724,7 @@ enum RemoteWebAssets {
           const anchor = markdownAnchor(href, href);
           if (anchor) {
             flushPlain(cursor);
-            parent.append(anchor);
+            appendNode(anchor);
             cursor = end;
             plainStart = cursor;
             continue;
@@ -720,16 +740,17 @@ enum RemoteWebAssets {
         let matched = false;
         for (const [marker, tag] of pairedMarkers) {
           if (!text.startsWith(marker, cursor)) continue;
-          const close = text.indexOf(marker, cursor + marker.length);
+          const close = boundedIndexOf(text, marker, cursor + marker.length);
           if (close <= cursor + marker.length) continue;
           flushPlain(cursor);
           const element = document.createElement(tag);
           appendMarkdownInline(
             element,
             text.slice(cursor + marker.length, close),
-            depth + 1
+            depth + 1,
+            budget
           );
-          parent.append(element);
+          appendNode(element);
           cursor = close + marker.length;
           plainStart = cursor;
           matched = true;
@@ -755,14 +776,19 @@ enum RemoteWebAssets {
         return;
       }
 
+      // Shared across every inline call for this document render so a
+      // pathological input (e.g. thousands of tiny bold spans) can't
+      // amplify into an unbounded number of DOM nodes.
+      const inlineBudget = { remaining: MARKDOWN_INLINE_MAX_NODES };
+
       parseMarkdownBlocks(text).forEach((block) => {
         if (block.type === 'heading') {
           const heading = document.createElement(`h${block.level}`);
-          appendMarkdownInline(heading, block.text);
+          appendMarkdownInline(heading, block.text, 0, inlineBudget);
           body.append(heading);
         } else if (block.type === 'paragraph') {
           const paragraph = document.createElement('p');
-          appendMarkdownInline(paragraph, block.text);
+          appendMarkdownInline(paragraph, block.text, 0, inlineBudget);
           body.append(paragraph);
         } else if (block.type === 'code') {
           const pre = document.createElement('pre');
@@ -772,7 +798,7 @@ enum RemoteWebAssets {
           body.append(pre);
         } else if (block.type === 'quote') {
           const quote = document.createElement('blockquote');
-          appendMarkdownInline(quote, block.text);
+          appendMarkdownInline(quote, block.text, 0, inlineBudget);
           body.append(quote);
         } else if (block.type === 'list') {
           const list = document.createElement('div');
@@ -791,7 +817,7 @@ enum RemoteWebAssets {
             marker.textContent = item.marker;
             const itemBody = document.createElement('span');
             itemBody.className = 'markdown-list-body';
-            appendMarkdownInline(itemBody, item.text);
+            appendMarkdownInline(itemBody, item.text, 0, inlineBudget);
             row.append(marker, itemBody);
             list.append(row);
           });
@@ -805,7 +831,7 @@ enum RemoteWebAssets {
           block.header.forEach((value, column) => {
             const cell = document.createElement('th');
             cell.style.textAlign = block.alignments[column] || 'left';
-            appendMarkdownInline(cell, value);
+            appendMarkdownInline(cell, value, 0, inlineBudget);
             headerRow.append(cell);
           });
           head.append(headerRow);
@@ -816,7 +842,7 @@ enum RemoteWebAssets {
             block.header.forEach((_, column) => {
               const cell = document.createElement('td');
               cell.style.textAlign = block.alignments[column] || 'left';
-              appendMarkdownInline(cell, values[column] || '');
+              appendMarkdownInline(cell, values[column] || '', 0, inlineBudget);
               row.append(cell);
             });
             bodyRows.append(row);

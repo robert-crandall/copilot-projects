@@ -4956,6 +4956,115 @@ final class AppLogicTests: XCTestCase {
         )
     }
 
+    /// Exercises `appendMarkdown`/`appendMarkdownInline` themselves (not just the
+    /// block parser) against a minimal DOM shim, so the DOM construction, inline
+    /// formatting, unsafe-link rejection, and the inline node/complexity budget
+    /// are actually executed rather than only asserted via source-string checks.
+    func testRemoteMarkdownDOMRenderingExecutesAppendMarkdown() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("markdown-dom-test.js")
+        let domShim = #"""
+        class FakeNode {
+          constructor(tagName) {
+            this.tagName = tagName;
+            this.children = [];
+            this.attributes = {};
+            this.style = { setProperty() {} };
+            this.className = '';
+            this._text = undefined;
+          }
+          append(...nodes) { for (const n of nodes) this.children.push(n); }
+          setAttribute(name, value) { this.attributes[name] = value; }
+          get textContent() {
+            if (this._text !== undefined) return this._text;
+            return this.children.map((c) => c.textContent).join('');
+          }
+          set textContent(value) { this._text = value; this.children = []; }
+          countNodes() {
+            return 1 + this.children.reduce((sum, c) => sum + (c.countNodes ? c.countNodes() : 1), 0);
+          }
+          findAll(tag) {
+            let results = this.tagName === tag ? [this] : [];
+            for (const c of this.children) {
+              if (c.findAll) results = results.concat(c.findAll(tag));
+            }
+            return results;
+          }
+        }
+        class FakeTextNode {
+          constructor(text) { this._text = text; }
+          get textContent() { return this._text; }
+          countNodes() { return 1; }
+        }
+        globalThis.document = {
+          createElement(tag) { return new FakeNode(tag); },
+          createTextNode(text) { return new FakeTextNode(text); },
+        };
+
+        """#
+        let harness = domShim + RemoteWebAssets.markdownJavascript + #"""
+
+        const assert = require('node:assert/strict');
+
+        // DOM construction: heading, bold, and a safe link are actually rendered.
+        const root = document.createElement('div');
+        appendMarkdown(root, '# Heading\n\nA paragraph with **bold** text and a [link](https://example.com).');
+        assert.equal(root.findAll('h1')[0].textContent, 'Heading');
+        assert.equal(root.findAll('strong')[0].textContent, 'bold');
+        const anchor = root.findAll('a')[0];
+        assert.equal(anchor.href, 'https://example.com/');
+        assert.equal(anchor.textContent, 'link');
+
+        // Unsafe link protocols are rejected and rendered as literal text.
+        const unsafe = document.createElement('div');
+        appendMarkdownInline(unsafe, '[bad](javascript:alert(1))');
+        assert.equal(unsafe.findAll('a').length, 0);
+        assert.equal(unsafe.textContent, '[bad](javascript:alert(1))');
+
+        // The inline node budget bounds DOM amplification from repeated markers.
+        const amplified = document.createElement('div');
+        const amplifiedStart = Date.now();
+        appendMarkdownInline(amplified, '**x**'.repeat(50000));
+        const amplifiedDuration = Date.now() - amplifiedStart;
+        assert.ok(
+          amplified.countNodes() < 20000,
+          `expected bounded node count, got ${amplified.countNodes()}`
+        );
+        assert.ok(
+          amplifiedDuration < 5000,
+          `expected amplified render under 5s, got ${amplifiedDuration}ms`
+        );
+
+        // A long run of unmatched delimiters must not degrade to quadratic scans.
+        const adversarial = document.createElement('div');
+        const adversarialStart = Date.now();
+        appendMarkdownInline(adversarial, '['.repeat(256 * 1024));
+        const adversarialDuration = Date.now() - adversarialStart;
+        assert.ok(
+          adversarialDuration < 5000,
+          `expected adversarial render under 5s, got ${adversarialDuration}ms`
+        );
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Markdown DOM rendering test failed"
+        )
+    }
+
     func testRemoteServiceWorkerClearsSyncedNotifications() {
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains("payload.action === 'clear'"))
         XCTAssertTrue(RemoteWebAssets.serviceWorker.contains(
