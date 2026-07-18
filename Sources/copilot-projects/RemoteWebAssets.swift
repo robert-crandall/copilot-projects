@@ -18,6 +18,7 @@ enum RemoteWebAssets {
     <body>
       <header>
         <strong>Copilot Projects</strong>
+        <select id="new-session-project" aria-label="New session project" disabled></select>
         <button id="new-session" aria-label="New session" title="New session" disabled>
           New Session
         </button>
@@ -223,8 +224,12 @@ enum RemoteWebAssets {
     header { flex: 0 0 48px; display:flex; align-items:center; gap:10px;
       padding: 0 14px; border-bottom: 1px solid #333; }
     header strong { margin-right:auto; }
+    #new-session-project { min-width:0; width:clamp(96px, 20vw, 160px); max-width:35vw;
+      padding:5px 7px; border:1px solid #444; border-radius:6px; background:#1f1f1f;
+      color:#eee; text-overflow:ellipsis; }
     #new-session { padding:5px 10px; font-size:12px; border:1px solid #444;
       border-radius:6px; background:#1f6feb; color:#fff; cursor:pointer; }
+    #new-session-project:disabled,
     #new-session:disabled { background:#30363d; color:#7d8590; cursor:default; }
     .create-status { font-size:11px; color:#8b949e; max-width:220px;
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -364,6 +369,11 @@ enum RemoteWebAssets {
       font:16px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; }
     .user-input-status { color:#c9a227; font-size:11px; min-height:1em; }
     @media (max-width: 700px) {
+      header { flex:0 0 auto; min-height:48px; flex-wrap:wrap; gap:6px; padding:6px 8px; }
+      header strong { display:none; }
+      #new-session-project { width:min(38vw, 140px); max-width:38vw; }
+      .create-status { flex:1 1 100%; max-width:none; }
+      .create-status:empty { display:none; }
       main { grid-template-columns: 92px minmax(0, 1fr); }
       nav { padding:4px; }
       nav button { padding:7px 5px; font-size:12px; }
@@ -981,7 +991,25 @@ enum RemoteWebAssets {
     loadPromptDrafts();
     """#
 
-    static let javascript = markdownJavascript + draftJavascript + #"""
+    static let sessionCreationJavascript = #"""
+    function chooseCreateProjectId(projects, currentProjectId, hostSelectedProjectId) {
+      const projectIds = new Set(projects.map((project) => project.id));
+      if (currentProjectId && projectIds.has(currentProjectId)) {
+        return currentProjectId;
+      }
+      if (hostSelectedProjectId && projectIds.has(hostSelectedProjectId)) {
+        return hostSelectedProjectId;
+      }
+      return projects[0]?.id || null;
+    }
+
+    function createProjectSignature(projects) {
+      return JSON.stringify(projects.map((project) => [project.id, project.name]));
+    }
+    """#
+
+    static let javascript =
+        markdownJavascript + draftJavascript + sessionCreationJavascript + #"""
     const sessions = document.querySelector('#sessions');
     const terminal = document.querySelector('#terminal');
     const connection = document.querySelector('#connection');
@@ -998,6 +1026,7 @@ enum RemoteWebAssets {
     const content = document.querySelector('#content');
     const pivotTabs = Array.from(document.querySelectorAll('.pivot-tab'));
     const newSessionButton = document.querySelector('#new-session');
+    const newSessionProject = document.querySelector('#new-session-project');
     const createStatus = document.querySelector('#create-status');
     const base = location.pathname.endsWith('/')
       ? location.pathname : `${location.pathname}/`;
@@ -1050,10 +1079,12 @@ enum RemoteWebAssets {
     const QUEUE_CAP = 25;
     const promptQueues = new Map();
     let flushingQueue = false;
-    // The host's currently selected project — the only place a remote New Session
-    // creates. A single retained request id makes a retried create idempotent; a new
-    // explicit click generates a fresh one.
+    // The host selection supplies the initial default only. The web user's explicit
+    // project choice is then preserved while that project remains available.
     let hostSelectedProjectId = null;
+    let createTargetProjectId = null;
+    let availableCreateProjects = [];
+    let renderedCreateProjectSignature = null;
     let createRequestId = null;
     let createRequestProjectId = null;
     let creating = false;
@@ -1147,22 +1178,61 @@ enum RemoteWebAssets {
       createStatus.textContent = text || '';
     }
     function updateNewSessionState() {
-      newSessionButton.disabled = !hostSelectedProjectId || creating;
+      newSessionButton.disabled = !createTargetProjectId || creating;
+      newSessionProject.disabled = !availableCreateProjects.length || creating;
     }
     function clearCreateRequest() {
       createRequestId = null;
       createRequestProjectId = null;
     }
+    function syncCreateProjectOptions(projects, selectedProjectId) {
+      availableCreateProjects = projects.map((project) => ({
+        id: project.id,
+        name: project.name
+      }));
+      const signature = createProjectSignature(availableCreateProjects);
+      if (signature !== renderedCreateProjectSignature) {
+        const fragment = document.createDocumentFragment();
+        availableCreateProjects.forEach((project) => {
+          const option = document.createElement('option');
+          option.value = project.id;
+          option.textContent = project.name;
+          fragment.append(option);
+        });
+        newSessionProject.replaceChildren(fragment);
+        renderedCreateProjectSignature = signature;
+      }
+
+      if (!creating) {
+        const previousTarget = createTargetProjectId;
+        createTargetProjectId = chooseCreateProjectId(
+          availableCreateProjects,
+          createTargetProjectId,
+          selectedProjectId
+        );
+        if (previousTarget !== createTargetProjectId) {
+          if (createRequestProjectId !== createTargetProjectId) {
+            clearCreateRequest();
+          }
+          setCreateStatus('');
+        }
+      }
+      const selectValue = createTargetProjectId || '';
+      if (newSessionProject.value !== selectValue) {
+        newSessionProject.value = selectValue;
+      }
+      updateNewSessionState();
+    }
     async function createSession() {
       // A double click is blocked while a request is active, and the button stays
-      // disabled without a host-selected project.
-      if (creating || !hostSelectedProjectId) return;
+      // disabled without a web-selected project.
+      const projectId = createTargetProjectId;
+      if (creating || !projectId) return;
       // Retain one request id across retries so a network/5xx retry is idempotent.
-      if (!createRequestId || createRequestProjectId !== hostSelectedProjectId) {
+      if (!createRequestId || createRequestProjectId !== projectId) {
         createRequestId = newUUID();
-        createRequestProjectId = hostSelectedProjectId;
+        createRequestProjectId = projectId;
       }
-      const projectId = hostSelectedProjectId;
       creating = true;
       updateNewSessionState();
       setCreateStatus('Creating session…');
@@ -1176,12 +1246,12 @@ enum RemoteWebAssets {
       } catch (error) {
         // Network failure: keep the request id so a retry reuses it.
         creating = false;
-        updateNewSessionState();
+        syncCreateProjectOptions(availableCreateProjects, hostSelectedProjectId);
         setCreateStatus('Network error — tap New Session to retry');
         return;
       }
       creating = false;
-      updateNewSessionState();
+      syncCreateProjectOptions(availableCreateProjects, hostSelectedProjectId);
       if (response.status >= 500) {
         // 5xx (incl. 503 Copilot unavailable): retain the id for an idempotent retry.
         setCreateStatus(
@@ -1473,11 +1543,8 @@ enum RemoteWebAssets {
     function renderWorkspace(data) {
       const active = selected;
       const nextProjectId = data.selectedProjectId || null;
-      if (hostSelectedProjectId !== nextProjectId && !creating) {
-        clearCreateRequest();
-        setCreateStatus('');
-      }
       hostSelectedProjectId = nextProjectId;
+      syncCreateProjectOptions(data.projects, hostSelectedProjectId);
       sessionState.clear();
       sessions.replaceChildren();
       data.projects.forEach((project) => {
@@ -2012,6 +2079,16 @@ enum RemoteWebAssets {
       if (next) { setViewMode(next.dataset.mode, {silent:true}); next.focus(); }
     });
     newSessionButton.onclick = () => { createSession(); };
+    newSessionProject.onchange = () => {
+      const nextProjectId = newSessionProject.value || null;
+      if (createTargetProjectId === nextProjectId) return;
+      createTargetProjectId = nextProjectId;
+      if (createRequestProjectId !== createTargetProjectId) {
+        clearCreateRequest();
+      }
+      setCreateStatus('');
+      updateNewSessionState();
+    };
     updateNewSessionState();
     document.querySelector('#input-form').onsubmit = (event) => {
       event.preventDefault();

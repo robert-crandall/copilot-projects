@@ -5319,13 +5319,28 @@ final class AppLogicTests: XCTestCase {
         ))
     }
 
-    func testRemoteWebNewSessionButtonCreatesInHostSelectedProject() {
-        // The button and its status live in the header.
+    func testRemoteWebNewSessionButtonCreatesInChosenProject() {
+        // The project picker, button, and status live in the header.
+        XCTAssertTrue(RemoteWebAssets.html.contains(
+            #"id="new-session-project" aria-label="New session project""#
+        ))
         XCTAssertTrue(RemoteWebAssets.html.contains(#"id="new-session""#))
         XCTAssertTrue(RemoteWebAssets.html.contains(#"id="create-status""#))
-        // Track the host's selected project and create only there.
+        XCTAssertTrue(RemoteWebAssets.css.contains(
+            "#new-session-project { min-width:0;"
+        ))
+        // Default from the host selection once, then preserve the web user's target.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "const nextProjectId = data.selectedProjectId || null;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "createTargetProjectId = chooseCreateProjectId("
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (signature !== renderedCreateProjectSignature) {"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "option.textContent = project.name;"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "body: JSON.stringify({ requestId: createRequestId, projectId })"
@@ -5333,21 +5348,24 @@ final class AppLogicTests: XCTestCase {
         // Disable without a selected project or while a request is active; double
         // clicks are blocked by the same guard.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "newSessionButton.disabled = !hostSelectedProjectId || creating;"
+            "newSessionButton.disabled = !createTargetProjectId || creating;"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "if (creating || !hostSelectedProjectId) return;"
+            "newSessionProject.disabled = !availableCreateProjects.length || creating;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (creating || !projectId) return;"
         ))
         // Retain one request id across network/5xx retries.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "if (!createRequestId || createRequestProjectId !== hostSelectedProjectId) {"
+            "if (!createRequestId || createRequestProjectId !== projectId) {"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("if (response.status >= 500) {"))
         // Clear the request id on 410 (and on success) so the next click is fresh.
         XCTAssertTrue(RemoteWebAssets.javascript.contains("if (response.status === 410) {"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("createRequestId = null;"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("createRequestProjectId = null;"))
-        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+        XCTAssertFalse(RemoteWebAssets.javascript.contains(
             "if (hostSelectedProjectId !== nextProjectId && !creating) {"
         ))
         // In insecure browser contexts randomUUID may be unavailable. The fallback
@@ -5366,6 +5384,54 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "if (pendingCreatedSessionId && sessionState.has(pendingCreatedSessionId)) {"
         ))
+    }
+
+    func testRemoteWebCreateProjectSelectionBehavior() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("create-project-test.js")
+        let harness = RemoteWebAssets.sessionCreationJavascript + #"""
+
+        const assert = require('node:assert/strict');
+        const projects = [
+          {id:'a', name:'Alpha'},
+          {id:'b', name:'Beta'},
+        ];
+        assert.equal(chooseCreateProjectId(projects, null, 'b'), 'b');
+        assert.equal(chooseCreateProjectId(projects, 'a', 'b'), 'a');
+        assert.equal(chooseCreateProjectId(projects, 'missing', 'b'), 'b');
+        assert.equal(chooseCreateProjectId(projects, null, null), 'a');
+        assert.equal(chooseCreateProjectId([], 'a', 'b'), null);
+
+        const signature = createProjectSignature(projects);
+        assert.equal(createProjectSignature(projects), signature);
+        assert.notEqual(
+          createProjectSignature([{id:'a', name:'Renamed'}, projects[1]]),
+          signature
+        );
+        assert.notEqual(
+          createProjectSignature([projects[1], projects[0]]),
+          signature
+        );
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8)
+                ?? "Create project JavaScript test failed"
+        )
     }
 
     func testRemoteWebJavaScriptSyntax() throws {
