@@ -5126,6 +5126,595 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("function setViewMode(mode"))
     }
 
+    func testRemoteWebMirrorsIOSInputParity() {
+        XCTAssertTrue(RemoteWebAssets.html.contains(
+            #"<button data-key="enter" aria-label="Enter" title="Enter">⏎</button>"#
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            #"'enter': 'enter'"#
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (previousSession && sessionState.has(previousSession)) {"
+        ))
+        // A session removed from the workspace snapshot must not have its
+        // prune undone by a later selectSession() resaving stale text.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "would undo that prune with a stale textarea value."
+        ))
+        // Always restore, including an empty draft, so text cannot leak into
+        // a newly selected session that has no saved composer input.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "prompt.value = draftForSession(id);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "setPromptDraft(selected, prompt.value);"
+        ))
+        // The composer's input handler must not resurrect a pruned
+        // session's draft if the user keeps typing after it disappears.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (selected && sessionState.has(selected)) {"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "setPromptDraft(selected, '');"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "prunePromptDrafts(new Set(sessionState.keys()));"
+        ))
+        // A prompt must not be accepted into the send queue once its
+        // session has been pruned - flushQueue can never send it, so
+        // enqueuePrompt must reject up front and leave the typed text alone.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (!sessionState.has(selected)) return false;"
+        ))
+        // Both truncation sites (the load-time correction pass and
+        // setPromptDraft's write path) must share the same surrogate-safe
+        // truncation helper rather than each calling slice() directly.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "function truncatePromptDraft(value) {"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const value = truncatePromptDraft(decoded.value);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const normalized = truncatePromptDraft(String(value ?? ''));"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "window.addEventListener('pagehide', persistPromptDrafts);"
+        ))
+    }
+
+    func testRemoteWebDraftPersistenceBehavior() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let helper = root.appendingPathComponent("draft-helper.js")
+        try RemoteWebAssets.draftJavascript.write(
+            to: helper,
+            atomically: true,
+            encoding: .utf8
+        )
+        let script = root.appendingPathComponent("draft-test.js")
+        let harness = #"""
+        const assert = require('node:assert/strict');
+        const fs = require('node:fs');
+        const vm = require('node:vm');
+        const source = fs.readFileSync(process.argv[2], 'utf8');
+        const storagePrefix = 'copilot-projects-prompt-draft-v2:';
+
+        function storageKey(sessionId) {
+          return `${storagePrefix}${encodeURIComponent(sessionId)}`;
+        }
+
+        function makeStorage(initialEntries = {}) {
+          const values = new Map(Object.entries(initialEntries));
+          return {
+            values,
+            getCalls: 0,
+            setCalls: 0,
+            removeCalls: 0,
+            get length() { return this.values.size; },
+            key(index) { return Array.from(this.values.keys())[index] ?? null; },
+            getItem(key) {
+              this.getCalls += 1;
+              return this.values.has(key) ? this.values.get(key) : null;
+            },
+            setItem(key, value) {
+              this.setCalls += 1;
+              this.values.set(key, value);
+            },
+            removeItem(key) {
+              this.removeCalls += 1;
+              this.values.delete(key);
+            },
+          };
+        }
+
+        function storedDraft(storage, sessionId) {
+          const raw = storage.values.get(storageKey(sessionId));
+          return raw ? JSON.parse(raw) : null;
+        }
+
+        function storedDraftKeys(storage) {
+          return Array.from(storage.values.keys())
+            .filter((key) => key.startsWith(storagePrefix));
+        }
+
+        function createContext(storage, warnings = []) {
+          let timer = null;
+          const context = {
+            localStorage: storage,
+            console: { warn(...args) { warnings.push(args); } },
+            setTimeout(callback) { timer = callback; return 1; },
+            clearTimeout() { timer = null; },
+          };
+          vm.createContext(context);
+          vm.runInContext(source, context);
+          return {
+            context,
+            flushTimer() {
+              const callback = timer;
+              timer = null;
+              if (callback) callback();
+            },
+          };
+        }
+
+        const storage = makeStorage();
+        const first = createContext(storage);
+        first.context.setPromptDraft('s1', 'half-typed message');
+        assert.equal(first.context.draftForSession('s1'), 'half-typed message');
+        assert.equal(storage.setCalls, 0, 'writes should be debounced');
+        first.context.persistPromptDrafts();
+        assert.equal(storage.setCalls, 1);
+        assert.equal(storedDraft(storage, 's1').value, 'half-typed message');
+
+        const restarted = createContext(storage);
+        assert.equal(restarted.context.draftForSession('s1'), 'half-typed message');
+        restarted.context.setPromptDraft('s2', 'x'.repeat(9000));
+        assert.equal(restarted.context.draftForSession('s2').length, 8192);
+
+        // Truncating at PROMPT_DRAFT_MAX_LENGTH must not split a surrogate
+        // pair: an 8191-unit prefix followed by a non-BMP character (2 UTF-16
+        // units) puts that character's high surrogate exactly at the cutoff,
+        // so a naive slice(0, 8192) would leave a dangling unpaired
+        // surrogate.
+        restarted.context.setPromptDraft('surrogate', 'x'.repeat(8191) + '\u{1F600}');
+        const surrogateDraft = restarted.context.draftForSession('surrogate');
+        assert.equal(surrogateDraft.length, 8191, 'the lone high surrogate must be dropped, not kept');
+        assert.equal(surrogateDraft, 'x'.repeat(8191));
+        const lastCode = surrogateDraft.charCodeAt(surrogateDraft.length - 1);
+        assert.ok(
+          lastCode < 0xd800 || lastCode > 0xdfff,
+          'result must not end on an unpaired surrogate'
+        );
+
+        // The same surrogate-safe truncation must apply to over-length
+        // values already on disk, normalized by loadPromptDrafts() on
+        // startup (not just to values typed via setPromptDraft()).
+        const seededStorage = makeStorage({
+          [storageKey('overlong')]: JSON.stringify({
+            value: 'y'.repeat(8191) + '\u{1F600}',
+            updatedAt: 1,
+          }),
+          [storagePrefix + '%ZZ']: 'invalid encoded key',
+          unrelated: 'keep me',
+        });
+        const seededWarnings = [];
+        const seeded = createContext(seededStorage, seededWarnings);
+        const seededDraft = seeded.context.draftForSession('overlong');
+        assert.equal(seededDraft.length, 8191, 'loaded value must drop the dangling surrogate too');
+        assert.equal(seededDraft, 'y'.repeat(8191));
+        seeded.context.persistPromptDrafts();
+        assert.equal(seededStorage.values.get('unrelated'), 'keep me');
+        assert.equal(seededStorage.values.has(storagePrefix + '%ZZ'), false);
+
+        restarted.context.setPromptDraft('gone', 'stale');
+        restarted.context.setPromptDraft('live', 'keep');
+        restarted.context.persistPromptDrafts();
+        restarted.context.prunePromptDrafts(new Set(['live']));
+        restarted.context.persistPromptDrafts();
+        assert.equal(storedDraft(storage, 'live').value, 'keep');
+        assert.equal(storage.values.has(storageKey('gone')), false);
+        assert.equal(storage.values.has(storageKey('s1')), false);
+        assert.equal(storage.values.has(storageKey('s2')), false);
+
+        restarted.context.setPromptDraft('live', '');
+        restarted.context.persistPromptDrafts();
+        assert.equal(storage.values.has(storageKey('live')), false);
+        assert.ok(storage.removeCalls > 0);
+
+        const boundedStorage = makeStorage();
+        const bounded = createContext(boundedStorage);
+        for (let index = 0; index < 101; index += 1) {
+          bounded.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        bounded.context.persistPromptDrafts();
+        assert.equal(storedDraftKeys(boundedStorage).length, 100);
+        assert.equal(boundedStorage.values.has(storageKey('s0')), false);
+        assert.equal(storedDraft(boundedStorage, 's100').value, 'draft 100');
+
+        // Recency ordering must survive across separate persist() calls: a
+        // key already on disk that is re-edited and flushed by itself must
+        // move to the end of the eviction order, not stay pinned at its old
+        // (now-stale) position and get evicted next just for being oldest.
+        const lruStorage = makeStorage();
+        const lru = createContext(lruStorage);
+        for (let index = 0; index < 100; index += 1) {
+          lru.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        lru.context.persistPromptDrafts();
+        lru.context.setPromptDraft('s0', 'edited');
+        lru.context.persistPromptDrafts();
+        lru.context.setPromptDraft('s100', 'draft 100');
+        lru.context.persistPromptDrafts();
+        assert.equal(storedDraftKeys(lruStorage).length, 100);
+        assert.equal(storedDraft(lruStorage, 's0').value, 'edited');
+        assert.equal(lruStorage.values.has(storageKey('s1')), false);
+        assert.equal(storedDraft(lruStorage, 's100').value, 'draft 100');
+
+        // Deletions run before writes so an eviction can free quota for the
+        // new draft in the same flush.
+        const oldKey = storageKey('old');
+        const newKey = storageKey('new');
+        const quotaStorage = makeStorage({
+          [oldKey]: JSON.stringify({value:'old', updatedAt:1}),
+        });
+        const baseSetItem = quotaStorage.setItem;
+        quotaStorage.setItem = function(key, value) {
+          if (key === newKey && this.values.has(oldKey)) {
+            throw new Error('quota full until old draft is removed');
+          }
+          return baseSetItem.call(this, key, value);
+        };
+        const quota = createContext(quotaStorage);
+        quota.context.setPromptDraft('new', 'new');
+        quota.context.setPromptDraft('old', '');
+        quota.context.persistPromptDrafts();
+        assert.equal(quotaStorage.values.has(oldKey), false);
+        assert.equal(storedDraft(quotaStorage, 'new').value, 'new');
+
+        // Eviction candidates must be checked against live per-key storage,
+        // not just this tab's local (possibly stale) snapshot: another tab
+        // can refresh a session this tab still believes is the oldest, and
+        // deleting it anyway would destroy live, freshly-written text.
+        const evictionStorage = makeStorage();
+        const evictA = createContext(evictionStorage);
+        for (let index = 0; index < 100; index += 1) {
+          evictA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        evictA.context.persistPromptDrafts();
+
+        // Tab B loads the same 100 sessions into its own local snapshot.
+        const evictB = createContext(evictionStorage);
+
+        // Advance to a new millisecond so tab A's refresh of s0 is
+        // unambiguously newer than what tab B's snapshot recorded for it.
+        const beforeRefresh = Date.now();
+        while (Date.now() === beforeRefresh) { /* spin to the next tick */ }
+
+        // Tab A refreshes s0 - the session tab B's local map still ranks as
+        // oldest - and persists the newer timestamp to storage.
+        evictA.context.setPromptDraft('s0', 's0 refreshed by tab A');
+        evictA.context.persistPromptDrafts();
+
+        // Tab B, unaware of tab A's refresh, adds a new session while at
+        // cap. It must not evict s0: storage shows it was written more
+        // recently than tab B's local record, even though tab B's own
+        // snapshot still ranks it as the oldest candidate.
+        evictB.context.setPromptDraft('s100', 'draft 100');
+        evictB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(evictionStorage, 's0').value,
+          's0 refreshed by tab A',
+          'tab B must not evict a session another tab just refreshed on disk'
+        );
+        assert.equal(storedDraft(evictionStorage, 's100').value, 'draft 100');
+
+        // The debounce window between deciding to evict a candidate and
+        // actually flushing it (up to PROMPT_DRAFT_SAVE_DELAY later) is
+        // itself long enough for another tab to refresh that exact
+        // candidate. The eviction decision alone isn't enough; the
+        // deletion must be re-verified again immediately before it runs.
+        const debounceStorage = makeStorage();
+        const debounceA = createContext(debounceStorage);
+        for (let index = 0; index < 100; index += 1) {
+          debounceA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        debounceA.context.persistPromptDrafts();
+
+        const debounceB = createContext(debounceStorage);
+        // Tab B decides to evict s0 (its local snapshot matches storage, so
+        // s0 is a legitimate candidate right now) but does not flush yet -
+        // mirroring the real debounced schedulePromptDraftPersistence().
+        debounceB.context.setPromptDraft('s100', 'draft 100');
+        assert.equal(debounceB.context.draftForSession('s0'), '');
+
+        const beforeDebounceRefresh = Date.now();
+        while (Date.now() === beforeDebounceRefresh) { /* spin to the next tick */ }
+
+        // Tab A refreshes s0 - the very candidate tab B already decided to
+        // evict - and flushes immediately.
+        debounceA.context.setPromptDraft('s0', 'refreshed by A during B\'s debounce');
+        debounceA.context.persistPromptDrafts();
+
+        // Tab B's deferred flush must not delete s0 now that storage shows
+        // it was refreshed after B's eviction decision.
+        debounceB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(debounceStorage, 's0').value,
+          'refreshed by A during B\'s debounce',
+          'a refresh that lands during the eviction debounce window must survive'
+        );
+        assert.equal(storedDraft(debounceStorage, 's100').value, 'draft 100');
+
+        // The same debounce-window race applies to the load-time cap
+        // cleanup in loadPromptDrafts(): if storage already holds more than
+        // PROMPT_DRAFT_MAX_SESSIONS keys (e.g. written by uncoordinated
+        // tabs before either reloaded), the oldest excess entries are
+        // scheduled for deletion but not flushed immediately. Another tab
+        // refreshing one of those exact excess sessions during that window
+        // must still win.
+        const loadExcessEntries = {};
+        for (let index = 0; index < 101; index += 1) {
+          loadExcessEntries[storageKey(`s${index}`)] = JSON.stringify({
+            value: `draft ${index}`,
+            updatedAt: index,
+          });
+        }
+        const loadExcessStorage = makeStorage(loadExcessEntries);
+
+        // Creating this context runs loadPromptDrafts() during init, which
+        // finds s0 (updatedAt 0) as the sole excess entry over the 100
+        // cap and marks it dirty for deletion, but does not flush yet.
+        const loadExcessB = createContext(loadExcessStorage);
+
+        // Tab A refreshes s0 - the exact session load-time cleanup already
+        // decided to evict - and flushes immediately.
+        loadExcessStorage.values.set(
+          storageKey('s0'),
+          JSON.stringify({ value: 's0 refreshed by tab A', updatedAt: 1000 })
+        );
+
+        // Tab B's deferred load-time cleanup flush must not delete s0 now
+        // that storage shows it was refreshed after the eviction decision.
+        loadExcessB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(loadExcessStorage, 's0').value,
+          's0 refreshed by tab A',
+          'a refresh during the load-time cap cleanup debounce window must survive'
+        );
+
+        // Date.now() only has millisecond resolution, so a timestamp-only
+        // freshness check ("stored.updatedAt > baseline") cannot tell a
+        // same-millisecond cross-tab rewrite apart from an untouched
+        // candidate - both compare equal. The recheck must compare the
+        // full stored record against the exact baseline snapshot instead,
+        // so it still declines the deletion when the value differs even
+        // though the timestamp doesn't.
+        const tieStorage = makeStorage();
+        const tieA = createContext(tieStorage);
+        for (let index = 0; index < 100; index += 1) {
+          tieA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        tieA.context.persistPromptDrafts();
+
+        const tieB = createContext(tieStorage);
+        // Tab B decides to evict s0 but does not flush yet.
+        tieB.context.setPromptDraft('s100', 'draft 100');
+
+        // The baseline tab B's eviction decision captured is whatever is
+        // still on disk, since tab B hasn't flushed.
+        const tieBaselineUpdatedAt = storedDraft(tieStorage, 's0').updatedAt;
+
+        // Simulate another tab rewriting s0 within that exact same
+        // millisecond - same updatedAt, different value.
+        tieStorage.values.set(
+          storageKey('s0'),
+          JSON.stringify({
+            value: 's0 rewritten same millisecond',
+            updatedAt: tieBaselineUpdatedAt,
+          })
+        );
+
+        tieB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(tieStorage, 's0').value,
+          's0 rewritten same millisecond',
+          'a same-millisecond rewrite of the eviction candidate must survive'
+        );
+        assert.equal(storedDraft(tieStorage, 's100').value, 'draft 100');
+
+        // Runtime eviction previously judged the cap only against
+        // promptDrafts.size (this tab's own local map). Two tabs that each
+        // start from an empty store and only ever create their own
+        // disjoint sessions would both stay within the cap by their own
+        // count while storage grew unbounded across both. Eviction must
+        // reconcile against the live storage-wide key set so the cap holds
+        // regardless of which tab created which session.
+        const disjointStorage = makeStorage();
+        const disjointA = createContext(disjointStorage);
+        const disjointB = createContext(disjointStorage);
+
+        for (let index = 0; index < 100; index += 1) {
+          disjointA.context.setPromptDraft(`a${index}`, `draft a${index}`);
+        }
+        disjointA.context.persistPromptDrafts();
+
+        // Force tab B's timestamps to be unambiguously newer than tab A's so
+        // the eviction order isn't left to a stable-sort tie-break between
+        // two sessions sharing the same millisecond (a real tie is a
+        // self-healing near-miss, not a correctness bug - see the read
+        // failure/retry test above - but it would make this specific
+        // assertion about *which* sessions survive nondeterministic).
+        const beforeDisjointB = Date.now();
+        while (Date.now() === beforeDisjointB) { /* spin to the next tick */ }
+
+        for (let index = 0; index < 100; index += 1) {
+          disjointB.context.setPromptDraft(`b${index}`, `draft b${index}`);
+        }
+        disjointB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraftKeys(disjointStorage).length,
+          100,
+          'the cap must hold storage-wide even when two tabs only ever create their own disjoint sessions'
+        );
+        for (let index = 0; index < 100; index += 1) {
+          assert.equal(disjointStorage.values.has(storageKey(`a${index}`)), false);
+          assert.equal(storedDraft(disjointStorage, `b${index}`).value, `draft b${index}`);
+        }
+
+        // A transient read failure while re-verifying an eviction candidate
+        // must not fall through to deleting it anyway - that would bypass
+        // the freshness guard on exactly the failure it exists to protect
+        // against. It must decline (retaining dirty/baseline state for a
+        // later retry) rather than silently destroying unverifiable data.
+        const flakyWarnings = [];
+        const flakyStorage = makeStorage();
+        const flakyA = createContext(flakyStorage);
+        for (let index = 0; index < 100; index += 1) {
+          flakyA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        flakyA.context.persistPromptDrafts();
+
+        const flakyB = createContext(flakyStorage, flakyWarnings);
+        // Tab B decides to evict s0 but does not flush yet.
+        flakyB.context.setPromptDraft('s100', 'draft 100');
+
+        const realGetItem = flakyStorage.getItem.bind(flakyStorage);
+        flakyStorage.getItem = function (key) {
+          if (key === storageKey('s0')) {
+            throw new Error('transient read failure');
+          }
+          return realGetItem(key);
+        };
+
+        flakyB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(flakyStorage, 's0').value,
+          'draft 0',
+          'a transient read failure during the freshness recheck must not delete the candidate'
+        );
+        assert.equal(storedDraft(flakyStorage, 's100').value, 'draft 100');
+        assert.ok(flakyWarnings.length > 0, 'a read failure during the recheck should warn');
+
+        // Once storage is readable again, a later retry must still finish
+        // the deferred eviction normally.
+        flakyStorage.getItem = realGetItem;
+        flakyB.context.persistPromptDrafts();
+        assert.equal(
+          flakyStorage.values.has(storageKey('s0')),
+          false,
+          'the deferred eviction should complete on a later retry once storage is readable again'
+        );
+
+        const warnings = [];
+        const failingStorage = {
+          get length() { throw new Error('storage unavailable'); },
+          key() { throw new Error('storage unavailable'); },
+          getItem() { throw new Error('storage unavailable'); },
+          setItem() { throw new Error('storage unavailable'); },
+          removeItem() { throw new Error('storage unavailable'); },
+        };
+        const failed = createContext(failingStorage, warnings);
+        failed.context.setPromptDraft('s1', 'memory only');
+        failed.context.persistPromptDrafts();
+        failed.context.persistPromptDrafts();
+        assert.equal(failed.context.draftForSession('s1'), 'memory only');
+        assert.equal(warnings.length, 1, 'storage failures should warn once');
+
+        // A failed write must not clear the dirty set or replace the
+        // in-memory map, or a later edit to a second session would rebuild
+        // promptDrafts from just {stored (empty, since storage is broken)}
+        // plus that second session, silently dropping the first session's
+        // memory-only draft even though storage was never actually written.
+        failed.context.setPromptDraft('s2', 'second memory-only draft');
+        failed.context.persistPromptDrafts();
+        assert.equal(
+          failed.context.draftForSession('s1'),
+          'memory only',
+          'a later failed persist must not drop an earlier memory-only draft'
+        );
+        assert.equal(failed.context.draftForSession('s2'), 'second memory-only draft');
+
+        // Two tabs can edit unrelated sessions before either flushes. Per-session
+        // keys keep the writes independent, so neither tab can overwrite the
+        // other's draft regardless of flush ordering.
+        const sharedStorage = makeStorage();
+        const tabA = createContext(sharedStorage);
+        const tabB = createContext(sharedStorage);
+        tabA.context.setPromptDraft('sessionA', 'from tab A');
+        tabB.context.setPromptDraft('sessionB', 'from tab B');
+        tabA.context.persistPromptDrafts();
+        tabB.context.persistPromptDrafts();
+        assert.equal(storedDraft(sharedStorage, 'sessionA').value, 'from tab A');
+        assert.equal(storedDraft(sharedStorage, 'sessionB').value, 'from tab B');
+
+        // An unconditional flush (e.g. pagehide) from a tab with no local
+        // changes must be a no-op, not a rewrite of stale state.
+        const priorSetCalls = sharedStorage.setCalls;
+        tabA.context.persistPromptDrafts();
+        assert.equal(sharedStorage.setCalls, priorSetCalls, 'idle flush must not write');
+
+        // Same-session edits are intentionally last-writer-wins.
+        const tabC = createContext(sharedStorage);
+        const tabD = createContext(sharedStorage);
+        tabC.context.setPromptDraft('shared', 'from tab C');
+        tabD.context.setPromptDraft('shared', 'from tab D');
+        tabC.context.persistPromptDrafts();
+        tabD.context.persistPromptDrafts();
+        assert.equal(storedDraft(sharedStorage, 'shared').value, 'from tab D');
+
+        // Clearing a draft in one tab must remove only that session, even
+        // when another tab owns a sibling draft.
+        tabB.context.setPromptDraft('sessionB', '');
+        tabB.context.persistPromptDrafts();
+        assert.equal(sharedStorage.values.has(storageKey('sessionB')), false);
+        assert.equal(storedDraft(sharedStorage, 'sessionA').value, 'from tab A');
+
+        // Startup enumerates safely, leaves unrelated keys alone, and deletes
+        // excess v2 entries after collecting the key list (no index shifting).
+        const manyEntries = { unrelated: 'safe' };
+        for (let index = 0; index < 110; index += 1) {
+          manyEntries[storageKey(`many${index}`)] = JSON.stringify({
+            value: `draft ${index}`,
+            updatedAt: index,
+          });
+        }
+        const manyStorage = makeStorage(manyEntries);
+        const many = createContext(manyStorage);
+        many.context.persistPromptDrafts();
+        assert.equal(storedDraftKeys(manyStorage).length, 100);
+        assert.equal(manyStorage.values.get('unrelated'), 'safe');
+        for (let index = 0; index < 10; index += 1) {
+          assert.equal(manyStorage.values.has(storageKey(`many${index}`)), false);
+        }
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path, helper.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Draft JavaScript test failed"
+        )
+    }
+
     func testRemoteWebPromptSubmitsOnEnter() {
         // Enter sends the Copilot prompt; Shift+Enter keeps inserting a newline.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
@@ -5158,13 +5747,28 @@ final class AppLogicTests: XCTestCase {
         ))
     }
 
-    func testRemoteWebNewSessionButtonCreatesInHostSelectedProject() {
-        // The button and its status live in the header.
+    func testRemoteWebNewSessionButtonCreatesInChosenProject() {
+        // The project picker, button, and status live in the header.
+        XCTAssertTrue(RemoteWebAssets.html.contains(
+            #"id="new-session-project" aria-label="New session project""#
+        ))
         XCTAssertTrue(RemoteWebAssets.html.contains(#"id="new-session""#))
         XCTAssertTrue(RemoteWebAssets.html.contains(#"id="create-status""#))
-        // Track the host's selected project and create only there.
+        XCTAssertTrue(RemoteWebAssets.css.contains(
+            "#new-session-project { min-width:0;"
+        ))
+        // Default from the host selection once, then preserve the web user's target.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "const nextProjectId = data.selectedProjectId || null;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "createTargetProjectId = chooseCreateProjectId("
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (signature !== renderedCreateProjectSignature) {"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "option.textContent = project.name;"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "body: JSON.stringify({ requestId: createRequestId, projectId })"
@@ -5172,21 +5776,24 @@ final class AppLogicTests: XCTestCase {
         // Disable without a selected project or while a request is active; double
         // clicks are blocked by the same guard.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "newSessionButton.disabled = !hostSelectedProjectId || creating;"
+            "newSessionButton.disabled = !createTargetProjectId || creating;"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "if (creating || !hostSelectedProjectId) return;"
+            "newSessionProject.disabled = !availableCreateProjects.length || creating;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (creating || !projectId) return;"
         ))
         // Retain one request id across network/5xx retries.
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "if (!createRequestId || createRequestProjectId !== hostSelectedProjectId) {"
+            "if (!createRequestId || createRequestProjectId !== projectId) {"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("if (response.status >= 500) {"))
         // Clear the request id on 410 (and on success) so the next click is fresh.
         XCTAssertTrue(RemoteWebAssets.javascript.contains("if (response.status === 410) {"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("createRequestId = null;"))
         XCTAssertTrue(RemoteWebAssets.javascript.contains("createRequestProjectId = null;"))
-        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+        XCTAssertFalse(RemoteWebAssets.javascript.contains(
             "if (hostSelectedProjectId !== nextProjectId && !creating) {"
         ))
         // In insecure browser contexts randomUUID may be unavailable. The fallback
@@ -5205,6 +5812,54 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "if (pendingCreatedSessionId && sessionState.has(pendingCreatedSessionId)) {"
         ))
+    }
+
+    func testRemoteWebCreateProjectSelectionBehavior() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("create-project-test.js")
+        let harness = RemoteWebAssets.sessionCreationJavascript + #"""
+
+        const assert = require('node:assert/strict');
+        const projects = [
+          {id:'a', name:'Alpha'},
+          {id:'b', name:'Beta'},
+        ];
+        assert.equal(chooseCreateProjectId(projects, null, 'b'), 'b');
+        assert.equal(chooseCreateProjectId(projects, 'a', 'b'), 'a');
+        assert.equal(chooseCreateProjectId(projects, 'missing', 'b'), 'b');
+        assert.equal(chooseCreateProjectId(projects, null, null), 'a');
+        assert.equal(chooseCreateProjectId([], 'a', 'b'), null);
+
+        const signature = createProjectSignature(projects);
+        assert.equal(createProjectSignature(projects), signature);
+        assert.notEqual(
+          createProjectSignature([{id:'a', name:'Renamed'}, projects[1]]),
+          signature
+        );
+        assert.notEqual(
+          createProjectSignature([projects[1], projects[0]]),
+          signature
+        );
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8)
+                ?? "Create project JavaScript test failed"
+        )
     }
 
     func testRemoteWebJavaScriptSyntax() throws {

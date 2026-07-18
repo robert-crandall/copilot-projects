@@ -151,20 +151,21 @@ Access token are rejected.
 
 The mobile web client can list projects, select a terminal, and acquire the single remote writer
 lease. Its Markdown-rendered completed-turn pane mirrors the desktop drawer and includes a message
-composer. Sending is enabled only when a fresh server-side check confirms Copilot is alive, fully
-idle, and has no scheduled/background work; it clears any unsent desktop draft before submitting
-the message through the native CLI input path. The full terminal remains available for permissions
-and other TUI interactions. Remote clients do not resize the PTY because dtach shares one terminal
-size with the desktop.
+composer with per-session drafts that survive session switches and reloads. Sending is enabled only
+when a fresh server-side check confirms Copilot is alive, fully idle, and has no
+scheduled/background work; it clears any unsent desktop draft before submitting the message through
+the native CLI input path. The full terminal remains available for permissions and other TUI
+interactions, with an on-screen Enter key alongside the other terminal controls. Remote clients do
+not resize the PTY because dtach shares one terminal size with the desktop.
 
-The header's **New Session** button creates a session in the host's currently selected project
-(and only there, so it never steals the Mac's selected tab). Creation is idempotent: the client
-generates one request id, retained across a network/5xx retry and cleared on success or when the
-host reports the earlier session was already created and closed. The new session opens `$HOME/Repos`
-and launches Copilot once on its fresh dtach master (resolving the CLI from an explicit override,
-then `$HOME/.local/bin/copilot`, then the app's `PATH`). The host records each creation in a
-private, bounded ledger so a retried or replayed request is answered — 201 created, 200 existing,
-409 collision, 410 already-closed, 422 unknown project or missing Repos, 503 Copilot unavailable —
+The header's **New Session** controls let the remote user choose any project without changing the
+Mac's selected project or tab. Creation is idempotent: the client generates one request id per
+chosen project, retained across a network/5xx retry and cleared on success or when the host reports
+the earlier session was already created and closed. The new session opens `$HOME/Repos` and
+launches Copilot once on its fresh dtach master (resolving the CLI from an explicit override, then
+`$HOME/.local/bin/copilot`, then the app's `PATH`). The host records each creation in a private,
+bounded ledger so a retried or replayed request is answered — 201 created, 200 existing, 409
+collision, 410 already-closed, 422 unknown project or missing Repos, 503 Copilot unavailable —
 without ever creating (or resurrecting) a second session. Hosts without this endpoint return 404,
 which the client surfaces as unsupported.
 
