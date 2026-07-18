@@ -5452,6 +5452,44 @@ final class AppLogicTests: XCTestCase {
         );
         assert.equal(storedDraft(debounceStorage, 's100').value, 'draft 100');
 
+        // The same debounce-window race applies to the load-time cap
+        // cleanup in loadPromptDrafts(): if storage already holds more than
+        // PROMPT_DRAFT_MAX_SESSIONS keys (e.g. written by uncoordinated
+        // tabs before either reloaded), the oldest excess entries are
+        // scheduled for deletion but not flushed immediately. Another tab
+        // refreshing one of those exact excess sessions during that window
+        // must still win.
+        const loadExcessEntries = {};
+        for (let index = 0; index < 101; index += 1) {
+          loadExcessEntries[storageKey(`s${index}`)] = JSON.stringify({
+            value: `draft ${index}`,
+            updatedAt: index,
+          });
+        }
+        const loadExcessStorage = makeStorage(loadExcessEntries);
+
+        // Creating this context runs loadPromptDrafts() during init, which
+        // finds s0 (updatedAt 0) as the sole excess entry over the 100
+        // cap and marks it dirty for deletion, but does not flush yet.
+        const loadExcessB = createContext(loadExcessStorage);
+
+        // Tab A refreshes s0 - the exact session load-time cleanup already
+        // decided to evict - and flushes immediately.
+        loadExcessStorage.values.set(
+          storageKey('s0'),
+          JSON.stringify({ value: 's0 refreshed by tab A', updatedAt: 1000 })
+        );
+
+        // Tab B's deferred load-time cleanup flush must not delete s0 now
+        // that storage shows it was refreshed after the eviction decision.
+        loadExcessB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(loadExcessStorage, 's0').value,
+          's0 refreshed by tab A',
+          'a refresh during the load-time cap cleanup debounce window must survive'
+        );
+
         const warnings = [];
         const failingStorage = {
           get length() { throw new Error('storage unavailable'); },

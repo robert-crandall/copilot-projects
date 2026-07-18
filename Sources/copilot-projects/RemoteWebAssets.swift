@@ -999,6 +999,7 @@ enum RemoteWebAssets {
       }
       for (const entry of excess) {
         promptDraftDirtySessions.add(entry.sessionId);
+        promptDraftEvictionBaseline.set(entry.sessionId, entry.draft.updatedAt);
       }
 
       for (const key of invalidKeys) {
