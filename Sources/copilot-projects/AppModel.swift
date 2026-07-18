@@ -1740,6 +1740,58 @@ final class AppModel: ObservableObject {
                 let supportsSessionIdleHook = FileManager.default.fileExists(
                     atPath: Paths.sessionIdleHookMarkerPath(sessionId: sid)
                 )
+                // Self-recovery for the snapshot-driven demotion below: if the
+                // foreground turn has resumed (a fresh `assistant.turn_start` flipped
+                // `foregroundTurnActive` back to true), restore `.running`. This
+                // reverses a demotion that fired during an unusually long
+                // inter-iteration gap, so the fix no longer depends on that gap being
+                // shorter than the two-scan dwell window. `foregroundTurnActive` is set
+                // true ONLY at the root's `assistant.turn_start` and cleared at
+                // `turn_end`/`session.idle`, so the freshest snapshot reporting it true
+                // means the root is genuinely mid-turn ⇒ running (this holds regardless
+                // of subagent count, which is why there's no `activeSubagents` gate here
+                // — a subagent finishing between demotion and the foreground resuming
+                // must not strand the tab as idle). A genuinely-finished session can't
+                // trip this: `session.idle`/`turn_end` leave `foregroundTurnActive ==
+                // false`, and the clock guard rejects a stale snapshot at or before the
+                // latest status hook. Reject a future-dated snapshot (clock rollback)
+                // too. Run this BEFORE the completion check so a session that's about to
+                // be promoted back to running never fires a spurious completion.
+                if status == .idle {
+                    let recoveryNowMs = SessionArtifacts.currentStatusTimestamp()
+                    if let snapshot = projects[pi].sessions[si].agentActivity,
+                       snapshot.isFresh(),
+                       snapshot.foregroundTurnActive == true,
+                       let snapshotMs = snapshot.foregroundTransitionMilliseconds,
+                       snapshotMs <= recoveryNowMs,
+                       snapshotMs > (statusEventClock.timestamp(for: sid) ?? Int64.min) {
+                        activityTracker.resetForegroundIdle(sessionId: sid)
+                        // Promote IN MEMORY ONLY, using the foreground-transition
+                        // timestamp (the root turn_start time — NOT `updatedAt`,
+                        // which unrelated republishes rewrite): `setStatus` advances
+                        // the clock via `shouldApply` to `snapshotMs` so a genuinely
+                        // newer idle/waiting hook is still accepted, and — because a
+                        // timestamp is supplied —
+                        // it does NOT persist to disk. We deliberately don't persist
+                        // here either: recovery compensates for a MISSING running hook,
+                        // so no hook wrote `running` to disk; writing it ourselves could
+                        // clobber a newer hook-written `idle` whose IPC is merely delayed
+                        // behind reconciliation, and a later timestamped idle IPC would
+                        // repair memory but not disk — leaving a stale `running` that
+                        // survives restart (the very bug this fixes). Leaving the disk
+                        // status to the hooks keeps recovery's only failure mode benign
+                        // and self-healing (disk reads `idle` for a running session →
+                        // footer promotion re-corrects within ~2s), never stuck-running.
+                        setStatus(
+                            sessionId: sid,
+                            status: .running,
+                            text: nil,
+                            timestamp: snapshotMs,
+                            source: "background-recovery"
+                        )
+                        continue
+                    }
+                }
                 if status == .idle, activity == .idle {
                     postCompletionIfReady(sessionId: sid)
                 }
@@ -1767,6 +1819,57 @@ final class AppModel: ObservableObject {
                     }
                     continue
                 }
+                // Stale "working" recovery: the foreground turn has ended, but live
+                // background subagents keep `session.idle` from firing, so the hook
+                // path below (guarded by `supportsSessionIdleHook`) never demotes the
+                // tab and it reads "working" while the terminal is actually idle and
+                // interactive. Scope this strictly to that shape — a running session
+                // whose FRESH snapshot reports the foreground (and any scheduled) turn
+                // inactive AND still has active subagents — so ordinary sessions keep
+                // falling through to the footer/liveness path below. Demote to idle
+                // once the ended-turn condition persists across two scans (a normal
+                // inter-iteration gap flips `foregroundTurnActive` false only briefly:
+                // `turn_end` fires per loop iteration and tool calls run *inside* a
+                // turn, so foreground stays active through them). Leave
+                // `activeSubagents` intact so the background indicator persists.
+                // The clock-ordering guard rejects a snapshot that predates the latest
+                // status hook, so a just-submitted prompt (whose running hook advanced
+                // the clock before its own fresh snapshot lands) can't be demoted; and
+                // seeding the clock from the foreground-transition timestamp (the
+                // turn_end time) — not `updatedAt` (which unrelated republishes bump)
+                // and not `now` — keeps a subsequent user-prompt hook from being
+                // swallowed. A future-dated transition (system-clock rollback) is
+                // rejected outright so it can't drive a demotion or poison the clock.
+                if status == .running,
+                   let snapshot = projects[pi].sessions[si].agentActivity,
+                   snapshot.isFresh(),
+                   snapshot.foregroundTurnActive == false,
+                   snapshot.scheduledTurnActive == false,
+                   !snapshot.activeSubagents.isEmpty,
+                   let snapshotMs = snapshot.foregroundTransitionMilliseconds,
+                   snapshotMs <= SessionArtifacts.currentStatusTimestamp(),
+                   snapshotMs >= (statusEventClock.timestamp(for: sid) ?? snapshotMs) {
+                    tracked.insert(sid)
+                    if activityTracker.observeForegroundIdle(
+                        sessionId: sid,
+                        currentStatus: status,
+                        foregroundTurnActive: snapshot.foregroundTurnActive
+                    ) {
+                        clearStatusToIdle(
+                            pi: pi,
+                            si: si,
+                            markFinished: false,
+                            effectiveTime: snapshotMs
+                        )
+                        // Don't post completion here: background subagents are still
+                        // running. Completion fires later via the agent-stop /
+                        // session-idle signal or `setBackgroundAgentsActive(false)`
+                        // once the background work clears.
+                    }
+                    continue
+                } else {
+                    activityTracker.resetForegroundIdle(sessionId: sid)
+                }
                 if supportsSessionIdleHook {
                     activityTracker.reset(sessionId: sid)
                     continue
@@ -1787,7 +1890,7 @@ final class AppModel: ObservableObject {
 
     /// Drop a session to idle and (unless it's on screen) flag it finished & unseen,
     /// then persist the corrected status. Shared by the liveness and footer reconcilers.
-    private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool) {
+    private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool, effectiveTime: Int64? = nil) {
         let sid = projects[pi].sessions[si].id
         activityTracker.reset(sessionId: sid)
         projects[pi].sessions[si].status = .idle
@@ -1795,8 +1898,17 @@ final class AppModel: ObservableObject {
         if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
             projects[pi].sessions[si].finishedUnseen = true
         }
+        // Seed the clock from the evidence that triggered the demotion, not `now`.
+        // For a snapshot-driven demotion `effectiveTime` is the snapshot's own
+        // timestamp; advancing the clock to `now` would let it swallow a fresh
+        // user-prompt running hook whose timestamp is slightly earlier than `now`,
+        // freezing the tab in idle. Clamp to `now` so a future-dated snapshot (e.g.
+        // after a system-clock rollback) can't poison the clock and reject later
+        // legitimate hooks. Liveness/footer callers pass nil and keep the prior
+        // `now`-based behavior.
         let now = SessionArtifacts.currentStatusTimestamp()
-        let timestamp = max(now, statusEventClock.timestamp(for: sid) ?? now)
+        let base = min(effectiveTime ?? now, now)
+        let timestamp = max(base, statusEventClock.timestamp(for: sid) ?? base)
         statusEventClock.seed(sessionId: sid, timestamp: timestamp)
         SessionArtifacts.persistStatus(
             sessionId: sid,
@@ -1909,6 +2021,13 @@ final class AppModel: ObservableObject {
         foregroundIdleGenerationBaselines.removeValue(forKey: sessionId)
 
         guard !isVisible(projectIndex: loc.p, sessionIndex: loc.s) else { return }
+        // Light the finished-and-unseen dot here too. When a session was already
+        // demoted to idle early (stale-working recovery, while background subagents
+        // were still running), the final agent-stop/session-idle arrives with
+        // `previous == .idle`, so the active→idle edge in `setStatus` won't set this.
+        // Setting it at the completion chokepoint keeps the sidebar/tab dot in parity
+        // for both the direct-finish and the pre-demoted paths.
+        projects[loc.p].sessions[loc.s].finishedUnseen = true
         postNotification(
             projectId: projects[loc.p].id,
             sessionId: sessionId,

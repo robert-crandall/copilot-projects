@@ -60,6 +60,18 @@ public enum CopilotExtension {
         const pendingElicitations = new Map();
         const inFlightElicitationResponses = new Set();
         let foregroundTurnActive = false;
+        // Wall-clock time of the most recent `foregroundTurnActive` transition
+        // (root turn_start/turn_end/session.idle). Distinct from `updatedAt`,
+        // which every publish() rewrites (heartbeats, questions, model/subagent
+        // events). The macOS client seeds its status-event clock from THIS value
+        // so those unrelated republishes can't advance the clock past a delayed
+        // status hook. At each transition it's set to `normalizedTimestamp(
+        // event.timestamp)` — the CLI event's causal time — matching the time
+        // base the status hooks use (`payload_timestamp` reads the same event
+        // `timestamp`), so it's directly comparable to the status-event clock.
+        // The initial value predates any turn and never seeds a clock (recovery/
+        // demotion require a real transition first).
+        let foregroundTransitionAt = new Date().toISOString();
         let scheduledTurnActive = false;
         let currentTurnKind = null;
         let idleGeneration = 0;
@@ -336,6 +348,7 @@ public enum CopilotExtension {
                 schemaVersion: 1,
                 updatedAt: new Date().toISOString(),
                 foregroundTurnActive,
+                foregroundTransitionAt,
                 scheduledTurnActive,
                 activeSubagents: [...activeSubagents.values()],
                 schedules,
@@ -979,6 +992,7 @@ public enum CopilotExtension {
             lastIdleTurnKind = null;
             scheduledTurnActive = currentTurnKind === "scheduled";
             foregroundTurnActive = !scheduledTurnActive;
+            foregroundTransitionAt = normalizedTimestamp(event.timestamp);
             if (scheduledTurnActive) setScheduledTurnMarker(true);
             publish();
         });
@@ -986,6 +1000,7 @@ public enum CopilotExtension {
         session.on("assistant.turn_end", (event) => {
             if (event.agentId) return;
             foregroundTurnActive = false;
+            foregroundTransitionAt = normalizedTimestamp(event.timestamp);
             publish();
         });
 
@@ -996,6 +1011,7 @@ public enum CopilotExtension {
             lastIdleTurnKind = currentTurnKind;
             currentTurnKind = null;
             foregroundTurnActive = false;
+            foregroundTransitionAt = normalizedTimestamp(event.timestamp);
             scheduledTurnActive = false;
             activeSubagents.clear();
             publish();

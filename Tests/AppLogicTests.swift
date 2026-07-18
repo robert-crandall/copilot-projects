@@ -307,6 +307,91 @@ final class AppLogicTests: XCTestCase {
         ))
     }
 
+    func testForegroundIdleDemotesOnlyAfterTwoInactiveScans() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        // A single inactive scan is a normal inter-iteration gap: don't demote.
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+        // Two consecutive inactive scans mean the foreground turn really ended.
+        XCTAssertTrue(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+    }
+
+    func testForegroundIdleDwellResetsWhenTurnResumes() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+        // Next agentic iteration starts — foreground turn active again resets dwell.
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: true))
+        // A later lone inactive scan must not demote on its own.
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+        XCTAssertTrue(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+    }
+
+    func testForegroundIdleOnlyAppliesToRunningStatus() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        // Not running (e.g. waiting/idle): never demote via this path.
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .waiting, foregroundTurnActive: false))
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .waiting, foregroundTurnActive: false))
+    }
+
+    func testResetForegroundIdlePreservesFooterDwellState() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        // Build up footer-demote dwell state (saw working, one idle tick).
+        XCTAssertFalse(tracker.observeFooter(
+            sessionId: sessionId, currentStatus: .running, activity: .working))
+        XCTAssertFalse(tracker.observeFooter(
+            sessionId: sessionId, currentStatus: .running, activity: .idle))
+        // Clearing only the foreground-idle counter must not wipe footer progress.
+        tracker.resetForegroundIdle(sessionId: sessionId)
+        XCTAssertTrue(tracker.observeFooter(
+            sessionId: sessionId, currentStatus: .running, activity: .idle))
+    }
+
+    func testForegroundTransitionMillisecondsParsesIndependentlyOfUpdatedAt() {
+        let snapshot = AgentActivitySnapshot(
+            schemaVersion: AgentActivitySnapshot.currentSchemaVersion,
+            updatedAt: "2024-01-01T21:48:52.500Z",
+            foregroundTurnActive: true,
+            foregroundTransitionAt: "2024-01-01T21:48:52.123Z",
+            scheduledTurnActive: false,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        // The transition timestamp is used for the status clock; `updatedAt` (which
+        // unrelated republishes bump) must not be conflated with it.
+        XCTAssertEqual(snapshot.foregroundTransitionMilliseconds, 1_704_145_732_123)
+    }
+
+    func testForegroundTransitionMillisecondsNilForOlderSnapshots() {
+        let snapshot = AgentActivitySnapshot(
+            schemaVersion: AgentActivitySnapshot.currentSchemaVersion,
+            updatedAt: "2024-01-01T21:48:52.123Z",
+            foregroundTurnActive: false,
+            scheduledTurnActive: false,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        XCTAssertNil(snapshot.foregroundTransitionMilliseconds)
+    }
+
     func testStatusEventClockRejectsLateHookEvents() {
         let sessionId = UUID().uuidString
         var clock = StatusEventClock()
