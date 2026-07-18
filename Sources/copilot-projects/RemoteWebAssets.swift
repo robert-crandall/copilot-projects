@@ -1089,33 +1089,77 @@ enum RemoteWebAssets {
     }
 
     function selectPromptDraftEvictionCandidate() {
-      // promptDrafts is only this tab's local snapshot: it's loaded once and
-      // otherwise only updated by this tab's own edits, so another tab can
-      // refresh (or newly create) a session's on-disk draft without this
-      // tab's copy ever finding out. Walk local candidates oldest-first, but
-      // before deleting any of them, re-check its live per-key timestamp -
-      // if storage shows it was written more recently than this tab's local
-      // record, another tab just touched it and it must not be evicted;
-      // move on to the next-oldest local candidate instead.
-      for (const candidateId of promptDrafts.keys()) {
-        const local = promptDrafts.get(candidateId);
+      // promptDrafts already reflects everything this tab knows about,
+      // including edits it made but hasn't flushed to storage yet - a
+      // live-storage-only scan would miss those pending sessions and
+      // wrongly conclude there's room to spare. But promptDrafts alone
+      // would miss sessions another tab created that this tab never
+      // loaded, which is the actual gap: two tabs that each start from an
+      // empty store and only ever create their own disjoint sessions would
+      // both judge the cap against their own map alone and never notice
+      // storage growing well past it. Combine both views - this tab's own
+      // record takes precedence for anything it knows, and live storage
+      // fills in only the sessions it doesn't - so the cap is judged
+      // against every session that exists anywhere, not just the ones a
+      // single tab happens to have loaded or created.
+      const candidates = [];
+      const known = new Set();
+      for (const [sessionId, draft] of promptDrafts.entries()) {
+        candidates.push({ sessionId, draft });
+        known.add(sessionId);
+      }
+
+      const storageKeys = [];
+      try {
+        for (let index = 0; index < localStorage.length; index += 1) {
+          const key = localStorage.key(index);
+          if (typeof key === 'string' && key.startsWith(PROMPT_DRAFT_STORAGE_PREFIX)) {
+            storageKeys.push(key);
+          }
+        }
+      } catch (error) {
+        warnPromptDraftStorage(error);
+        // Fall back to this tab's own view alone rather than skipping
+        // eviction entirely - it still enforces the cap against what this
+        // tab actually knows.
+        if (candidates.length < PROMPT_DRAFT_MAX_SESSIONS) return null;
+        candidates.sort((left, right) => left.draft.updatedAt - right.draft.updatedAt);
+        return candidates[0];
+      }
+
+      for (const key of storageKeys) {
+        const sessionId = sessionIdForPromptDraftStorageKey(key);
+        // A session already staged for eviction (promptDraftEvictionBaseline)
+        // is still physically present in storage until this tab's next
+        // flush actually deletes it, so a naive re-scan would keep finding
+        // and re-picking that same not-yet-removed entry on every
+        // subsequent call instead of progressing to the next-oldest
+        // candidate - one net-new session added would never make more than
+        // one eviction happen no matter how many more were added after it.
+        // Treat anything already staged as already gone for this decision.
+        if (!sessionId || known.has(sessionId) || promptDraftEvictionBaseline.has(sessionId)) {
+          continue;
+        }
         let raw = null;
         try {
-          raw = localStorage.getItem(promptDraftStorageKey(candidateId));
+          raw = localStorage.getItem(key);
         } catch (error) {
           warnPromptDraftStorage(error);
-          return candidateId;
+          continue;
         }
-        const stored = raw ? parseStoredPromptDraft(raw) : null;
-        if (!stored || stored.draft.updatedAt <= local.updatedAt) {
-          return candidateId;
-        }
+        const parsed = raw ? parseStoredPromptDraft(raw) : null;
+        if (!parsed) continue;
+        candidates.push({ sessionId, draft: parsed.draft });
       }
-      // Every locally-known candidate was refreshed elsewhere more recently
-      // than this tab knew; nothing is safe to evict from this tab's view.
-      // Let the local map grow by one rather than delete fresh data - the
-      // next full loadPromptDrafts() reconciles against the true count.
-      return null;
+
+      if (candidates.length < PROMPT_DRAFT_MAX_SESSIONS) {
+        // Storage isn't actually at cap once every tab's sessions are
+        // counted; nothing needs to be evicted to make room for a new one.
+        return null;
+      }
+
+      candidates.sort((left, right) => left.draft.updatedAt - right.draft.updatedAt);
+      return candidates[0];
     }
 
     function setPromptDraft(sessionId, value) {
@@ -1130,16 +1174,15 @@ enum RemoteWebAssets {
       if (promptDrafts.get(sessionId)?.value === normalized) return;
       if (promptDrafts.has(sessionId)) {
         promptDrafts.delete(sessionId);
-      } else if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
-        const evictedSessionId = selectPromptDraftEvictionCandidate();
-        if (evictedSessionId !== null) {
-          const evictedLocal = promptDrafts.get(evictedSessionId);
-          promptDraftEvictionBaseline.set(evictedSessionId, {
-            value: evictedLocal ? evictedLocal.value : undefined,
-            updatedAt: evictedLocal ? evictedLocal.updatedAt : 0,
+      } else {
+        const evicted = selectPromptDraftEvictionCandidate();
+        if (evicted) {
+          promptDraftEvictionBaseline.set(evicted.sessionId, {
+            value: evicted.draft.value,
+            updatedAt: evicted.draft.updatedAt,
           });
-          promptDrafts.delete(evictedSessionId);
-          promptDraftDirtySessions.add(evictedSessionId);
+          promptDrafts.delete(evicted.sessionId);
+          promptDraftDirtySessions.add(evicted.sessionId);
         }
       }
       promptDrafts.set(sessionId, { value: normalized, updatedAt: Date.now() });

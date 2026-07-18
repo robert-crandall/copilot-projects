@@ -5531,6 +5531,37 @@ final class AppLogicTests: XCTestCase {
         );
         assert.equal(storedDraft(tieStorage, 's100').value, 'draft 100');
 
+        // Runtime eviction previously judged the cap only against
+        // promptDrafts.size (this tab's own local map). Two tabs that each
+        // start from an empty store and only ever create their own
+        // disjoint sessions would both stay within the cap by their own
+        // count while storage grew unbounded across both. Eviction must
+        // reconcile against the live storage-wide key set so the cap holds
+        // regardless of which tab created which session.
+        const disjointStorage = makeStorage();
+        const disjointA = createContext(disjointStorage);
+        const disjointB = createContext(disjointStorage);
+
+        for (let index = 0; index < 100; index += 1) {
+          disjointA.context.setPromptDraft(`a${index}`, `draft a${index}`);
+        }
+        disjointA.context.persistPromptDrafts();
+
+        for (let index = 0; index < 100; index += 1) {
+          disjointB.context.setPromptDraft(`b${index}`, `draft b${index}`);
+        }
+        disjointB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraftKeys(disjointStorage).length,
+          100,
+          'the cap must hold storage-wide even when two tabs only ever create their own disjoint sessions'
+        );
+        for (let index = 0; index < 100; index += 1) {
+          assert.equal(disjointStorage.values.has(storageKey(`a${index}`)), false);
+          assert.equal(storedDraft(disjointStorage, `b${index}`).value, `draft b${index}`);
+        }
+
         const warnings = [];
         const failingStorage = {
           get length() { throw new Error('storage unavailable'); },
