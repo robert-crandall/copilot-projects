@@ -1484,6 +1484,11 @@ enum RemoteWebAssets {
     }
     function enqueuePrompt(value) {
       if (!value.trim() || !selected || !writable) return false;
+      // A session pruned from the workspace snapshot can no longer flush a
+      // queued prompt (flushQueue requires a live sessionState entry), so
+      // reject here instead of silently swallowing the message into a queue
+      // that will never send - the composer keeps the typed text instead.
+      if (!sessionState.has(selected)) return false;
       if (new TextEncoder().encode(value).length > 8192) {
         updatePromptState('Message is too large (8 KB maximum)');
         return false;

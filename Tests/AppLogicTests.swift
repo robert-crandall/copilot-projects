@@ -5160,6 +5160,12 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "prunePromptDrafts(new Set(sessionState.keys()));"
         ))
+        // A prompt must not be accepted into the send queue once its
+        // session has been pruned - flushQueue can never send it, so
+        // enqueuePrompt must reject up front and leave the typed text alone.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (!sessionState.has(selected)) return false;"
+        ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "window.addEventListener('pagehide', persistPromptDrafts);"
         ))
