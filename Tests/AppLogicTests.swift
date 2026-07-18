@@ -5166,6 +5166,18 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "if (!sessionState.has(selected)) return false;"
         ))
+        // Both truncation sites (the load-time correction pass and
+        // setPromptDraft's write path) must share the same surrogate-safe
+        // truncation helper rather than each calling slice() directly.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "function truncatePromptDraft(value) {"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const normalized = truncatePromptDraft(value);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const normalized = truncatePromptDraft(String(value ?? ''));"
+        ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "window.addEventListener('pagehide', persistPromptDrafts);"
         ))
@@ -5247,6 +5259,33 @@ final class AppLogicTests: XCTestCase {
         assert.equal(restarted.context.draftForSession('s1'), 'half-typed message');
         restarted.context.setPromptDraft('s2', 'x'.repeat(9000));
         assert.equal(restarted.context.draftForSession('s2').length, 8192);
+
+        // Truncating at PROMPT_DRAFT_MAX_LENGTH must not split a surrogate
+        // pair: an 8191-unit prefix followed by a non-BMP character (2 UTF-16
+        // units) puts that character's high surrogate exactly at the cutoff,
+        // so a naive slice(0, 8192) would leave a dangling unpaired
+        // surrogate.
+        restarted.context.setPromptDraft('surrogate', 'x'.repeat(8191) + '\u{1F600}');
+        const surrogateDraft = restarted.context.draftForSession('surrogate');
+        assert.equal(surrogateDraft.length, 8191, 'the lone high surrogate must be dropped, not kept');
+        assert.equal(surrogateDraft, 'x'.repeat(8191));
+        const lastCode = surrogateDraft.charCodeAt(surrogateDraft.length - 1);
+        assert.ok(
+          lastCode < 0xd800 || lastCode > 0xdfff,
+          'result must not end on an unpaired surrogate'
+        );
+
+        // The same surrogate-safe truncation must apply to over-length
+        // values already on disk, normalized by loadPromptDrafts() on
+        // startup (not just to values typed via setPromptDraft()).
+        const seededStorage = makeStorage(
+          JSON.stringify({ overlong: 'y'.repeat(8191) + '\u{1F600}' })
+        );
+        const seeded = createContext(seededStorage);
+        const seededDraft = seeded.context.draftForSession('overlong');
+        assert.equal(seededDraft.length, 8191, 'loaded value must drop the dangling surrogate too');
+        assert.equal(seededDraft, 'y'.repeat(8191));
+
         restarted.context.setPromptDraft('gone', 'stale');
         restarted.context.setPromptDraft('live', 'keep');
         restarted.context.persistPromptDrafts();

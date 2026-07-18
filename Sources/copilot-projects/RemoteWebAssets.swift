@@ -881,6 +881,21 @@ enum RemoteWebAssets {
     const PROMPT_DRAFT_MAX_SESSIONS = 100;
     const PROMPT_DRAFT_SAVE_DELAY = 200;
     const promptDrafts = new Map();
+
+    function truncatePromptDraft(value) {
+      // String.slice() counts UTF-16 code units, so cutting at exactly
+      // PROMPT_DRAFT_MAX_LENGTH can land between the two halves of a
+      // surrogate pair (e.g. many emoji), leaving an unpaired high
+      // surrogate that renders as a replacement character on the next
+      // read. Drop a trailing unpaired high surrogate so truncation
+      // always lands on a code-point boundary.
+      let sliced = value.slice(0, PROMPT_DRAFT_MAX_LENGTH);
+      const lastCode = sliced.charCodeAt(sliced.length - 1);
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+        sliced = sliced.slice(0, -1);
+      }
+      return sliced;
+    }
     // Session ids this tab has actually changed since the last successful
     // persist. Only these are applied on top of a fresh storage read so a
     // flush from this tab can never clobber drafts written by another tab.
@@ -945,7 +960,7 @@ enum RemoteWebAssets {
           correctedSessions.add(sessionId);
           continue;
         }
-        const normalized = value.slice(0, PROMPT_DRAFT_MAX_LENGTH);
+        const normalized = truncatePromptDraft(value);
         if (normalized !== value) correctedSessions.add(sessionId);
         promptDrafts.set(sessionId, normalized);
       }
@@ -1023,7 +1038,7 @@ enum RemoteWebAssets {
 
     function setPromptDraft(sessionId, value) {
       if (!sessionId) return;
-      const normalized = String(value ?? '').slice(0, PROMPT_DRAFT_MAX_LENGTH);
+      const normalized = truncatePromptDraft(String(value ?? ''));
       if (!normalized) {
         if (!promptDrafts.delete(sessionId)) return;
         markPromptDraftDirty(sessionId);
