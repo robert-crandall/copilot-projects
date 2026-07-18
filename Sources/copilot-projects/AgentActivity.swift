@@ -7,6 +7,14 @@ struct AgentActivitySnapshot: Codable, Equatable {
     var schemaVersion: Int
     var updatedAt: String
     var foregroundTurnActive: Bool
+    /// Wall-clock time (ISO8601) of the most recent `foregroundTurnActive`
+    /// transition — set by the extension only at root turn_start/turn_end/
+    /// session.idle, unlike `updatedAt` which every publish() rewrites. Carries
+    /// the CLI event's causal timestamp (`normalizedTimestamp(event.timestamp)`),
+    /// the same time base the status hooks use, so it's directly comparable to
+    /// the status-event clock. Optional (nil default) so snapshots written before
+    /// this field still decode.
+    var foregroundTransitionAt: String? = nil
     var scheduledTurnActive: Bool
     var activeSubagents: [TrackedSubagent]
     var schedules: [TrackedSchedule]
@@ -28,6 +36,19 @@ struct AgentActivitySnapshot: Codable, Equatable {
         guard schemaVersion == Self.currentSchemaVersion,
               let updated = Self.date(from: updatedAt) else { return false }
         return now.timeIntervalSince(updated) <= ttl
+    }
+
+    /// `foregroundTransitionAt` as epoch milliseconds, matching the status-event
+    /// clock's units. This is the causal time of the current foreground state
+    /// (turn_start → active, turn_end/session.idle → inactive), so recovery and
+    /// demotion seed the status clock from it rather than `updatedAt` — otherwise
+    /// an unrelated republish (heartbeat, question, model/subagent event) could
+    /// advance the clock past a delayed status hook and silently drop it. Older
+    /// snapshots predating the field return nil and cannot drive reconciliation.
+    var foregroundTransitionMilliseconds: Int64? {
+        guard let value = foregroundTransitionAt,
+              let transition = Self.date(from: value) else { return nil }
+        return Int64(transition.timeIntervalSince1970 * 1_000)
     }
 
     /// Convert the tracked questions into the shared remote model for workspace

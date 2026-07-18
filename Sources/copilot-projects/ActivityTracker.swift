@@ -14,6 +14,32 @@ struct ActivityTracker {
     private var footerIdleTicks: [String: Int] = [:]
     private var footerWorkingTicks: [String: Int] = [:]
     private var footerSawWorking: Set<String> = []
+    private var foregroundIdleTicks: [String: Int] = [:]
+
+    /// Demote a running session whose foreground turn has ended but whose live
+    /// background subagents keep `session.idle` from firing — so the hook path
+    /// never demotes it and the tab stays falsely "working". Gated behind two
+    /// consecutive scans reporting the foreground turn inactive: `assistant.turn_end`
+    /// fires once per agentic-loop iteration, so a normal inter-iteration gap flips
+    /// `foregroundTurnActive` false only momentarily and the next `turn_start`
+    /// republishes before a second scan lands. Returns true once the ended-turn
+    /// condition has persisted, at which point the caller drops the session to idle
+    /// while leaving `activeSubagents` intact.
+    mutating func observeForegroundIdle(
+        sessionId: String,
+        currentStatus: SessionStatus,
+        foregroundTurnActive: Bool
+    ) -> Bool {
+        guard currentStatus == .running, !foregroundTurnActive else {
+            foregroundIdleTicks[sessionId] = nil
+            return false
+        }
+        let ticks = (foregroundIdleTicks[sessionId] ?? 0) + 1
+        foregroundIdleTicks[sessionId] = ticks
+        guard ticks >= 2 else { return false }
+        foregroundIdleTicks[sessionId] = nil
+        return true
+    }
 
     mutating func shouldPromoteFromFooter(
         sessionId: String,
@@ -70,12 +96,18 @@ struct ActivityTracker {
         footerIdleTicks = footerIdleTicks.filter { activeSessionIds.contains($0.key) }
         footerWorkingTicks = footerWorkingTicks.filter { activeSessionIds.contains($0.key) }
         footerSawWorking = footerSawWorking.intersection(activeSessionIds)
+        foregroundIdleTicks = foregroundIdleTicks.filter { activeSessionIds.contains($0.key) }
     }
 
     mutating func reset(sessionId: String) {
         footerIdleTicks[sessionId] = nil
         footerWorkingTicks[sessionId] = nil
         footerSawWorking.remove(sessionId)
+        foregroundIdleTicks[sessionId] = nil
+    }
+
+    mutating func resetForegroundIdle(sessionId: String) {
+        foregroundIdleTicks[sessionId] = nil
     }
 
     static func livenessShouldDemote(
