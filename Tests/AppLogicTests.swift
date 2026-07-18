@@ -5149,6 +5149,11 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "setPromptDraft(selected, prompt.value);"
         ))
+        // The composer's input handler must not resurrect a pruned
+        // session's draft if the user keeps typing after it disappears.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (selected && sessionState.has(selected)) {"
+        ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "setPromptDraft(selected, '');"
         ))

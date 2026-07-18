@@ -2159,7 +2159,12 @@ enum RemoteWebAssets {
       }
     });
     prompt.addEventListener('input', () => {
-      setPromptDraft(selected, prompt.value);
+      // Mirror the selectSession() guard: don't resurrect a draft for a
+      // session that was just pruned from the workspace snapshot while its
+      // composer is still visible and the user keeps typing into it.
+      if (selected && sessionState.has(selected)) {
+        setPromptDraft(selected, prompt.value);
+      }
       updatePromptState();
     });
     promptForm.onsubmit = (event) => {
