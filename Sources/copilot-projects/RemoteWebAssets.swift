@@ -885,6 +885,18 @@ enum RemoteWebAssets {
     // persist. Only these are applied on top of a fresh storage read so a
     // flush from this tab can never clobber drafts written by another tab.
     const promptDraftDirtySessions = new Set();
+
+    function markPromptDraftDirty(sessionId) {
+      // Delete before re-adding so a session touched again (e.g. edited,
+      // then edited again before the debounced persist fires) moves to the
+      // end of this Set's iteration order, matching the recency ordering
+      // promptDrafts maintains via its own delete/set pattern. A plain
+      // Set.add() on an already-present key leaves its position unchanged,
+      // which would make persistPromptDrafts() apply dirty writes in a
+      // stale order and could evict the most recently edited draft first.
+      promptDraftDirtySessions.delete(sessionId);
+      promptDraftDirtySessions.add(sessionId);
+    }
     let promptDraftSaveTimer = null;
     let promptDraftStorageWarningShown = false;
 
@@ -938,7 +950,7 @@ enum RemoteWebAssets {
         promptDrafts.set(sessionId, normalized);
       }
       if (!correctedSessions.size) return;
-      for (const sessionId of correctedSessions) promptDraftDirtySessions.add(sessionId);
+      for (const sessionId of correctedSessions) markPromptDraftDirty(sessionId);
       schedulePromptDraftPersistence();
     }
 
@@ -1014,7 +1026,7 @@ enum RemoteWebAssets {
       const normalized = String(value ?? '').slice(0, PROMPT_DRAFT_MAX_LENGTH);
       if (!normalized) {
         if (!promptDrafts.delete(sessionId)) return;
-        promptDraftDirtySessions.add(sessionId);
+        markPromptDraftDirty(sessionId);
         schedulePromptDraftPersistence();
         return;
       }
@@ -1025,7 +1037,7 @@ enum RemoteWebAssets {
         promptDrafts.delete(promptDrafts.keys().next().value);
       }
       promptDrafts.set(sessionId, normalized);
-      promptDraftDirtySessions.add(sessionId);
+      markPromptDraftDirty(sessionId);
       schedulePromptDraftPersistence();
     }
 
@@ -1034,7 +1046,7 @@ enum RemoteWebAssets {
       for (const sessionId of promptDrafts.keys()) {
         if (activeSessionIds.has(sessionId)) continue;
         promptDrafts.delete(sessionId);
-        promptDraftDirtySessions.add(sessionId);
+        markPromptDraftDirty(sessionId);
         changed = true;
       }
       if (changed) schedulePromptDraftPersistence();

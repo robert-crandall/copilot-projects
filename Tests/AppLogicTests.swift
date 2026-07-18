@@ -5301,6 +5301,29 @@ final class AppLogicTests: XCTestCase {
         );
         assert.equal(lruDrafts.s100, 'draft 100');
 
+        // Set.add() on an already-present key doesn't move it, so re-editing
+        // a session that's already dirty (edit, edit again, before persist
+        // flushes) must not leave its dirty-tracking entry pinned at its
+        // first-touched position - the merge order must reflect the actual
+        // last-edited recency, not the first-dirtied order.
+        const orderStorage = makeStorage();
+        const order = createContext(orderStorage);
+        order.context.setPromptDraft('s0', 'v0');
+        order.context.setPromptDraft('s1', 'v1');
+        order.context.persistPromptDrafts();
+        order.context.setPromptDraft('s0', 'edit1');
+        order.context.setPromptDraft('s1', 'edit1');
+        order.context.setPromptDraft('s0', 'edit2');
+        order.context.persistPromptDrafts();
+        const orderKeys = Object.keys(
+          JSON.parse(orderStorage.values.get(storageKey))
+        );
+        assert.ok(
+          orderKeys.indexOf('s0') > orderKeys.indexOf('s1'),
+          's0 was edited last (edit2, after s1\'s edit1) and must be ordered ' +
+            'as more recent than s1, not stuck at its first-dirtied position'
+        );
+
         const warnings = [];
         const failingStorage = {
           getItem() { throw new Error('storage unavailable'); },
