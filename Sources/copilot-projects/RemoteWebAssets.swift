@@ -999,7 +999,10 @@ enum RemoteWebAssets {
       }
       for (const entry of excess) {
         promptDraftDirtySessions.add(entry.sessionId);
-        promptDraftEvictionBaseline.set(entry.sessionId, entry.draft.updatedAt);
+        promptDraftEvictionBaseline.set(entry.sessionId, {
+          value: entry.draft.value,
+          updatedAt: entry.draft.updatedAt,
+        });
       }
 
       for (const key of invalidKeys) {
@@ -1037,9 +1040,20 @@ enum RemoteWebAssets {
             warnPromptDraftStorage(error);
           }
           const stored = raw ? parseStoredPromptDraft(raw) : null;
-          if (stored && stored.draft.updatedAt > baseline) {
-            // Refreshed elsewhere since the eviction decision - decline
-            // this deletion and leave storage untouched.
+          // Compare the exact stored record against the exact baseline
+          // snapshot rather than only `updatedAt > baseline`: Date.now()
+          // is millisecond-resolution, so another tab can write a
+          // different value within the same millisecond the baseline was
+          // captured in, and a timestamp-only comparison would treat that
+          // as unchanged. An exact mismatch on either field means some
+          // write happened since the decision, regardless of ordering.
+          if (
+            stored &&
+            (stored.draft.value !== baseline.value ||
+              stored.draft.updatedAt !== baseline.updatedAt)
+          ) {
+            // Changed elsewhere since the eviction decision - decline this
+            // deletion and leave storage untouched.
             promptDraftDirtySessions.delete(sessionId);
             promptDraftEvictionBaseline.delete(sessionId);
             continue;
@@ -1120,10 +1134,10 @@ enum RemoteWebAssets {
         const evictedSessionId = selectPromptDraftEvictionCandidate();
         if (evictedSessionId !== null) {
           const evictedLocal = promptDrafts.get(evictedSessionId);
-          promptDraftEvictionBaseline.set(
-            evictedSessionId,
-            evictedLocal ? evictedLocal.updatedAt : 0
-          );
+          promptDraftEvictionBaseline.set(evictedSessionId, {
+            value: evictedLocal ? evictedLocal.value : undefined,
+            updatedAt: evictedLocal ? evictedLocal.updatedAt : 0,
+          });
           promptDrafts.delete(evictedSessionId);
           promptDraftDirtySessions.add(evictedSessionId);
         }

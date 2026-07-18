@@ -5490,6 +5490,47 @@ final class AppLogicTests: XCTestCase {
           'a refresh during the load-time cap cleanup debounce window must survive'
         );
 
+        // Date.now() only has millisecond resolution, so a timestamp-only
+        // freshness check ("stored.updatedAt > baseline") cannot tell a
+        // same-millisecond cross-tab rewrite apart from an untouched
+        // candidate - both compare equal. The recheck must compare the
+        // full stored record against the exact baseline snapshot instead,
+        // so it still declines the deletion when the value differs even
+        // though the timestamp doesn't.
+        const tieStorage = makeStorage();
+        const tieA = createContext(tieStorage);
+        for (let index = 0; index < 100; index += 1) {
+          tieA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        tieA.context.persistPromptDrafts();
+
+        const tieB = createContext(tieStorage);
+        // Tab B decides to evict s0 but does not flush yet.
+        tieB.context.setPromptDraft('s100', 'draft 100');
+
+        // The baseline tab B's eviction decision captured is whatever is
+        // still on disk, since tab B hasn't flushed.
+        const tieBaselineUpdatedAt = storedDraft(tieStorage, 's0').updatedAt;
+
+        // Simulate another tab rewriting s0 within that exact same
+        // millisecond - same updatedAt, different value.
+        tieStorage.values.set(
+          storageKey('s0'),
+          JSON.stringify({
+            value: 's0 rewritten same millisecond',
+            updatedAt: tieBaselineUpdatedAt,
+          })
+        );
+
+        tieB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(tieStorage, 's0').value,
+          's0 rewritten same millisecond',
+          'a same-millisecond rewrite of the eviction candidate must survive'
+        );
+        assert.equal(storedDraft(tieStorage, 's100').value, 'draft 100');
+
         const warnings = [];
         const failingStorage = {
           get length() { throw new Error('storage unavailable'); },
