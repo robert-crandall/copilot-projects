@@ -5414,6 +5414,44 @@ final class AppLogicTests: XCTestCase {
         );
         assert.equal(storedDraft(evictionStorage, 's100').value, 'draft 100');
 
+        // The debounce window between deciding to evict a candidate and
+        // actually flushing it (up to PROMPT_DRAFT_SAVE_DELAY later) is
+        // itself long enough for another tab to refresh that exact
+        // candidate. The eviction decision alone isn't enough; the
+        // deletion must be re-verified again immediately before it runs.
+        const debounceStorage = makeStorage();
+        const debounceA = createContext(debounceStorage);
+        for (let index = 0; index < 100; index += 1) {
+          debounceA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        debounceA.context.persistPromptDrafts();
+
+        const debounceB = createContext(debounceStorage);
+        // Tab B decides to evict s0 (its local snapshot matches storage, so
+        // s0 is a legitimate candidate right now) but does not flush yet -
+        // mirroring the real debounced schedulePromptDraftPersistence().
+        debounceB.context.setPromptDraft('s100', 'draft 100');
+        assert.equal(debounceB.context.draftForSession('s0'), '');
+
+        const beforeDebounceRefresh = Date.now();
+        while (Date.now() === beforeDebounceRefresh) { /* spin to the next tick */ }
+
+        // Tab A refreshes s0 - the very candidate tab B already decided to
+        // evict - and flushes immediately.
+        debounceA.context.setPromptDraft('s0', 'refreshed by A during B\'s debounce');
+        debounceA.context.persistPromptDrafts();
+
+        // Tab B's deferred flush must not delete s0 now that storage shows
+        // it was refreshed after B's eviction decision.
+        debounceB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(debounceStorage, 's0').value,
+          'refreshed by A during B\'s debounce',
+          'a refresh that lands during the eviction debounce window must survive'
+        );
+        assert.equal(storedDraft(debounceStorage, 's100').value, 'draft 100');
+
         const warnings = [];
         const failingStorage = {
           get length() { throw new Error('storage unavailable'); },

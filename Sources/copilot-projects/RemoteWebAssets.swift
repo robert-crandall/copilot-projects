@@ -898,6 +898,14 @@ enum RemoteWebAssets {
     }
     // Session ids this tab changed since their last successful per-key write.
     const promptDraftDirtySessions = new Set();
+    // For sessions marked dirty by capacity eviction (not an intentional
+    // prune/clear), the candidate's live updatedAt observed at the moment
+    // eviction was decided. The debounced flush can land up to
+    // PROMPT_DRAFT_SAVE_DELAY later, which is enough time for another tab to
+    // refresh the same candidate; persistPromptDrafts() re-checks this
+    // baseline immediately before deleting so that later refresh wins
+    // instead of being silently destroyed.
+    const promptDraftEvictionBaseline = new Map();
     let promptDraftSaveTimer = null;
     let promptDraftStorageWarningShown = false;
 
@@ -1014,8 +1022,30 @@ enum RemoteWebAssets {
       const deletions = dirtySessions.filter((sessionId) => !promptDrafts.has(sessionId));
       const writes = dirtySessions.filter((sessionId) => promptDrafts.has(sessionId));
       for (const sessionId of [...deletions, ...writes]) {
+        const isWrite = promptDrafts.has(sessionId);
+        if (!isWrite && promptDraftEvictionBaseline.has(sessionId)) {
+          // This deletion came from capacity-based eviction. Re-check the
+          // live value right before deleting - the debounce window since
+          // the eviction decision is enough time for another tab to have
+          // refreshed this same candidate, and that refresh must win.
+          const baseline = promptDraftEvictionBaseline.get(sessionId);
+          let raw = null;
+          try {
+            raw = localStorage.getItem(promptDraftStorageKey(sessionId));
+          } catch (error) {
+            warnPromptDraftStorage(error);
+          }
+          const stored = raw ? parseStoredPromptDraft(raw) : null;
+          if (stored && stored.draft.updatedAt > baseline) {
+            // Refreshed elsewhere since the eviction decision - decline
+            // this deletion and leave storage untouched.
+            promptDraftDirtySessions.delete(sessionId);
+            promptDraftEvictionBaseline.delete(sessionId);
+            continue;
+          }
+        }
         try {
-          if (promptDrafts.has(sessionId)) {
+          if (isWrite) {
             localStorage.setItem(
               promptDraftStorageKey(sessionId),
               JSON.stringify(promptDrafts.get(sessionId))
@@ -1024,6 +1054,7 @@ enum RemoteWebAssets {
             localStorage.removeItem(promptDraftStorageKey(sessionId));
           }
           promptDraftDirtySessions.delete(sessionId);
+          promptDraftEvictionBaseline.delete(sessionId);
         } catch (error) {
           warnPromptDraftStorage(error);
         }
@@ -1087,6 +1118,11 @@ enum RemoteWebAssets {
       } else if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
         const evictedSessionId = selectPromptDraftEvictionCandidate();
         if (evictedSessionId !== null) {
+          const evictedLocal = promptDrafts.get(evictedSessionId);
+          promptDraftEvictionBaseline.set(
+            evictedSessionId,
+            evictedLocal ? evictedLocal.updatedAt : 0
+          );
           promptDrafts.delete(evictedSessionId);
           promptDraftDirtySessions.add(evictedSessionId);
         }
