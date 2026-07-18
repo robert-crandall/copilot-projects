@@ -881,6 +881,10 @@ enum RemoteWebAssets {
     const PROMPT_DRAFT_MAX_SESSIONS = 100;
     const PROMPT_DRAFT_SAVE_DELAY = 200;
     const promptDrafts = new Map();
+    // Session ids this tab has actually changed since the last successful
+    // persist. Only these are applied on top of a fresh storage read so a
+    // flush from this tab can never clobber drafts written by another tab.
+    const promptDraftDirtySessions = new Set();
     let promptDraftSaveTimer = null;
     let promptDraftStorageWarningShown = false;
 
@@ -890,43 +894,52 @@ enum RemoteWebAssets {
       console.warn('Copilot Projects could not persist message drafts.', error);
     }
 
-    function loadPromptDrafts() {
+    function readStoredPromptDrafts() {
       let raw = null;
       try {
         raw = localStorage.getItem(PROMPT_DRAFT_STORAGE_KEY);
       } catch (error) {
         warnPromptDraftStorage(error);
-        return;
+        return {};
       }
-      if (!raw) return;
+      if (!raw) return {};
 
       let decoded = null;
       try {
         decoded = JSON.parse(raw);
       } catch (error) {
         warnPromptDraftStorage(error);
-        return;
+        return {};
       }
       if (!decoded || Array.isArray(decoded) || typeof decoded !== 'object') {
         warnPromptDraftStorage(new Error('Stored message drafts are invalid.'));
-        return;
+        return {};
       }
+      return decoded;
+    }
 
-      let needsRewrite = false;
+    function loadPromptDrafts() {
+      const decoded = readStoredPromptDrafts();
+      // Entries dropped or truncated during normalization are recorded as
+      // this tab's own dirty changes so the merge in persistPromptDrafts()
+      // applies the correction instead of silently discarding it.
+      const correctedSessions = new Set();
       for (const [sessionId, value] of Object.entries(decoded)) {
         if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
-          needsRewrite = true;
-          break;
+          correctedSessions.add(sessionId);
+          continue;
         }
         if (typeof value !== 'string' || !value) {
-          needsRewrite = true;
+          correctedSessions.add(sessionId);
           continue;
         }
         const normalized = value.slice(0, PROMPT_DRAFT_MAX_LENGTH);
-        if (normalized !== value) needsRewrite = true;
+        if (normalized !== value) correctedSessions.add(sessionId);
         promptDrafts.set(sessionId, normalized);
       }
-      if (needsRewrite) schedulePromptDraftPersistence();
+      if (!correctedSessions.size) return;
+      for (const sessionId of correctedSessions) promptDraftDirtySessions.add(sessionId);
+      schedulePromptDraftPersistence();
     }
 
     function persistPromptDrafts() {
@@ -934,11 +947,36 @@ enum RemoteWebAssets {
         clearTimeout(promptDraftSaveTimer);
         promptDraftSaveTimer = null;
       }
+      if (!promptDraftDirtySessions.size) return;
+
+      // Merge this tab's dirty sessions on top of the freshest on-disk state
+      // instead of blindly serializing this tab's whole in-memory map, so a
+      // stale/background tab can never discard drafts another tab wrote.
+      const stored = readStoredPromptDrafts();
+      const merged = new Map();
+      for (const [sessionId, value] of Object.entries(stored)) {
+        if (typeof value === 'string' && value) merged.set(sessionId, value);
+      }
+      for (const sessionId of promptDraftDirtySessions) {
+        if (promptDrafts.has(sessionId)) {
+          merged.set(sessionId, promptDrafts.get(sessionId));
+        } else {
+          merged.delete(sessionId);
+        }
+      }
+      while (merged.size > PROMPT_DRAFT_MAX_SESSIONS) {
+        merged.delete(merged.keys().next().value);
+      }
+
+      promptDrafts.clear();
+      for (const [sessionId, value] of merged) promptDrafts.set(sessionId, value);
+      promptDraftDirtySessions.clear();
+
       try {
-        if (promptDrafts.size) {
+        if (merged.size) {
           localStorage.setItem(
             PROMPT_DRAFT_STORAGE_KEY,
-            JSON.stringify(Object.fromEntries(promptDrafts))
+            JSON.stringify(Object.fromEntries(merged))
           );
         } else {
           localStorage.removeItem(PROMPT_DRAFT_STORAGE_KEY);
@@ -965,6 +1003,7 @@ enum RemoteWebAssets {
       const normalized = String(value ?? '').slice(0, PROMPT_DRAFT_MAX_LENGTH);
       if (!normalized) {
         if (!promptDrafts.delete(sessionId)) return;
+        promptDraftDirtySessions.add(sessionId);
         schedulePromptDraftPersistence();
         return;
       }
@@ -975,6 +1014,7 @@ enum RemoteWebAssets {
         promptDrafts.delete(promptDrafts.keys().next().value);
       }
       promptDrafts.set(sessionId, normalized);
+      promptDraftDirtySessions.add(sessionId);
       schedulePromptDraftPersistence();
     }
 
@@ -983,6 +1023,7 @@ enum RemoteWebAssets {
       for (const sessionId of promptDrafts.keys()) {
         if (activeSessionIds.has(sessionId)) continue;
         promptDrafts.delete(sessionId);
+        promptDraftDirtySessions.add(sessionId);
         changed = true;
       }
       if (changed) schedulePromptDraftPersistence();

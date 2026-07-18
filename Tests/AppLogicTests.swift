@@ -5269,6 +5269,59 @@ final class AppLogicTests: XCTestCase {
         failed.context.persistPromptDrafts();
         assert.equal(failed.context.draftForSession('s1'), 'memory only');
         assert.equal(warnings.length, 1, 'storage failures should warn once');
+
+        // Two tabs sharing one localStorage: each tab loads the draft map
+        // once, so a later flush from either tab must merge with the
+        // freshest on-disk state rather than overwriting it with its own
+        // (now stale) in-memory copy. Otherwise a stale tab's flush -
+        // triggered unconditionally by session-switch/pagehide - would
+        // silently discard drafts the other tab just wrote.
+        const sharedStorage = makeStorage();
+        const tabA = createContext(sharedStorage);
+        const tabB = createContext(sharedStorage);
+
+        tabA.context.setPromptDraft('sessionA', 'from tab A');
+        tabA.context.persistPromptDrafts();
+        assert.deepEqual(
+          JSON.parse(sharedStorage.values.get(storageKey)),
+          { sessionA: 'from tab A' }
+        );
+
+        // Tab B never touched sessionA, but its in-memory map (loaded before
+        // tab A's write) must not clobber it when tab B flushes its own
+        // unrelated change.
+        tabB.context.setPromptDraft('sessionB', 'from tab B');
+        tabB.context.persistPromptDrafts();
+        assert.deepEqual(
+          JSON.parse(sharedStorage.values.get(storageKey)),
+          { sessionA: 'from tab A', sessionB: 'from tab B' },
+          'tab B flush must not discard tab A drafts it never loaded'
+        );
+
+        // An unconditional flush (e.g. pagehide) from a tab with no local
+        // changes must be a no-op, not a rewrite of stale state.
+        const priorSetCalls = sharedStorage.setCalls;
+        tabA.context.persistPromptDrafts();
+        assert.equal(sharedStorage.setCalls, priorSetCalls, 'idle flush must not write');
+
+        // A same-session edit in tab A must still win over tab A's own
+        // change, while preserving tab B's unrelated draft.
+        tabA.context.setPromptDraft('sessionA', 'from tab A, revised');
+        tabA.context.persistPromptDrafts();
+        assert.deepEqual(
+          JSON.parse(sharedStorage.values.get(storageKey)),
+          { sessionA: 'from tab A, revised', sessionB: 'from tab B' }
+        );
+
+        // Clearing a draft in one tab must remove only that session, even
+        // though the clearing tab's in-memory map never held the sibling's
+        // draft in the first place.
+        tabB.context.setPromptDraft('sessionB', '');
+        tabB.context.persistPromptDrafts();
+        assert.deepEqual(
+          JSON.parse(sharedStorage.values.get(storageKey)),
+          { sessionA: 'from tab A, revised' }
+        );
         """#
         try harness.write(to: script, atomically: true, encoding: .utf8)
 
