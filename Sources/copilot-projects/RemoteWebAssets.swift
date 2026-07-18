@@ -1034,10 +1034,20 @@ enum RemoteWebAssets {
           // refreshed this same candidate, and that refresh must win.
           const baseline = promptDraftEvictionBaseline.get(sessionId);
           let raw = null;
+          let readFailed = false;
           try {
             raw = localStorage.getItem(promptDraftStorageKey(sessionId));
           } catch (error) {
             warnPromptDraftStorage(error);
+            readFailed = true;
+          }
+          if (readFailed) {
+            // Could not verify whether another tab touched this candidate
+            // since the eviction decision was made - proceeding to delete
+            // anyway would bypass the freshness guard entirely on exactly
+            // the failure it exists to protect against. Leave it dirty and
+            // retry the recheck on the next flush instead.
+            continue;
           }
           const stored = raw ? parseStoredPromptDraft(raw) : null;
           // Compare the exact stored record against the exact baseline

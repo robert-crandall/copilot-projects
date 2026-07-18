@@ -5547,6 +5547,15 @@ final class AppLogicTests: XCTestCase {
         }
         disjointA.context.persistPromptDrafts();
 
+        // Force tab B's timestamps to be unambiguously newer than tab A's so
+        // the eviction order isn't left to a stable-sort tie-break between
+        // two sessions sharing the same millisecond (a real tie is a
+        // self-healing near-miss, not a correctness bug - see the read
+        // failure/retry test above - but it would make this specific
+        // assertion about *which* sessions survive nondeterministic).
+        const beforeDisjointB = Date.now();
+        while (Date.now() === beforeDisjointB) { /* spin to the next tick */ }
+
         for (let index = 0; index < 100; index += 1) {
           disjointB.context.setPromptDraft(`b${index}`, `draft b${index}`);
         }
@@ -5561,6 +5570,51 @@ final class AppLogicTests: XCTestCase {
           assert.equal(disjointStorage.values.has(storageKey(`a${index}`)), false);
           assert.equal(storedDraft(disjointStorage, `b${index}`).value, `draft b${index}`);
         }
+
+        // A transient read failure while re-verifying an eviction candidate
+        // must not fall through to deleting it anyway - that would bypass
+        // the freshness guard on exactly the failure it exists to protect
+        // against. It must decline (retaining dirty/baseline state for a
+        // later retry) rather than silently destroying unverifiable data.
+        const flakyWarnings = [];
+        const flakyStorage = makeStorage();
+        const flakyA = createContext(flakyStorage);
+        for (let index = 0; index < 100; index += 1) {
+          flakyA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        flakyA.context.persistPromptDrafts();
+
+        const flakyB = createContext(flakyStorage, flakyWarnings);
+        // Tab B decides to evict s0 but does not flush yet.
+        flakyB.context.setPromptDraft('s100', 'draft 100');
+
+        const realGetItem = flakyStorage.getItem.bind(flakyStorage);
+        flakyStorage.getItem = function (key) {
+          if (key === storageKey('s0')) {
+            throw new Error('transient read failure');
+          }
+          return realGetItem(key);
+        };
+
+        flakyB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(flakyStorage, 's0').value,
+          'draft 0',
+          'a transient read failure during the freshness recheck must not delete the candidate'
+        );
+        assert.equal(storedDraft(flakyStorage, 's100').value, 'draft 100');
+        assert.ok(flakyWarnings.length > 0, 'a read failure during the recheck should warn');
+
+        // Once storage is readable again, a later retry must still finish
+        // the deferred eviction normally.
+        flakyStorage.getItem = realGetItem;
+        flakyB.context.persistPromptDrafts();
+        assert.equal(
+          flakyStorage.values.has(storageKey('s0')),
+          false,
+          'the deferred eviction should complete on a later retry once storage is readable again'
+        );
 
         const warnings = [];
         const failingStorage = {
