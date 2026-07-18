@@ -958,10 +958,14 @@ enum RemoteWebAssets {
         if (typeof value === 'string' && value) merged.set(sessionId, value);
       }
       for (const sessionId of promptDraftDirtySessions) {
+        // Delete before re-inserting so a touched key that already existed
+        // in `stored` moves to the end (most-recently-used), matching the
+        // recency ordering setPromptDraft() maintains. A plain Map.set() on
+        // an existing key updates its value in place without moving it,
+        // which would let eviction below drop a key we just edited.
+        merged.delete(sessionId);
         if (promptDrafts.has(sessionId)) {
           merged.set(sessionId, promptDrafts.get(sessionId));
-        } else {
-          merged.delete(sessionId);
         }
       }
       while (merged.size > PROMPT_DRAFT_MAX_SESSIONS) {

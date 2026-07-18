@@ -5273,6 +5273,34 @@ final class AppLogicTests: XCTestCase {
         assert.equal(boundedDrafts.s0, undefined);
         assert.equal(boundedDrafts.s100, 'draft 100');
 
+        // Recency ordering must survive across separate persist() calls: a
+        // key already on disk that is re-edited and flushed by itself must
+        // move to the end of the eviction order, not stay pinned at its old
+        // (now-stale) position and get evicted next just for being oldest.
+        const lruStorage = makeStorage();
+        const lru = createContext(lruStorage);
+        for (let index = 0; index < 100; index += 1) {
+          lru.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        lru.context.persistPromptDrafts();
+        lru.context.setPromptDraft('s0', 'edited');
+        lru.context.persistPromptDrafts();
+        lru.context.setPromptDraft('s100', 'draft 100');
+        lru.context.persistPromptDrafts();
+        const lruDrafts = JSON.parse(lruStorage.values.get(storageKey));
+        assert.equal(Object.keys(lruDrafts).length, 100);
+        assert.equal(
+          lruDrafts.s0,
+          'edited',
+          's0 was just edited and must survive the eviction that follows'
+        );
+        assert.equal(
+          lruDrafts.s1,
+          undefined,
+          's1 (untouched since the first persist) should be evicted instead of s0'
+        );
+        assert.equal(lruDrafts.s100, 'draft 100');
+
         const warnings = [];
         const failingStorage = {
           getItem() { throw new Error('storage unavailable'); },
