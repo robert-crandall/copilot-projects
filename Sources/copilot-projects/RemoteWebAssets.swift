@@ -876,7 +876,7 @@ enum RemoteWebAssets {
     """#
 
     static let draftJavascript = #"""
-    const PROMPT_DRAFT_STORAGE_KEY = 'copilot-projects-prompt-drafts-v1';
+    const PROMPT_DRAFT_STORAGE_PREFIX = 'copilot-projects-prompt-draft-v2:';
     const PROMPT_DRAFT_MAX_LENGTH = 8192;
     const PROMPT_DRAFT_MAX_SESSIONS = 100;
     const PROMPT_DRAFT_SAVE_DELAY = 200;
@@ -896,24 +896,26 @@ enum RemoteWebAssets {
       }
       return sliced;
     }
-    // Session ids this tab has actually changed since the last successful
-    // persist. Only these are applied on top of a fresh storage read so a
-    // flush from this tab can never clobber drafts written by another tab.
+    // Session ids this tab changed since their last successful per-key write.
     const promptDraftDirtySessions = new Set();
-
-    function markPromptDraftDirty(sessionId) {
-      // Delete before re-adding so a session touched again (e.g. edited,
-      // then edited again before the debounced persist fires) moves to the
-      // end of this Set's iteration order, matching the recency ordering
-      // promptDrafts maintains via its own delete/set pattern. A plain
-      // Set.add() on an already-present key leaves its position unchanged,
-      // which would make persistPromptDrafts() apply dirty writes in a
-      // stale order and could evict the most recently edited draft first.
-      promptDraftDirtySessions.delete(sessionId);
-      promptDraftDirtySessions.add(sessionId);
-    }
     let promptDraftSaveTimer = null;
     let promptDraftStorageWarningShown = false;
+
+    function promptDraftStorageKey(sessionId) {
+      return `${PROMPT_DRAFT_STORAGE_PREFIX}${encodeURIComponent(sessionId)}`;
+    }
+
+    function sessionIdForPromptDraftStorageKey(key) {
+      if (typeof key !== 'string' || !key.startsWith(PROMPT_DRAFT_STORAGE_PREFIX)) {
+        return null;
+      }
+      try {
+        const sessionId = decodeURIComponent(key.slice(PROMPT_DRAFT_STORAGE_PREFIX.length));
+        return sessionId && promptDraftStorageKey(sessionId) === key ? sessionId : null;
+      } catch (_) {
+        return null;
+      }
+    }
 
     function warnPromptDraftStorage(error) {
       if (promptDraftStorageWarningShown) return;
@@ -921,52 +923,84 @@ enum RemoteWebAssets {
       console.warn('Copilot Projects could not persist message drafts.', error);
     }
 
-    function readStoredPromptDrafts() {
-      let raw = null;
-      try {
-        raw = localStorage.getItem(PROMPT_DRAFT_STORAGE_KEY);
-      } catch (error) {
-        warnPromptDraftStorage(error);
-        return {};
-      }
-      if (!raw) return {};
-
+    function parseStoredPromptDraft(raw) {
       let decoded = null;
       try {
         decoded = JSON.parse(raw);
       } catch (error) {
         warnPromptDraftStorage(error);
-        return {};
+        return null;
       }
-      if (!decoded || Array.isArray(decoded) || typeof decoded !== 'object') {
+      if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)
+          || typeof decoded.value !== 'string' || !decoded.value) {
         warnPromptDraftStorage(new Error('Stored message drafts are invalid.'));
-        return {};
+        return null;
       }
-      return decoded;
+      const value = truncatePromptDraft(decoded.value);
+      const updatedAt = Number.isFinite(decoded.updatedAt) ? decoded.updatedAt : 0;
+      return {
+        draft: { value, updatedAt },
+        corrected: value !== decoded.value || updatedAt !== decoded.updatedAt
+      };
     }
 
     function loadPromptDrafts() {
-      const decoded = readStoredPromptDrafts();
-      // Entries dropped or truncated during normalization are recorded as
-      // this tab's own dirty changes so the merge in persistPromptDrafts()
-      // applies the correction instead of silently discarding it.
-      const correctedSessions = new Set();
-      for (const [sessionId, value] of Object.entries(decoded)) {
-        if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
-          correctedSessions.add(sessionId);
-          continue;
+      const storageKeys = [];
+      try {
+        for (let index = 0; index < localStorage.length; index += 1) {
+          const key = localStorage.key(index);
+          if (typeof key === 'string' && key.startsWith(PROMPT_DRAFT_STORAGE_PREFIX)) {
+            storageKeys.push(key);
+          }
         }
-        if (typeof value !== 'string' || !value) {
-          correctedSessions.add(sessionId);
-          continue;
-        }
-        const normalized = truncatePromptDraft(value);
-        if (normalized !== value) correctedSessions.add(sessionId);
-        promptDrafts.set(sessionId, normalized);
+      } catch (error) {
+        warnPromptDraftStorage(error);
+        return;
       }
-      if (!correctedSessions.size) return;
-      for (const sessionId of correctedSessions) markPromptDraftDirty(sessionId);
-      schedulePromptDraftPersistence();
+
+      const loaded = [];
+      const invalidKeys = [];
+      for (const key of storageKeys) {
+        const sessionId = sessionIdForPromptDraftStorageKey(key);
+        if (!sessionId) {
+          invalidKeys.push(key);
+          continue;
+        }
+        let raw = null;
+        try {
+          raw = localStorage.getItem(key);
+        } catch (error) {
+          promptDrafts.clear();
+          warnPromptDraftStorage(error);
+          return;
+        }
+        const parsed = raw ? parseStoredPromptDraft(raw) : null;
+        if (!parsed) {
+          invalidKeys.push(key);
+          continue;
+        }
+        loaded.push({ sessionId, key, ...parsed });
+      }
+
+      loaded.sort((left, right) => left.draft.updatedAt - right.draft.updatedAt);
+      const retained = loaded.slice(-PROMPT_DRAFT_MAX_SESSIONS);
+      const excess = loaded.slice(0, -PROMPT_DRAFT_MAX_SESSIONS);
+      for (const entry of retained) {
+        promptDrafts.set(entry.sessionId, entry.draft);
+        if (entry.corrected) promptDraftDirtySessions.add(entry.sessionId);
+      }
+      for (const entry of excess) {
+        promptDraftDirtySessions.add(entry.sessionId);
+      }
+
+      for (const key of invalidKeys) {
+        try {
+          localStorage.removeItem(key);
+        } catch (error) {
+          warnPromptDraftStorage(error);
+        }
+      }
+      if (promptDraftDirtySessions.size) schedulePromptDraftPersistence();
     }
 
     function persistPromptDrafts() {
@@ -976,52 +1010,24 @@ enum RemoteWebAssets {
       }
       if (!promptDraftDirtySessions.size) return;
 
-      // Merge this tab's dirty sessions on top of the freshest on-disk state
-      // instead of blindly serializing this tab's whole in-memory map, so a
-      // stale/background tab can never discard drafts another tab wrote.
-      const stored = readStoredPromptDrafts();
-      const merged = new Map();
-      for (const [sessionId, value] of Object.entries(stored)) {
-        if (typeof value === 'string' && value) merged.set(sessionId, value);
-      }
-      for (const sessionId of promptDraftDirtySessions) {
-        // Delete before re-inserting so a touched key that already existed
-        // in `stored` moves to the end (most-recently-used), matching the
-        // recency ordering setPromptDraft() maintains. A plain Map.set() on
-        // an existing key updates its value in place without moving it,
-        // which would let eviction below drop a key we just edited.
-        merged.delete(sessionId);
-        if (promptDrafts.has(sessionId)) {
-          merged.set(sessionId, promptDrafts.get(sessionId));
+      const dirtySessions = Array.from(promptDraftDirtySessions);
+      const deletions = dirtySessions.filter((sessionId) => !promptDrafts.has(sessionId));
+      const writes = dirtySessions.filter((sessionId) => promptDrafts.has(sessionId));
+      for (const sessionId of [...deletions, ...writes]) {
+        try {
+          if (promptDrafts.has(sessionId)) {
+            localStorage.setItem(
+              promptDraftStorageKey(sessionId),
+              JSON.stringify(promptDrafts.get(sessionId))
+            );
+          } else {
+            localStorage.removeItem(promptDraftStorageKey(sessionId));
+          }
+          promptDraftDirtySessions.delete(sessionId);
+        } catch (error) {
+          warnPromptDraftStorage(error);
         }
       }
-      while (merged.size > PROMPT_DRAFT_MAX_SESSIONS) {
-        merged.delete(merged.keys().next().value);
-      }
-
-      try {
-        if (merged.size) {
-          localStorage.setItem(
-            PROMPT_DRAFT_STORAGE_KEY,
-            JSON.stringify(Object.fromEntries(merged))
-          );
-        } else {
-          localStorage.removeItem(PROMPT_DRAFT_STORAGE_KEY);
-        }
-      } catch (error) {
-        warnPromptDraftStorage(error);
-        // Storage failed: leave promptDrafts and the dirty set untouched so
-        // the memory-only fallback keeps every pending session (not just the
-        // ones touched by this call) and a later flush can retry them all.
-        return;
-      }
-
-      // Only adopt the merged view - and only clear the dirty set - once the
-      // write actually succeeded, so a failed write can't silently drop a
-      // memory-only draft that was never confirmed on disk.
-      promptDrafts.clear();
-      for (const [sessionId, value] of merged) promptDrafts.set(sessionId, value);
-      promptDraftDirtySessions.clear();
     }
 
     function schedulePromptDraftPersistence() {
@@ -1033,7 +1039,7 @@ enum RemoteWebAssets {
     }
 
     function draftForSession(sessionId) {
-      return sessionId ? (promptDrafts.get(sessionId) || '') : '';
+      return sessionId ? (promptDrafts.get(sessionId)?.value || '') : '';
     }
 
     function setPromptDraft(sessionId, value) {
@@ -1041,18 +1047,20 @@ enum RemoteWebAssets {
       const normalized = truncatePromptDraft(String(value ?? ''));
       if (!normalized) {
         if (!promptDrafts.delete(sessionId)) return;
-        markPromptDraftDirty(sessionId);
+        promptDraftDirtySessions.add(sessionId);
         schedulePromptDraftPersistence();
         return;
       }
-      if (promptDrafts.get(sessionId) === normalized) return;
+      if (promptDrafts.get(sessionId)?.value === normalized) return;
       if (promptDrafts.has(sessionId)) {
         promptDrafts.delete(sessionId);
       } else if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
-        promptDrafts.delete(promptDrafts.keys().next().value);
+        const evictedSessionId = promptDrafts.keys().next().value;
+        promptDrafts.delete(evictedSessionId);
+        promptDraftDirtySessions.add(evictedSessionId);
       }
-      promptDrafts.set(sessionId, normalized);
-      markPromptDraftDirty(sessionId);
+      promptDrafts.set(sessionId, { value: normalized, updatedAt: Date.now() });
+      promptDraftDirtySessions.add(sessionId);
       schedulePromptDraftPersistence();
     }
 
@@ -1061,7 +1069,7 @@ enum RemoteWebAssets {
       for (const sessionId of promptDrafts.keys()) {
         if (activeSessionIds.has(sessionId)) continue;
         promptDrafts.delete(sessionId);
-        markPromptDraftDirty(sessionId);
+        promptDraftDirtySessions.add(sessionId);
         changed = true;
       }
       if (changed) schedulePromptDraftPersistence();

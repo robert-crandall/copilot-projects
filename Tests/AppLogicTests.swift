@@ -5173,7 +5173,7 @@ final class AppLogicTests: XCTestCase {
             "function truncatePromptDraft(value) {"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "const normalized = truncatePromptDraft(value);"
+            "const value = truncatePromptDraft(decoded.value);"
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "const normalized = truncatePromptDraft(String(value ?? ''));"
@@ -5202,16 +5202,21 @@ final class AppLogicTests: XCTestCase {
         const fs = require('node:fs');
         const vm = require('node:vm');
         const source = fs.readFileSync(process.argv[2], 'utf8');
-        const storageKey = 'copilot-projects-prompt-drafts-v1';
+        const storagePrefix = 'copilot-projects-prompt-draft-v2:';
 
-        function makeStorage(initialValue = null) {
-          const values = new Map();
-          if (initialValue !== null) values.set(storageKey, initialValue);
+        function storageKey(sessionId) {
+          return `${storagePrefix}${encodeURIComponent(sessionId)}`;
+        }
+
+        function makeStorage(initialEntries = {}) {
+          const values = new Map(Object.entries(initialEntries));
           return {
             values,
             getCalls: 0,
             setCalls: 0,
             removeCalls: 0,
+            get length() { return this.values.size; },
+            key(index) { return Array.from(this.values.keys())[index] ?? null; },
             getItem(key) {
               this.getCalls += 1;
               return this.values.has(key) ? this.values.get(key) : null;
@@ -5225,6 +5230,16 @@ final class AppLogicTests: XCTestCase {
               this.values.delete(key);
             },
           };
+        }
+
+        function storedDraft(storage, sessionId) {
+          const raw = storage.values.get(storageKey(sessionId));
+          return raw ? JSON.parse(raw) : null;
+        }
+
+        function storedDraftKeys(storage) {
+          return Array.from(storage.values.keys())
+            .filter((key) => key.startsWith(storagePrefix));
         }
 
         function createContext(storage, warnings = []) {
@@ -5254,6 +5269,7 @@ final class AppLogicTests: XCTestCase {
         assert.equal(storage.setCalls, 0, 'writes should be debounced');
         first.context.persistPromptDrafts();
         assert.equal(storage.setCalls, 1);
+        assert.equal(storedDraft(storage, 's1').value, 'half-typed message');
 
         const restarted = createContext(storage);
         assert.equal(restarted.context.draftForSession('s1'), 'half-typed message');
@@ -5278,27 +5294,36 @@ final class AppLogicTests: XCTestCase {
         // The same surrogate-safe truncation must apply to over-length
         // values already on disk, normalized by loadPromptDrafts() on
         // startup (not just to values typed via setPromptDraft()).
-        const seededStorage = makeStorage(
-          JSON.stringify({ overlong: 'y'.repeat(8191) + '\u{1F600}' })
-        );
-        const seeded = createContext(seededStorage);
+        const seededStorage = makeStorage({
+          [storageKey('overlong')]: JSON.stringify({
+            value: 'y'.repeat(8191) + '\u{1F600}',
+            updatedAt: 1,
+          }),
+          [storagePrefix + '%ZZ']: 'invalid encoded key',
+          unrelated: 'keep me',
+        });
+        const seededWarnings = [];
+        const seeded = createContext(seededStorage, seededWarnings);
         const seededDraft = seeded.context.draftForSession('overlong');
         assert.equal(seededDraft.length, 8191, 'loaded value must drop the dangling surrogate too');
         assert.equal(seededDraft, 'y'.repeat(8191));
+        seeded.context.persistPromptDrafts();
+        assert.equal(seededStorage.values.get('unrelated'), 'keep me');
+        assert.equal(seededStorage.values.has(storagePrefix + '%ZZ'), false);
 
         restarted.context.setPromptDraft('gone', 'stale');
         restarted.context.setPromptDraft('live', 'keep');
         restarted.context.persistPromptDrafts();
         restarted.context.prunePromptDrafts(new Set(['live']));
         restarted.context.persistPromptDrafts();
-        assert.deepEqual(
-          JSON.parse(storage.values.get(storageKey)),
-          { live: 'keep' }
-        );
+        assert.equal(storedDraft(storage, 'live').value, 'keep');
+        assert.equal(storage.values.has(storageKey('gone')), false);
+        assert.equal(storage.values.has(storageKey('s1')), false);
+        assert.equal(storage.values.has(storageKey('s2')), false);
 
         restarted.context.setPromptDraft('live', '');
         restarted.context.persistPromptDrafts();
-        assert.equal(storage.values.has(storageKey), false);
+        assert.equal(storage.values.has(storageKey('live')), false);
         assert.ok(storage.removeCalls > 0);
 
         const boundedStorage = makeStorage();
@@ -5307,10 +5332,9 @@ final class AppLogicTests: XCTestCase {
           bounded.context.setPromptDraft(`s${index}`, `draft ${index}`);
         }
         bounded.context.persistPromptDrafts();
-        const boundedDrafts = JSON.parse(boundedStorage.values.get(storageKey));
-        assert.equal(Object.keys(boundedDrafts).length, 100);
-        assert.equal(boundedDrafts.s0, undefined);
-        assert.equal(boundedDrafts.s100, 'draft 100');
+        assert.equal(storedDraftKeys(boundedStorage).length, 100);
+        assert.equal(boundedStorage.values.has(storageKey('s0')), false);
+        assert.equal(storedDraft(boundedStorage, 's100').value, 'draft 100');
 
         // Recency ordering must survive across separate persist() calls: a
         // key already on disk that is re-edited and flushed by itself must
@@ -5326,45 +5350,36 @@ final class AppLogicTests: XCTestCase {
         lru.context.persistPromptDrafts();
         lru.context.setPromptDraft('s100', 'draft 100');
         lru.context.persistPromptDrafts();
-        const lruDrafts = JSON.parse(lruStorage.values.get(storageKey));
-        assert.equal(Object.keys(lruDrafts).length, 100);
-        assert.equal(
-          lruDrafts.s0,
-          'edited',
-          's0 was just edited and must survive the eviction that follows'
-        );
-        assert.equal(
-          lruDrafts.s1,
-          undefined,
-          's1 (untouched since the first persist) should be evicted instead of s0'
-        );
-        assert.equal(lruDrafts.s100, 'draft 100');
+        assert.equal(storedDraftKeys(lruStorage).length, 100);
+        assert.equal(storedDraft(lruStorage, 's0').value, 'edited');
+        assert.equal(lruStorage.values.has(storageKey('s1')), false);
+        assert.equal(storedDraft(lruStorage, 's100').value, 'draft 100');
 
-        // Set.add() on an already-present key doesn't move it, so re-editing
-        // a session that's already dirty (edit, edit again, before persist
-        // flushes) must not leave its dirty-tracking entry pinned at its
-        // first-touched position - the merge order must reflect the actual
-        // last-edited recency, not the first-dirtied order.
-        const orderStorage = makeStorage();
-        const order = createContext(orderStorage);
-        order.context.setPromptDraft('s0', 'v0');
-        order.context.setPromptDraft('s1', 'v1');
-        order.context.persistPromptDrafts();
-        order.context.setPromptDraft('s0', 'edit1');
-        order.context.setPromptDraft('s1', 'edit1');
-        order.context.setPromptDraft('s0', 'edit2');
-        order.context.persistPromptDrafts();
-        const orderKeys = Object.keys(
-          JSON.parse(orderStorage.values.get(storageKey))
-        );
-        assert.ok(
-          orderKeys.indexOf('s0') > orderKeys.indexOf('s1'),
-          's0 was edited last (edit2, after s1\'s edit1) and must be ordered ' +
-            'as more recent than s1, not stuck at its first-dirtied position'
-        );
+        // Deletions run before writes so an eviction can free quota for the
+        // new draft in the same flush.
+        const oldKey = storageKey('old');
+        const newKey = storageKey('new');
+        const quotaStorage = makeStorage({
+          [oldKey]: JSON.stringify({value:'old', updatedAt:1}),
+        });
+        const baseSetItem = quotaStorage.setItem;
+        quotaStorage.setItem = function(key, value) {
+          if (key === newKey && this.values.has(oldKey)) {
+            throw new Error('quota full until old draft is removed');
+          }
+          return baseSetItem.call(this, key, value);
+        };
+        const quota = createContext(quotaStorage);
+        quota.context.setPromptDraft('new', 'new');
+        quota.context.setPromptDraft('old', '');
+        quota.context.persistPromptDrafts();
+        assert.equal(quotaStorage.values.has(oldKey), false);
+        assert.equal(storedDraft(quotaStorage, 'new').value, 'new');
 
         const warnings = [];
         const failingStorage = {
+          get length() { throw new Error('storage unavailable'); },
+          key() { throw new Error('storage unavailable'); },
           getItem() { throw new Error('storage unavailable'); },
           setItem() { throw new Error('storage unavailable'); },
           removeItem() { throw new Error('storage unavailable'); },
@@ -5390,33 +5405,18 @@ final class AppLogicTests: XCTestCase {
         );
         assert.equal(failed.context.draftForSession('s2'), 'second memory-only draft');
 
-        // Two tabs sharing one localStorage: each tab loads the draft map
-        // once, so a later flush from either tab must merge with the
-        // freshest on-disk state rather than overwriting it with its own
-        // (now stale) in-memory copy. Otherwise a stale tab's flush -
-        // triggered unconditionally by session-switch/pagehide - would
-        // silently discard drafts the other tab just wrote.
+        // Two tabs can edit unrelated sessions before either flushes. Per-session
+        // keys keep the writes independent, so neither tab can overwrite the
+        // other's draft regardless of flush ordering.
         const sharedStorage = makeStorage();
         const tabA = createContext(sharedStorage);
         const tabB = createContext(sharedStorage);
-
         tabA.context.setPromptDraft('sessionA', 'from tab A');
-        tabA.context.persistPromptDrafts();
-        assert.deepEqual(
-          JSON.parse(sharedStorage.values.get(storageKey)),
-          { sessionA: 'from tab A' }
-        );
-
-        // Tab B never touched sessionA, but its in-memory map (loaded before
-        // tab A's write) must not clobber it when tab B flushes its own
-        // unrelated change.
         tabB.context.setPromptDraft('sessionB', 'from tab B');
+        tabA.context.persistPromptDrafts();
         tabB.context.persistPromptDrafts();
-        assert.deepEqual(
-          JSON.parse(sharedStorage.values.get(storageKey)),
-          { sessionA: 'from tab A', sessionB: 'from tab B' },
-          'tab B flush must not discard tab A drafts it never loaded'
-        );
+        assert.equal(storedDraft(sharedStorage, 'sessionA').value, 'from tab A');
+        assert.equal(storedDraft(sharedStorage, 'sessionB').value, 'from tab B');
 
         // An unconditional flush (e.g. pagehide) from a tab with no local
         // changes must be a no-op, not a rewrite of stale state.
@@ -5424,24 +5424,39 @@ final class AppLogicTests: XCTestCase {
         tabA.context.persistPromptDrafts();
         assert.equal(sharedStorage.setCalls, priorSetCalls, 'idle flush must not write');
 
-        // A same-session edit in tab A must still win over tab A's own
-        // change, while preserving tab B's unrelated draft.
-        tabA.context.setPromptDraft('sessionA', 'from tab A, revised');
-        tabA.context.persistPromptDrafts();
-        assert.deepEqual(
-          JSON.parse(sharedStorage.values.get(storageKey)),
-          { sessionA: 'from tab A, revised', sessionB: 'from tab B' }
-        );
+        // Same-session edits are intentionally last-writer-wins.
+        const tabC = createContext(sharedStorage);
+        const tabD = createContext(sharedStorage);
+        tabC.context.setPromptDraft('shared', 'from tab C');
+        tabD.context.setPromptDraft('shared', 'from tab D');
+        tabC.context.persistPromptDrafts();
+        tabD.context.persistPromptDrafts();
+        assert.equal(storedDraft(sharedStorage, 'shared').value, 'from tab D');
 
         // Clearing a draft in one tab must remove only that session, even
-        // though the clearing tab's in-memory map never held the sibling's
-        // draft in the first place.
+        // when another tab owns a sibling draft.
         tabB.context.setPromptDraft('sessionB', '');
         tabB.context.persistPromptDrafts();
-        assert.deepEqual(
-          JSON.parse(sharedStorage.values.get(storageKey)),
-          { sessionA: 'from tab A, revised' }
-        );
+        assert.equal(sharedStorage.values.has(storageKey('sessionB')), false);
+        assert.equal(storedDraft(sharedStorage, 'sessionA').value, 'from tab A');
+
+        // Startup enumerates safely, leaves unrelated keys alone, and deletes
+        // excess v2 entries after collecting the key list (no index shifting).
+        const manyEntries = { unrelated: 'safe' };
+        for (let index = 0; index < 110; index += 1) {
+          manyEntries[storageKey(`many${index}`)] = JSON.stringify({
+            value: `draft ${index}`,
+            updatedAt: index,
+          });
+        }
+        const manyStorage = makeStorage(manyEntries);
+        const many = createContext(manyStorage);
+        many.context.persistPromptDrafts();
+        assert.equal(storedDraftKeys(manyStorage).length, 100);
+        assert.equal(manyStorage.values.get('unrelated'), 'safe');
+        for (let index = 0; index < 10; index += 1) {
+          assert.equal(manyStorage.values.has(storageKey(`many${index}`)), false);
+        }
         """#
         try harness.write(to: script, atomically: true, encoding: .utf8)
 
