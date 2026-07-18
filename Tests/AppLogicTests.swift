@@ -5376,6 +5376,44 @@ final class AppLogicTests: XCTestCase {
         assert.equal(quotaStorage.values.has(oldKey), false);
         assert.equal(storedDraft(quotaStorage, 'new').value, 'new');
 
+        // Eviction candidates must be checked against live per-key storage,
+        // not just this tab's local (possibly stale) snapshot: another tab
+        // can refresh a session this tab still believes is the oldest, and
+        // deleting it anyway would destroy live, freshly-written text.
+        const evictionStorage = makeStorage();
+        const evictA = createContext(evictionStorage);
+        for (let index = 0; index < 100; index += 1) {
+          evictA.context.setPromptDraft(`s${index}`, `draft ${index}`);
+        }
+        evictA.context.persistPromptDrafts();
+
+        // Tab B loads the same 100 sessions into its own local snapshot.
+        const evictB = createContext(evictionStorage);
+
+        // Advance to a new millisecond so tab A's refresh of s0 is
+        // unambiguously newer than what tab B's snapshot recorded for it.
+        const beforeRefresh = Date.now();
+        while (Date.now() === beforeRefresh) { /* spin to the next tick */ }
+
+        // Tab A refreshes s0 - the session tab B's local map still ranks as
+        // oldest - and persists the newer timestamp to storage.
+        evictA.context.setPromptDraft('s0', 's0 refreshed by tab A');
+        evictA.context.persistPromptDrafts();
+
+        // Tab B, unaware of tab A's refresh, adds a new session while at
+        // cap. It must not evict s0: storage shows it was written more
+        // recently than tab B's local record, even though tab B's own
+        // snapshot still ranks it as the oldest candidate.
+        evictB.context.setPromptDraft('s100', 'draft 100');
+        evictB.context.persistPromptDrafts();
+
+        assert.equal(
+          storedDraft(evictionStorage, 's0').value,
+          's0 refreshed by tab A',
+          'tab B must not evict a session another tab just refreshed on disk'
+        );
+        assert.equal(storedDraft(evictionStorage, 's100').value, 'draft 100');
+
         const warnings = [];
         const failingStorage = {
           get length() { throw new Error('storage unavailable'); },

@@ -1042,6 +1042,36 @@ enum RemoteWebAssets {
       return sessionId ? (promptDrafts.get(sessionId)?.value || '') : '';
     }
 
+    function selectPromptDraftEvictionCandidate() {
+      // promptDrafts is only this tab's local snapshot: it's loaded once and
+      // otherwise only updated by this tab's own edits, so another tab can
+      // refresh (or newly create) a session's on-disk draft without this
+      // tab's copy ever finding out. Walk local candidates oldest-first, but
+      // before deleting any of them, re-check its live per-key timestamp -
+      // if storage shows it was written more recently than this tab's local
+      // record, another tab just touched it and it must not be evicted;
+      // move on to the next-oldest local candidate instead.
+      for (const candidateId of promptDrafts.keys()) {
+        const local = promptDrafts.get(candidateId);
+        let raw = null;
+        try {
+          raw = localStorage.getItem(promptDraftStorageKey(candidateId));
+        } catch (error) {
+          warnPromptDraftStorage(error);
+          return candidateId;
+        }
+        const stored = raw ? parseStoredPromptDraft(raw) : null;
+        if (!stored || stored.draft.updatedAt <= local.updatedAt) {
+          return candidateId;
+        }
+      }
+      // Every locally-known candidate was refreshed elsewhere more recently
+      // than this tab knew; nothing is safe to evict from this tab's view.
+      // Let the local map grow by one rather than delete fresh data - the
+      // next full loadPromptDrafts() reconciles against the true count.
+      return null;
+    }
+
     function setPromptDraft(sessionId, value) {
       if (!sessionId) return;
       const normalized = truncatePromptDraft(String(value ?? ''));
@@ -1055,9 +1085,11 @@ enum RemoteWebAssets {
       if (promptDrafts.has(sessionId)) {
         promptDrafts.delete(sessionId);
       } else if (promptDrafts.size >= PROMPT_DRAFT_MAX_SESSIONS) {
-        const evictedSessionId = promptDrafts.keys().next().value;
-        promptDrafts.delete(evictedSessionId);
-        promptDraftDirtySessions.add(evictedSessionId);
+        const evictedSessionId = selectPromptDraftEvictionCandidate();
+        if (evictedSessionId !== null) {
+          promptDrafts.delete(evictedSessionId);
+          promptDraftDirtySessions.add(evictedSessionId);
+        }
       }
       promptDrafts.set(sessionId, { value: normalized, updatedAt: Date.now() });
       promptDraftDirtySessions.add(sessionId);
