@@ -968,10 +968,6 @@ enum RemoteWebAssets {
         merged.delete(merged.keys().next().value);
       }
 
-      promptDrafts.clear();
-      for (const [sessionId, value] of merged) promptDrafts.set(sessionId, value);
-      promptDraftDirtySessions.clear();
-
       try {
         if (merged.size) {
           localStorage.setItem(
@@ -983,7 +979,18 @@ enum RemoteWebAssets {
         }
       } catch (error) {
         warnPromptDraftStorage(error);
+        // Storage failed: leave promptDrafts and the dirty set untouched so
+        // the memory-only fallback keeps every pending session (not just the
+        // ones touched by this call) and a later flush can retry them all.
+        return;
       }
+
+      // Only adopt the merged view - and only clear the dirty set - once the
+      // write actually succeeded, so a failed write can't silently drop a
+      // memory-only draft that was never confirmed on disk.
+      promptDrafts.clear();
+      for (const [sessionId, value] of merged) promptDrafts.set(sessionId, value);
+      promptDraftDirtySessions.clear();
     }
 
     function schedulePromptDraftPersistence() {
@@ -1358,7 +1365,11 @@ enum RemoteWebAssets {
     }
     function selectSession(id) {
       const previousSession = selected;
-      if (previousSession) {
+      // Only resave the outgoing draft while that session is still part of
+      // the current workspace snapshot. If it was removed since it was
+      // selected, prunePromptDrafts() already deleted it; resaving it here
+      // would undo that prune with a stale textarea value.
+      if (previousSession && sessionState.has(previousSession)) {
         setPromptDraft(previousSession, prompt.value);
         persistPromptDrafts();
       }

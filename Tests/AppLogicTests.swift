@@ -5134,7 +5134,12 @@ final class AppLogicTests: XCTestCase {
             #"'enter': 'enter'"#
         ))
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
-            "if (previousSession) {"
+            "if (previousSession && sessionState.has(previousSession)) {"
+        ))
+        // A session removed from the workspace snapshot must not have its
+        // prune undone by a later selectSession() resaving stale text.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "would undo that prune with a stale textarea value."
         ))
         // Always restore, including an empty draft, so text cannot leak into
         // a newly selected session that has no saved composer input.
@@ -5269,6 +5274,20 @@ final class AppLogicTests: XCTestCase {
         failed.context.persistPromptDrafts();
         assert.equal(failed.context.draftForSession('s1'), 'memory only');
         assert.equal(warnings.length, 1, 'storage failures should warn once');
+
+        // A failed write must not clear the dirty set or replace the
+        // in-memory map, or a later edit to a second session would rebuild
+        // promptDrafts from just {stored (empty, since storage is broken)}
+        // plus that second session, silently dropping the first session's
+        // memory-only draft even though storage was never actually written.
+        failed.context.setPromptDraft('s2', 'second memory-only draft');
+        failed.context.persistPromptDrafts();
+        assert.equal(
+          failed.context.draftForSession('s1'),
+          'memory only',
+          'a later failed persist must not drop an earlier memory-only draft'
+        );
+        assert.equal(failed.context.draftForSession('s2'), 'second memory-only draft');
 
         // Two tabs sharing one localStorage: each tab loads the draft map
         // once, so a later flush from either tab must merge with the
