@@ -6287,35 +6287,40 @@ final class AppLogicTests: XCTestCase {
             verifier: verifier,
             port: 0
         )
-        defer { Task { await gateway.stop() } }
+        do {
+            let optedOut = try startSSECapture(
+                port: port,
+                path: "/events?s=\(sessionId)&terminal=0",
+                token: token
+            )
+            try await Task.sleep(for: .seconds(1))
+            optedOut.task.cancel()
+            optedOut.session.invalidateAndCancel()
+            XCTAssertTrue(optedOut.delegate.text().contains("retry: 3000"))
+            XCTAssertFalse(optedOut.delegate.text().contains("\"type\":\"screen\""))
 
-        let optedOut = try startSSECapture(
-            port: port,
-            path: "/events?s=\(sessionId)&terminal=0",
-            token: token
-        )
-        try await Task.sleep(for: .seconds(1))
-        optedOut.task.cancel()
-        optedOut.session.invalidateAndCancel()
-        XCTAssertTrue(optedOut.delegate.text().contains("retry: 3000"))
-        XCTAssertFalse(optedOut.delegate.text().contains("\"type\":\"screen\""))
-
-        let defaultStream = try startSSECapture(
-            port: port,
-            path: "/events?s=\(sessionId)",
-            token: token
-        )
-        try await Task.sleep(for: .seconds(1))
-        defaultStream.task.cancel()
-        defaultStream.session.invalidateAndCancel()
-        XCTAssertTrue(
-            defaultStream.delegate.text().contains("\"type\":\"screen\""),
-            defaultStream.delegate.text()
-        )
-        XCTAssertTrue(
-            defaultStream.delegate.text().contains("terminal output"),
-            defaultStream.delegate.text()
-        )
+            let defaultStream = try startSSECapture(
+                port: port,
+                path: "/events?s=\(sessionId)",
+                token: token
+            )
+            try await Task.sleep(for: .seconds(1))
+            defaultStream.task.cancel()
+            defaultStream.session.invalidateAndCancel()
+            XCTAssertTrue(
+                defaultStream.delegate.text().contains("\"type\":\"screen\""),
+                defaultStream.delegate.text()
+            )
+            XCTAssertTrue(
+                defaultStream.delegate.text().contains("terminal output"),
+                defaultStream.delegate.text()
+            )
+            try await Task.sleep(for: .milliseconds(100))
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
     }
 
     func testRemoteWriterLeaseTakeoverGivesControlToLatestClient() {
