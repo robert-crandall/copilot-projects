@@ -390,6 +390,21 @@ private let remoteMaxBodyBytes = 80 * 1_024
 private let remoteMaxEncodedUserInputAnswerBytes = 64 * 1_024
 private let remoteWorkspaceRefreshInterval: TimeInterval = 2
 
+struct RemoteEventStreamOptions: Equatable {
+    let sessionId: String?
+    let streamsTerminal: Bool
+
+    init(uri: String) {
+        let query = RemoteRequestAuth.queryItems(uri)
+        sessionId = query["s"].flatMap {
+            $0.isEmpty || $0.utf8.count > 64 ? nil : $0
+        }
+        // Existing clients do not send this parameter, so only an explicit zero
+        // opts out of terminal snapshots.
+        streamsTerminal = query["terminal"] != "0"
+    }
+}
+
 private final class RemoteHTTPHandler:
     ChannelInboundHandler, @unchecked Sendable
 {
@@ -410,6 +425,7 @@ private final class RemoteHTTPHandler:
     // Event-stream state (set once the connection becomes an SSE stream).
     private var streaming = false
     private var streamSessionId: String?
+    private var streamsTerminal = true
     private var refreshTask: RepeatedTask?
     private var refreshInFlight = false
     private var lastWorkspaceRefreshAt = Date.distantPast
@@ -1072,12 +1088,10 @@ private final class RemoteHTTPHandler:
         head: HTTPRequestHead,
         authorizationExpiresAt: Date
     ) {
-        let query = RemoteRequestAuth.queryItems(head.uri)
-        let sessionId = query["s"].flatMap {
-            $0.isEmpty || $0.utf8.count > 64 ? nil : $0
-        }
+        let options = RemoteEventStreamOptions(uri: head.uri)
         streaming = true
-        streamSessionId = sessionId
+        streamSessionId = options.sessionId
+        streamsTerminal = options.streamsTerminal
 
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "text/event-stream")
@@ -1104,6 +1118,7 @@ private final class RemoteHTTPHandler:
             guard channel.isWritable, !self.refreshInFlight else { return }
             self.refreshInFlight = true
             let streamSessionId = self.streamSessionId
+            let streamsTerminal = self.streamsTerminal
             let refreshWorkspace =
                 now.timeIntervalSince(self.lastWorkspaceRefreshAt)
                 >= remoteWorkspaceRefreshInterval
@@ -1135,9 +1150,9 @@ private final class RemoteHTTPHandler:
                             }
                         }
                     }
-                    let screenRevision = streamSessionId.flatMap {
+                    let screenRevision = streamsTerminal ? streamSessionId.flatMap {
                         bridge.screenRevision(sessionId: $0)
-                    }
+                    } : nil
                     let screen: RemoteTerminalScreen?
                     if let streamSessionId, let screenRevision,
                        screenRevision != previousScreenRevision {

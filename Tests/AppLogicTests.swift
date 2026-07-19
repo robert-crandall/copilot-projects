@@ -6191,6 +6191,28 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(items["s"], "session/id")
     }
 
+    func testRemoteEventStreamOptionsDefaultTerminalOn() {
+        let options = RemoteEventStreamOptions(uri: "/events?s=session%2Fid")
+        XCTAssertEqual(options.sessionId, "session/id")
+        XCTAssertTrue(options.streamsTerminal)
+        XCTAssertTrue(
+            RemoteEventStreamOptions(uri: "/events?s=session&terminal=1")
+                .streamsTerminal
+        )
+        XCTAssertTrue(
+            RemoteEventStreamOptions(uri: "/events?s=session&terminal=false")
+                .streamsTerminal
+        )
+    }
+
+    func testRemoteEventStreamOptionsAllowExplicitTerminalOptOut() {
+        let options = RemoteEventStreamOptions(
+            uri: "/events?s=session&terminal=0"
+        )
+        XCTAssertEqual(options.sessionId, "session")
+        XCTAssertFalse(options.streamsTerminal)
+    }
+
     func testRemoteWriterLeaseTakeoverGivesControlToLatestClient() {
         let leases = RemoteWriterLeases()
         leases.acquire(sessionId: "session", clientId: "phone")
