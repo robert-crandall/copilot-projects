@@ -10,6 +10,27 @@ import CryptoKit
 import Darwin
 #endif
 
+private final class SSECaptureDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var received = Data()
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        lock.lock()
+        received.append(data)
+        lock.unlock()
+    }
+
+    func text() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(decoding: received, as: UTF8.self)
+    }
+}
+
 final class AppLogicTests: XCTestCase {
     func testFooterClassification() {
         XCTAssertEqual(
@@ -6213,6 +6234,90 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(options.streamsTerminal)
     }
 
+    @MainActor
+    func testRemoteGatewayEventStreamHonorsTerminalOptOut() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+        controller.terminalView.dataReceived(slice: Array("terminal output\r\n".utf8)[...])
+        XCTAssertNotNil(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { Date() },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0
+        )
+        defer { Task { await gateway.stop() } }
+
+        let optedOut = try startSSECapture(
+            port: port,
+            path: "/events?s=\(sessionId)&terminal=0",
+            token: token
+        )
+        try await Task.sleep(for: .seconds(1))
+        optedOut.task.cancel()
+        optedOut.session.invalidateAndCancel()
+        XCTAssertTrue(optedOut.delegate.text().contains("retry: 3000"))
+        XCTAssertFalse(optedOut.delegate.text().contains("\"type\":\"screen\""))
+
+        let defaultStream = try startSSECapture(
+            port: port,
+            path: "/events?s=\(sessionId)",
+            token: token
+        )
+        try await Task.sleep(for: .seconds(1))
+        defaultStream.task.cancel()
+        defaultStream.session.invalidateAndCancel()
+        XCTAssertTrue(
+            defaultStream.delegate.text().contains("\"type\":\"screen\""),
+            defaultStream.delegate.text()
+        )
+        XCTAssertTrue(
+            defaultStream.delegate.text().contains("terminal output"),
+            defaultStream.delegate.text()
+        )
+    }
+
     func testRemoteWriterLeaseTakeoverGivesControlToLatestClient() {
         let leases = RemoteWriterLeases()
         leases.acquire(sessionId: "session", clientId: "phone")
@@ -6636,6 +6741,28 @@ final class AppLogicTests: XCTestCase {
         let (data, response) = try await session.data(for: request)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
         return data
+    }
+
+    private func startSSECapture(
+        port: Int,
+        path: String,
+        token: String
+    ) throws -> (session: URLSession, task: URLSessionDataTask, delegate: SSECaptureDelegate) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 5
+        let delegate = SSECaptureDelegate()
+        let session = URLSession(
+            configuration: configuration,
+            delegate: delegate,
+            delegateQueue: nil
+        )
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)\(path)"))
+        var request = URLRequest(url: url)
+        request.setValue(token, forHTTPHeaderField: "Cf-Access-Jwt-Assertion")
+        let task = session.dataTask(with: request)
+        task.resume()
+        return (session, task, delegate)
     }
 
     private func connectUnixSocket(path: String) throws -> Int32 {
