@@ -277,6 +277,70 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(model.projects[0].selectedSessionId)
     }
 
+    @MainActor
+    func testRemoteMoveSessionPreservesTargetSelectionAndIsIdempotent() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let moved = Session(title: "move", cwd: root.path)
+        let sourceFallback = Session(title: "source fallback", cwd: root.path)
+        let targetSelected = Session(title: "target selected", cwd: root.path)
+        let source = Project(
+            name: "source",
+            cwd: root.path,
+            sessions: [moved, sourceFallback],
+            selectedSessionId: moved.id
+        )
+        let target = Project(
+            name: "target",
+            cwd: root.path,
+            sessions: [targetSelected],
+            selectedSessionId: targetSelected.id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [source, target],
+            selectedProjectId: target.id
+        ))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+
+        XCTAssertEqual(
+            model.moveRemoteSession(
+                sessionId: moved.id,
+                toProjectId: target.id
+            ),
+            .moved
+        )
+        XCTAssertEqual(model.projects[0].sessions.map(\.id), [sourceFallback.id])
+        XCTAssertEqual(model.projects[0].selectedSessionId, sourceFallback.id)
+        XCTAssertEqual(
+            model.projects[1].sessions.map(\.id),
+            [targetSelected.id, moved.id]
+        )
+        XCTAssertEqual(model.projects[1].selectedSessionId, targetSelected.id)
+        XCTAssertEqual(model.globalSelectedSessionId, targetSelected.id)
+        XCTAssertEqual(
+            model.moveRemoteSession(
+                sessionId: moved.id,
+                toProjectId: target.id
+            ),
+            .unchanged
+        )
+        XCTAssertEqual(
+            model.moveRemoteSession(
+                sessionId: "missing",
+                toProjectId: target.id
+            ),
+            .missing
+        )
+    }
+
     func testActivityTrackerRequiresObservedWorkAndTwoIdleTicks() {
         let sessionId = UUID().uuidString
         var tracker = ActivityTracker()
@@ -3290,6 +3354,113 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteGatewayMoveSessionMapsOutcomesWithoutLease() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let moved = Session(id: "session-move", title: "Move", cwd: root.path)
+        let source = Project(
+            id: "source", name: "Source", cwd: root.path, sessions: [moved])
+        let target = Project(
+            id: "target", name: "Target", cwd: root.path, sessions: [])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [source, target], selectedProjectId: source.id))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config, now: { Date() }, fetch: { _ in nil })
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0
+        )
+        let origin = "https://projects.example.com"
+
+        func moveBody(sessionId: String, targetProjectId: String?) throws -> Data {
+            try JSONEncoder().encode(RemoteClientMessage(
+                type: "move-session",
+                clientId: "phone",
+                sessionId: sessionId,
+                data: targetProjectId
+            ))
+        }
+
+        do {
+            let movedStatus = try await remoteHTTPStatus(
+                port: port, path: "/control", method: "POST",
+                token: token, origin: origin,
+                body: try moveBody(sessionId: moved.id, targetProjectId: target.id))
+            XCTAssertEqual(movedStatus, 204)
+            XCTAssertTrue(model.project(source.id)?.sessions.isEmpty == true)
+            XCTAssertEqual(model.project(target.id)?.sessions.map(\.id), [moved.id])
+
+            let replayStatus = try await remoteHTTPStatus(
+                port: port, path: "/control", method: "POST",
+                token: token, origin: origin,
+                body: try moveBody(sessionId: moved.id, targetProjectId: target.id))
+            XCTAssertEqual(replayStatus, 204)
+
+            let missingDataStatus = try await remoteHTTPStatus(
+                port: port, path: "/control", method: "POST",
+                token: token, origin: origin,
+                body: try moveBody(sessionId: moved.id, targetProjectId: nil))
+            XCTAssertEqual(missingDataStatus, 400)
+
+            let malformedDataStatus = try await remoteHTTPStatus(
+                port: port, path: "/control", method: "POST",
+                token: token, origin: origin,
+                body: try moveBody(
+                    sessionId: moved.id,
+                    targetProjectId: String(repeating: "p", count: 65)))
+            XCTAssertEqual(malformedDataStatus, 400)
+
+            let missingSessionStatus = try await remoteHTTPStatus(
+                port: port, path: "/control", method: "POST",
+                token: token, origin: origin,
+                body: try moveBody(sessionId: "missing", targetProjectId: target.id))
+            XCTAssertEqual(missingSessionStatus, 404)
+
+            let missingProjectStatus = try await remoteHTTPStatus(
+                port: port, path: "/control", method: "POST",
+                token: token, origin: origin,
+                body: try moveBody(sessionId: moved.id, targetProjectId: "missing"))
+            XCTAssertEqual(missingProjectStatus, 404)
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
+    }
+
+    @MainActor
     func testRemoteGatewayAnswerUserInputRequiresLeaseAndReportsStatuses() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -4328,6 +4499,62 @@ final class AppLogicTests: XCTestCase {
             .conflict
         )
         XCTAssertTrue(model.project("p2")?.sessions.isEmpty == true)
+    }
+
+    @MainActor
+    func testCreateRemoteSessionReplayFollowsMovedOriginal() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let repos = root.appendingPathComponent("Repos", isDirectory: true)
+        try FileManager.default.createDirectory(at: repos, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let ledger = SessionCreationLedger(url: root.appendingPathComponent("ledger.json"))
+        let model = try makeRemoteCreateModel(
+            root: root,
+            projects: [
+                Project(id: "p1", name: "First", cwd: "/tmp", sessions: []),
+                Project(id: "p2", name: "Second", cwd: "/tmp", sessions: []),
+            ],
+            selectedProjectId: "p1",
+            reposDirectory: { repos.path },
+            ledger: ledger,
+            onLaunch: { _, _ in }
+        )
+        let request = RemoteCreateSessionRequest(
+            requestId: UUID(),
+            projectId: "p1"
+        )
+        _ = model.createRemoteSession(request)
+        XCTAssertEqual(
+            model.moveRemoteSession(
+                sessionId: request.requestId.uuidString,
+                toProjectId: "p2"
+            ),
+            .moved
+        )
+
+        XCTAssertEqual(
+            model.createRemoteSession(request),
+            .existing(RemoteCreateSessionResponse(
+                requestId: request.requestId,
+                projectId: "p2",
+                sessionId: request.requestId.uuidString
+            ))
+        )
+        XCTAssertEqual(
+            model.createRemoteSession(RemoteCreateSessionRequest(
+                requestId: request.requestId,
+                projectId: "p2"
+            )),
+            .conflict
+        )
+        XCTAssertTrue(model.project("p1")?.sessions.isEmpty == true)
+        XCTAssertEqual(
+            model.project("p2")?.sessions.map(\.id),
+            [request.requestId.uuidString]
+        )
     }
 
     @MainActor
