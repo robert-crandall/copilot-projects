@@ -270,7 +270,10 @@ final class AppModel: ObservableObject {
     // cooldown from a prior chain — which `asyncAfter` cannot cancel — no-ops
     // instead of corrupting the current chain's throttle state.
     private var agentActivityRefreshGeneration = 0
-    private let agentActivityRefreshThrottle: TimeInterval = 0.5
+    private let agentActivityRefreshThrottle: TimeInterval
+    private let agentActivityCooldownScheduler:
+        (_ delay: TimeInterval, _ action: @escaping @MainActor () -> Void) -> Void
+    private let agentActivityScanObserver: (() -> Void)?
 
     private var activityTracker = ActivityTracker()
     private var statusEventClock = StatusEventClock()
@@ -339,6 +342,16 @@ final class AppModel: ObservableObject {
         },
         remoteSessionLauncher: ((String, String) -> Void)? = nil,
         sessionCreationLedger: SessionCreationLedger = SessionCreationLedger(),
+        agentActivityRefreshThrottle: TimeInterval = 0.5,
+        agentActivityCooldownScheduler: @escaping (
+            _ delay: TimeInterval,
+            _ action: @escaping @MainActor () -> Void
+        ) -> Void = { delay, action in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                Task { @MainActor in action() }
+            }
+        },
+        agentActivityScanObserver: (() -> Void)? = nil,
         webPushService: WebPushService? = nil,
         apnsService: APNsService? = nil,
         notificationSync: NotificationSyncService? = nil
@@ -355,6 +368,9 @@ final class AppModel: ObservableObject {
         self.remoteSessionBackendAvailable = remoteSessionBackendAvailable
         self.remoteSessionLauncher = remoteSessionLauncher
         self.sessionCreationLedger = sessionCreationLedger
+        self.agentActivityRefreshThrottle = agentActivityRefreshThrottle
+        self.agentActivityCooldownScheduler = agentActivityCooldownScheduler
+        self.agentActivityScanObserver = agentActivityScanObserver
         remoteAccess = RemoteAccessController(
             webPushService: webPushService,
             apnsService: apnsService,
@@ -1752,7 +1768,7 @@ final class AppModel: ObservableObject {
     /// unlike a resettable trailing debounce, which would keep deferring and only
     /// fire once the storm paused. Bounds the *event-driven* scans to one pass per
     /// `agentActivityRefreshThrottle`; the 10s backstop timer scans independently.
-    private func throttledRefreshAgentActivitySnapshots() {
+    func throttledRefreshAgentActivitySnapshots() {
         guard !agentActivityRefreshCoolingDown else {
             agentActivityRefreshPending = true
             return
@@ -1763,7 +1779,7 @@ final class AppModel: ObservableObject {
     }
 
     private func scheduleAgentActivityCooldown(generation: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + agentActivityRefreshThrottle) { [weak self] in
+        agentActivityCooldownScheduler(agentActivityRefreshThrottle) { [weak self] in
             guard let self, generation == self.agentActivityRefreshGeneration else { return }
             if self.agentActivityRefreshPending {
                 self.agentActivityRefreshPending = false
@@ -1776,6 +1792,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshAgentActivitySnapshots(now: Date = Date()) {
+        agentActivityScanObserver?()
         let decoder = JSONDecoder()
         let fm = FileManager.default
         for pi in projects.indices {
