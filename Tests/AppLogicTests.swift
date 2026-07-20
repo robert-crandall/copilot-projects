@@ -1955,6 +1955,64 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testAgentActivityRefreshIsIdempotentAndClearsOnDeletion() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let activityDirectory = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: activityDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let targetSession = Session(title: "target", cwd: "/tmp")
+        defer { SessionArtifacts.removeFiles(sessionId: targetSession.id) }
+        let targetProject = Project(name: "target", cwd: "/tmp", sessions: [targetSession])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [targetProject],
+            selectedProjectId: targetProject.id
+        ))
+
+        let snapshot = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: ISO8601DateFormatter().string(from: Date()),
+            foregroundTurnActive: true,
+            scheduledTurnActive: false,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        let path = activityDirectory
+            .appendingPathComponent("\(targetSession.id).agent-activity.json")
+        try JSONEncoder().encode(snapshot).write(to: path)
+
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: activityDirectory
+        )
+        model.refreshAgentActivitySnapshots()
+        XCTAssertNotNil(model.projects[0].sessions[0].agentActivity)
+
+        // A second scan with no file change must not clear the snapshot — the
+        // equality guard skips the redundant @Published write without dropping the
+        // value. (If the guard regressed to clearing-then-reassigning, this would
+        // surface as a transient nil / lost state.)
+        model.refreshAgentActivitySnapshots()
+        XCTAssertNotNil(model.projects[0].sessions[0].agentActivity)
+
+        // Deleting the file (not just TTL expiry) must still nil the snapshot — the
+        // guard must detect the value change from present to nil, not skip it.
+        try FileManager.default.removeItem(at: path)
+        model.refreshAgentActivitySnapshots()
+        XCTAssertNil(model.projects[0].sessions[0].agentActivity)
+    }
+
+    @MainActor
     func testAnswerUserInputEnforcesChoiceFreeformSizeAndSession() throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory
