@@ -32,6 +32,18 @@ VERSION="${VERSION#v}"   # accept either 0.1.0 or v0.1.0
 TAG="v$VERSION"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
+NOTARY_ARGS=()
+
+if [ -n "$NOTARY_PROFILE" ]; then
+  NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+  if [ -n "$NOTARY_KEYCHAIN" ]; then
+    NOTARY_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
+  fi
+elif [ -n "$NOTARY_KEYCHAIN" ]; then
+  echo "error: NOTARY_KEYCHAIN requires NOTARY_PROFILE" >&2
+  exit 1
+fi
 
 # Prefer a stable Developer ID Application identity (keeps macOS permission grants
 # across builds and is required to notarize). Override by setting CODESIGN_IDENTITY,
@@ -51,11 +63,11 @@ if [ "$PUBLISH" = "1" ]; then
     echo "error: codesigning identity not found: $CODESIGN_IDENTITY" >&2
     exit 1
   }
-  [ -n "$NOTARY_PROFILE" ] || {
-    echo "error: --publish requires NOTARY_PROFILE" >&2
+  [ "${#NOTARY_ARGS[@]}" -gt 0 ] || {
+    echo "error: --publish requires notarization credentials" >&2
     exit 1
   }
-  xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null
+  xcrun notarytool history "${NOTARY_ARGS[@]}" >/dev/null
 fi
 
 # SwiftPM + git need this when the user's global git sets safe.bareRepository=explicit.
@@ -89,13 +101,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [ "$CODESIGN_IDENTITY" != "-" ] && [ -n "$NOTARY_PROFILE" ]; then
+if [ "$CODESIGN_IDENTITY" != "-" ] && [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
   echo "==> notarizing app"
   APP_ZIP="$ROOT/dist/Copilot-Projects-$VERSION.zip"
   rm -f "$APP_ZIP"
   ditto -c -k --keepParent "$APP" "$APP_ZIP"
   xcrun notarytool submit "$APP_ZIP" \
-    --keychain-profile "$NOTARY_PROFILE" --wait
+    "${NOTARY_ARGS[@]}" --wait --timeout 20m
   xcrun stapler staple "$APP"
   xcrun stapler validate "$APP"
   spctl --assess --type execute --verbose=4 "$APP"
@@ -105,11 +117,11 @@ cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"   # drag-to-install target
 rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
-if [ "$CODESIGN_IDENTITY" != "-" ] && [ -n "$NOTARY_PROFILE" ]; then
+if [ "$CODESIGN_IDENTITY" != "-" ] && [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
   echo "==> signing and notarizing DMG"
   codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG"
   xcrun notarytool submit "$DMG" \
-    --keychain-profile "$NOTARY_PROFILE" --wait
+    "${NOTARY_ARGS[@]}" --wait --timeout 20m
   xcrun stapler staple "$DMG"
   xcrun stapler validate "$DMG"
   spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"

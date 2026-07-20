@@ -96,7 +96,21 @@ NOTARY_PROFILE="copilot-projects-notary" \
 
 `--publish` refuses ad-hoc artifacts, notarizes and staples both the app and DMG, runs
 Gatekeeper checks, then uses the active `gh` account to publish. The Actions workflow
-also fails closed until equivalent signing/notarization credentials are configured.
+uses a protected `release` environment and fails closed unless these environment secrets
+are configured:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_DEVELOPER_ID_P12_BASE64` | Base64-encoded PKCS#12 export containing one Developer ID Application certificate and private key |
+| `MACOS_DEVELOPER_ID_P12_PASSWORD` | Password for the PKCS#12 export |
+| `APPLE_NOTARY_KEY_P8_BASE64` | Base64-encoded App Store Connect team API private key |
+| `APPLE_NOTARY_KEY_ID` | App Store Connect API key ID |
+| `APPLE_NOTARY_ISSUER_ID` | App Store Connect API issuer ID |
+
+Configure required reviewers and restrict deployments to `main` on the `release`
+environment before adding the secrets. The workflow imports credentials only after tests
+pass, removes the source files immediately after use, and deletes its temporary signing
+keychain at the end of the job.
 
 ## CLI
 
