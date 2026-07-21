@@ -15,6 +15,7 @@ struct ActivityTracker {
     private var footerWorkingTicks: [String: Int] = [:]
     private var footerSawWorking: Set<String> = []
     private var foregroundIdleTicks: [String: Int] = [:]
+    private var disconnectIdleTicks: [String: Int] = [:]
 
     /// Demote a running session whose foreground turn has ended but whose live
     /// background subagents keep `session.idle` from firing — so the hook path
@@ -38,6 +39,21 @@ struct ActivityTracker {
         foregroundIdleTicks[sessionId] = ticks
         guard ticks >= 2 else { return false }
         foregroundIdleTicks[sessionId] = nil
+        return true
+    }
+
+    mutating func observeDisconnectIdle(
+        sessionId: String,
+        currentStatus: SessionStatus
+    ) -> Bool {
+        guard currentStatus == .running else {
+            disconnectIdleTicks[sessionId] = nil
+            return false
+        }
+        let ticks = (disconnectIdleTicks[sessionId] ?? 0) + 1
+        disconnectIdleTicks[sessionId] = ticks
+        guard ticks >= 2 else { return false }
+        disconnectIdleTicks[sessionId] = nil
         return true
     }
 
@@ -97,6 +113,7 @@ struct ActivityTracker {
         footerWorkingTicks = footerWorkingTicks.filter { activeSessionIds.contains($0.key) }
         footerSawWorking = footerSawWorking.intersection(activeSessionIds)
         foregroundIdleTicks = foregroundIdleTicks.filter { activeSessionIds.contains($0.key) }
+        disconnectIdleTicks = disconnectIdleTicks.filter { activeSessionIds.contains($0.key) }
     }
 
     mutating func reset(sessionId: String) {
@@ -104,10 +121,15 @@ struct ActivityTracker {
         footerWorkingTicks[sessionId] = nil
         footerSawWorking.remove(sessionId)
         foregroundIdleTicks[sessionId] = nil
+        disconnectIdleTicks[sessionId] = nil
     }
 
     mutating func resetForegroundIdle(sessionId: String) {
         foregroundIdleTicks[sessionId] = nil
+    }
+
+    mutating func resetDisconnectIdle(sessionId: String) {
+        disconnectIdleTicks[sessionId] = nil
     }
 
     static func livenessShouldDemote(
