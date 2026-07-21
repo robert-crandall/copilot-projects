@@ -6,12 +6,6 @@ import CopilotProjectsProtocol
 
 @MainActor
 final class TranscriptController: ObservableObject {
-    private struct FileSignature: Equatable, Sendable {
-        let size: UInt64
-        let modifiedAt: TimeInterval
-        let fileNumber: UInt64
-    }
-
     private struct LoadResult: Sendable {
         let signature: FileSignature?
         let snapshot: TranscriptSnapshot?
@@ -97,13 +91,7 @@ final class TranscriptController: ObservableObject {
             guard previousSignature != nil else { return nil }
             return LoadResult(signature: nil, snapshot: nil)
         }
-        let signature = FileSignature(
-            size: (attributes[.size] as? NSNumber)?.uint64Value ?? 0,
-            modifiedAt: (attributes[.modificationDate] as? Date)?
-                .timeIntervalSinceReferenceDate ?? 0,
-            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?
-                .uint64Value ?? 0
-        )
+        let signature = FileSignature(attributes: attributes)
         guard signature != previousSignature else { return nil }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             return nil
@@ -122,14 +110,10 @@ final class TranscriptController: ObservableObject {
         else {
             return RemoteTranscriptRevision(sessionId: sessionId, generation: "missing")
         }
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        let modified = (attributes[.modificationDate] as? Date)?
-            .timeIntervalSinceReferenceDate ?? 0
-        let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?
-            .uint64Value ?? 0
+        let signature = FileSignature(attributes: attributes)
         return RemoteTranscriptRevision(
             sessionId: sessionId,
-            generation: "\(fileNumber):\(size):\(modified)"
+            generation: "\(signature.fileNumber):\(signature.size):\(signature.modifiedAt)"
         )
     }
 

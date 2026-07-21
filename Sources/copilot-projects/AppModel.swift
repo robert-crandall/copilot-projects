@@ -274,6 +274,17 @@ final class AppModel: ObservableObject {
     private let agentActivityCooldownScheduler:
         (_ delay: TimeInterval, _ action: @escaping @MainActor () -> Void) -> Void
     private let agentActivityScanObserver: (() -> Void)?
+    // Per-session decoded-snapshot cache keyed by a file signature (inode+size+
+    // mtime). Every live session heartbeats a write to its
+    // `<id>.agent-activity.json` roughly every 5s, and both the directory watcher
+    // and the 10s backstop re-scan *all* sessions — so re-reading and JSON-decoding
+    // every file on each scan dominated the main thread (blocking `open()` is
+    // especially costly when a security agent intercepts file events). Skip the
+    // read+decode when a file's signature is unchanged; the caller still re-applies
+    // the freshness TTL to the cached snapshot each scan, so a skipped read never
+    // stalls a stale→nil transition.
+    private var agentActivitySnapshotCache:
+        [String: (signature: FileSignature, snapshot: AgentActivitySnapshot?)] = [:]
 
     private var activityTracker = ActivityTracker()
     private var statusEventClock = StatusEventClock()
@@ -1914,17 +1925,16 @@ final class AppModel: ObservableObject {
         agentActivityScanObserver?()
         let decoder = JSONDecoder()
         let fm = FileManager.default
+        var seenSessionIds: Set<String> = []
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let sessionId = projects[pi].sessions[si].id
+                seenSessionIds.insert(sessionId)
                 let path = agentActivityDirectory
                     .appendingPathComponent("\(sessionId).agent-activity.json").path
-                let snapshot: AgentActivitySnapshot?
-                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
-                    snapshot = try? decoder.decode(AgentActivitySnapshot.self, from: data)
-                } else {
-                    snapshot = nil
-                }
+                let snapshot = loadAgentActivitySnapshot(
+                    sessionId: sessionId, path: path, decoder: decoder, fm: fm
+                )
                 let fresh = snapshot?.isFresh(at: now) == true ? snapshot : nil
                 if projects[pi].sessions[si].agentActivity != fresh {
                     projects[pi].sessions[si].agentActivity = fresh
@@ -1945,6 +1955,50 @@ final class AppModel: ObservableObject {
 
             }
         }
+        // Drop cache entries for sessions no longer present so the cache can't grow
+        // across a long-lived app run that opens and closes many sessions. Filtering
+        // ~30 entries is microsecond-cheap, so run it unconditionally — a count-based
+        // guard misses the case where one session is closed while another (whose file
+        // isn't written yet) is opened, leaving the count unchanged but a stale entry.
+        agentActivitySnapshotCache = agentActivitySnapshotCache
+            .filter { seenSessionIds.contains($0.key) }
+    }
+
+    /// Load a session's agent-activity snapshot, skipping the `Data(contentsOf:)`
+    /// read + JSON decode when the file's signature (inode+size+mtime) matches the
+    /// cached one — the common case, since only 1–2 of N session files change per
+    /// scan. The caller re-applies the freshness TTL, so skipping the read never
+    /// stalls a stale→nil transition. Kept synchronous on the main actor so scans
+    /// stay serialized and single-writer — no races against `setStatus` or the
+    /// reconcilers that also mutate/read this state on main.
+    private func loadAgentActivitySnapshot(
+        sessionId: String,
+        path: String,
+        decoder: JSONDecoder,
+        fm: FileManager
+    ) -> AgentActivitySnapshot? {
+        let cached = agentActivitySnapshotCache[sessionId]
+        guard let attributes = try? fm.attributesOfItem(atPath: path) else {
+            if cached != nil { agentActivitySnapshotCache.removeValue(forKey: sessionId) }
+            return nil
+        }
+        let signature = FileSignature(attributes: attributes)
+        if let cached, cached.signature == signature {
+            return cached.snapshot
+        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            // The file exists but the read failed (a transient `open()` denial or a
+            // racing writer). Fail closed and DON'T advance the cached signature: the
+            // signature mismatch guarantees a retry next scan, so this neither sticks
+            // a `nil` against a live signature nor serves a stale snapshot to
+            // freshness/promptability decisions in the meantime.
+            return nil
+        }
+        // A present-but-malformed file caches `(signature, nil)` so it isn't
+        // re-decoded every scan — only its next real change (new signature) re-reads.
+        let snapshot = try? decoder.decode(AgentActivitySnapshot.self, from: data)
+        agentActivitySnapshotCache[sessionId] = (signature, snapshot)
+        return snapshot
     }
 
     /// Decide whether a `.running` session should be demoted to idle because its
