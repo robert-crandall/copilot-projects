@@ -857,6 +857,13 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(clock.shouldApply(sessionId: sessionId, timestamp: nil))
     }
 
+    func testPromptSafetyClockIgnoresScheduledActivityReaffirmations() {
+        XCTAssertFalse(AppModel.advancesPromptSafetyClock(source: "scheduled-active"))
+        XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-start"))
+        XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-idle"))
+        XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: nil))
+    }
+
     @MainActor
     func testActiveStatusClearsStaleReadyMarker() throws {
         _ = NSApplication.shared

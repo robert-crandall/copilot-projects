@@ -277,6 +277,7 @@ final class AppModel: ObservableObject {
 
     private var activityTracker = ActivityTracker()
     private var statusEventClock = StatusEventClock()
+    private var promptStatusEventClock = StatusEventClock()
     private var backgroundAgentsSuppressed: Set<String> = []
     private var completionPending: Set<String> = []
     private var scheduledSnapshotsSuppressed: Set<String> = []
@@ -808,6 +809,7 @@ final class AppModel: ObservableObject {
         }
         transcriptOpenSessions.remove(sid)
         statusEventClock.reset(sessionId: sid)
+        promptStatusEventClock.reset(sessionId: sid)
         backgroundAgentsSuppressed.remove(sid)
         completionPending.remove(sid)
         scheduledSnapshotsSuppressed.remove(sid)
@@ -947,7 +949,7 @@ final class AppModel: ObservableObject {
                                     snapshot: session.agentActivity,
                                     now: promptNow,
                                     nowMs: promptNowMs,
-                                    clockMs: statusEventClock.timestamp(for: session.id)
+                                    clockMs: promptStatusEventClock.timestamp(for: session.id)
                                 ),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1059,7 +1061,7 @@ final class AppModel: ObservableObject {
                 snapshot: session.agentActivity,
                 now: promptNow,
                 nowMs: promptNowMs,
-                clockMs: statusEventClock.timestamp(for: sessionId)
+                clockMs: promptStatusEventClock.timestamp(for: sessionId)
             ),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1646,6 +1648,9 @@ final class AppModel: ObservableObject {
     ) {
         guard let loc = locateIndex(sessionId) else { return }
         guard statusEventClock.shouldApply(sessionId: sessionId, timestamp: timestamp) else { return }
+        if Self.advancesPromptSafetyClock(source: source) {
+            promptStatusEventClock.seed(sessionId: sessionId, timestamp: timestamp)
+        }
         // sessionEnd is also emitted during graceful macOS shutdown. Only a live,
         // non-terminating app can treat it as an explicit user exit.
         if source == "session-end", !isTerminating, !isPoweringOff,
@@ -1712,12 +1717,19 @@ final class AppModel: ObservableObject {
             let now = SessionArtifacts.currentStatusTimestamp()
             let effectiveTimestamp = max(now, statusEventClock.timestamp(for: sessionId) ?? now)
             statusEventClock.seed(sessionId: sessionId, timestamp: effectiveTimestamp)
+            if Self.advancesPromptSafetyClock(source: source) {
+                promptStatusEventClock.seed(
+                    sessionId: sessionId,
+                    timestamp: effectiveTimestamp
+                )
+            }
             SessionArtifacts.persistStatus(
                 sessionId: sessionId,
                 status: status,
                 timestamp: effectiveTimestamp
             )
         }
+
         if status == .idle {
             activityTracker.reset(sessionId: sessionId)
             if source == "session-idle" {
@@ -1752,6 +1764,13 @@ final class AppModel: ObservableObject {
                 body: nil
             )
         }
+    }
+
+    /// Scheduled pre/post hooks reaffirm background activity but do not describe
+    /// foreground ownership. Keep them out of the prompt-safety clock so they cannot
+    /// invalidate an already-settled foreground snapshot.
+    nonisolated static func advancesPromptSafetyClock(source: String?) -> Bool {
+        source != "scheduled-active"
     }
 
     private func shouldClearResumeMarkers(
@@ -2170,6 +2189,7 @@ final class AppModel: ObservableObject {
         let base = min(effectiveTime ?? now, now)
         let timestamp = max(base, statusEventClock.timestamp(for: sid) ?? base)
         statusEventClock.seed(sessionId: sid, timestamp: timestamp)
+        promptStatusEventClock.seed(sessionId: sid, timestamp: timestamp)
         SessionArtifacts.persistStatus(
             sessionId: sid,
             status: .idle,
@@ -2611,6 +2631,10 @@ final class AppModel: ObservableObject {
                 projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
                 projects[pi].sessions[si].status = restoredStatus(forSession: projects[pi].sessions[si].id)
                 statusEventClock.seed(
+                    sessionId: projects[pi].sessions[si].id,
+                    timestamp: restoredStatusTimestamp(forSession: projects[pi].sessions[si].id)
+                )
+                promptStatusEventClock.seed(
                     sessionId: projects[pi].sessions[si].id,
                     timestamp: restoredStatusTimestamp(forSession: projects[pi].sessions[si].id)
                 )
