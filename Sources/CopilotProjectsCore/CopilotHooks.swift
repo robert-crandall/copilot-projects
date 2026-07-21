@@ -68,6 +68,10 @@ public enum CopilotHooks {
       printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
       if [ -n "${2:-}" ]; then
         printf '%s' "$2" > "$state_dir/sessions/$session_id.status-timestamp" 2>/dev/null || true
+        if [ "${3:-}" != "scheduled-active" ]; then
+          printf '%s' "$2" \
+            > "$state_dir/sessions/$session_id.prompt-status-timestamp" 2>/dev/null || true
+        fi
       fi
       # Synchronous (not backgrounded) so rapid transitions — e.g. running→waiting —
       # reach the app in order; backgrounding let them race and the "waiting" dot get

@@ -2023,6 +2023,12 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
+        let promptTimestamp = root
+            .appendingPathComponent("sessions/\(tabId).prompt-status-timestamp")
+        XCTAssertEqual(
+            try String(contentsOf: promptTimestamp, encoding: .utf8),
+            "100"
+        )
         try runHook(
             hookURL: hookURL,
             action: "notify",
@@ -2198,6 +2204,8 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
 
         let tabId = UUID().uuidString
+        let promptTimestamp = root
+            .appendingPathComponent("sessions/\(tabId).prompt-status-timestamp")
         try runHook(
             hookURL: hookURL,
             action: "running",
@@ -2215,6 +2223,10 @@ final class AppLogicTests: XCTestCase {
             root: root,
             bin: bin,
             capture: capture
+        )
+        XCTAssertEqual(
+            try String(contentsOf: promptTimestamp, encoding: .utf8),
+            "100"
         )
         try runHook(
             hookURL: hookURL,
@@ -2240,6 +2252,10 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(calls.contains("set-status idle --timestamp 110 --source scheduled-active"))
         XCTAssertTrue(calls.contains("set-status idle --timestamp 115 --source scheduled-idle"))
         XCTAssertTrue(calls.contains("set-status idle --timestamp 120 --source session-idle"))
+        XCTAssertEqual(
+            try String(contentsOf: promptTimestamp, encoding: .utf8),
+            "120"
+        )
         XCTAssertFalse(calls.contains { $0.contains("--notification completed") })
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: root.appendingPathComponent("sessions/\(tabId).scheduled-turn").path
