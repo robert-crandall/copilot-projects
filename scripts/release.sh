@@ -252,6 +252,14 @@ verify_expected_predecessor() {
       return 1
     }
     latest_sha="$(remote_tag_commit "$latest_tag")" || return 1
+    git fetch origin "refs/tags/$latest_tag" --quiet || {
+      echo "error: could not fetch latest release tag $latest_tag" >&2
+      return 1
+    }
+    git merge-base --is-ancestor "$latest_sha" origin/main || {
+      echo "error: latest release $latest_tag is not on origin/main" >&2
+      return 1
+    }
     expected_sha="${EXPECTED_PREVIOUS_SHA:-}"
     if [ "$latest_tag" = "$EXPECTED_PREVIOUS_TAG" ]; then
       [ -n "$expected_sha" ] && [ "$latest_sha" = "$expected_sha" ] || {
@@ -317,21 +325,27 @@ gh api -X POST "repos/$REPO/git/refs" \
   -f ref="refs/tags/$TAG" \
   -f sha="$SHA" >/dev/null
 TAG_CREATED=1
-gh release create "$TAG" \
-  --repo "$REPO" \
-  --verify-tag \
-  --title "Copilot Projects $VERSION" \
-  --notes-file "$NOTES_FILE" \
-  --draft
+release_response="$(
+  gh api -X POST "repos/$REPO/releases" \
+    -f tag_name="$TAG" \
+    -f target_commitish="$SHA" \
+    -f name="Copilot Projects $VERSION" \
+    -f body="$(cat "$NOTES_FILE")" \
+    -F draft=true
+)"
+RELEASE_ID="$(jq -er '.id | tostring' <<< "$release_response")"
+UPLOAD_URL="$(jq -er '.upload_url | sub("\\{.*$"; "")' <<< "$release_response")"
 RELEASE_CREATED=1
-RELEASE_ID="$(
-  gh release view "$TAG" \
-    --repo "$REPO" \
-    --json databaseId \
-    --jq .databaseId
-)" || RELEASE_ID=""
-gh release upload "$TAG" "$DMG" --repo "$REPO"
-gh release edit "$TAG" --repo "$REPO" --draft=false
+API_TOKEN="${GH_TOKEN:-$(gh auth token)}"
+curl --fail-with-body --location \
+  -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  -H "Content-Type: application/x-apple-diskimage" \
+  --data-binary "@$DMG" \
+  "$UPLOAD_URL?name=$(basename "$DMG")" >/dev/null
+gh api -X PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false >/dev/null
 TAG_CREATED=0
 RELEASE_CREATED=0
 RELEASE_ID=""

@@ -97,6 +97,10 @@ jobs:
             fi
             latest_sha="$(git rev-list -n 1 "$latest_tag")"
             if git merge-base --is-ancestor "$GITHUB_SHA" "$latest_sha"; then
+              if ! git merge-base --is-ancestor "$latest_sha" origin/main; then
+                echo "Latest release $latest_tag is not on main." >&2
+                exit 1
+              fi
               echo "should_release=false" >> "$GITHUB_OUTPUT"
               echo "Skipped: $GITHUB_SHA is already contained in $latest_tag." \
                 >> "$GITHUB_STEP_SUMMARY"
