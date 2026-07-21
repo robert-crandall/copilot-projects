@@ -1838,6 +1838,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Decide whether a `.running` session should be demoted to idle because its
+    /// extension's RPC connection is gone. Pure and side-effect-free so it can be
+    /// unit-tested without the reconciler's controller/timer machinery. Returns the
+    /// evidence timestamp (ms) to seed the status clock, or nil when no demotion is
+    /// warranted. Conditions: the session is `.running`; the terminal footer is
+    /// idle (a disconnect proves RPC loss, not turn completion — the footer is the
+    /// authoritative foreground signal, so a genuinely-working session is never
+    /// demoted); the snapshot is fresh and reports a terminal disconnect (healthy
+    /// sessions have `error == nil` and never qualify); and the snapshot's evidence
+    /// time is within `[clockMs, nowMs]` so a newer status hook can't be overridden
+    /// and a future-dated snapshot (clock rollback) can't poison the clock.
+    nonisolated static func disconnectDemotionEvidenceMs(
+        status: SessionStatus,
+        footerActivity: FooterActivity,
+        snapshot: AgentActivitySnapshot?,
+        now: Date,
+        nowMs: Int64,
+        clockMs: Int64
+    ) -> Int64? {
+        guard status == .running,
+              footerActivity == .idle,
+              let snapshot,
+              snapshot.isFresh(at: now),
+              snapshot.reportsTerminalDisconnect,
+              let evidenceMs = snapshot.updatedAtMilliseconds,
+              evidenceMs <= nowMs,
+              evidenceMs >= clockMs else { return nil }
+        return evidenceMs
+    }
+
     /// Backstop for cancelled turns. An Esc-cancel fires no stop hook and leaves the
     /// agent alive, so neither the stop hook nor `reconcileLiveness` clears the tab
     /// spinner — but the agent's own footer returns to its idle signature. Clear a
@@ -1881,6 +1911,7 @@ final class AppModel: ObservableObject {
                     if let snapshot = projects[pi].sessions[si].agentActivity,
                        snapshot.isFresh(),
                        snapshot.foregroundTurnActive == true,
+                       !snapshot.reportsTerminalDisconnect,
                        let snapshotMs = snapshot.foregroundTransitionMilliseconds,
                        snapshotMs <= recoveryNowMs,
                        snapshotMs > (statusEventClock.timestamp(for: sid) ?? Int64.min) {
@@ -1935,6 +1966,36 @@ final class AppModel: ObservableObject {
                             text: nil,
                             source: "footer"
                         )
+                    }
+                    continue
+                }
+                // Disconnected-extension recovery: a fresh snapshot reporting a
+                // terminal RPC disconnect can no longer observe
+                // `turn_end`/`session.idle`, so its stuck `foregroundTurnActive`
+                // would otherwise keep the tab "working" forever (the 5s heartbeat
+                // republishes it fresh, defeating the isFresh TTL). Demote to idle
+                // once the disconnect persists across two scans — but ONLY when the
+                // terminal footer is idle (a disconnect proves RPC loss, not turn
+                // completion; the footer is the authoritative foreground signal, so
+                // a genuinely-working session is never demoted). Scoped to
+                // `reportsTerminalDisconnect`, so a healthy session (error == nil)
+                // never enters here. The evidence timestamp orders the demotion
+                // against the status clock so a reconnect turn_start isn't dropped.
+                if let evidenceMs = Self.disconnectDemotionEvidenceMs(
+                    status: status,
+                    footerActivity: activity,
+                    snapshot: projects[pi].sessions[si].agentActivity,
+                    now: Date(),
+                    nowMs: SessionArtifacts.currentStatusTimestamp(),
+                    clockMs: statusEventClock.timestamp(for: sid) ?? Int64.min
+                ) {
+                    tracked.insert(sid)
+                    if activityTracker.observeForegroundIdle(
+                        sessionId: sid,
+                        currentStatus: status,
+                        foregroundTurnActive: false
+                    ) {
+                        clearStatusToIdle(pi: pi, si: si, markFinished: false, effectiveTime: evidenceMs)
                     }
                     continue
                 }

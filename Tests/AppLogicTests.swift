@@ -5167,6 +5167,67 @@ final class AppLogicTests: XCTestCase {
         )
     }
 
+    func testAgentActivitySnapshotDetectsTerminalDisconnect() throws {
+        let base = "\"schemaVersion\":1,\"updatedAt\":\"2026-07-14T00:00:00Z\","
+            + "\"foregroundTurnActive\":true,\"scheduledTurnActive\":false,"
+            + "\"activeSubagents\":[],\"schedules\":[],\"idleGeneration\":0,"
+            + "\"lastIdleAborted\":false"
+        func snapshot(errorJSON: String?) throws -> AgentActivitySnapshot {
+            let body = errorJSON.map { "{" + base + ",\"error\":\($0)}" } ?? "{" + base + "}"
+            return try JSONDecoder().decode(AgentActivitySnapshot.self, from: Data(body.utf8))
+        }
+        // No error, or an unrelated error, is not a terminal disconnect.
+        XCTAssertFalse(try snapshot(errorJSON: nil).reportsTerminalDisconnect)
+        XCTAssertFalse(try snapshot(errorJSON: "\"Error: schedule list failed\"").reportsTerminalDisconnect)
+        // vscode-jsonrpc terminal wordings, case-insensitive.
+        XCTAssertTrue(try snapshot(errorJSON: "\"Error: Connection is closed.\"").reportsTerminalDisconnect)
+        XCTAssertTrue(try snapshot(errorJSON: "\"Connection is disposed.\"").reportsTerminalDisconnect)
+        XCTAssertTrue(try snapshot(errorJSON: "\"CONNECTION IS CLOSED\"").reportsTerminalDisconnect)
+    }
+
+    func testDisconnectDemotionEvidencePolicy() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-14T00:00:00Z"))
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        func snap(error: String?, updatedAt: String = "2026-07-14T00:00:00Z") throws -> AgentActivitySnapshot {
+            var body = "{\"schemaVersion\":1,\"updatedAt\":\"\(updatedAt)\","
+                + "\"foregroundTurnActive\":true,\"scheduledTurnActive\":false,"
+                + "\"activeSubagents\":[],\"schedules\":[],\"idleGeneration\":0,"
+                + "\"lastIdleAborted\":false"
+            if let error { body += ",\"error\":\"\(error)\"" }
+            body += "}"
+            return try JSONDecoder().decode(AgentActivitySnapshot.self, from: Data(body.utf8))
+        }
+        // Running + idle footer + fresh disconnect, newer than the clock → demote (returns evidence ms).
+        XCTAssertEqual(
+            AppModel.disconnectDemotionEvidenceMs(
+                status: .running, footerActivity: .idle,
+                snapshot: try snap(error: "Connection is closed."),
+                now: now, nowMs: nowMs, clockMs: .min),
+            nowMs
+        )
+        // Healthy snapshot (no terminal error) → never demote.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .idle,
+            snapshot: try snap(error: nil), now: now, nowMs: nowMs, clockMs: .min))
+        // Footer still working → don't demote a genuinely-working session.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .working,
+            snapshot: try snap(error: "Connection is closed."), now: now, nowMs: nowMs, clockMs: .min))
+        // Not running → not applicable.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .idle, footerActivity: .idle,
+            snapshot: try snap(error: "Connection is closed."), now: now, nowMs: nowMs, clockMs: .min))
+        // Snapshot older than the status clock → don't override a newer hook.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .idle,
+            snapshot: try snap(error: "Connection is closed."), now: now, nowMs: nowMs, clockMs: nowMs + 1))
+        // Stale snapshot (updatedAt long past) → isFresh false → don't demote.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .idle,
+            snapshot: try snap(error: "Connection is closed.", updatedAt: "2000-01-01T00:00:00Z"),
+            now: now, nowMs: nowMs, clockMs: .min))
+    }
+
     func testRemoteTerminalScreenCaptureNormalizesCells() {
         XCTAssertEqual(RemoteTerminalScreen.captureVisible(
             sessionId: "session",
