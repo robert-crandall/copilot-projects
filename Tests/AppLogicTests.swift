@@ -145,7 +145,6 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .idle,
-                hasBackgroundWork: false,
                 hasLiveAgent: true,
                 footerActivity: .idle
             ),
@@ -154,16 +153,17 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .idle,
-                hasBackgroundWork: true,
+                scheduledTurnActive: true,
                 hasLiveAgent: true,
                 footerActivity: .idle
             ),
             .busy
         )
+        // A foreground turn in progress (running/waiting) still blocks so we never
+        // inject over an active turn or a pending permission/question prompt.
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .running,
-                hasBackgroundWork: false,
                 hasLiveAgent: true,
                 footerActivity: .working
             ),
@@ -171,8 +171,15 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
+                status: .waiting,
+                hasLiveAgent: true,
+                footerActivity: .idle
+            ),
+            .busy
+        )
+        XCTAssertEqual(
+            AppModel.remotePromptEligibility(
                 status: .idle,
-                hasBackgroundWork: false,
                 hasLiveAgent: false,
                 footerActivity: .idle
             ),
@@ -181,7 +188,6 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .idle,
-                hasBackgroundWork: false,
                 hasLiveAgent: true,
                 footerActivity: .unknown
             ),
@@ -216,6 +222,7 @@ final class AppLogicTests: XCTestCase {
         var sentValues: [String] = []
         let model = AppModel(
             stateRepository: repository,
+            agentActivityDirectory: root,
             remotePromptLiveSessions: { _ in liveSessions },
             remotePromptTarget: { requestedSessionId in
                 guard requestedSessionId == session.id else { return nil }
@@ -247,20 +254,73 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(sentValues, ["hello"])
         model.setStatus(sessionId: session.id, status: .idle, text: nil, timestamp: 2)
 
+        // Background agents active must NOT block a settled foreground at a prompt:
+        // the message sends even while background work runs.
         model.setBackgroundAgentsActive(sessionId: session.id, active: true)
         XCTAssertEqual(
             model.sendRemotePrompt(sessionId: session.id, value: "background"),
+            .sent
+        )
+        XCTAssertEqual(sentValues, ["hello", "background"])
+        model.setBackgroundAgentsActive(sessionId: session.id, active: false)
+
+        let subagentSnapshot = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: ISO8601DateFormatter().string(from: Date()),
+            foregroundTurnActive: false,
+            scheduledTurnActive: false,
+            activeSubagents: [
+                TrackedSubagent(
+                    id: "agent-1",
+                    name: "reviewer",
+                    description: "Reviews the PR",
+                    model: "gpt"
+                ),
+            ],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        try JSONEncoder().encode(subagentSnapshot).write(
+            to: root.appendingPathComponent("\(session.id).agent-activity.json")
+        )
+        model.refreshAgentActivitySnapshots()
+        XCTAssertEqual(model.projects[0].sessions[0].activeSubagentCount, 1)
+        XCTAssertTrue(model.projects[0].sessions[0].hasBackgroundWork)
+        XCTAssertEqual(
+            model.sendRemotePrompt(sessionId: session.id, value: "subagent"),
+            .sent
+        )
+        XCTAssertEqual(sentValues, ["hello", "background", "subagent"])
+
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 3,
+            source: "scheduled-start"
+        )
+        XCTAssertEqual(
+            model.sendRemotePrompt(sessionId: session.id, value: "scheduled"),
             .busy
         )
-        XCTAssertEqual(sentValues, ["hello"])
-        model.setBackgroundAgentsActive(sessionId: session.id, active: false)
+        XCTAssertEqual(sentValues, ["hello", "background", "subagent"])
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 4,
+            source: "scheduled-idle"
+        )
 
         liveSessions = []
         XCTAssertEqual(
             model.sendRemotePrompt(sessionId: session.id, value: "no process"),
             .noLiveCopilot
         )
-        XCTAssertEqual(sentValues, ["hello"])
+        XCTAssertEqual(sentValues, ["hello", "background", "subagent"])
         liveSessions = [session.id]
 
         activity = .working
@@ -268,7 +328,7 @@ final class AppLogicTests: XCTestCase {
             model.sendRemotePrompt(sessionId: session.id, value: "working"),
             .noLiveCopilot
         )
-        XCTAssertEqual(sentValues, ["hello"])
+        XCTAssertEqual(sentValues, ["hello", "background", "subagent"])
         activity = .idle
 
         sendSucceeds = false
@@ -276,7 +336,7 @@ final class AppLogicTests: XCTestCase {
             model.sendRemotePrompt(sessionId: session.id, value: "not sent"),
             .invalid
         )
-        XCTAssertEqual(sentValues, ["hello", "not sent"])
+        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "not sent"])
     }
 
     @MainActor
@@ -434,6 +494,29 @@ final class AppLogicTests: XCTestCase {
         // Two consecutive inactive scans mean the foreground turn really ended.
         XCTAssertTrue(tracker.observeForegroundIdle(
             sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+    }
+
+    func testDisconnectIdleDwellDoesNotReuseForegroundIdleTicks() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+        XCTAssertFalse(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+        XCTAssertTrue(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+    }
+
+    func testDisconnectIdleDwellResetsWhenPolicyStopsQualifying() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        XCTAssertFalse(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+        tracker.resetDisconnectIdle(sessionId: sessionId)
+        XCTAssertFalse(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+        XCTAssertTrue(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
     }
 
     func testForegroundIdleDwellResetsWhenTurnResumes() {
@@ -2912,11 +2995,11 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(TerminalController.shellSingleQuote("a'b"), "'a'\\''b'")
         XCTAssertEqual(
             TerminalController.resumeCommand(sessionId: sessionId, allowAll: false),
-            "copilot --resume=\(sessionId)"
+            "copilot --no-remote --no-remote-export --resume=\(sessionId)"
         )
         XCTAssertEqual(
             TerminalController.resumeCommand(sessionId: sessionId, allowAll: true),
-            "copilot --allow-all --resume=\(sessionId)"
+            "copilot --no-remote --no-remote-export --allow-all --resume=\(sessionId)"
         )
         XCTAssertTrue(AppModel.shouldResumeWithAllowAll(
             copilotSessionId: sessionId,
@@ -2959,7 +3042,7 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             TerminalController.launchCommand(executable: executable, shell: shell),
-            "'/opt/my copilot/copilot'"
+            "'/opt/my copilot/copilot' --no-remote --no-remote-export"
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
         )
@@ -2968,7 +3051,7 @@ final class AppLogicTests: XCTestCase {
             TerminalController.launchCommand(
                 executable: executable, shell: shell, allowAll: true
             ),
-            "'/opt/my copilot/copilot' --allow-all"
+            "'/opt/my copilot/copilot' --no-remote --no-remote-export --allow-all"
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
         )
@@ -2993,7 +3076,9 @@ final class AppLogicTests: XCTestCase {
             launchCopilotExecutable: executable
         )
         let joined = resumeProgram.joined(separator: " ")
-        XCTAssertTrue(joined.contains("copilot --resume=\(sessionId)"))
+        XCTAssertTrue(joined.contains(
+            "copilot --no-remote --no-remote-export --resume=\(sessionId)"
+        ))
         XCTAssertFalse(joined.contains("my copilot/copilot"))
     }
 
@@ -5105,6 +5190,67 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(
             try JSONDecoder().decode(AgentActivitySnapshot.self, from: bare).remoteModelInfo()
         )
+    }
+
+    func testAgentActivitySnapshotDetectsTerminalDisconnect() throws {
+        let base = "\"schemaVersion\":1,\"updatedAt\":\"2026-07-14T00:00:00Z\","
+            + "\"foregroundTurnActive\":true,\"scheduledTurnActive\":false,"
+            + "\"activeSubagents\":[],\"schedules\":[],\"idleGeneration\":0,"
+            + "\"lastIdleAborted\":false"
+        func snapshot(errorJSON: String?) throws -> AgentActivitySnapshot {
+            let body = errorJSON.map { "{" + base + ",\"error\":\($0)}" } ?? "{" + base + "}"
+            return try JSONDecoder().decode(AgentActivitySnapshot.self, from: Data(body.utf8))
+        }
+        // No error, or an unrelated error, is not a terminal disconnect.
+        XCTAssertFalse(try snapshot(errorJSON: nil).reportsTerminalDisconnect)
+        XCTAssertFalse(try snapshot(errorJSON: "\"Error: schedule list failed\"").reportsTerminalDisconnect)
+        // vscode-jsonrpc terminal wordings, case-insensitive.
+        XCTAssertTrue(try snapshot(errorJSON: "\"Error: Connection is closed.\"").reportsTerminalDisconnect)
+        XCTAssertTrue(try snapshot(errorJSON: "\"Connection is disposed.\"").reportsTerminalDisconnect)
+        XCTAssertTrue(try snapshot(errorJSON: "\"CONNECTION IS CLOSED\"").reportsTerminalDisconnect)
+    }
+
+    func testDisconnectDemotionEvidencePolicy() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-14T00:00:00Z"))
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        func snap(error: String?, updatedAt: String = "2026-07-14T00:00:00Z") throws -> AgentActivitySnapshot {
+            var body = "{\"schemaVersion\":1,\"updatedAt\":\"\(updatedAt)\","
+                + "\"foregroundTurnActive\":true,\"scheduledTurnActive\":false,"
+                + "\"activeSubagents\":[],\"schedules\":[],\"idleGeneration\":0,"
+                + "\"lastIdleAborted\":false"
+            if let error { body += ",\"error\":\"\(error)\"" }
+            body += "}"
+            return try JSONDecoder().decode(AgentActivitySnapshot.self, from: Data(body.utf8))
+        }
+        // Running + idle footer + fresh disconnect, newer than the clock → demote (returns evidence ms).
+        XCTAssertEqual(
+            AppModel.disconnectDemotionEvidenceMs(
+                status: .running, footerActivity: .idle,
+                snapshot: try snap(error: "Connection is closed."),
+                now: now, nowMs: nowMs, clockMs: .min),
+            nowMs
+        )
+        // Healthy snapshot (no terminal error) → never demote.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .idle,
+            snapshot: try snap(error: nil), now: now, nowMs: nowMs, clockMs: .min))
+        // Footer still working → don't demote a genuinely-working session.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .working,
+            snapshot: try snap(error: "Connection is closed."), now: now, nowMs: nowMs, clockMs: .min))
+        // Not running → not applicable.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .idle, footerActivity: .idle,
+            snapshot: try snap(error: "Connection is closed."), now: now, nowMs: nowMs, clockMs: .min))
+        // Snapshot older than the status clock → don't override a newer hook.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .idle,
+            snapshot: try snap(error: "Connection is closed."), now: now, nowMs: nowMs, clockMs: nowMs + 1))
+        // Stale snapshot (updatedAt long past) → isFresh false → don't demote.
+        XCTAssertNil(AppModel.disconnectDemotionEvidenceMs(
+            status: .running, footerActivity: .idle,
+            snapshot: try snap(error: "Connection is closed.", updatedAt: "2000-01-01T00:00:00Z"),
+            now: now, nowMs: nowMs, clockMs: .min))
     }
 
     func testRemoteTerminalScreenCaptureNormalizesCells() {

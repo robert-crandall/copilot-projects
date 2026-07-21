@@ -38,6 +38,20 @@ struct AgentActivitySnapshot: Codable, Equatable {
         return now.timeIntervalSince(updated) <= ttl
     }
 
+    /// True when the last heartbeat carried a terminal RPC-connection error
+    /// (closed/disposed). A disconnected extension can no longer observe
+    /// `assistant.turn_end`/`session.idle`, so its `foregroundTurnActive` (and
+    /// other in-flight) claims are stale and must not be treated as authoritative
+    /// evidence that a foreground turn is still running — otherwise the 5s
+    /// heartbeat republishes the stuck snapshot fresh and the tab reads "working"
+    /// forever. Matches the vscode-jsonrpc terminal wordings.
+    var reportsTerminalDisconnect: Bool {
+        guard let error else { return false }
+        let lowered = error.lowercased()
+        return lowered.contains("connection is closed")
+            || lowered.contains("connection is disposed")
+    }
+
     /// `foregroundTransitionAt` as epoch milliseconds, matching the status-event
     /// clock's units. This is the causal time of the current foreground state
     /// (turn_start → active, turn_end/session.idle → inactive), so recovery and
@@ -49,6 +63,16 @@ struct AgentActivitySnapshot: Codable, Equatable {
         guard let value = foregroundTransitionAt,
               let transition = Self.date(from: value) else { return nil }
         return Int64(transition.timeIntervalSince1970 * 1_000)
+    }
+
+    /// `updatedAt` as epoch milliseconds. Every `publish()` rewrites `updatedAt`,
+    /// so for a disconnected session the 5s heartbeat keeps this ~current; it is
+    /// the freshest evidence time available when a snapshot only carries a
+    /// terminal-disconnect error (no clean turn transition), used to order the
+    /// disconnect demotion against the status-event clock.
+    var updatedAtMilliseconds: Int64? {
+        guard let updated = Self.date(from: updatedAt) else { return nil }
+        return Int64(updated.timeIntervalSince1970 * 1_000)
     }
 
     /// Convert the tracked questions into the shared remote model for workspace

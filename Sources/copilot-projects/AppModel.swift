@@ -937,7 +937,7 @@ final class AppModel: ObservableObject {
                             scheduled: !session.schedules.isEmpty,
                             promptable: Self.remotePromptEligibility(
                                 status: session.status,
-                                hasBackgroundWork: session.hasBackgroundWork,
+                                scheduledTurnActive: session.scheduledTurnActive,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1039,7 +1039,7 @@ final class AppModel: ObservableObject {
         }
         let eligibility = Self.remotePromptEligibility(
             status: session.status,
-            hasBackgroundWork: session.hasBackgroundWork,
+            scheduledTurnActive: session.scheduledTurnActive,
             hasLiveAgent: liveSessions.contains(sessionId),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1052,13 +1052,23 @@ final class AppModel: ObservableObject {
         return target.send(value) ? .sent : .invalid
     }
 
+    /// Remote message sends are gated on the *foreground* being settled and at a
+    /// prompt — NOT on background work. Background subagents keep `hasBackgroundWork`
+    /// true while the foreground turn is already done (the footer/status reconciler
+    /// demotes such a session to `.idle`), so blocking on background work stranded
+    /// the remote composer's queued messages indefinitely. `status == .idle` still
+    /// excludes `.running`/`.waiting` (an in-progress foreground turn or a pending
+    /// permission/`ask_user` prompt), while `scheduledTurnActive` preserves the
+    /// explicit scheduled-turn guard for scheduled hooks that publish `.idle`.
+    /// The live-agent + idle-footer check confirms Copilot is actually at a prompt.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
-        hasBackgroundWork: Bool,
+        scheduledTurnActive: Bool = false,
         hasLiveAgent: Bool,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
-        guard status == .idle, !hasBackgroundWork else { return .busy }
+        guard status == .idle else { return .busy }
+        guard !scheduledTurnActive else { return .busy }
         guard hasLiveAgent, footerActivity == .idle else { return .noLiveCopilot }
         return .sent
     }
@@ -1828,6 +1838,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Decide whether a `.running` session should be demoted to idle because its
+    /// extension's RPC connection is gone. Pure and side-effect-free so it can be
+    /// unit-tested without the reconciler's controller/timer machinery. Returns the
+    /// evidence timestamp (ms) to seed the status clock, or nil when no demotion is
+    /// warranted. Conditions: the session is `.running`; the terminal footer is
+    /// idle (a disconnect proves RPC loss, not turn completion — the footer is the
+    /// authoritative foreground signal, so a genuinely-working session is never
+    /// demoted); the snapshot is fresh and reports a terminal disconnect (healthy
+    /// sessions have `error == nil` and never qualify); and the snapshot's evidence
+    /// time is within `[clockMs, nowMs]` so a newer status hook can't be overridden
+    /// and a future-dated snapshot (clock rollback) can't poison the clock.
+    nonisolated static func disconnectDemotionEvidenceMs(
+        status: SessionStatus,
+        footerActivity: FooterActivity,
+        snapshot: AgentActivitySnapshot?,
+        now: Date,
+        nowMs: Int64,
+        clockMs: Int64
+    ) -> Int64? {
+        guard status == .running,
+              footerActivity == .idle,
+              let snapshot,
+              snapshot.isFresh(at: now),
+              snapshot.reportsTerminalDisconnect,
+              let evidenceMs = snapshot.updatedAtMilliseconds,
+              evidenceMs <= nowMs,
+              evidenceMs >= clockMs else { return nil }
+        return evidenceMs
+    }
+
     /// Backstop for cancelled turns. An Esc-cancel fires no stop hook and leaves the
     /// agent alive, so neither the stop hook nor `reconcileLiveness` clears the tab
     /// spinner — but the agent's own footer returns to its idle signature. Clear a
@@ -1871,10 +1911,12 @@ final class AppModel: ObservableObject {
                     if let snapshot = projects[pi].sessions[si].agentActivity,
                        snapshot.isFresh(),
                        snapshot.foregroundTurnActive == true,
+                       !snapshot.reportsTerminalDisconnect,
                        let snapshotMs = snapshot.foregroundTransitionMilliseconds,
                        snapshotMs <= recoveryNowMs,
                        snapshotMs > (statusEventClock.timestamp(for: sid) ?? Int64.min) {
                         activityTracker.resetForegroundIdle(sessionId: sid)
+                        activityTracker.resetDisconnectIdle(sessionId: sid)
                         // Promote IN MEMORY ONLY, using the foreground-transition
                         // timestamp (the root turn_start time — NOT `updatedAt`,
                         // which unrelated republishes rewrite): `setStatus` advances
@@ -1905,6 +1947,7 @@ final class AppModel: ObservableObject {
                     postCompletionIfReady(sessionId: sid)
                 }
                 if status == .idle {
+                    activityTracker.resetDisconnectIdle(sessionId: sid)
                     guard ActivityTracker.canPromoteIdleFromFooter(
                         backgroundAgentsActive: projects[pi].sessions[si].hasBackgroundWork,
                         hasLiveAgent: liveAgentSessions.contains(sid),
@@ -1927,6 +1970,38 @@ final class AppModel: ObservableObject {
                         )
                     }
                     continue
+                }
+                // Disconnected-extension recovery: a fresh snapshot reporting a
+                // terminal RPC disconnect can no longer observe
+                // `turn_end`/`session.idle`, so its stuck `foregroundTurnActive`
+                // would otherwise keep the tab "working" forever (the 5s heartbeat
+                // republishes it fresh, defeating the isFresh TTL). Demote to idle
+                // once the disconnect persists across two scans — but ONLY when the
+                // terminal footer is idle (a disconnect proves RPC loss, not turn
+                // completion; the footer is the authoritative foreground signal, so
+                // a genuinely-working session is never demoted). Scoped to
+                // `reportsTerminalDisconnect`, so a healthy session (error == nil)
+                // never enters here. The evidence timestamp orders the demotion
+                // against the status clock so a reconnect turn_start isn't dropped.
+                if let evidenceMs = Self.disconnectDemotionEvidenceMs(
+                    status: status,
+                    footerActivity: activity,
+                    snapshot: projects[pi].sessions[si].agentActivity,
+                    now: Date(),
+                    nowMs: SessionArtifacts.currentStatusTimestamp(),
+                    clockMs: statusEventClock.timestamp(for: sid) ?? Int64.min
+                ) {
+                    tracked.insert(sid)
+                    activityTracker.resetForegroundIdle(sessionId: sid)
+                    if activityTracker.observeDisconnectIdle(
+                        sessionId: sid,
+                        currentStatus: status
+                    ) {
+                        clearStatusToIdle(pi: pi, si: si, markFinished: false, effectiveTime: evidenceMs)
+                    }
+                    continue
+                } else {
+                    activityTracker.resetDisconnectIdle(sessionId: sid)
                 }
                 // Stale "working" recovery: the foreground turn has ended, but live
                 // background subagents keep `session.idle` from firing, so the hook
