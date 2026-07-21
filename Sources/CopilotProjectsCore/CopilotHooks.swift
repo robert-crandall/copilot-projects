@@ -61,17 +61,61 @@ public enum CopilotHooks {
     [ -z "$cli" ] && cli="$(command -v copilot-mux 2>/dev/null || true)"
     [ -z "$cli" ] && [ -x "$HOME/.local/bin/copilot-mux" ] && cli="$HOME/.local/bin/copilot-mux"
 
-    # Persist the status to a marker file (survives an app restart and stays
-    # current even while the app isn't running) and notify the live app.
+    status_record_prompt_timestamp() {
+      local record value
+      record="$state_dir/sessions/$session_id.status-record.json"
+      value="$(sed -n \
+        's/.*"promptStatusTimestamp":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$record" 2>/dev/null | head -1)"
+      if [ -z "$value" ]; then
+        value="$(cat "$state_dir/sessions/$session_id.prompt-status-timestamp" \
+          2>/dev/null || true)"
+      fi
+      case "$value" in
+        ""|*[!0-9]*) printf '' ;;
+        *) printf '%s' "$value" ;;
+      esac
+    }
+    persist_status_record() {
+      local timestamp prompt_timestamp record record_tmp
+      timestamp="$2"
+      [ -n "$timestamp" ] || return 1
+      prompt_timestamp="$timestamp"
+      if [ "${3:-}" = "scheduled-active" ]; then
+        prompt_timestamp="$(status_record_prompt_timestamp)"
+        # No prior foreground clock is unusual, but advancing is the safe fallback:
+        # it blocks background-only prompt injection rather than trusting no clock.
+        [ -n "$prompt_timestamp" ] || prompt_timestamp="$timestamp"
+      fi
+      record="$state_dir/sessions/$session_id.status-record.json"
+      record_tmp="$record.$$"
+      (
+        umask 077
+        printf '{"schemaVersion":1,"status":"%s","statusTimestamp":%s,"promptStatusTimestamp":%s}\n' \
+          "$1" "$timestamp" "$prompt_timestamp" > "$record_tmp"
+      ) || { rm -f "$record_tmp" 2>/dev/null || true; return 1; }
+      mv -f "$record_tmp" "$record" 2>/dev/null \
+        || { rm -f "$record_tmp" 2>/dev/null || true; return 1; }
+    }
+    # Persist status and both ordering clocks as one atomic record (survives an app
+    # restart and stays current even while the app isn't running), then update the
+    # legacy compatibility markers and notify the live app.
     status() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true
-      printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
       if [ -n "${2:-}" ]; then
-        printf '%s' "$2" > "$state_dir/sessions/$session_id.status-timestamp" 2>/dev/null || true
-        if [ "${3:-}" != "scheduled-active" ]; then
+        if persist_status_record "$1" "$2" "${3:-}"; then
           printf '%s' "$2" \
-            > "$state_dir/sessions/$session_id.prompt-status-timestamp" 2>/dev/null || true
+            > "$state_dir/sessions/$session_id.status-timestamp" 2>/dev/null || true
+          if [ "${3:-}" != "scheduled-active" ]; then
+            printf '%s' "$2" \
+              > "$state_dir/sessions/$session_id.prompt-status-timestamp" 2>/dev/null || true
+          fi
+          # Write status last for pre-record app versions so they also avoid
+          # observing a new status paired with older clock markers.
+          printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
         fi
+      else
+        printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
       fi
       # Synchronous (not backgrounded) so rapid transitions — e.g. running→waiting —
       # reach the app in order; backgrounding let them race and the "waiting" dot get
@@ -87,7 +131,12 @@ public enum CopilotHooks {
       fi
     }
     current_status() {
-      cat "$state_dir/sessions/$session_id.status" 2>/dev/null || true
+      local record value
+      record="$state_dir/sessions/$session_id.status-record.json"
+      value="$(sed -n 's/.*"status":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$record" 2>/dev/null | head -1)"
+      [ -n "$value" ] && printf '%s' "$value" \
+        || cat "$state_dir/sessions/$session_id.status" 2>/dev/null || true
     }
     mark_turn_active() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true

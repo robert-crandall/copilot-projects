@@ -2228,6 +2228,14 @@ final class AppLogicTests: XCTestCase {
             try String(contentsOf: promptTimestamp, encoding: .utf8),
             "100"
         )
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: root
+                .appendingPathComponent("sessions/\(tabId).status-record.json"))
+        )
+        XCTAssertEqual(record.status, .idle)
+        XCTAssertEqual(record.statusTimestamp, 110)
+        XCTAssertEqual(record.promptStatusTimestamp, 100)
         try runHook(
             hookURL: hookURL,
             action: "idle",
@@ -3629,7 +3637,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(bounded.contains { $0.requestId == "r\(overflow - 1)" })
     }
 
-    func testSessionStatusMarkersPersistAsAPair() throws {
+    func testSessionStatusMarkersPersistAsAtomicRecord() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3639,8 +3647,22 @@ final class AppLogicTests: XCTestCase {
             sessionId: sessionId,
             status: .running,
             timestamp: 123_456,
+            promptStatusTimestamp: 123_400,
             sessionsDirectory: root
         ))
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: root
+                .appendingPathComponent("\(sessionId).status-record.json"))
+        )
+        XCTAssertEqual(
+            record,
+            SessionStatusRecord(
+                status: .running,
+                statusTimestamp: 123_456,
+                promptStatusTimestamp: 123_400
+            )
+        )
         XCTAssertEqual(
             try String(
                 contentsOf: root.appendingPathComponent("\(sessionId).status"),
@@ -3655,11 +3677,6 @@ final class AppLogicTests: XCTestCase {
             ),
             "123456"
         )
-        XCTAssertTrue(SessionArtifacts.persistPromptStatusTimestamp(
-            sessionId: sessionId,
-            timestamp: 123_400,
-            sessionsDirectory: root
-        ))
         XCTAssertEqual(
             try String(
                 contentsOf: root
@@ -3667,6 +3684,30 @@ final class AppLogicTests: XCTestCase {
                 encoding: .utf8
             ),
             "123400"
+        )
+    }
+
+    func testInvalidAtomicStatusRecordDoesNotFallBackToLegacyMarkers() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = UUID().uuidString
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("running".utf8).write(
+            to: root.appendingPathComponent("\(sessionId).status"))
+        try Data("200".utf8).write(
+            to: root.appendingPathComponent("\(sessionId).status-timestamp"))
+        try Data("100".utf8).write(
+            to: root.appendingPathComponent("\(sessionId).prompt-status-timestamp"))
+        try Data(#"{"schemaVersion":1,"status":"running"}"#.utf8).write(
+            to: root.appendingPathComponent("\(sessionId).status-record.json"))
+
+        XCTAssertEqual(
+            SessionArtifacts.loadStatusRecord(
+                sessionId: sessionId,
+                sessionsDirectory: root
+            ),
+            .invalid
         )
     }
 

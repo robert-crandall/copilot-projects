@@ -2,6 +2,28 @@ import Foundation
 import Darwin
 import CopilotProjectsCore
 
+struct SessionStatusRecord: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    let schemaVersion: Int
+    let status: SessionStatus
+    let statusTimestamp: Int64
+    let promptStatusTimestamp: Int64
+
+    init(status: SessionStatus, statusTimestamp: Int64, promptStatusTimestamp: Int64) {
+        schemaVersion = Self.currentSchemaVersion
+        self.status = status
+        self.statusTimestamp = statusTimestamp
+        self.promptStatusTimestamp = promptStatusTimestamp
+    }
+}
+
+enum SessionStatusRecordLoad: Equatable {
+    case missing
+    case loaded(SessionStatusRecord)
+    case invalid
+}
+
 enum SessionArtifacts {
     static func currentStatusTimestamp() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1_000)
@@ -12,6 +34,7 @@ enum SessionArtifacts {
         sessionId: String,
         status: SessionStatus,
         timestamp: Int64,
+        promptStatusTimestamp: Int64,
         sessionsDirectory: URL = Paths.sessionsDir
     ) -> Bool {
         do {
@@ -20,12 +43,28 @@ enum SessionArtifacts {
                 withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700]
             )
-            try Data(status.rawValue.utf8).write(
-                to: sessionsDirectory.appendingPathComponent("\(sessionId).status"),
+            let record = SessionStatusRecord(
+                status: status,
+                statusTimestamp: timestamp,
+                promptStatusTimestamp: promptStatusTimestamp
+            )
+            try JSONEncoder().encode(record).write(
+                to: sessionsDirectory.appendingPathComponent("\(sessionId).status-record.json"),
                 options: .atomic
             )
             try Data(String(timestamp).utf8).write(
                 to: sessionsDirectory.appendingPathComponent("\(sessionId).status-timestamp"),
+                options: .atomic
+            )
+            try Data(String(promptStatusTimestamp).utf8).write(
+                to: sessionsDirectory
+                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
+                options: .atomic
+            )
+            // Compatibility markers are written only after the complete record, with
+            // status last so older app versions cannot combine it with stale clocks.
+            try Data(status.rawValue.utf8).write(
+                to: sessionsDirectory.appendingPathComponent("\(sessionId).status"),
                 options: .atomic
             )
             return true
@@ -35,31 +74,17 @@ enum SessionArtifacts {
         }
     }
 
-    @discardableResult
-    static func persistPromptStatusTimestamp(
+    static func loadStatusRecord(
         sessionId: String,
-        timestamp: Int64,
         sessionsDirectory: URL = Paths.sessionsDir
-    ) -> Bool {
-        do {
-            try FileManager.default.createDirectory(
-                at: sessionsDirectory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try Data(String(timestamp).utf8).write(
-                to: sessionsDirectory
-                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
-                options: .atomic
-            )
-            return true
-        } catch {
-            NSLog(
-                "copilot-projects: could not persist prompt status timestamp "
-                    + "for \(sessionId): \(error)"
-            )
-            return false
-        }
+    ) -> SessionStatusRecordLoad {
+        let url = sessionsDirectory.appendingPathComponent("\(sessionId).status-record.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        guard let data = try? Data(contentsOf: url),
+              let record = try? JSONDecoder().decode(SessionStatusRecord.self, from: data),
+              record.schemaVersion == SessionStatusRecord.currentSchemaVersion
+        else { return .invalid }
+        return .loaded(record)
     }
 
     @discardableResult
@@ -109,6 +134,7 @@ enum SessionArtifacts {
             Paths.statusMarkerPath(sessionId: sessionId),
             Paths.statusTimestampMarkerPath(sessionId: sessionId),
             Paths.promptStatusTimestampMarkerPath(sessionId: sessionId),
+            Paths.statusRecordPath(sessionId: sessionId),
             Paths.backgroundAgentsMarkerPath(sessionId: sessionId),
             Paths.sessionIdleHookMarkerPath(sessionId: sessionId),
             Paths.copilotSessionMarkerPath(sessionId: sessionId),

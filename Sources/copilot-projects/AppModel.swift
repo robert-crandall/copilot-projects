@@ -1661,12 +1661,6 @@ final class AppModel: ObservableObject {
         guard statusEventClock.shouldApply(sessionId: sessionId, timestamp: timestamp) else { return }
         if Self.advancesPromptSafetyClock(source: source) {
             promptStatusEventClock.seed(sessionId: sessionId, timestamp: timestamp)
-            if let timestamp {
-                SessionArtifacts.persistPromptStatusTimestamp(
-                    sessionId: sessionId,
-                    timestamp: timestamp
-                )
-            }
         }
         // sessionEnd is also emitted during graceful macOS shutdown. Only a live,
         // non-terminating app can treat it as an explicit user exit.
@@ -1739,15 +1733,13 @@ final class AppModel: ObservableObject {
                     sessionId: sessionId,
                     timestamp: effectiveTimestamp
                 )
-                SessionArtifacts.persistPromptStatusTimestamp(
-                    sessionId: sessionId,
-                    timestamp: effectiveTimestamp
-                )
             }
             SessionArtifacts.persistStatus(
                 sessionId: sessionId,
                 status: status,
-                timestamp: effectiveTimestamp
+                timestamp: effectiveTimestamp,
+                promptStatusTimestamp: promptStatusEventClock.timestamp(for: sessionId)
+                    ?? effectiveTimestamp
             )
         }
 
@@ -2254,14 +2246,11 @@ final class AppModel: ObservableObject {
         let timestamp = max(base, statusEventClock.timestamp(for: sid) ?? base)
         statusEventClock.seed(sessionId: sid, timestamp: timestamp)
         promptStatusEventClock.seed(sessionId: sid, timestamp: timestamp)
-        SessionArtifacts.persistPromptStatusTimestamp(
-            sessionId: sid,
-            timestamp: timestamp
-        )
         SessionArtifacts.persistStatus(
             sessionId: sid,
             status: .idle,
-            timestamp: timestamp
+            timestamp: timestamp,
+            promptStatusTimestamp: timestamp
         )
     }
 
@@ -2698,8 +2687,9 @@ final class AppModel: ObservableObject {
                 // Migrate any legacy `file://host/path` cwds (stored before OSC 7 was
                 // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.
                 projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
-                let status = restoredStatus(forSession: sid)
-                let statusTimestamp = restoredStatusTimestamp(forSession: sid)
+                let restored = restoredStatusState(forSession: sid)
+                let status = restored.status
+                let statusTimestamp = restored.statusTimestamp
                 projects[pi].sessions[si].status = status
                 statusEventClock.seed(
                     sessionId: sid,
@@ -2707,8 +2697,7 @@ final class AppModel: ObservableObject {
                 )
                 promptStatusEventClock.seed(
                     sessionId: sid,
-                    timestamp: restoredPromptStatusTimestamp(forSession: sid)
-                        ?? statusTimestamp
+                    timestamp: restored.promptStatusTimestamp ?? statusTimestamp
                 )
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false
@@ -2726,9 +2715,29 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Restore a session's status from its marker file (written by the Copilot
-    /// hook). The liveness reconciler then clears any whose agent is no longer alive.
-    private func restoredStatus(forSession sessionId: String) -> SessionStatus {
+    private func restoredStatusState(
+        forSession sessionId: String
+    ) -> (status: SessionStatus, statusTimestamp: Int64?, promptStatusTimestamp: Int64?) {
+        switch SessionArtifacts.loadStatusRecord(sessionId: sessionId) {
+        case .loaded(let record):
+            return (record.status, record.statusTimestamp, record.promptStatusTimestamp)
+        case .invalid:
+            // A present but unreadable atomic record must never fall back to a possibly
+            // torn set of legacy files. Restore busy and put the prompt clock at app
+            // startup time, so only fresh post-recovery background evidence can bypass it.
+            NSLog("copilot-projects: invalid status record for \(sessionId); restoring busy")
+            return (.running, nil, SessionArtifacts.currentStatusTimestamp())
+        case .missing:
+            return (
+                restoredLegacyStatus(forSession: sessionId),
+                restoredLegacyStatusTimestamp(forSession: sessionId),
+                restoredLegacyPromptStatusTimestamp(forSession: sessionId)
+            )
+        }
+    }
+
+    /// Restore pre-record app versions from their compatibility markers.
+    private func restoredLegacyStatus(forSession sessionId: String) -> SessionStatus {
         let path = Paths.statusMarkerPath(sessionId: sessionId)
         if let raw = try? String(contentsOfFile: path, encoding: .utf8) {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2737,13 +2746,13 @@ final class AppModel: ObservableObject {
         return .idle
     }
 
-    private func restoredStatusTimestamp(forSession sessionId: String) -> Int64? {
+    private func restoredLegacyStatusTimestamp(forSession sessionId: String) -> Int64? {
         let path = Paths.statusTimestampMarkerPath(sessionId: sessionId)
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    private func restoredPromptStatusTimestamp(forSession sessionId: String) -> Int64? {
+    private func restoredLegacyPromptStatusTimestamp(forSession sessionId: String) -> Int64? {
         let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))

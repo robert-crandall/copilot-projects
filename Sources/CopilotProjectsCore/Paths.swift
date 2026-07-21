@@ -116,6 +116,12 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).prompt-status-timestamp").path
     }
 
+    /// Atomically replaced status + clock record. New app versions restore from this
+    /// record so independently written compatibility markers can never be combined.
+    public static func statusRecordPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).status-record.json").path
+    }
+
     /// Present while the app has observed Copilot waiting on background agents.
     public static func backgroundAgentsMarkerPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).background-agents").path
