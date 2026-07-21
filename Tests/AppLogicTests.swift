@@ -149,7 +149,7 @@ final class AppLogicTests: XCTestCase {
             AppModel.remotePromptEligibility(
                 status: .running,
                 hasLiveAgent: true,
-                runningBackgroundOnly: true,
+                backgroundOnly: true,
                 footerActivity: .idle
             ),
             .sent
@@ -163,7 +163,7 @@ final class AppLogicTests: XCTestCase {
             ),
             .busy
         )
-        // A scheduled turn occupies the foreground → block.
+        // Scheduled state alone is not enough to bypass foreground gating.
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .running,
@@ -172,6 +172,18 @@ final class AppLogicTests: XCTestCase {
                 footerActivity: .idle
             ),
             .busy
+        )
+        // Fresh background-only evidence allows a separate foreground prompt while
+        // scheduled work continues behind it.
+        XCTAssertEqual(
+            AppModel.remotePromptEligibility(
+                status: .running,
+                scheduledTurnActive: true,
+                hasLiveAgent: true,
+                backgroundOnly: true,
+                footerActivity: .idle
+            ),
+            .sent
         )
         // A pending structured ask_user/elicitation → block (answer via its card).
         XCTAssertEqual(
@@ -225,7 +237,7 @@ final class AppLogicTests: XCTestCase {
         )
     }
 
-    func testRunningBackgroundOnlyPromptEvidenceRequiresOrderedSubagentSnapshot() throws {
+    func testBackgroundOnlyPromptEvidenceRequiresOrderedSnapshot() throws {
         let formatter = ISO8601DateFormatter()
         let now = Date()
         let transition = now.addingTimeInterval(-1)
@@ -252,21 +264,21 @@ final class AppLogicTests: XCTestCase {
         let nowMs = Int64(now.timeIntervalSince1970 * 1_000)
         let transitionMs = try XCTUnwrap(snapshot.foregroundTransitionMilliseconds)
 
-        XCTAssertTrue(AppModel.runningBackgroundOnlyPromptEvidence(
+        XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
             status: .running,
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs - 1
         ))
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             status: .running,
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs
         ))
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             status: .running,
             snapshot: snapshot,
             now: now,
@@ -276,7 +288,7 @@ final class AppLogicTests: XCTestCase {
 
         var activeForeground = snapshot
         activeForeground.foregroundTurnActive = true
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             status: .running,
             snapshot: activeForeground,
             now: now,
@@ -286,9 +298,51 @@ final class AppLogicTests: XCTestCase {
 
         var noSubagents = snapshot
         noSubagents.activeSubagents = []
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             status: .running,
             snapshot: noSubagents,
+            now: now,
+            nowMs: nowMs,
+            clockMs: nil
+        ))
+
+        var scheduled = noSubagents
+        scheduled.scheduledTurnActive = true
+        XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
+            snapshot: scheduled,
+            now: now,
+            nowMs: nowMs,
+            clockMs: transitionMs - 1
+        ))
+        XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            status: .idle,
+            snapshot: scheduled,
+            now: now,
+            nowMs: nowMs,
+            clockMs: transitionMs
+        ))
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .idle,
+            snapshot: scheduled,
+            now: now,
+            nowMs: nowMs,
+            clockMs: transitionMs + 1
+        ))
+
+        var disconnected = snapshot
+        disconnected.error = "Connection is closed."
+        XCTAssertEqual(
+            AppModel.backgroundOnlyEvidenceMs(
+                snapshot: disconnected,
+                now: now,
+                nowMs: nowMs
+            ),
+            transitionMs
+        )
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .idle,
+            snapshot: disconnected,
             now: now,
             nowMs: nowMs,
             clockMs: nil
@@ -462,23 +516,47 @@ final class AppLogicTests: XCTestCase {
             source: "permission-resolved"
         )
 
+        let scheduledTransitionMs = Int64(Date().timeIntervalSince1970) * 1_000
+        let scheduledTransition = Date(
+            timeIntervalSince1970: Double(scheduledTransitionMs) / 1_000
+        )
         model.setStatus(
             sessionId: session.id,
             status: .idle,
             text: nil,
-            timestamp: 3,
+            timestamp: scheduledTransitionMs,
             source: "scheduled-start"
         )
+        let scheduledSnapshot = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: ISO8601DateFormatter().string(from: scheduledTransition),
+            foregroundTurnActive: false,
+            foregroundTransitionAt: ISO8601DateFormatter().string(from: scheduledTransition),
+            scheduledTurnActive: true,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        try JSONEncoder().encode(scheduledSnapshot).write(
+            to: root.appendingPathComponent("\(session.id).agent-activity.json")
+        )
+        model.refreshAgentActivitySnapshots()
         XCTAssertEqual(
             model.sendRemotePrompt(sessionId: session.id, value: "scheduled"),
-            .busy
+            .sent
         )
-        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "running-background"])
+        XCTAssertEqual(
+            sentValues,
+            ["hello", "background", "subagent", "running-background", "scheduled"]
+        )
         model.setStatus(
             sessionId: session.id,
             status: .idle,
             text: nil,
-            timestamp: 4,
+            timestamp: scheduledTransitionMs + 1,
             source: "scheduled-idle"
         )
 
@@ -487,7 +565,10 @@ final class AppLogicTests: XCTestCase {
             model.sendRemotePrompt(sessionId: session.id, value: "no process"),
             .noLiveCopilot
         )
-        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "running-background"])
+        XCTAssertEqual(
+            sentValues,
+            ["hello", "background", "subagent", "running-background", "scheduled"]
+        )
         liveSessions = [session.id]
 
         // Footer not idle → busy (queue + retry), never injected mid-work.
@@ -496,7 +577,10 @@ final class AppLogicTests: XCTestCase {
             model.sendRemotePrompt(sessionId: session.id, value: "working"),
             .busy
         )
-        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "running-background"])
+        XCTAssertEqual(
+            sentValues,
+            ["hello", "background", "subagent", "running-background", "scheduled"]
+        )
         activity = .idle
 
         sendSucceeds = false
@@ -506,7 +590,7 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             sentValues,
-            ["hello", "background", "subagent", "running-background", "not sent"]
+            ["hello", "background", "subagent", "running-background", "scheduled", "not sent"]
         )
     }
 
@@ -771,6 +855,13 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(clock.shouldApply(sessionId: sessionId, timestamp: 100))
         XCTAssertTrue(clock.shouldApply(sessionId: sessionId, timestamp: 300))
         XCTAssertTrue(clock.shouldApply(sessionId: sessionId, timestamp: nil))
+    }
+
+    func testPromptSafetyClockIgnoresScheduledActivityReaffirmations() {
+        XCTAssertFalse(AppModel.advancesPromptSafetyClock(source: "scheduled-active"))
+        XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-start"))
+        XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-idle"))
+        XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: nil))
     }
 
     @MainActor
@@ -1932,6 +2023,12 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
+        let promptTimestamp = root
+            .appendingPathComponent("sessions/\(tabId).prompt-status-timestamp")
+        XCTAssertEqual(
+            try String(contentsOf: promptTimestamp, encoding: .utf8),
+            "100"
+        )
         try runHook(
             hookURL: hookURL,
             action: "notify",
@@ -2107,6 +2204,8 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
 
         let tabId = UUID().uuidString
+        let promptTimestamp = root
+            .appendingPathComponent("sessions/\(tabId).prompt-status-timestamp")
         try runHook(
             hookURL: hookURL,
             action: "running",
@@ -2125,6 +2224,18 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
+        XCTAssertEqual(
+            try String(contentsOf: promptTimestamp, encoding: .utf8),
+            "100"
+        )
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: root
+                .appendingPathComponent("sessions/\(tabId).status-record.json"))
+        )
+        XCTAssertEqual(record.status, .idle)
+        XCTAssertEqual(record.statusTimestamp, 110)
+        XCTAssertEqual(record.promptStatusTimestamp, 100)
         try runHook(
             hookURL: hookURL,
             action: "idle",
@@ -2149,6 +2260,10 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(calls.contains("set-status idle --timestamp 110 --source scheduled-active"))
         XCTAssertTrue(calls.contains("set-status idle --timestamp 115 --source scheduled-idle"))
         XCTAssertTrue(calls.contains("set-status idle --timestamp 120 --source session-idle"))
+        XCTAssertEqual(
+            try String(contentsOf: promptTimestamp, encoding: .utf8),
+            "120"
+        )
         XCTAssertFalse(calls.contains { $0.contains("--notification completed") })
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: root.appendingPathComponent("sessions/\(tabId).scheduled-turn").path
@@ -3522,7 +3637,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(bounded.contains { $0.requestId == "r\(overflow - 1)" })
     }
 
-    func testSessionStatusMarkersPersistAsAPair() throws {
+    func testSessionStatusMarkersPersistAsAtomicRecord() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -3532,8 +3647,22 @@ final class AppLogicTests: XCTestCase {
             sessionId: sessionId,
             status: .running,
             timestamp: 123_456,
+            promptStatusTimestamp: 123_400,
             sessionsDirectory: root
         ))
+        let record = try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: root
+                .appendingPathComponent("\(sessionId).status-record.json"))
+        )
+        XCTAssertEqual(
+            record,
+            SessionStatusRecord(
+                status: .running,
+                statusTimestamp: 123_456,
+                promptStatusTimestamp: 123_400
+            )
+        )
         XCTAssertEqual(
             try String(
                 contentsOf: root.appendingPathComponent("\(sessionId).status"),
@@ -3547,6 +3676,38 @@ final class AppLogicTests: XCTestCase {
                 encoding: .utf8
             ),
             "123456"
+        )
+        XCTAssertEqual(
+            try String(
+                contentsOf: root
+                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
+                encoding: .utf8
+            ),
+            "123400"
+        )
+    }
+
+    func testInvalidAtomicStatusRecordDoesNotFallBackToLegacyMarkers() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = UUID().uuidString
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("running".utf8).write(
+            to: root.appendingPathComponent("\(sessionId).status"))
+        try Data("200".utf8).write(
+            to: root.appendingPathComponent("\(sessionId).status-timestamp"))
+        try Data("100".utf8).write(
+            to: root.appendingPathComponent("\(sessionId).prompt-status-timestamp"))
+        try Data(#"{"schemaVersion":1,"status":"running"}"#.utf8).write(
+            to: root.appendingPathComponent("\(sessionId).status-record.json"))
+
+        XCTAssertEqual(
+            SessionArtifacts.loadStatusRecord(
+                sessionId: sessionId,
+                sessionsDirectory: root
+            ),
+            .invalid
         )
     }
 
@@ -3719,6 +3880,18 @@ final class AppLogicTests: XCTestCase {
         for path in paths {
             XCTAssertFalse(FileManager.default.fileExists(atPath: path))
         }
+    }
+
+    func testSessionArtifactCleanupRemovesPromptStatusTimestamp() throws {
+        let sessionId = UUID().uuidString
+        Paths.ensureStateDir()
+        let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
+        try Data("123".utf8).write(to: URL(fileURLWithPath: path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+
+        SessionArtifacts.removeFiles(sessionId: sessionId)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
     }
 
     @MainActor

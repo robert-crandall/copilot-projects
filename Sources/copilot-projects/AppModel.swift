@@ -288,6 +288,7 @@ final class AppModel: ObservableObject {
 
     private var activityTracker = ActivityTracker()
     private var statusEventClock = StatusEventClock()
+    private var promptStatusEventClock = StatusEventClock()
     private var backgroundAgentsSuppressed: Set<String> = []
     private var completionPending: Set<String> = []
     private var scheduledSnapshotsSuppressed: Set<String> = []
@@ -819,6 +820,7 @@ final class AppModel: ObservableObject {
         }
         transcriptOpenSessions.remove(sid)
         statusEventClock.reset(sessionId: sid)
+        promptStatusEventClock.reset(sessionId: sid)
         backgroundAgentsSuppressed.remove(sid)
         completionPending.remove(sid)
         scheduledSnapshotsSuppressed.remove(sid)
@@ -953,12 +955,12 @@ final class AppModel: ObservableObject {
                                 scheduledTurnActive: session.scheduledTurnActive,
                                 hasPendingQuestions: session.hasPendingQuestions,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
-                                runningBackgroundOnly: Self.runningBackgroundOnlyPromptEvidence(
+                                backgroundOnly: Self.backgroundOnlyPromptEvidence(
                                     status: session.status,
                                     snapshot: session.agentActivity,
                                     now: promptNow,
                                     nowMs: promptNowMs,
-                                    clockMs: statusEventClock.timestamp(for: session.id)
+                                    clockMs: promptStatusEventClock.timestamp(for: session.id)
                                 ),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1065,12 +1067,12 @@ final class AppModel: ObservableObject {
             scheduledTurnActive: session.scheduledTurnActive,
             hasPendingQuestions: session.hasPendingQuestions,
             hasLiveAgent: liveSessions.contains(sessionId),
-            runningBackgroundOnly: Self.runningBackgroundOnlyPromptEvidence(
+            backgroundOnly: Self.backgroundOnlyPromptEvidence(
                 status: session.status,
                 snapshot: session.agentActivity,
                 now: promptNow,
                 nowMs: promptNowMs,
-                clockMs: statusEventClock.timestamp(for: sessionId)
+                clockMs: promptStatusEventClock.timestamp(for: sessionId)
             ),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1085,69 +1087,81 @@ final class AppModel: ObservableObject {
 
     /// Whether a remote message may be sent to a session right now. Readiness of the
     /// *foreground* is the gate — primarily the terminal footer, NOT whether the
-    /// session is globally `.running`. Background subagents keep `status` at
-    /// `.running` while the foreground has returned to an idle prompt, so gating on
-    /// `.running` stranded the composer's queued messages while a background agent
-    /// ran; `.running` is deliberately allowed through here.
+    /// session is globally `.running`. Scheduled work and subagents can keep the
+    /// session globally active after the foreground has returned to an idle prompt,
+    /// so gating on that background state stranded the composer's queued messages.
     ///
     /// `status == .waiting` is still blocked: it marks a foreground question the user
     /// must answer inline — an `ask_user`/`elicitation` dialog OR a raw tool
     /// permission prompt. Permission prompts surface *only* via the CLI status hook
     /// (they populate no structured-question entry, so `hasPendingQuestions` is
     /// `false` for them) and the footer can read `.idle` behind the dialog, so the
-    /// `.waiting` check is the one signal that reliably guards them. A scheduled turn
-    /// (foreground-occupying) and `hasPendingQuestions` (the extension's authoritative
-    /// signal for structured questions) are additional, independent blocks.
+    /// `.waiting` check is the one signal that reliably guards them.
+    /// `hasPendingQuestions` is the extension's authoritative signal for structured
+    /// questions. Scheduled work is allowed only with fresh, clock-ordered evidence
+    /// that the interactive foreground is inactive.
     /// `sendRemotePrompt` re-checks the footer immediately before the actual send.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
         scheduledTurnActive: Bool = false,
         hasPendingQuestions: Bool = false,
         hasLiveAgent: Bool,
-        runningBackgroundOnly: Bool = false,
+        backgroundOnly: Bool = false,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
         guard hasLiveAgent else { return .noLiveCopilot }
-        // Never inject a free-form message over a foreground user prompt: a scheduled
-        // turn occupies the foreground; a structured ask_user/elicitation must be
-        // answered via its card; and `status == .waiting` covers raw permission
+        // Never inject a free-form message over a foreground user prompt: a structured
+        // ask_user/elicitation must be answered via its card; and `status == .waiting`
+        // covers raw permission
         // prompts that no structured-question signal sees — even when the footer
         // momentarily reads idle behind the dialog.
-        guard !scheduledTurnActive, !hasPendingQuestions, status != .waiting else {
+        guard !hasPendingQuestions, status != .waiting else {
             return .busy
         }
-        guard status != .running || runningBackgroundOnly else { return .busy }
+        guard !scheduledTurnActive || backgroundOnly else { return .busy }
+        guard status != .running || backgroundOnly else { return .busy }
         // For the remaining states the terminal footer is the authoritative "Copilot
-        // is at a prompt" signal. Background subagents can keep `status` at
-        // `.running`, but bypassing that state requires a fresh, clock-ordered
-        // heartbeat proving the foreground turn is inactive while subagents remain.
+        // is at a prompt" signal. Bypassing scheduled/running state requires a fresh,
+        // clock-ordered heartbeat proving the foreground is inactive while background
+        // work remains.
         // `sendRemotePrompt` re-checks this footer immediately before sending.
         guard footerActivity == .idle else { return .busy }
         return .sent
     }
 
-    /// Evidence that a `.running` session is only busy because background subagents
-    /// remain active after the foreground turn ended. This mirrors the causal guards
-    /// in `reconcileAgentFooters`: stale footer text alone is never enough to inject
-    /// a remote prompt over a possibly-active foreground turn.
-    nonisolated static func runningBackgroundOnlyPromptEvidence(
+    /// Evidence that a session is only busy because scheduled or subagent work
+    /// remains after the interactive foreground ended. This mirrors the causal
+    /// guards in `reconcileAgentFooters`: stale footer text alone is never enough
+    /// to inject a remote prompt over a possibly-active foreground turn.
+    nonisolated static func backgroundOnlyEvidenceMs(
+        snapshot: AgentActivitySnapshot?,
+        now: Date,
+        nowMs: Int64
+    ) -> Int64? {
+        guard let snapshot,
+              snapshot.isFresh(at: now),
+              snapshot.foregroundTurnActive == false,
+              snapshot.scheduledTurnActive || !snapshot.activeSubagents.isEmpty,
+              let snapshotMs = snapshot.foregroundTransitionMilliseconds,
+              snapshotMs <= nowMs else { return nil }
+        return snapshotMs
+    }
+
+    nonisolated static func backgroundOnlyPromptEvidence(
         status: SessionStatus,
         snapshot: AgentActivitySnapshot?,
         now: Date,
         nowMs: Int64,
         clockMs: Int64?
     ) -> Bool {
-        guard status == .running,
-              let snapshot,
-              snapshot.isFresh(at: now),
-              snapshot.foregroundTurnActive == false,
-              snapshot.scheduledTurnActive == false,
-              !snapshot.activeSubagents.isEmpty,
-              !snapshot.reportsTerminalDisconnect,
-              let snapshotMs = snapshot.foregroundTransitionMilliseconds,
-              snapshotMs <= nowMs else { return false }
+        guard snapshot?.reportsTerminalDisconnect != true else { return false }
+        guard let snapshotMs = backgroundOnlyEvidenceMs(
+            snapshot: snapshot,
+            now: now,
+            nowMs: nowMs
+        ) else { return false }
         if let clockMs {
-            return snapshotMs > clockMs
+            return status == .idle ? snapshotMs >= clockMs : snapshotMs > clockMs
         }
         return true
     }
@@ -1645,6 +1659,9 @@ final class AppModel: ObservableObject {
     ) {
         guard let loc = locateIndex(sessionId) else { return }
         guard statusEventClock.shouldApply(sessionId: sessionId, timestamp: timestamp) else { return }
+        if Self.advancesPromptSafetyClock(source: source) {
+            promptStatusEventClock.seed(sessionId: sessionId, timestamp: timestamp)
+        }
         // sessionEnd is also emitted during graceful macOS shutdown. Only a live,
         // non-terminating app can treat it as an explicit user exit.
         if source == "session-end", !isTerminating, !isPoweringOff,
@@ -1711,12 +1728,21 @@ final class AppModel: ObservableObject {
             let now = SessionArtifacts.currentStatusTimestamp()
             let effectiveTimestamp = max(now, statusEventClock.timestamp(for: sessionId) ?? now)
             statusEventClock.seed(sessionId: sessionId, timestamp: effectiveTimestamp)
+            if Self.advancesPromptSafetyClock(source: source) {
+                promptStatusEventClock.seed(
+                    sessionId: sessionId,
+                    timestamp: effectiveTimestamp
+                )
+            }
             SessionArtifacts.persistStatus(
                 sessionId: sessionId,
                 status: status,
-                timestamp: effectiveTimestamp
+                timestamp: effectiveTimestamp,
+                promptStatusTimestamp: promptStatusEventClock.timestamp(for: sessionId)
+                    ?? effectiveTimestamp
             )
         }
+
         if status == .idle {
             activityTracker.reset(sessionId: sessionId)
             if source == "session-idle" {
@@ -1751,6 +1777,13 @@ final class AppModel: ObservableObject {
                 body: nil
             )
         }
+    }
+
+    /// Scheduled pre/post hooks reaffirm background activity but do not describe
+    /// foreground ownership. Keep them out of the prompt-safety clock so they cannot
+    /// invalidate an already-settled foreground snapshot.
+    nonisolated static func advancesPromptSafetyClock(source: String?) -> Bool {
+        source != "scheduled-active"
     }
 
     private func shouldClearResumeMarkers(
@@ -2125,19 +2158,17 @@ final class AppModel: ObservableObject {
                 } else {
                     activityTracker.resetDisconnectIdle(sessionId: sid)
                 }
-                // Stale "working" recovery: the foreground turn has ended, but live
-                // background subagents keep `session.idle` from firing, so the hook
-                // path below (guarded by `supportsSessionIdleHook`) never demotes the
-                // tab and it reads "working" while the terminal is actually idle and
-                // interactive. Scope this strictly to that shape — a running session
-                // whose FRESH snapshot reports the foreground (and any scheduled) turn
-                // inactive AND still has active subagents — so ordinary sessions keep
-                // falling through to the footer/liveness path below. Demote to idle
+                // Stale "working" recovery: the foreground turn has ended, but
+                // scheduled or subagent work keeps `session.idle` from firing, so the
+                // hook path below (guarded by `supportsSessionIdleHook`) never demotes
+                // the tab and it reads "working" while the terminal is actually idle
+                // and interactive. Scope this strictly to fresh background-only
+                // evidence so ordinary sessions keep falling through. Demote to idle
                 // once the ended-turn condition persists across two scans (a normal
                 // inter-iteration gap flips `foregroundTurnActive` false only briefly:
                 // `turn_end` fires per loop iteration and tool calls run *inside* a
-                // turn, so foreground stays active through them). Leave
-                // `activeSubagents` intact so the background indicator persists.
+                // turn, so foreground stays active through them). Leave scheduled
+                // and subagent state intact so the background indicator persists.
                 // The clock-ordering guard rejects a snapshot that predates the latest
                 // status hook, so a just-submitted prompt (whose running hook advanced
                 // the clock before its own fresh snapshot lands) can't be demoted; and
@@ -2146,20 +2177,20 @@ final class AppModel: ObservableObject {
                 // and not `now` — keeps a subsequent user-prompt hook from being
                 // swallowed. A future-dated transition (system-clock rollback) is
                 // rejected outright so it can't drive a demotion or poison the clock.
+                let backgroundNow = Date()
+                let backgroundNowMs = SessionArtifacts.currentStatusTimestamp()
                 if status == .running,
-                   let snapshot = projects[pi].sessions[si].agentActivity,
-                   snapshot.isFresh(),
-                   snapshot.foregroundTurnActive == false,
-                   snapshot.scheduledTurnActive == false,
-                   !snapshot.activeSubagents.isEmpty,
-                   let snapshotMs = snapshot.foregroundTransitionMilliseconds,
-                   snapshotMs <= SessionArtifacts.currentStatusTimestamp(),
+                   let snapshotMs = Self.backgroundOnlyEvidenceMs(
+                       snapshot: projects[pi].sessions[si].agentActivity,
+                       now: backgroundNow,
+                       nowMs: backgroundNowMs
+                   ),
                    snapshotMs >= (statusEventClock.timestamp(for: sid) ?? snapshotMs) {
                     tracked.insert(sid)
                     if activityTracker.observeForegroundIdle(
                         sessionId: sid,
                         currentStatus: status,
-                        foregroundTurnActive: snapshot.foregroundTurnActive
+                        foregroundTurnActive: false
                     ) {
                         clearStatusToIdle(
                             pi: pi,
@@ -2167,10 +2198,8 @@ final class AppModel: ObservableObject {
                             markFinished: false,
                             effectiveTime: snapshotMs
                         )
-                        // Don't post completion here: background subagents are still
-                        // running. Completion fires later via the agent-stop /
-                        // session-idle signal or `setBackgroundAgentsActive(false)`
-                        // once the background work clears.
+                        // Don't post completion here: background work is still active.
+                        // Its final stop/session-idle signal owns completion.
                     }
                     continue
                 } else {
@@ -2216,10 +2245,12 @@ final class AppModel: ObservableObject {
         let base = min(effectiveTime ?? now, now)
         let timestamp = max(base, statusEventClock.timestamp(for: sid) ?? base)
         statusEventClock.seed(sessionId: sid, timestamp: timestamp)
+        promptStatusEventClock.seed(sessionId: sid, timestamp: timestamp)
         SessionArtifacts.persistStatus(
             sessionId: sid,
             status: .idle,
-            timestamp: timestamp
+            timestamp: timestamp,
+            promptStatusTimestamp: timestamp
         )
     }
 
@@ -2652,17 +2683,24 @@ final class AppModel: ObservableObject {
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
+                let sid = projects[pi].sessions[si].id
                 // Migrate any legacy `file://host/path` cwds (stored before OSC 7 was
                 // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.
                 projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
-                projects[pi].sessions[si].status = restoredStatus(forSession: projects[pi].sessions[si].id)
+                let restored = restoredStatusState(forSession: sid)
+                let status = restored.status
+                let statusTimestamp = restored.statusTimestamp
+                projects[pi].sessions[si].status = status
                 statusEventClock.seed(
-                    sessionId: projects[pi].sessions[si].id,
-                    timestamp: restoredStatusTimestamp(forSession: projects[pi].sessions[si].id)
+                    sessionId: sid,
+                    timestamp: statusTimestamp
+                )
+                promptStatusEventClock.seed(
+                    sessionId: sid,
+                    timestamp: restored.promptStatusTimestamp ?? statusTimestamp
                 )
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false
-                let sid = projects[pi].sessions[si].id
                 let hasBackgroundAgents = FileManager.default.fileExists(
                     atPath: Paths.backgroundAgentsMarkerPath(sessionId: sid)
                 )
@@ -2677,9 +2715,29 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Restore a session's status from its marker file (written by the Copilot
-    /// hook). The liveness reconciler then clears any whose agent is no longer alive.
-    private func restoredStatus(forSession sessionId: String) -> SessionStatus {
+    private func restoredStatusState(
+        forSession sessionId: String
+    ) -> (status: SessionStatus, statusTimestamp: Int64?, promptStatusTimestamp: Int64?) {
+        switch SessionArtifacts.loadStatusRecord(sessionId: sessionId) {
+        case .loaded(let record):
+            return (record.status, record.statusTimestamp, record.promptStatusTimestamp)
+        case .invalid:
+            // A present but unreadable atomic record must never fall back to a possibly
+            // torn set of legacy files. Restore busy and put the prompt clock at app
+            // startup time, so only fresh post-recovery background evidence can bypass it.
+            NSLog("copilot-projects: invalid status record for \(sessionId); restoring busy")
+            return (.running, nil, SessionArtifacts.currentStatusTimestamp())
+        case .missing:
+            return (
+                restoredLegacyStatus(forSession: sessionId),
+                restoredLegacyStatusTimestamp(forSession: sessionId),
+                restoredLegacyPromptStatusTimestamp(forSession: sessionId)
+            )
+        }
+    }
+
+    /// Restore pre-record app versions from their compatibility markers.
+    private func restoredLegacyStatus(forSession sessionId: String) -> SessionStatus {
         let path = Paths.statusMarkerPath(sessionId: sessionId)
         if let raw = try? String(contentsOfFile: path, encoding: .utf8) {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2688,8 +2746,14 @@ final class AppModel: ObservableObject {
         return .idle
     }
 
-    private func restoredStatusTimestamp(forSession sessionId: String) -> Int64? {
+    private func restoredLegacyStatusTimestamp(forSession sessionId: String) -> Int64? {
         let path = Paths.statusTimestampMarkerPath(sessionId: sessionId)
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func restoredLegacyPromptStatusTimestamp(forSession sessionId: String) -> Int64? {
+        let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }

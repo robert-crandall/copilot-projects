@@ -17,9 +17,9 @@ struct ActivityTracker {
     private var foregroundIdleTicks: [String: Int] = [:]
     private var disconnectIdleTicks: [String: Int] = [:]
 
-    /// Demote a running session whose foreground turn has ended but whose live
-    /// background subagents keep `session.idle` from firing — so the hook path
-    /// never demotes it and the tab stays falsely "working". Gated behind two
+    /// Demote a running session whose foreground turn has ended but whose scheduled
+    /// or subagent work keeps `session.idle` from firing — so the hook path never
+    /// demotes it and the tab stays falsely "working". Gated behind two
     /// consecutive scans reporting the foreground turn inactive: `assistant.turn_end`
     /// fires once per agentic-loop iteration, so a normal inter-iteration gap flips
     /// `foregroundTurnActive` false only momentarily and the next `turn_start`
