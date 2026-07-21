@@ -942,12 +942,13 @@ final class AppModel: ObservableObject {
                                 scheduledTurnActive: session.scheduledTurnActive,
                                 hasPendingQuestions: session.hasPendingQuestions,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
-                                runningBackgroundOnly: Self.runningBackgroundOnlyPromptEvidence(
-                                    status: session.status,
+                                backgroundOnly: Self.backgroundOnlyPromptEvidence(
                                     snapshot: session.agentActivity,
                                     now: promptNow,
                                     nowMs: promptNowMs,
-                                    clockMs: statusEventClock.timestamp(for: session.id)
+                                    clockMs: session.status == .idle
+                                        ? nil
+                                        : statusEventClock.timestamp(for: session.id)
                                 ),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1054,12 +1055,13 @@ final class AppModel: ObservableObject {
             scheduledTurnActive: session.scheduledTurnActive,
             hasPendingQuestions: session.hasPendingQuestions,
             hasLiveAgent: liveSessions.contains(sessionId),
-            runningBackgroundOnly: Self.runningBackgroundOnlyPromptEvidence(
-                status: session.status,
+            backgroundOnly: Self.backgroundOnlyPromptEvidence(
                 snapshot: session.agentActivity,
                 now: promptNow,
                 nowMs: promptNowMs,
-                clockMs: statusEventClock.timestamp(for: sessionId)
+                clockMs: session.status == .idle
+                    ? nil
+                    : statusEventClock.timestamp(for: sessionId)
             ),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1074,67 +1076,78 @@ final class AppModel: ObservableObject {
 
     /// Whether a remote message may be sent to a session right now. Readiness of the
     /// *foreground* is the gate — primarily the terminal footer, NOT whether the
-    /// session is globally `.running`. Background subagents keep `status` at
-    /// `.running` while the foreground has returned to an idle prompt, so gating on
-    /// `.running` stranded the composer's queued messages while a background agent
-    /// ran; `.running` is deliberately allowed through here.
+    /// session is globally `.running`. Scheduled work and subagents can keep the
+    /// session globally active after the foreground has returned to an idle prompt,
+    /// so gating on that background state stranded the composer's queued messages.
     ///
     /// `status == .waiting` is still blocked: it marks a foreground question the user
     /// must answer inline — an `ask_user`/`elicitation` dialog OR a raw tool
     /// permission prompt. Permission prompts surface *only* via the CLI status hook
     /// (they populate no structured-question entry, so `hasPendingQuestions` is
     /// `false` for them) and the footer can read `.idle` behind the dialog, so the
-    /// `.waiting` check is the one signal that reliably guards them. A scheduled turn
-    /// (foreground-occupying) and `hasPendingQuestions` (the extension's authoritative
-    /// signal for structured questions) are additional, independent blocks.
+    /// `.waiting` check is the one signal that reliably guards them.
+    /// `hasPendingQuestions` is the extension's authoritative signal for structured
+    /// questions. Scheduled work is allowed only with fresh, clock-ordered evidence
+    /// that the interactive foreground is inactive.
     /// `sendRemotePrompt` re-checks the footer immediately before the actual send.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
         scheduledTurnActive: Bool = false,
         hasPendingQuestions: Bool = false,
         hasLiveAgent: Bool,
-        runningBackgroundOnly: Bool = false,
+        backgroundOnly: Bool = false,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
         guard hasLiveAgent else { return .noLiveCopilot }
-        // Never inject a free-form message over a foreground user prompt: a scheduled
-        // turn occupies the foreground; a structured ask_user/elicitation must be
-        // answered via its card; and `status == .waiting` covers raw permission
+        // Never inject a free-form message over a foreground user prompt: a structured
+        // ask_user/elicitation must be answered via its card; and `status == .waiting`
+        // covers raw permission
         // prompts that no structured-question signal sees — even when the footer
         // momentarily reads idle behind the dialog.
-        guard !scheduledTurnActive, !hasPendingQuestions, status != .waiting else {
+        guard !hasPendingQuestions, status != .waiting else {
             return .busy
         }
-        guard status != .running || runningBackgroundOnly else { return .busy }
+        guard !scheduledTurnActive || backgroundOnly else { return .busy }
+        guard status != .running || backgroundOnly else { return .busy }
         // For the remaining states the terminal footer is the authoritative "Copilot
-        // is at a prompt" signal. Background subagents can keep `status` at
-        // `.running`, but bypassing that state requires a fresh, clock-ordered
-        // heartbeat proving the foreground turn is inactive while subagents remain.
+        // is at a prompt" signal. Bypassing scheduled/running state requires a fresh,
+        // clock-ordered heartbeat proving the foreground is inactive while background
+        // work remains.
         // `sendRemotePrompt` re-checks this footer immediately before sending.
         guard footerActivity == .idle else { return .busy }
         return .sent
     }
 
-    /// Evidence that a `.running` session is only busy because background subagents
-    /// remain active after the foreground turn ended. This mirrors the causal guards
-    /// in `reconcileAgentFooters`: stale footer text alone is never enough to inject
-    /// a remote prompt over a possibly-active foreground turn.
-    nonisolated static func runningBackgroundOnlyPromptEvidence(
-        status: SessionStatus,
+    /// Evidence that a session is only busy because scheduled or subagent work
+    /// remains after the interactive foreground ended. This mirrors the causal
+    /// guards in `reconcileAgentFooters`: stale footer text alone is never enough
+    /// to inject a remote prompt over a possibly-active foreground turn.
+    nonisolated static func backgroundOnlyEvidenceMs(
+        snapshot: AgentActivitySnapshot?,
+        now: Date,
+        nowMs: Int64
+    ) -> Int64? {
+        guard let snapshot,
+              snapshot.isFresh(at: now),
+              snapshot.foregroundTurnActive == false,
+              snapshot.scheduledTurnActive || !snapshot.activeSubagents.isEmpty,
+              let snapshotMs = snapshot.foregroundTransitionMilliseconds,
+              snapshotMs <= nowMs else { return nil }
+        return snapshotMs
+    }
+
+    nonisolated static func backgroundOnlyPromptEvidence(
         snapshot: AgentActivitySnapshot?,
         now: Date,
         nowMs: Int64,
         clockMs: Int64?
     ) -> Bool {
-        guard status == .running,
-              let snapshot,
-              snapshot.isFresh(at: now),
-              snapshot.foregroundTurnActive == false,
-              snapshot.scheduledTurnActive == false,
-              !snapshot.activeSubagents.isEmpty,
-              !snapshot.reportsTerminalDisconnect,
-              let snapshotMs = snapshot.foregroundTransitionMilliseconds,
-              snapshotMs <= nowMs else { return false }
+        guard snapshot?.reportsTerminalDisconnect != true else { return false }
+        guard let snapshotMs = backgroundOnlyEvidenceMs(
+            snapshot: snapshot,
+            now: now,
+            nowMs: nowMs
+        ) else { return false }
         if let clockMs {
             return snapshotMs > clockMs
         }
@@ -2071,19 +2084,17 @@ final class AppModel: ObservableObject {
                 } else {
                     activityTracker.resetDisconnectIdle(sessionId: sid)
                 }
-                // Stale "working" recovery: the foreground turn has ended, but live
-                // background subagents keep `session.idle` from firing, so the hook
-                // path below (guarded by `supportsSessionIdleHook`) never demotes the
-                // tab and it reads "working" while the terminal is actually idle and
-                // interactive. Scope this strictly to that shape — a running session
-                // whose FRESH snapshot reports the foreground (and any scheduled) turn
-                // inactive AND still has active subagents — so ordinary sessions keep
-                // falling through to the footer/liveness path below. Demote to idle
+                // Stale "working" recovery: the foreground turn has ended, but
+                // scheduled or subagent work keeps `session.idle` from firing, so the
+                // hook path below (guarded by `supportsSessionIdleHook`) never demotes
+                // the tab and it reads "working" while the terminal is actually idle
+                // and interactive. Scope this strictly to fresh background-only
+                // evidence so ordinary sessions keep falling through. Demote to idle
                 // once the ended-turn condition persists across two scans (a normal
                 // inter-iteration gap flips `foregroundTurnActive` false only briefly:
                 // `turn_end` fires per loop iteration and tool calls run *inside* a
-                // turn, so foreground stays active through them). Leave
-                // `activeSubagents` intact so the background indicator persists.
+                // turn, so foreground stays active through them). Leave scheduled
+                // and subagent state intact so the background indicator persists.
                 // The clock-ordering guard rejects a snapshot that predates the latest
                 // status hook, so a just-submitted prompt (whose running hook advanced
                 // the clock before its own fresh snapshot lands) can't be demoted; and
@@ -2092,20 +2103,20 @@ final class AppModel: ObservableObject {
                 // and not `now` — keeps a subsequent user-prompt hook from being
                 // swallowed. A future-dated transition (system-clock rollback) is
                 // rejected outright so it can't drive a demotion or poison the clock.
+                let backgroundNow = Date()
+                let backgroundNowMs = SessionArtifacts.currentStatusTimestamp()
                 if status == .running,
-                   let snapshot = projects[pi].sessions[si].agentActivity,
-                   snapshot.isFresh(),
-                   snapshot.foregroundTurnActive == false,
-                   snapshot.scheduledTurnActive == false,
-                   !snapshot.activeSubagents.isEmpty,
-                   let snapshotMs = snapshot.foregroundTransitionMilliseconds,
-                   snapshotMs <= SessionArtifacts.currentStatusTimestamp(),
+                   let snapshotMs = Self.backgroundOnlyEvidenceMs(
+                       snapshot: projects[pi].sessions[si].agentActivity,
+                       now: backgroundNow,
+                       nowMs: backgroundNowMs
+                   ),
                    snapshotMs >= (statusEventClock.timestamp(for: sid) ?? snapshotMs) {
                     tracked.insert(sid)
                     if activityTracker.observeForegroundIdle(
                         sessionId: sid,
                         currentStatus: status,
-                        foregroundTurnActive: snapshot.foregroundTurnActive
+                        foregroundTurnActive: false
                     ) {
                         clearStatusToIdle(
                             pi: pi,
@@ -2113,10 +2124,8 @@ final class AppModel: ObservableObject {
                             markFinished: false,
                             effectiveTime: snapshotMs
                         )
-                        // Don't post completion here: background subagents are still
-                        // running. Completion fires later via the agent-stop /
-                        // session-idle signal or `setBackgroundAgentsActive(false)`
-                        // once the background work clears.
+                        // Don't post completion here: background work is still active.
+                        // Its final stop/session-idle signal owns completion.
                     }
                     continue
                 } else {

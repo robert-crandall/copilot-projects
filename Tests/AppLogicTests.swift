@@ -149,7 +149,7 @@ final class AppLogicTests: XCTestCase {
             AppModel.remotePromptEligibility(
                 status: .running,
                 hasLiveAgent: true,
-                runningBackgroundOnly: true,
+                backgroundOnly: true,
                 footerActivity: .idle
             ),
             .sent
@@ -163,7 +163,7 @@ final class AppLogicTests: XCTestCase {
             ),
             .busy
         )
-        // A scheduled turn occupies the foreground → block.
+        // Scheduled state alone is not enough to bypass foreground gating.
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .running,
@@ -172,6 +172,18 @@ final class AppLogicTests: XCTestCase {
                 footerActivity: .idle
             ),
             .busy
+        )
+        // Fresh background-only evidence allows a separate foreground prompt while
+        // scheduled work continues behind it.
+        XCTAssertEqual(
+            AppModel.remotePromptEligibility(
+                status: .running,
+                scheduledTurnActive: true,
+                hasLiveAgent: true,
+                backgroundOnly: true,
+                footerActivity: .idle
+            ),
+            .sent
         )
         // A pending structured ask_user/elicitation → block (answer via its card).
         XCTAssertEqual(
@@ -225,7 +237,7 @@ final class AppLogicTests: XCTestCase {
         )
     }
 
-    func testRunningBackgroundOnlyPromptEvidenceRequiresOrderedSubagentSnapshot() throws {
+    func testBackgroundOnlyPromptEvidenceRequiresOrderedSnapshot() throws {
         let formatter = ISO8601DateFormatter()
         let now = Date()
         let transition = now.addingTimeInterval(-1)
@@ -252,22 +264,19 @@ final class AppLogicTests: XCTestCase {
         let nowMs = Int64(now.timeIntervalSince1970 * 1_000)
         let transitionMs = try XCTUnwrap(snapshot.foregroundTransitionMilliseconds)
 
-        XCTAssertTrue(AppModel.runningBackgroundOnlyPromptEvidence(
-            status: .running,
+        XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs - 1
         ))
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
-            status: .running,
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs
         ))
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
-            status: .running,
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
@@ -276,8 +285,7 @@ final class AppLogicTests: XCTestCase {
 
         var activeForeground = snapshot
         activeForeground.foregroundTurnActive = true
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
-            status: .running,
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             snapshot: activeForeground,
             now: now,
             nowMs: nowMs,
@@ -286,9 +294,40 @@ final class AppLogicTests: XCTestCase {
 
         var noSubagents = snapshot
         noSubagents.activeSubagents = []
-        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
-            status: .running,
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             snapshot: noSubagents,
+            now: now,
+            nowMs: nowMs,
+            clockMs: nil
+        ))
+
+        var scheduled = noSubagents
+        scheduled.scheduledTurnActive = true
+        XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            snapshot: scheduled,
+            now: now,
+            nowMs: nowMs,
+            clockMs: transitionMs - 1
+        ))
+        XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            snapshot: scheduled,
+            now: now,
+            nowMs: nowMs,
+            clockMs: nil
+        ))
+
+        var disconnected = snapshot
+        disconnected.error = "Connection is closed."
+        XCTAssertEqual(
+            AppModel.backgroundOnlyEvidenceMs(
+                snapshot: disconnected,
+                now: now,
+                nowMs: nowMs
+            ),
+            transitionMs
+        )
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            snapshot: disconnected,
             now: now,
             nowMs: nowMs,
             clockMs: nil
@@ -462,23 +501,47 @@ final class AppLogicTests: XCTestCase {
             source: "permission-resolved"
         )
 
+        let scheduledTransition = Date()
+        let scheduledTransitionMs = Int64(
+            scheduledTransition.timeIntervalSince1970 * 1_000
+        )
         model.setStatus(
             sessionId: session.id,
             status: .idle,
             text: nil,
-            timestamp: 3,
+            timestamp: scheduledTransitionMs,
             source: "scheduled-start"
         )
+        let scheduledSnapshot = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: ISO8601DateFormatter().string(from: scheduledTransition),
+            foregroundTurnActive: false,
+            foregroundTransitionAt: ISO8601DateFormatter().string(from: scheduledTransition),
+            scheduledTurnActive: true,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        try JSONEncoder().encode(scheduledSnapshot).write(
+            to: root.appendingPathComponent("\(session.id).agent-activity.json")
+        )
+        model.refreshAgentActivitySnapshots()
         XCTAssertEqual(
             model.sendRemotePrompt(sessionId: session.id, value: "scheduled"),
-            .busy
+            .sent
         )
-        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "running-background"])
+        XCTAssertEqual(
+            sentValues,
+            ["hello", "background", "subagent", "running-background", "scheduled"]
+        )
         model.setStatus(
             sessionId: session.id,
             status: .idle,
             text: nil,
-            timestamp: 4,
+            timestamp: scheduledTransitionMs + 1,
             source: "scheduled-idle"
         )
 
@@ -487,7 +550,10 @@ final class AppLogicTests: XCTestCase {
             model.sendRemotePrompt(sessionId: session.id, value: "no process"),
             .noLiveCopilot
         )
-        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "running-background"])
+        XCTAssertEqual(
+            sentValues,
+            ["hello", "background", "subagent", "running-background", "scheduled"]
+        )
         liveSessions = [session.id]
 
         // Footer not idle → busy (queue + retry), never injected mid-work.
@@ -496,7 +562,10 @@ final class AppLogicTests: XCTestCase {
             model.sendRemotePrompt(sessionId: session.id, value: "working"),
             .busy
         )
-        XCTAssertEqual(sentValues, ["hello", "background", "subagent", "running-background"])
+        XCTAssertEqual(
+            sentValues,
+            ["hello", "background", "subagent", "running-background", "scheduled"]
+        )
         activity = .idle
 
         sendSucceeds = false
@@ -506,7 +575,7 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             sentValues,
-            ["hello", "background", "subagent", "running-background", "not sent"]
+            ["hello", "background", "subagent", "running-background", "scheduled", "not sent"]
         )
     }
 
