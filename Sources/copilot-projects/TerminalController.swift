@@ -231,7 +231,10 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     }
 
     nonisolated static func resumeCommand(sessionId: String, allowAll: Bool) -> String {
-        "copilot \(allowAll ? "--allow-all " : "")--resume=\(sessionId)"
+        // Pass both flags because the CLI can otherwise inherit persisted remote
+        // steering on resume even when event export was explicitly disabled.
+        "copilot --no-remote --no-remote-export "
+            + "\(allowAll ? "--allow-all " : "")--resume=\(sessionId)"
     }
 
     /// Copilot loader/supervisor env vars that leak in when this app was itself
@@ -294,7 +297,8 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         shell: String,
         allowAll: Bool = false
     ) -> String {
-        "\(shellSingleQuote(executable))\(allowAll ? " --allow-all" : "")"
+        "\(shellSingleQuote(executable)) --no-remote --no-remote-export"
+            + "\(allowAll ? " --allow-all" : "")"
             + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
             + " exec \(shellSingleQuote(shell)) -l"
     }
