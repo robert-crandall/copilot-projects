@@ -862,6 +862,19 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-start"))
         XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-idle"))
         XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: nil))
+
+        XCTAssertFalse(AppModel.shouldRestorePromptSafetyClock(
+            status: .idle,
+            scheduledMarkerPresent: true
+        ))
+        XCTAssertTrue(AppModel.shouldRestorePromptSafetyClock(
+            status: .idle,
+            scheduledMarkerPresent: false
+        ))
+        XCTAssertTrue(AppModel.shouldRestorePromptSafetyClock(
+            status: .running,
+            scheduledMarkerPresent: true
+        ))
     }
 
     @MainActor

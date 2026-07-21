@@ -1773,6 +1773,13 @@ final class AppModel: ObservableObject {
         source != "scheduled-active"
     }
 
+    nonisolated static func shouldRestorePromptSafetyClock(
+        status: SessionStatus,
+        scheduledMarkerPresent: Bool
+    ) -> Bool {
+        status != .idle || !scheduledMarkerPresent
+    }
+
     private func shouldClearResumeMarkers(
         sessionId: String,
         copilotSessionId: String?
@@ -2626,21 +2633,31 @@ final class AppModel: ObservableObject {
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
+                let sid = projects[pi].sessions[si].id
                 // Migrate any legacy `file://host/path` cwds (stored before OSC 7 was
                 // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.
                 projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
-                projects[pi].sessions[si].status = restoredStatus(forSession: projects[pi].sessions[si].id)
+                let status = restoredStatus(forSession: sid)
+                let statusTimestamp = restoredStatusTimestamp(forSession: sid)
+                projects[pi].sessions[si].status = status
                 statusEventClock.seed(
-                    sessionId: projects[pi].sessions[si].id,
-                    timestamp: restoredStatusTimestamp(forSession: projects[pi].sessions[si].id)
+                    sessionId: sid,
+                    timestamp: statusTimestamp
                 )
-                promptStatusEventClock.seed(
-                    sessionId: projects[pi].sessions[si].id,
-                    timestamp: restoredStatusTimestamp(forSession: projects[pi].sessions[si].id)
+                let scheduledMarkerPresent = FileManager.default.fileExists(
+                    atPath: Paths.scheduledTurnMarkerPath(sessionId: sid)
                 )
+                if Self.shouldRestorePromptSafetyClock(
+                    status: status,
+                    scheduledMarkerPresent: scheduledMarkerPresent
+                ) {
+                    promptStatusEventClock.seed(
+                        sessionId: sid,
+                        timestamp: statusTimestamp
+                    )
+                }
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false
-                let sid = projects[pi].sessions[si].id
                 let hasBackgroundAgents = FileManager.default.fileExists(
                     atPath: Paths.backgroundAgentsMarkerPath(sessionId: sid)
                 )
