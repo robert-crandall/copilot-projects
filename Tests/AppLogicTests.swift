@@ -2304,6 +2304,197 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testAgentActivityRefreshReappliesTTLOnUnchangedFile() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let activityDirectory = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: activityDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let targetSession = Session(title: "target", cwd: "/tmp")
+        defer { SessionArtifacts.removeFiles(sessionId: targetSession.id) }
+        let targetProject = Project(name: "target", cwd: "/tmp", sessions: [targetSession])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [targetProject], selectedProjectId: targetProject.id
+        ))
+
+        let base = Date()
+        let snapshot = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: ISO8601DateFormatter().string(from: base),
+            foregroundTurnActive: true,
+            scheduledTurnActive: false,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+        let path = activityDirectory
+            .appendingPathComponent("\(targetSession.id).agent-activity.json")
+        try JSONEncoder().encode(snapshot).write(to: path)
+
+        let model = AppModel(
+            stateRepository: repository, agentActivityDirectory: activityDirectory
+        )
+        model.refreshAgentActivitySnapshots(now: base)
+        XCTAssertNotNil(model.projects[0].sessions[0].agentActivity)
+
+        // The file never changes, so the second scan takes the mtime-gated cache
+        // path (no re-read). Freshness must still be re-applied against the newer
+        // `now`, so a snapshot past its 15s TTL is cleared without any file write —
+        // the correctness trap of skipping reads.
+        model.refreshAgentActivitySnapshots(now: base.addingTimeInterval(20))
+        XCTAssertNil(model.projects[0].sessions[0].agentActivity)
+    }
+
+    @MainActor
+    func testAgentActivityRefreshSkipsRereadWhenFileSignatureUnchanged() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let activityDirectory = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: activityDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let targetSession = Session(title: "target", cwd: "/tmp")
+        defer { SessionArtifacts.removeFiles(sessionId: targetSession.id) }
+        let targetProject = Project(name: "target", cwd: "/tmp", sessions: [targetSession])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [targetProject], selectedProjectId: targetProject.id
+        ))
+
+        let updatedAt = ISO8601DateFormatter().string(from: Date())
+        func snapshot(idleGeneration: Int) -> AgentActivitySnapshot {
+            AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: updatedAt,
+                foregroundTurnActive: true,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: idleGeneration,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil
+            )
+        }
+        let path = activityDirectory
+            .appendingPathComponent("\(targetSession.id).agent-activity.json")
+        let dataA = try JSONEncoder().encode(snapshot(idleGeneration: 0))
+        let dataB = try JSONEncoder().encode(snapshot(idleGeneration: 9))
+        // A single-digit change keeps the byte length identical, so an in-place
+        // overwrite leaves size unchanged; a FileHandle write keeps the inode; and
+        // pinning both writes to the SAME fixed mtime keeps the modification date
+        // bit-identical (a natural write's mtime can't be restored exactly). Together
+        // the (size, mtime, inode) signature is unchanged — the case the gate skips.
+        XCTAssertEqual(dataA.count, dataB.count)
+        let pinnedMtime = Date(timeIntervalSince1970: 1_600_000_000)
+        try dataA.write(to: path)
+        try FileManager.default.setAttributes(
+            [.modificationDate: pinnedMtime], ofItemAtPath: path.path
+        )
+
+        let model = AppModel(
+            stateRepository: repository, agentActivityDirectory: activityDirectory
+        )
+        model.refreshAgentActivitySnapshots()
+        XCTAssertEqual(model.projects[0].sessions[0].agentActivity?.idleGeneration, 0)
+
+        // Overwrite the bytes in place via a FileHandle (keeps the same inode, unlike
+        // Data.write which can allocate a new one), then re-pin the identical mtime so
+        // the (size, mtime, inode) signature matches the cached one exactly.
+        let handle = try FileHandle(forWritingTo: path)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: dataB)
+        try handle.close()
+        try FileManager.default.setAttributes(
+            [.modificationDate: pinnedMtime], ofItemAtPath: path.path
+        )
+
+        // Signature unchanged → the gate returns the cached snapshot and never reads
+        // the new bytes, so idleGeneration stays 0 (it would be 9 on a re-read).
+        model.refreshAgentActivitySnapshots()
+        XCTAssertEqual(model.projects[0].sessions[0].agentActivity?.idleGeneration, 0)
+    }
+
+    @MainActor
+    func testAgentActivityRefreshFailsClosedAndRetriesAfterReadFailure() throws {
+        // A 0o000 file denies reads only to non-root users; root bypasses it (the read
+        // would succeed and the branch wouldn't be exercised).
+        try XCTSkipIf(getuid() == 0, "root bypasses 0o000 permissions")
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let activityDirectory = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: activityDirectory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let targetSession = Session(title: "target", cwd: "/tmp")
+        defer { SessionArtifacts.removeFiles(sessionId: targetSession.id) }
+        let targetProject = Project(name: "target", cwd: "/tmp", sessions: [targetSession])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(
+            projects: [targetProject], selectedProjectId: targetProject.id
+        ))
+
+        let updatedAt = ISO8601DateFormatter().string(from: Date())
+        func snapshot(idleGeneration: Int) -> AgentActivitySnapshot {
+            AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: updatedAt,
+                foregroundTurnActive: true,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: idleGeneration,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil
+            )
+        }
+        let path = activityDirectory
+            .appendingPathComponent("\(targetSession.id).agent-activity.json")
+        try JSONEncoder().encode(snapshot(idleGeneration: 0)).write(to: path)
+
+        let model = AppModel(
+            stateRepository: repository, agentActivityDirectory: activityDirectory
+        )
+        model.refreshAgentActivitySnapshots()
+        XCTAssertEqual(model.projects[0].sessions[0].agentActivity?.idleGeneration, 0)
+
+        // Rewrite the file (new signature → forces a read attempt) then make it
+        // unreadable. The gate must FAIL CLOSED (nil), never serve the stale
+        // last-known snapshot to promptability decisions, and must not cache a nil
+        // against the signature.
+        try JSONEncoder().encode(snapshot(idleGeneration: 9)).write(to: path)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000], ofItemAtPath: path.path
+        )
+        model.refreshAgentActivitySnapshots()
+        XCTAssertNil(model.projects[0].sessions[0].agentActivity)
+
+        // Restore readability. chmod leaves size/mtime/inode unchanged, so the
+        // signature is identical to the failed read's — a poisoned cache would return
+        // the stuck nil; the fix re-reads and picks up the new content.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644], ofItemAtPath: path.path
+        )
+        model.refreshAgentActivitySnapshots()
+        XCTAssertEqual(model.projects[0].sessions[0].agentActivity?.idleGeneration, 9)
+    }
+
+    @MainActor
     func testAgentActivityWatcherThrottleCoalescesTrailingAndSustainedScans() throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory
