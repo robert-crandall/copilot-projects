@@ -151,6 +151,21 @@ cat > "$NOTES_FILE" <<NOTES
 Requires macOS 26+ on Apple Silicon.
 NOTES
 
+delete_owned_tag() {
+  local ref="refs/tags/$TAG"
+  if git \
+    -c credential.helper= \
+    -c 'credential.helper=!gh auth git-credential' \
+    push --porcelain \
+    --force-with-lease="$ref:$SHA" \
+    origin ":$ref" >/dev/null; then
+    TAG_CREATED=0
+    return 0
+  fi
+  echo "warning: preserving $TAG because the remote ref is absent or no longer owned by $SHA" >&2
+  return 1
+}
+
 cleanup_partial_release() {
   local release_state releases match is_draft
   if [ "$RELEASE_CREATED" = "1" ]; then
@@ -160,8 +175,7 @@ cleanup_partial_release() {
     )" || return
     if [ "$(jq -r '.draft' <<< "$release_state")" = "true" ]; then
       if gh api -X DELETE "repos/$REPO/releases/$RELEASE_ID" >/dev/null 2>&1; then
-        gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" >/dev/null 2>&1 || true
-        TAG_CREATED=0
+        delete_owned_tag || true
         RELEASE_CREATED=0
       fi
     fi
@@ -180,14 +194,12 @@ cleanup_partial_release() {
       <<< "$releases"
   )"
   if [ -z "$match" ]; then
-    gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" >/dev/null 2>&1 || true
-    TAG_CREATED=0
+    delete_owned_tag || true
     return
   fi
   is_draft="$(jq -r '.draft' <<< "$match")"
   if [ "$is_draft" = "true" ]; then
-    gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" >/dev/null 2>&1 || true
-    TAG_CREATED=0
+    delete_owned_tag || true
   fi
 }
 
