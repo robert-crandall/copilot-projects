@@ -88,10 +88,12 @@ DMG="$ROOT/dist/Copilot-Projects-$VERSION.dmg"
 STAGING="$(mktemp -d)"
 NOTES_FILE=""
 APP_ZIP=""
+TAG_CREATED=0
 RELEASE_CREATED=0
+RELEASE_ID=""
 cleanup() {
   status=$?
-  if [ "$status" -ne 0 ] && [ "$RELEASE_CREATED" = "1" ]; then
+  if [ "$status" -ne 0 ] && [ "$TAG_CREATED" = "1" ]; then
     cleanup_partial_release
   fi
   rm -rf "$STAGING"
@@ -149,7 +151,169 @@ cat > "$NOTES_FILE" <<NOTES
 Requires macOS 26+ on Apple Silicon.
 NOTES
 
-if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+delete_owned_tag() {
+  local ref="refs/tags/$TAG"
+  if git \
+    -c credential.helper= \
+    -c 'credential.helper=!gh auth git-credential' \
+    push --porcelain \
+    --force-with-lease="$ref:$SHA" \
+    origin ":$ref" >/dev/null; then
+    TAG_CREATED=0
+    return 0
+  fi
+  echo "warning: preserving $TAG because the remote ref is absent or no longer owned by $SHA" >&2
+  return 1
+}
+
+cleanup_partial_release() {
+  local release_state releases match is_draft
+  if [ "$RELEASE_CREATED" = "1" ]; then
+    [ -n "$RELEASE_ID" ] || return
+    release_state="$(
+      gh api "repos/$REPO/releases/$RELEASE_ID"
+    )" || return
+    if [ "$(jq -r '.draft' <<< "$release_state")" = "true" ]; then
+      if gh api -X DELETE "repos/$REPO/releases/$RELEASE_ID" >/dev/null 2>&1; then
+        delete_owned_tag || true
+        RELEASE_CREATED=0
+      fi
+    fi
+    return
+  fi
+
+  # This run owns only the tag. Never delete a release that another publisher
+  # may have created for the same name; delete the tag only when no published
+  # release currently owns it.
+  releases="$(
+    gh api --paginate --slurp "repos/$REPO/releases?per_page=100"
+  )" || return
+  match="$(
+    jq -c --arg tag "$TAG" \
+      '[.[][] | select(.tag_name == $tag)][0] // empty' \
+      <<< "$releases"
+  )"
+  if [ -z "$match" ]; then
+    delete_owned_tag || true
+    return
+  fi
+  is_draft="$(jq -r '.draft' <<< "$match")"
+  if [ "$is_draft" = "true" ]; then
+    delete_owned_tag || true
+  fi
+}
+
+latest_semver_tag() {
+  local refs version
+  refs="$(git ls-remote --tags --refs origin 'v*')" || return 1
+  version="$(
+    awk '{
+        sub("^refs/tags/v", "", $2)
+        if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) print $2
+      }' <<< "$refs" \
+      | sort -t. -k1,1nr -k2,2nr -k3,3nr \
+      | head -1 || true
+  )"
+  [ -z "$version" ] || printf 'v%s\n' "$version"
+}
+
+remote_tag_commit() {
+  local refs direct peeled
+  refs="$(
+    git ls-remote --tags origin \
+      "refs/tags/$1" \
+      "refs/tags/$1^{}"
+  )" || return 1
+  direct="$(awk '$2 !~ /\^\{\}$/ { print $1; exit }' <<< "$refs")"
+  peeled="$(awk '$2 ~ /\^\{\}$/ { print $1; exit }' <<< "$refs")"
+  printf '%s\n' "${peeled:-$direct}"
+}
+
+release_is_complete() {
+  local release expected_asset
+  expected_asset="Copilot-Projects-${1#v}.dmg"
+  release="$(
+    gh release view "$1" \
+      --repo "$REPO" \
+      --json assets,isDraft,publishedAt
+  )" || return 1
+  jq -e --arg asset "$expected_asset" \
+    '.isDraft == false
+     and .publishedAt != null
+     and any(.assets[]; .name == $asset and .size > 0)' \
+    <<< "$release" >/dev/null
+}
+
+verify_expected_predecessor() {
+  if [ -n "${EXPECTED_PREVIOUS_TAG:-}" ]; then
+    local latest_tag latest_sha expected_sha
+    latest_tag="$(latest_semver_tag)" || {
+      echo "error: could not list remote release tags" >&2
+      return 1
+    }
+    latest_sha="$(remote_tag_commit "$latest_tag")" || return 1
+    git fetch origin "refs/tags/$latest_tag" --quiet || {
+      echo "error: could not fetch latest release tag $latest_tag" >&2
+      return 1
+    }
+    git merge-base --is-ancestor "$latest_sha" origin/main || {
+      echo "error: latest release $latest_tag is not on origin/main" >&2
+      return 1
+    }
+    expected_sha="${EXPECTED_PREVIOUS_SHA:-}"
+    if [ "$latest_tag" = "$EXPECTED_PREVIOUS_TAG" ]; then
+      [ -n "$expected_sha" ] && [ "$latest_sha" = "$expected_sha" ] || {
+        echo "error: predecessor $EXPECTED_PREVIOUS_TAG moved from ${expected_sha:-unknown} to $latest_sha" >&2
+        return 1
+      }
+      release_is_complete "$latest_tag" || {
+        echo "error: predecessor release $latest_tag is no longer complete" >&2
+        return 1
+      }
+      return 0
+    fi
+    if git merge-base --is-ancestor "$SHA" "$latest_sha" \
+      && release_is_complete "$latest_tag"; then
+      echo "==> superseded by complete descendant release $latest_tag"
+      return 2
+    fi
+    echo "error: latest release changed from $EXPECTED_PREVIOUS_TAG to ${latest_tag:-none}" >&2
+    return 1
+  fi
+  return 0
+}
+# Revalidate immediately before publishing so a queued/manual run cannot release
+# a commit that was force-pushed off main while tests, signing, or notarization ran.
+git fetch origin main --quiet
+git merge-base --is-ancestor "$SHA" origin/main || {
+  echo "error: refusing to publish $SHA because it is no longer on origin/main" >&2
+  exit 1
+}
+if verify_expected_predecessor; then
+  :
+else
+  predecessor_status=$?
+  [ "$predecessor_status" -eq 2 ] && exit 0
+  exit "$predecessor_status"
+fi
+if ! existing_release="$(
+  gh release view "$TAG" \
+    --repo "$REPO" \
+    --json databaseId,isDraft
+)"; then
+  releases="$(
+    gh api --paginate --slurp "repos/$REPO/releases?per_page=100"
+  )" || {
+    echo "error: could not verify whether release $TAG already exists" >&2
+    exit 1
+  }
+  existing_release="$(
+    jq -c --arg tag "$TAG" \
+      '[.[][] | select(.tag_name == $tag)][0] // empty' \
+      <<< "$releases"
+  )"
+fi
+if [ -n "$existing_release" ]; then
   echo "error: release $TAG already exists" >&2
   exit 1
 fi
@@ -157,21 +321,33 @@ if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
   echo "error: tag $TAG already exists in $REPO" >&2
   exit 1
 fi
-
-cleanup_partial_release() {
-  if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
-    gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
-  fi
-}
+gh api -X POST "repos/$REPO/git/refs" \
+  -f ref="refs/tags/$TAG" \
+  -f sha="$SHA" >/dev/null
+TAG_CREATED=1
+release_response="$(
+  gh api -X POST "repos/$REPO/releases" \
+    -f tag_name="$TAG" \
+    -f target_commitish="$SHA" \
+    -f name="Copilot Projects $VERSION" \
+    -f body="$(cat "$NOTES_FILE")" \
+    -F draft=true
+)"
+RELEASE_ID="$(jq -er '.id | tostring' <<< "$release_response")"
+UPLOAD_URL="$(jq -er '.upload_url | sub("\\{.*$"; "")' <<< "$release_response")"
 RELEASE_CREATED=1
-gh release create "$TAG" \
-  --repo "$REPO" \
-  --target "$SHA" \
-  --title "Copilot Projects $VERSION" \
-  --notes-file "$NOTES_FILE" \
-  --draft
-gh release upload "$TAG" "$DMG" --repo "$REPO"
-gh release edit "$TAG" --repo "$REPO" --draft=false
+API_TOKEN="${GH_TOKEN:-$(gh auth token)}"
+curl --fail-with-body --location \
+  -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  -H "Content-Type: application/x-apple-diskimage" \
+  --data-binary "@$DMG" \
+  "$UPLOAD_URL?name=$(basename "$DMG")" >/dev/null
+gh api -X PATCH "repos/$REPO/releases/$RELEASE_ID" -F draft=false >/dev/null
+TAG_CREATED=0
 RELEASE_CREATED=0
+RELEASE_ID=""
 
 echo "==> done: https://github.com/$REPO/releases/tag/$TAG"
