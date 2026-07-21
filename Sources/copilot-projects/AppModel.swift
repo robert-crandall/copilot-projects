@@ -1650,6 +1650,12 @@ final class AppModel: ObservableObject {
         guard statusEventClock.shouldApply(sessionId: sessionId, timestamp: timestamp) else { return }
         if Self.advancesPromptSafetyClock(source: source) {
             promptStatusEventClock.seed(sessionId: sessionId, timestamp: timestamp)
+            if let timestamp {
+                SessionArtifacts.persistPromptStatusTimestamp(
+                    sessionId: sessionId,
+                    timestamp: timestamp
+                )
+            }
         }
         // sessionEnd is also emitted during graceful macOS shutdown. Only a live,
         // non-terminating app can treat it as an explicit user exit.
@@ -1722,6 +1728,10 @@ final class AppModel: ObservableObject {
                     sessionId: sessionId,
                     timestamp: effectiveTimestamp
                 )
+                SessionArtifacts.persistPromptStatusTimestamp(
+                    sessionId: sessionId,
+                    timestamp: effectiveTimestamp
+                )
             }
             SessionArtifacts.persistStatus(
                 sessionId: sessionId,
@@ -1771,13 +1781,6 @@ final class AppModel: ObservableObject {
     /// invalidate an already-settled foreground snapshot.
     nonisolated static func advancesPromptSafetyClock(source: String?) -> Bool {
         source != "scheduled-active"
-    }
-
-    nonisolated static func shouldRestorePromptSafetyClock(
-        status: SessionStatus,
-        scheduledMarkerPresent: Bool
-    ) -> Bool {
-        status != .idle || !scheduledMarkerPresent
     }
 
     private func shouldClearResumeMarkers(
@@ -2197,6 +2200,10 @@ final class AppModel: ObservableObject {
         let timestamp = max(base, statusEventClock.timestamp(for: sid) ?? base)
         statusEventClock.seed(sessionId: sid, timestamp: timestamp)
         promptStatusEventClock.seed(sessionId: sid, timestamp: timestamp)
+        SessionArtifacts.persistPromptStatusTimestamp(
+            sessionId: sid,
+            timestamp: timestamp
+        )
         SessionArtifacts.persistStatus(
             sessionId: sid,
             status: .idle,
@@ -2644,18 +2651,11 @@ final class AppModel: ObservableObject {
                     sessionId: sid,
                     timestamp: statusTimestamp
                 )
-                let scheduledMarkerPresent = FileManager.default.fileExists(
-                    atPath: Paths.scheduledTurnMarkerPath(sessionId: sid)
+                promptStatusEventClock.seed(
+                    sessionId: sid,
+                    timestamp: restoredPromptStatusTimestamp(forSession: sid)
+                        ?? statusTimestamp
                 )
-                if Self.shouldRestorePromptSafetyClock(
-                    status: status,
-                    scheduledMarkerPresent: scheduledMarkerPresent
-                ) {
-                    promptStatusEventClock.seed(
-                        sessionId: sid,
-                        timestamp: statusTimestamp
-                    )
-                }
                 projects[pi].sessions[si].statusText = nil
                 projects[pi].sessions[si].hasUnread = false
                 let hasBackgroundAgents = FileManager.default.fileExists(
@@ -2685,6 +2685,12 @@ final class AppModel: ObservableObject {
 
     private func restoredStatusTimestamp(forSession sessionId: String) -> Int64? {
         let path = Paths.statusTimestampMarkerPath(sessionId: sessionId)
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func restoredPromptStatusTimestamp(forSession sessionId: String) -> Int64? {
+        let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }

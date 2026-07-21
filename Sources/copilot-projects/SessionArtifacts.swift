@@ -36,6 +36,33 @@ enum SessionArtifacts {
     }
 
     @discardableResult
+    static func persistPromptStatusTimestamp(
+        sessionId: String,
+        timestamp: Int64,
+        sessionsDirectory: URL = Paths.sessionsDir
+    ) -> Bool {
+        do {
+            try FileManager.default.createDirectory(
+                at: sessionsDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try Data(String(timestamp).utf8).write(
+                to: sessionsDirectory
+                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
+                options: .atomic
+            )
+            return true
+        } catch {
+            NSLog(
+                "copilot-projects: could not persist prompt status timestamp "
+                    + "for \(sessionId): \(error)"
+            )
+            return false
+        }
+    }
+
+    @discardableResult
     static func setBackgroundAgentsActive(
         sessionId: String,
         active: Bool,
@@ -81,6 +108,7 @@ enum SessionArtifacts {
             Paths.dtachSocketPath(sessionId: sessionId),
             Paths.statusMarkerPath(sessionId: sessionId),
             Paths.statusTimestampMarkerPath(sessionId: sessionId),
+            Paths.promptStatusTimestampMarkerPath(sessionId: sessionId),
             Paths.backgroundAgentsMarkerPath(sessionId: sessionId),
             Paths.sessionIdleHookMarkerPath(sessionId: sessionId),
             Paths.copilotSessionMarkerPath(sessionId: sessionId),

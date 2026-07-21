@@ -862,19 +862,6 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-start"))
         XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: "scheduled-idle"))
         XCTAssertTrue(AppModel.advancesPromptSafetyClock(source: nil))
-
-        XCTAssertFalse(AppModel.shouldRestorePromptSafetyClock(
-            status: .idle,
-            scheduledMarkerPresent: true
-        ))
-        XCTAssertTrue(AppModel.shouldRestorePromptSafetyClock(
-            status: .idle,
-            scheduledMarkerPresent: false
-        ))
-        XCTAssertTrue(AppModel.shouldRestorePromptSafetyClock(
-            status: .running,
-            scheduledMarkerPresent: true
-        ))
     }
 
     @MainActor
@@ -3461,6 +3448,19 @@ final class AppLogicTests: XCTestCase {
             ),
             "123456"
         )
+        XCTAssertTrue(SessionArtifacts.persistPromptStatusTimestamp(
+            sessionId: sessionId,
+            timestamp: 123_400,
+            sessionsDirectory: root
+        ))
+        XCTAssertEqual(
+            try String(
+                contentsOf: root
+                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
+                encoding: .utf8
+            ),
+            "123400"
+        )
     }
 
     func testBackgroundAgentMarkerLifecycle() throws {
@@ -3632,6 +3632,18 @@ final class AppLogicTests: XCTestCase {
         for path in paths {
             XCTAssertFalse(FileManager.default.fileExists(atPath: path))
         }
+    }
+
+    func testSessionArtifactCleanupRemovesPromptStatusTimestamp() throws {
+        let sessionId = UUID().uuidString
+        Paths.ensureStateDir()
+        let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
+        try Data("123".utf8).write(to: URL(fileURLWithPath: path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+
+        SessionArtifacts.removeFiles(sessionId: sessionId)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
     }
 
     @MainActor

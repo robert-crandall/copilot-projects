@@ -112,6 +112,10 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).status-timestamp").path
     }
 
+    public static func promptStatusTimestampMarkerPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).prompt-status-timestamp").path
+    }
+
     /// Present while the app has observed Copilot waiting on background agents.
     public static func backgroundAgentsMarkerPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).background-agents").path
