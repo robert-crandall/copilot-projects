@@ -1134,8 +1134,10 @@ final class AppModel: ObservableObject {
               !snapshot.activeSubagents.isEmpty,
               !snapshot.reportsTerminalDisconnect,
               let snapshotMs = snapshot.foregroundTransitionMilliseconds,
-              snapshotMs <= nowMs,
-              snapshotMs >= (clockMs ?? snapshotMs) else { return false }
+              snapshotMs <= nowMs else { return false }
+        if let clockMs {
+            return snapshotMs > clockMs
+        }
         return true
     }
 

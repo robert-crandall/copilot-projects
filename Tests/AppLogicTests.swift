@@ -257,6 +257,13 @@ final class AppLogicTests: XCTestCase {
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
+            clockMs: transitionMs - 1
+        ))
+        XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
+            status: .running,
+            snapshot: snapshot,
+            now: now,
+            nowMs: nowMs,
             clockMs: transitionMs
         ))
         XCTAssertFalse(AppModel.runningBackgroundOnlyPromptEvidence(
