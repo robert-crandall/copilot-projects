@@ -943,12 +943,11 @@ final class AppModel: ObservableObject {
                                 hasPendingQuestions: session.hasPendingQuestions,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
                                 backgroundOnly: Self.backgroundOnlyPromptEvidence(
+                                    status: session.status,
                                     snapshot: session.agentActivity,
                                     now: promptNow,
                                     nowMs: promptNowMs,
-                                    clockMs: session.status == .idle
-                                        ? nil
-                                        : statusEventClock.timestamp(for: session.id)
+                                    clockMs: statusEventClock.timestamp(for: session.id)
                                 ),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1056,12 +1055,11 @@ final class AppModel: ObservableObject {
             hasPendingQuestions: session.hasPendingQuestions,
             hasLiveAgent: liveSessions.contains(sessionId),
             backgroundOnly: Self.backgroundOnlyPromptEvidence(
+                status: session.status,
                 snapshot: session.agentActivity,
                 now: promptNow,
                 nowMs: promptNowMs,
-                clockMs: session.status == .idle
-                    ? nil
-                    : statusEventClock.timestamp(for: sessionId)
+                clockMs: statusEventClock.timestamp(for: sessionId)
             ),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1137,6 +1135,7 @@ final class AppModel: ObservableObject {
     }
 
     nonisolated static func backgroundOnlyPromptEvidence(
+        status: SessionStatus,
         snapshot: AgentActivitySnapshot?,
         now: Date,
         nowMs: Int64,
@@ -1149,7 +1148,7 @@ final class AppModel: ObservableObject {
             nowMs: nowMs
         ) else { return false }
         if let clockMs {
-            return snapshotMs > clockMs
+            return status == .idle ? snapshotMs >= clockMs : snapshotMs > clockMs
         }
         return true
     }

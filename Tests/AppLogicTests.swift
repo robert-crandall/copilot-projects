@@ -265,18 +265,21 @@ final class AppLogicTests: XCTestCase {
         let transitionMs = try XCTUnwrap(snapshot.foregroundTransitionMilliseconds)
 
         XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs - 1
         ))
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs
         ))
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
             snapshot: snapshot,
             now: now,
             nowMs: nowMs,
@@ -286,6 +289,7 @@ final class AppLogicTests: XCTestCase {
         var activeForeground = snapshot
         activeForeground.foregroundTurnActive = true
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
             snapshot: activeForeground,
             now: now,
             nowMs: nowMs,
@@ -295,6 +299,7 @@ final class AppLogicTests: XCTestCase {
         var noSubagents = snapshot
         noSubagents.activeSubagents = []
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
             snapshot: noSubagents,
             now: now,
             nowMs: nowMs,
@@ -304,16 +309,25 @@ final class AppLogicTests: XCTestCase {
         var scheduled = noSubagents
         scheduled.scheduledTurnActive = true
         XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            status: .running,
             snapshot: scheduled,
             now: now,
             nowMs: nowMs,
             clockMs: transitionMs - 1
         ))
         XCTAssertTrue(AppModel.backgroundOnlyPromptEvidence(
+            status: .idle,
             snapshot: scheduled,
             now: now,
             nowMs: nowMs,
-            clockMs: nil
+            clockMs: transitionMs
+        ))
+        XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .idle,
+            snapshot: scheduled,
+            now: now,
+            nowMs: nowMs,
+            clockMs: transitionMs + 1
         ))
 
         var disconnected = snapshot
@@ -327,6 +341,7 @@ final class AppLogicTests: XCTestCase {
             transitionMs
         )
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
+            status: .idle,
             snapshot: disconnected,
             now: now,
             nowMs: nowMs,
@@ -501,9 +516,9 @@ final class AppLogicTests: XCTestCase {
             source: "permission-resolved"
         )
 
-        let scheduledTransition = Date()
-        let scheduledTransitionMs = Int64(
-            scheduledTransition.timeIntervalSince1970 * 1_000
+        let scheduledTransitionMs = Int64(Date().timeIntervalSince1970) * 1_000
+        let scheduledTransition = Date(
+            timeIntervalSince1970: Double(scheduledTransitionMs) / 1_000
         )
         model.setStatus(
             sessionId: session.id,
