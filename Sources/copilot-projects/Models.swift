@@ -28,6 +28,13 @@ struct Session: Identifiable, Codable, Equatable {
     var hasBackgroundWork: Bool {
         backgroundAgentsActive || scheduledTurnActive || activeSubagentCount > 0
     }
+    /// A pending `ask_user`/permission or schema `elicitation` awaiting an answer.
+    /// These are answered via their own card, so a free-form remote prompt must
+    /// never be injected over one even when the terminal footer reads idle.
+    var hasPendingQuestions: Bool {
+        (agentActivity?.trackedUserInputs?.isEmpty == false)
+            || (agentActivity?.trackedElicitations?.isEmpty == false)
+    }
 
     private enum CodingKeys: String, CodingKey { case id, title, cwd }
 

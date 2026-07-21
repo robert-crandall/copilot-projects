@@ -938,6 +938,7 @@ final class AppModel: ObservableObject {
                             promptable: Self.remotePromptEligibility(
                                 status: session.status,
                                 scheduledTurnActive: session.scheduledTurnActive,
+                                hasPendingQuestions: session.hasPendingQuestions,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1040,6 +1041,7 @@ final class AppModel: ObservableObject {
         let eligibility = Self.remotePromptEligibility(
             status: session.status,
             scheduledTurnActive: session.scheduledTurnActive,
+            hasPendingQuestions: session.hasPendingQuestions,
             hasLiveAgent: liveSessions.contains(sessionId),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1052,24 +1054,44 @@ final class AppModel: ObservableObject {
         return target.send(value) ? .sent : .invalid
     }
 
-    /// Remote message sends are gated on the *foreground* being settled and at a
-    /// prompt — NOT on background work. Background subagents keep `hasBackgroundWork`
-    /// true while the foreground turn is already done (the footer/status reconciler
-    /// demotes such a session to `.idle`), so blocking on background work stranded
-    /// the remote composer's queued messages indefinitely. `status == .idle` still
-    /// excludes `.running`/`.waiting` (an in-progress foreground turn or a pending
-    /// permission/`ask_user` prompt), while `scheduledTurnActive` preserves the
-    /// explicit scheduled-turn guard for scheduled hooks that publish `.idle`.
-    /// The live-agent + idle-footer check confirms Copilot is actually at a prompt.
+    /// Whether a remote message may be sent to a session right now. Readiness of the
+    /// *foreground* is the gate — primarily the terminal footer, NOT whether the
+    /// session is globally `.running`. Background subagents keep `status` at
+    /// `.running` while the foreground has returned to an idle prompt, so gating on
+    /// `.running` stranded the composer's queued messages while a background agent
+    /// ran; `.running` is deliberately allowed through here.
+    ///
+    /// `status == .waiting` is still blocked: it marks a foreground question the user
+    /// must answer inline — an `ask_user`/`elicitation` dialog OR a raw tool
+    /// permission prompt. Permission prompts surface *only* via the CLI status hook
+    /// (they populate no structured-question entry, so `hasPendingQuestions` is
+    /// `false` for them) and the footer can read `.idle` behind the dialog, so the
+    /// `.waiting` check is the one signal that reliably guards them. A scheduled turn
+    /// (foreground-occupying) and `hasPendingQuestions` (the extension's authoritative
+    /// signal for structured questions) are additional, independent blocks.
+    /// `sendRemotePrompt` re-checks the footer immediately before the actual send.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
         scheduledTurnActive: Bool = false,
+        hasPendingQuestions: Bool = false,
         hasLiveAgent: Bool,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
-        guard status == .idle else { return .busy }
-        guard !scheduledTurnActive else { return .busy }
-        guard hasLiveAgent, footerActivity == .idle else { return .noLiveCopilot }
+        guard hasLiveAgent else { return .noLiveCopilot }
+        // Never inject a free-form message over a foreground user prompt: a scheduled
+        // turn occupies the foreground; a structured ask_user/elicitation must be
+        // answered via its card; and `status == .waiting` covers raw permission
+        // prompts that no structured-question signal sees — even when the footer
+        // momentarily reads idle behind the dialog.
+        guard !scheduledTurnActive, !hasPendingQuestions, status != .waiting else {
+            return .busy
+        }
+        // For the remaining states the terminal footer is the authoritative "Copilot
+        // is at a prompt" signal. Background subagents keep `status` at `.running`
+        // while the foreground has returned to an idle, interactive prompt, so we let
+        // `.running` through and rely on the footer. `sendRemotePrompt` re-checks this
+        // footer immediately before sending.
+        guard footerActivity == .idle else { return .busy }
         return .sent
     }
 
