@@ -150,8 +150,8 @@ final class AppLogicTests: XCTestCase {
             ),
             .sent
         )
-        // Background work (subagents/schedules) must NOT block input: an idle
-        // foreground with a live agent at a prompt is sendable regardless.
+        // Background subagents must NOT block input: an idle foreground with a
+        // live agent at a prompt is sendable regardless.
         XCTAssertEqual(
             AppModel.remotePromptEligibility(
                 status: .idle,
@@ -159,6 +159,15 @@ final class AppLogicTests: XCTestCase {
                 footerActivity: .idle
             ),
             .sent
+        )
+        XCTAssertEqual(
+            AppModel.remotePromptEligibility(
+                status: .idle,
+                scheduledTurnActive: true,
+                hasLiveAgent: true,
+                footerActivity: .idle
+            ),
+            .busy
         )
         // A foreground turn in progress (running/waiting) still blocks so we never
         // inject over an active turn or a pending permission/question prompt.
@@ -263,6 +272,26 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(sentValues, ["hello", "background"])
         model.setBackgroundAgentsActive(sessionId: session.id, active: false)
+
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 3,
+            source: "scheduled-start"
+        )
+        XCTAssertEqual(
+            model.sendRemotePrompt(sessionId: session.id, value: "scheduled"),
+            .busy
+        )
+        XCTAssertEqual(sentValues, ["hello", "background"])
+        model.setStatus(
+            sessionId: session.id,
+            status: .idle,
+            text: nil,
+            timestamp: 4,
+            source: "scheduled-idle"
+        )
 
         liveSessions = []
         XCTAssertEqual(

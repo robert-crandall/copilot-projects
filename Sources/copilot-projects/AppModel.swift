@@ -937,6 +937,7 @@ final class AppModel: ObservableObject {
                             scheduled: !session.schedules.isEmpty,
                             promptable: Self.remotePromptEligibility(
                                 status: session.status,
+                                scheduledTurnActive: session.scheduledTurnActive,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1038,6 +1039,7 @@ final class AppModel: ObservableObject {
         }
         let eligibility = Self.remotePromptEligibility(
             status: session.status,
+            scheduledTurnActive: session.scheduledTurnActive,
             hasLiveAgent: liveSessions.contains(sessionId),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1055,15 +1057,18 @@ final class AppModel: ObservableObject {
     /// true while the foreground turn is already done (the footer/status reconciler
     /// demotes such a session to `.idle`), so blocking on background work stranded
     /// the remote composer's queued messages indefinitely. `status == .idle` still
-    /// excludes `.running`/`.waiting` (an in-progress foreground turn, a scheduled
-    /// turn, or a pending permission/`ask_user` prompt), so we never inject over
-    /// one; the live-agent + idle-footer check confirms Copilot is actually at a prompt.
+    /// excludes `.running`/`.waiting` (an in-progress foreground turn or a pending
+    /// permission/`ask_user` prompt), while `scheduledTurnActive` preserves the
+    /// explicit scheduled-turn guard for scheduled hooks that publish `.idle`.
+    /// The live-agent + idle-footer check confirms Copilot is actually at a prompt.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
+        scheduledTurnActive: Bool = false,
         hasLiveAgent: Bool,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
         guard status == .idle else { return .busy }
+        guard !scheduledTurnActive else { return .busy }
         guard hasLiveAgent, footerActivity == .idle else { return .noLiveCopilot }
         return .sent
     }
