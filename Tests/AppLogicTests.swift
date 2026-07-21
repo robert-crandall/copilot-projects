@@ -2972,11 +2972,11 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(TerminalController.shellSingleQuote("a'b"), "'a'\\''b'")
         XCTAssertEqual(
             TerminalController.resumeCommand(sessionId: sessionId, allowAll: false),
-            "copilot --resume=\(sessionId)"
+            "copilot --no-remote --no-remote-export --resume=\(sessionId)"
         )
         XCTAssertEqual(
             TerminalController.resumeCommand(sessionId: sessionId, allowAll: true),
-            "copilot --allow-all --resume=\(sessionId)"
+            "copilot --no-remote --no-remote-export --allow-all --resume=\(sessionId)"
         )
         XCTAssertTrue(AppModel.shouldResumeWithAllowAll(
             copilotSessionId: sessionId,
@@ -3019,7 +3019,7 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             TerminalController.launchCommand(executable: executable, shell: shell),
-            "'/opt/my copilot/copilot'"
+            "'/opt/my copilot/copilot' --no-remote --no-remote-export"
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
         )
@@ -3028,7 +3028,7 @@ final class AppLogicTests: XCTestCase {
             TerminalController.launchCommand(
                 executable: executable, shell: shell, allowAll: true
             ),
-            "'/opt/my copilot/copilot' --allow-all"
+            "'/opt/my copilot/copilot' --no-remote --no-remote-export --allow-all"
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
         )
@@ -3053,7 +3053,9 @@ final class AppLogicTests: XCTestCase {
             launchCopilotExecutable: executable
         )
         let joined = resumeProgram.joined(separator: " ")
-        XCTAssertTrue(joined.contains("copilot --resume=\(sessionId)"))
+        XCTAssertTrue(joined.contains(
+            "copilot --no-remote --no-remote-export --resume=\(sessionId)"
+        ))
         XCTAssertFalse(joined.contains("my copilot/copilot"))
     }
 
