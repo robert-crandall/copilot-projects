@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -10,17 +12,22 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate:
     runs-on: macos-26
     timeout-minutes: 30
     outputs:
+      previous_sha: ${{ steps.release.outputs.previous_sha }}
+      previous_tag: ${{ steps.release.outputs.previous_tag }}
       version: ${{ steps.release.outputs.version }}
+      should_release: ${{ steps.release.outputs.should_release }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -31,6 +38,7 @@ jobs:
         id: release
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -38,7 +46,74 @@ jobs:
             echo "Releases must be dispatched from main (got $GITHUB_REF)." >&2
             exit 1
           fi
-          version="${INPUT_VERSION#v}"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            if ! triggering_pull_requests="$(
+              gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            )"; then
+              echo "Could not verify PR provenance for $GITHUB_SHA." >&2
+              exit 1
+            fi
+            if ! jq -e --arg sha "$GITHUB_SHA" \
+              'any(.[]; .merged_at != null and .base.ref == "main" and .merge_commit_sha == $sha)' \
+              <<< "$triggering_pull_requests" >/dev/null; then
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Skipped: $GITHUB_SHA was not created by a PR merge to main." \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            git fetch origin main --quiet
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "Refusing to release $GITHUB_SHA because it is no longer on main." >&2
+              exit 1
+            fi
+            latest_tag="$(
+              git tag --list 'v*' --sort=-version:refname \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                | head -1 || true
+            )"
+            if [[ -z "$latest_tag" ]]; then
+              echo "No semantic-version release tag exists to increment." >&2
+              exit 1
+            fi
+            expected_asset="Copilot-Projects-${latest_tag#v}.dmg"
+            if ! latest_release="$(
+              gh release view "$latest_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets,isDraft,publishedAt \
+            )"; then
+              echo "Could not inspect release metadata for $latest_tag." >&2
+              exit 1
+            fi
+            if ! jq -e --arg asset "$expected_asset" \
+              '.isDraft == false
+               and .publishedAt != null
+               and any(.assets[]; .name == $asset and .size > 0)' \
+              <<< "$latest_release" >/dev/null; then
+              echo "Latest tag $latest_tag is not a complete published release." >&2
+              echo "Delete the incomplete release/tag and retry." >&2
+              exit 1
+            fi
+            latest_sha="$(git rev-list -n 1 "$latest_tag")"
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$latest_sha"; then
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Skipped: $GITHUB_SHA is already contained in $latest_tag." \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor "$latest_sha" "$GITHUB_SHA"; then
+              echo "Latest release $latest_tag is on a divergent history." >&2
+              exit 1
+            fi
+            echo "previous_sha=$latest_sha" >> "$GITHUB_OUTPUT"
+            echo "previous_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+            current="${latest_tag#v}"
+            IFS=. read -r major minor patch <<< "$current"
+            version="$major.$minor.$((10#$patch + 1))"
+          else
+            version="${INPUT_VERSION#v}"
+          fi
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Version must be X.Y.Z (optionally prefixed with v)." >&2
             exit 1
@@ -52,13 +127,17 @@ jobs:
             echo "Tag $tag already exists in $GITHUB_REPOSITORY." >&2
             exit 1
           fi
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release version: v$version" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test
+        if: steps.release.outputs.should_release == 'true'
         run: swift test
 
   release:
     needs: validate
+    if: needs.validate.outputs.should_release == 'true'
     runs-on: macos-26
     timeout-minutes: 60
     environment: release
@@ -144,6 +223,8 @@ jobs:
       - name: Build and publish
         env:
           VERSION: ${{ needs.validate.outputs.version }}
+          EXPECTED_PREVIOUS_SHA: ${{ needs.validate.outputs.previous_sha }}
+          EXPECTED_PREVIOUS_TAG: ${{ needs.validate.outputs.previous_tag }}
           GH_TOKEN: ${{ github.token }}
           CODESIGN_IDENTITY: ${{ steps.signing.outputs.codesign_identity }}
           NOTARY_PROFILE: copilot-projects-release
