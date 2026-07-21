@@ -1916,6 +1916,7 @@ final class AppModel: ObservableObject {
                        snapshotMs <= recoveryNowMs,
                        snapshotMs > (statusEventClock.timestamp(for: sid) ?? Int64.min) {
                         activityTracker.resetForegroundIdle(sessionId: sid)
+                        activityTracker.resetDisconnectIdle(sessionId: sid)
                         // Promote IN MEMORY ONLY, using the foreground-transition
                         // timestamp (the root turn_start time — NOT `updatedAt`,
                         // which unrelated republishes rewrite): `setStatus` advances
@@ -1946,6 +1947,7 @@ final class AppModel: ObservableObject {
                     postCompletionIfReady(sessionId: sid)
                 }
                 if status == .idle {
+                    activityTracker.resetDisconnectIdle(sessionId: sid)
                     guard ActivityTracker.canPromoteIdleFromFooter(
                         backgroundAgentsActive: projects[pi].sessions[si].hasBackgroundWork,
                         hasLiveAgent: liveAgentSessions.contains(sid),
@@ -1990,14 +1992,16 @@ final class AppModel: ObservableObject {
                     clockMs: statusEventClock.timestamp(for: sid) ?? Int64.min
                 ) {
                     tracked.insert(sid)
-                    if activityTracker.observeForegroundIdle(
+                    activityTracker.resetForegroundIdle(sessionId: sid)
+                    if activityTracker.observeDisconnectIdle(
                         sessionId: sid,
-                        currentStatus: status,
-                        foregroundTurnActive: false
+                        currentStatus: status
                     ) {
                         clearStatusToIdle(pi: pi, si: si, markFinished: false, effectiveTime: evidenceMs)
                     }
                     continue
+                } else {
+                    activityTracker.resetDisconnectIdle(sessionId: sid)
                 }
                 // Stale "working" recovery: the foreground turn has ended, but live
                 // background subagents keep `session.idle` from firing, so the hook

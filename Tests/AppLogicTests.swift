@@ -496,6 +496,29 @@ final class AppLogicTests: XCTestCase {
             sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
     }
 
+    func testDisconnectIdleDwellDoesNotReuseForegroundIdleTicks() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        XCTAssertFalse(tracker.observeForegroundIdle(
+            sessionId: sessionId, currentStatus: .running, foregroundTurnActive: false))
+        XCTAssertFalse(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+        XCTAssertTrue(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+    }
+
+    func testDisconnectIdleDwellResetsWhenPolicyStopsQualifying() {
+        let sessionId = UUID().uuidString
+        var tracker = ActivityTracker()
+        XCTAssertFalse(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+        tracker.resetDisconnectIdle(sessionId: sessionId)
+        XCTAssertFalse(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+        XCTAssertTrue(tracker.observeDisconnectIdle(
+            sessionId: sessionId, currentStatus: .running))
+    }
+
     func testForegroundIdleDwellResetsWhenTurnResumes() {
         let sessionId = UUID().uuidString
         var tracker = ActivityTracker()
