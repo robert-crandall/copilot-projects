@@ -1182,8 +1182,15 @@ private final class RemoteHTTPHandler:
                     let workspaceObservedAt = Date()
                     if let workspace {
                         for project in workspace.projects {
+                            // A prompt's dedup guard is cleared once we observe the
+                            // foreground actually leave the promptable state (the sent
+                            // prompt landed). Key this on `promptable` alone — NOT
+                            // `status != "idle"` — because a background subagent keeps
+                            // `status == "running"` while the foreground stays
+                            // promptable, which would otherwise clear the guard before
+                            // the prompt was picked up and let a retry double-send.
                             for session in project.sessions
-                            where session.status != "idle" || session.promptable == false {
+                            where session.promptable == false {
                                 self.leases.observePromptUnavailable(
                                     sessionId: session.id,
                                     observedAt: workspaceObservedAt

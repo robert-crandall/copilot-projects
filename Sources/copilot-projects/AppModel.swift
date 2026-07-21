@@ -919,7 +919,9 @@ final class AppModel: ObservableObject {
     }
 
     func remoteWorkspaceSnapshot() -> RemoteWorkspaceSnapshot {
-        RemoteWorkspaceSnapshot(
+        let promptNow = Date()
+        let promptNowMs = SessionArtifacts.currentStatusTimestamp()
+        return RemoteWorkspaceSnapshot(
             projects: projects.map { project in
                 RemoteProjectSnapshot(
                     id: project.id,
@@ -938,7 +940,15 @@ final class AppModel: ObservableObject {
                             promptable: Self.remotePromptEligibility(
                                 status: session.status,
                                 scheduledTurnActive: session.scheduledTurnActive,
+                                hasPendingQuestions: session.hasPendingQuestions,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
+                                runningBackgroundOnly: Self.runningBackgroundOnlyPromptEvidence(
+                                    status: session.status,
+                                    snapshot: session.agentActivity,
+                                    now: promptNow,
+                                    nowMs: promptNowMs,
+                                    clockMs: statusEventClock.timestamp(for: session.id)
+                                ),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
                             ) == .sent,
@@ -1037,10 +1047,20 @@ final class AppModel: ObservableObject {
         } else {
             target = nil
         }
+        let promptNow = Date()
+        let promptNowMs = SessionArtifacts.currentStatusTimestamp()
         let eligibility = Self.remotePromptEligibility(
             status: session.status,
             scheduledTurnActive: session.scheduledTurnActive,
+            hasPendingQuestions: session.hasPendingQuestions,
             hasLiveAgent: liveSessions.contains(sessionId),
+            runningBackgroundOnly: Self.runningBackgroundOnlyPromptEvidence(
+                status: session.status,
+                snapshot: session.agentActivity,
+                now: promptNow,
+                nowMs: promptNowMs,
+                clockMs: statusEventClock.timestamp(for: sessionId)
+            ),
             footerActivity: target?.activity ?? .unknown
         )
         if eligibility == .busy { return .busy }
@@ -1052,25 +1072,73 @@ final class AppModel: ObservableObject {
         return target.send(value) ? .sent : .invalid
     }
 
-    /// Remote message sends are gated on the *foreground* being settled and at a
-    /// prompt — NOT on background work. Background subagents keep `hasBackgroundWork`
-    /// true while the foreground turn is already done (the footer/status reconciler
-    /// demotes such a session to `.idle`), so blocking on background work stranded
-    /// the remote composer's queued messages indefinitely. `status == .idle` still
-    /// excludes `.running`/`.waiting` (an in-progress foreground turn or a pending
-    /// permission/`ask_user` prompt), while `scheduledTurnActive` preserves the
-    /// explicit scheduled-turn guard for scheduled hooks that publish `.idle`.
-    /// The live-agent + idle-footer check confirms Copilot is actually at a prompt.
+    /// Whether a remote message may be sent to a session right now. Readiness of the
+    /// *foreground* is the gate — primarily the terminal footer, NOT whether the
+    /// session is globally `.running`. Background subagents keep `status` at
+    /// `.running` while the foreground has returned to an idle prompt, so gating on
+    /// `.running` stranded the composer's queued messages while a background agent
+    /// ran; `.running` is deliberately allowed through here.
+    ///
+    /// `status == .waiting` is still blocked: it marks a foreground question the user
+    /// must answer inline — an `ask_user`/`elicitation` dialog OR a raw tool
+    /// permission prompt. Permission prompts surface *only* via the CLI status hook
+    /// (they populate no structured-question entry, so `hasPendingQuestions` is
+    /// `false` for them) and the footer can read `.idle` behind the dialog, so the
+    /// `.waiting` check is the one signal that reliably guards them. A scheduled turn
+    /// (foreground-occupying) and `hasPendingQuestions` (the extension's authoritative
+    /// signal for structured questions) are additional, independent blocks.
+    /// `sendRemotePrompt` re-checks the footer immediately before the actual send.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
         scheduledTurnActive: Bool = false,
+        hasPendingQuestions: Bool = false,
         hasLiveAgent: Bool,
+        runningBackgroundOnly: Bool = false,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
-        guard status == .idle else { return .busy }
-        guard !scheduledTurnActive else { return .busy }
-        guard hasLiveAgent, footerActivity == .idle else { return .noLiveCopilot }
+        guard hasLiveAgent else { return .noLiveCopilot }
+        // Never inject a free-form message over a foreground user prompt: a scheduled
+        // turn occupies the foreground; a structured ask_user/elicitation must be
+        // answered via its card; and `status == .waiting` covers raw permission
+        // prompts that no structured-question signal sees — even when the footer
+        // momentarily reads idle behind the dialog.
+        guard !scheduledTurnActive, !hasPendingQuestions, status != .waiting else {
+            return .busy
+        }
+        guard status != .running || runningBackgroundOnly else { return .busy }
+        // For the remaining states the terminal footer is the authoritative "Copilot
+        // is at a prompt" signal. Background subagents can keep `status` at
+        // `.running`, but bypassing that state requires a fresh, clock-ordered
+        // heartbeat proving the foreground turn is inactive while subagents remain.
+        // `sendRemotePrompt` re-checks this footer immediately before sending.
+        guard footerActivity == .idle else { return .busy }
         return .sent
+    }
+
+    /// Evidence that a `.running` session is only busy because background subagents
+    /// remain active after the foreground turn ended. This mirrors the causal guards
+    /// in `reconcileAgentFooters`: stale footer text alone is never enough to inject
+    /// a remote prompt over a possibly-active foreground turn.
+    nonisolated static func runningBackgroundOnlyPromptEvidence(
+        status: SessionStatus,
+        snapshot: AgentActivitySnapshot?,
+        now: Date,
+        nowMs: Int64,
+        clockMs: Int64?
+    ) -> Bool {
+        guard status == .running,
+              let snapshot,
+              snapshot.isFresh(at: now),
+              snapshot.foregroundTurnActive == false,
+              snapshot.scheduledTurnActive == false,
+              !snapshot.activeSubagents.isEmpty,
+              !snapshot.reportsTerminalDisconnect,
+              let snapshotMs = snapshot.foregroundTransitionMilliseconds,
+              snapshotMs <= nowMs else { return false }
+        if let clockMs {
+            return snapshotMs > clockMs
+        }
+        return true
     }
 
     /// Accept a remote answer to a structured `ask_user` question and hand it to the
