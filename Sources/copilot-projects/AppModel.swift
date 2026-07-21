@@ -937,7 +937,6 @@ final class AppModel: ObservableObject {
                             scheduled: !session.schedules.isEmpty,
                             promptable: Self.remotePromptEligibility(
                                 status: session.status,
-                                hasBackgroundWork: session.hasBackgroundWork,
                                 hasLiveAgent: liveAgentSessions.contains(session.id),
                                 footerActivity: controllers[session.id]?.agentActivity
                                     ?? .unknown
@@ -1039,7 +1038,6 @@ final class AppModel: ObservableObject {
         }
         let eligibility = Self.remotePromptEligibility(
             status: session.status,
-            hasBackgroundWork: session.hasBackgroundWork,
             hasLiveAgent: liveSessions.contains(sessionId),
             footerActivity: target?.activity ?? .unknown
         )
@@ -1052,13 +1050,20 @@ final class AppModel: ObservableObject {
         return target.send(value) ? .sent : .invalid
     }
 
+    /// Remote message sends are gated on the *foreground* being settled and at a
+    /// prompt — NOT on background work. Background subagents keep `hasBackgroundWork`
+    /// true while the foreground turn is already done (the footer/status reconciler
+    /// demotes such a session to `.idle`), so blocking on background work stranded
+    /// the remote composer's queued messages indefinitely. `status == .idle` still
+    /// excludes `.running`/`.waiting` (an in-progress foreground turn, a scheduled
+    /// turn, or a pending permission/`ask_user` prompt), so we never inject over
+    /// one; the live-agent + idle-footer check confirms Copilot is actually at a prompt.
     nonisolated static func remotePromptEligibility(
         status: SessionStatus,
-        hasBackgroundWork: Bool,
         hasLiveAgent: Bool,
         footerActivity: FooterActivity
     ) -> RemotePromptResult {
-        guard status == .idle, !hasBackgroundWork else { return .busy }
+        guard status == .idle else { return .busy }
         guard hasLiveAgent, footerActivity == .idle else { return .noLiveCopilot }
         return .sent
     }
