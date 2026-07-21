@@ -151,32 +151,6 @@ cat > "$NOTES_FILE" <<NOTES
 Requires macOS 26+ on Apple Silicon.
 NOTES
 
-if ! existing_release="$(
-  gh release view "$TAG" \
-    --repo "$REPO" \
-    --json databaseId,isDraft
-)"; then
-  releases="$(
-    gh api --paginate --slurp "repos/$REPO/releases?per_page=100"
-  )" || {
-    echo "error: could not verify whether release $TAG already exists" >&2
-    exit 1
-  }
-  existing_release="$(
-    jq -c --arg tag "$TAG" \
-      '[.[][] | select(.tag_name == $tag)][0] // empty' \
-      <<< "$releases"
-  )"
-fi
-if [ -n "$existing_release" ]; then
-  echo "error: release $TAG already exists" >&2
-  exit 1
-fi
-if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
-  echo "error: tag $TAG already exists in $REPO" >&2
-  exit 1
-fi
-
 cleanup_partial_release() {
   local release_state releases match is_draft
   if [ "$RELEASE_CREATED" = "1" ]; then
@@ -301,6 +275,31 @@ else
   predecessor_status=$?
   [ "$predecessor_status" -eq 2 ] && exit 0
   exit "$predecessor_status"
+fi
+if ! existing_release="$(
+  gh release view "$TAG" \
+    --repo "$REPO" \
+    --json databaseId,isDraft
+)"; then
+  releases="$(
+    gh api --paginate --slurp "repos/$REPO/releases?per_page=100"
+  )" || {
+    echo "error: could not verify whether release $TAG already exists" >&2
+    exit 1
+  }
+  existing_release="$(
+    jq -c --arg tag "$TAG" \
+      '[.[][] | select(.tag_name == $tag)][0] // empty' \
+      <<< "$releases"
+  )"
+fi
+if [ -n "$existing_release" ]; then
+  echo "error: release $TAG already exists" >&2
+  exit 1
+fi
+if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+  echo "error: tag $TAG already exists in $REPO" >&2
+  exit 1
 fi
 gh api -X POST "repos/$REPO/git/refs" \
   -f ref="refs/tags/$TAG" \
