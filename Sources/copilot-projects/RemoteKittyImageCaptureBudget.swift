@@ -27,13 +27,23 @@ final class RemoteKittyImageCaptureBudget {
 
     let maxTotalBytes: Int
     let maxTotalEntries: Int
+    /// Process-wide cap on *in-flight, undecoded* base64 bytes across every
+    /// still-open transmission of every owner combined — independent of
+    /// `maxTotalBytes`, which only bounds already-finalized, retained decoded
+    /// images. Without this, each open terminal could separately buffer up to
+    /// its own local `remoteKittyMaxAccumulatedBase64Bytes` (8 MiB) worth of
+    /// pending, never-finalized transmission data, and that per-terminal cap
+    /// multiplies unbounded by however many terminals happen to be open.
+    let maxTotalPendingBytes: Int
 
     init(
         maxTotalBytes: Int = 32 * 1_024 * 1_024,
-        maxTotalEntries: Int = 32
+        maxTotalEntries: Int = 32,
+        maxTotalPendingBytes: Int = 8 * 1_024 * 1_024
     ) {
         self.maxTotalBytes = maxTotalBytes
         self.maxTotalEntries = maxTotalEntries
+        self.maxTotalPendingBytes = maxTotalPendingBytes
     }
 
     private struct GlobalKey: Hashable {
@@ -123,5 +133,61 @@ final class RemoteKittyImageCaptureBudget {
         let owner = entry.owner
         remove(key)
         owner?.evictForBudget(imageId: entry.imageId, version: entry.version)
+    }
+
+    // MARK: - Pending (in-flight, undecoded) transmission bytes
+
+    private struct PendingEntry {
+        weak var owner: RemoteKittyImageCapture?
+        var bytes: Int
+    }
+
+    // Keyed by owner identity (never by image id/version — a transmission
+    // isn't retained data yet, just bytes accumulating toward one), so an
+    // owner's whole in-flight buffer is tracked as a single reservation that
+    // grows/shrinks with each chunk rather than one entry per chunk.
+    private var pendingByOwner: [ObjectIdentifier: PendingEntry] = [:]
+
+    private(set) var totalPendingBytes = 0
+
+    /// Attempts to reserve `additionalBytes` more in-flight bytes on top of
+    /// whatever `owner` already has reserved. Returns `false` (reserving
+    /// nothing) if that would push the process-wide pending total over
+    /// `maxTotalPendingBytes` — the caller must abort its in-flight
+    /// transmission rather than let unaccounted memory grow, since (unlike
+    /// the retained-bytes budget) there is nothing safe to evict here: a
+    /// still-in-flight, not-yet-validated transmission isn't real data any
+    /// other owner could be relying on yet.
+    func reservePending(owner: RemoteKittyImageCapture, additionalBytes: Int) -> Bool {
+        pruneOrphanedPendingOwners()
+        guard additionalBytes > 0 else { return true }
+        guard totalPendingBytes + additionalBytes <= maxTotalPendingBytes else { return false }
+        let key = ObjectIdentifier(owner)
+        let current = pendingByOwner[key]?.bytes ?? 0
+        pendingByOwner[key] = PendingEntry(owner: owner, bytes: current + additionalBytes)
+        totalPendingBytes += additionalBytes
+        return true
+    }
+
+    /// Releases every pending byte currently reserved for `owner` — the exact
+    /// counterpart to every successful `reservePending` call for it — called
+    /// whenever its in-flight transmission ends for any reason (begins a new
+    /// one, overflows, finalizes successfully or not, or is discarded by an
+    /// explicit delete/clear). Idempotent: a no-op if nothing is reserved.
+    func releasePending(owner: RemoteKittyImageCapture) {
+        let key = ObjectIdentifier(owner)
+        guard let entry = pendingByOwner.removeValue(forKey: key) else { return }
+        totalPendingBytes -= entry.bytes
+    }
+
+    /// A deallocated owner (its terminal session closed mid-transmission)
+    /// never calls `releasePending` itself, so its reservation is reclaimed
+    /// unconditionally the next time any owner attempts to reserve more.
+    private func pruneOrphanedPendingOwners() {
+        let orphaned = pendingByOwner.filter { $0.value.owner == nil }
+        for (key, entry) in orphaned {
+            totalPendingBytes -= entry.bytes
+            pendingByOwner.removeValue(forKey: key)
+        }
     }
 }

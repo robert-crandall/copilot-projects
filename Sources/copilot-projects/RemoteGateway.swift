@@ -5,8 +5,19 @@ import NIOPosix
 import NIOHTTP1
 import CopilotProjectsProtocol
 
-fileprivate struct RemoteTerminalRevision: Equatable, Sendable {
+struct RemoteTerminalRevision: Equatable, Sendable {
     let contentGeneration: UInt64
+    /// The advertising session's own `RemoteKittyImageCapture.imageAvailabilityGeneration`
+    /// at the moment this revision was computed. Bumped not only by that
+    /// session's own capture activity but also whenever the process-wide
+    /// `RemoteKittyImageCaptureBudget` reclaims one of *this* session's
+    /// currently-advertised images to satisfy a different session's request —
+    /// so a cached screen here is correctly invalidated by cross-session
+    /// global eviction, even though nothing about this session's own terminal
+    /// content changed. Without this, a stale cached screen could keep
+    /// advertising a placement whose backing image the global budget already
+    /// evicted, and a client fetching it would 404.
+    let imageAvailabilityGeneration: UInt64
     let cols: Int
     let rows: Int
     let terminalScroll: Bool
@@ -43,12 +54,13 @@ final class RemoteModelBridge: @unchecked Sendable {
         model?.createRemoteSession(request) ?? .unavailable
     }
 
-    fileprivate func screenRevision(sessionId: String) -> RemoteTerminalRevision? {
+    func screenRevision(sessionId: String) -> RemoteTerminalRevision? {
         guard let model,
               let view = model.controller(for: sessionId)?.terminalView,
               let terminal = view.terminal else { return nil }
         return RemoteTerminalRevision(
             contentGeneration: view.remoteContentGeneration,
+            imageAvailabilityGeneration: view.kittyImageCapture.imageAvailabilityGeneration,
             cols: terminal.cols,
             rows: terminal.rows,
             terminalScroll: terminal.isCurrentBufferAlternate
@@ -56,7 +68,7 @@ final class RemoteModelBridge: @unchecked Sendable {
         )
     }
 
-    fileprivate func screen(
+    func screen(
         sessionId: String,
         revision: RemoteTerminalRevision,
         afterLine: Int?

@@ -1039,15 +1039,16 @@ final class AppModel: ObservableObject {
         // History mode: recompute against the screen's own `firstLine` (never a
         // stale value from a prior live/history capture) using scroll-invariant
         // absolute row ids, matching how its lines were captured above. The scan
-        // window itself is widened up to `terminal.rows` on each side of the
-        // emitted text window — bounded to the retained history range
-        // `[historyStartLine, liveTopLine + rows)` — so a multi-row image
-        // component that straddles an incremental (`afterLine`-narrowed)
-        // window boundary is still discovered in full: only its *emitted*
-        // `line` stays relative to `screen.firstLine` (so it can go negative
-        // for rows above the emitted window), never the scan itself.
-        let scanLowerBound = max(screen.historyStartLine, screen.firstLine - terminal.rows)
-        let scanUpperBound = min(screen.liveTopLine + terminal.rows, screen.firstLine + screen.lines.count + terminal.rows)
+        // window covers the *entire* retained history range
+        // `[historyStartLine, liveTopLine + rows)` — not just the emitted text
+        // window padded by a fixed number of rows — so any image retained
+        // anywhere in that window (including one taller than the viewport, or
+        // one that straddles an incremental `afterLine`-narrowed window
+        // boundary) is discovered in full: only its *emitted* `line` stays
+        // relative to `screen.firstLine` (so it can go negative for rows above
+        // the emitted window), never the scan itself.
+        let scanLowerBound = screen.historyStartLine
+        let scanUpperBound = screen.liveTopLine + screen.rows
         let gridLines = (scanLowerBound ..< max(scanLowerBound, scanUpperBound)).compactMap { row in
             terminal.getScrollInvariantLine(row: row).map { (lineId: row, line: $0) }
         }

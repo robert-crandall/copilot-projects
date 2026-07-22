@@ -27,6 +27,15 @@ private let remoteKittyMaxTotalRetainedBytes = 8 * 1_024 * 1_024
 /// cap, so a burst of tiny images can't accumulate unboundedly either), also
 /// deliberately smaller than the process-wide entry cap.
 private let remoteKittyMaxRetainedEntries = 16
+/// Size above which a discarded/finalized transient buffer (`rawFrame` or
+/// `pendingBase64`) has its underlying storage actually deallocated
+/// (`keepingCapacity: false`) rather than kept around for reuse. Below this,
+/// `keepingCapacity: true` avoids paying for a realloc on every tiny/common
+/// frame. A buffer that grew past this before being discarded proves it can
+/// grow large, so its capacity must be given back — otherwise N busy
+/// terminals could each pin megabytes of buffer capacity even though the
+/// shared pending-byte *count* budget below is enforced.
+private let remoteKittyLargeBufferReleaseThreshold = 64 * 1_024
 /// Hard cap on placements emitted by a single scan, so a pathological grid
 /// (e.g. hundreds of disjoint single-cell placeholder fragments) can't make a
 /// scan (or its JSON payload) unbounded. Connected-component work stops the
@@ -262,6 +271,20 @@ final class RemoteKittyImageCapture {
     private let epoch: UInt32
     private var nextCounter: UInt64 = 1
     private let budget: RemoteKittyImageCaptureBudget
+    private let maxAccumulatedBase64Bytes: Int
+
+    /// Bumped every time this instance's *currently advertised* availability
+    /// for some image id can change — a fresh current version is retained, or
+    /// a still-current version is removed (by local grace-cache eviction, an
+    /// explicit Kitty delete/clear, or the process-wide budget reclaiming it
+    /// via `evictForBudget`, including when triggered by a *different*
+    /// capture instance entirely). A superseded (non-current) version being
+    /// reclaimed never bumps this, since what a scan would currently discover
+    /// hasn't changed. Exposed so a screen cache keyed on it (see
+    /// `RemoteTerminalRevision`) invalidates itself exactly when a
+    /// previously-advertised placement could now 404, including across
+    /// sessions sharing the same process-wide budget.
+    private(set) var imageAvailabilityGeneration: UInt64 = 0
 
     /// - Parameters:
     ///   - epoch: The high 32 bits every version handed out by this instance
@@ -272,9 +295,19 @@ final class RemoteKittyImageCapture {
     ///     accounted against. Defaults to the real shared singleton; tests
     ///     inject an isolated instance so cross-test process state can never
     ///     leak into an assertion about global bounds.
+    ///   - maxAccumulatedBase64Bytes: The per-instance cap on base64 bytes
+    ///     accumulated across `m=1` continuation chunks for one in-flight
+    ///     transmission. Defaults to the real production bound (comfortably
+    ///     above `remoteKittyMaxDecodedImageBytes`'s base64 size); tests
+    ///     inject a much smaller value so an overflow test can prove the
+    ///     accumulated-bytes guard specifically — via many small continuation
+    ///     chunks, each individually well under both the raw-frame and
+    ///     decoded-image bounds — rather than relying on a single frame large
+    ///     enough to *also* trip those other, unrelated bounds first.
     init(
         epoch: UInt32 = UInt32.random(in: UInt32.min ... UInt32.max),
-        budget: RemoteKittyImageCaptureBudget? = nil
+        budget: RemoteKittyImageCaptureBudget? = nil,
+        maxAccumulatedBase64Bytes: Int = remoteKittyMaxAccumulatedBase64Bytes
     ) {
         self.epoch = epoch
         // `budget`'s default can't be spelled as `= .shared` in the parameter
@@ -284,6 +317,7 @@ final class RemoteKittyImageCapture {
         // Resolving it here, inside the (main-actor-isolated) initializer
         // body, is equivalent for every real caller.
         self.budget = budget ?? .shared
+        self.maxAccumulatedBase64Bytes = maxAccumulatedBase64Bytes
     }
 
     /// Feeds raw terminal output bytes. Safe to call with any chunking of the
@@ -320,7 +354,7 @@ final class RemoteKittyImageCapture {
             if byte == 0x1B { state = .sawEsc }
         case .sawEsc:
             if byte == 0x5F { // '_' — APC start
-                rawFrame.removeAll(keepingCapacity: true)
+                clearRawFrame()
                 state = .apcAwaitingMarker
             } else if byte == 0x1B {
                 state = .sawEsc // a fresh ESC restarts the lookahead window
@@ -341,7 +375,7 @@ final class RemoteKittyImageCapture {
             } else if rawFrame.count >= remoteKittyMaxRawFrameBytes {
                 // Overflow: drop the frame and resynchronize on the next
                 // terminator so a later valid frame still parses.
-                rawFrame.removeAll(keepingCapacity: true)
+                clearRawFrame()
                 state = .apcSkipping
             } else {
                 rawFrame.append(byte)
@@ -364,7 +398,7 @@ final class RemoteKittyImageCapture {
                 // begins right here rather than being swallowed back into skip
                 // mode (which would otherwise let this frame's own terminator
                 // masquerade as the end of the abandoned one).
-                rawFrame.removeAll(keepingCapacity: true)
+                clearRawFrame()
                 state = .apcAwaitingMarker
             } else if byte != 0x1B {
                 state = .apcSkipping
@@ -380,7 +414,7 @@ final class RemoteKittyImageCapture {
     /// (`.ground` only reacts to a *subsequent* ESC) — so a fresh APC starts
     /// directly instead, exactly as `.apcSkippingEsc` does for the same byte.
     private func abortAPC(reprocessing byte: UInt8) {
-        rawFrame.removeAll(keepingCapacity: true)
+        clearRawFrame()
         if byte == 0x5F {
             state = .apcAwaitingMarker
             return
@@ -389,9 +423,22 @@ final class RemoteKittyImageCapture {
         process(byte)
     }
 
+    /// Empties `rawFrame`, releasing its underlying storage
+    /// (`keepingCapacity: false`) if it had grown past
+    /// `remoteKittyLargeBufferReleaseThreshold` before being discarded — so a
+    /// frame that grew large (e.g. right up to `remoteKittyMaxRawFrameBytes`)
+    /// doesn't leave that much capacity pinned per terminal indefinitely.
+    private func clearRawFrame() {
+        if rawFrame.count > remoteKittyLargeBufferReleaseThreshold {
+            rawFrame.removeAll(keepingCapacity: false)
+        } else {
+            rawFrame.removeAll(keepingCapacity: true)
+        }
+    }
+
     private func completeFrame() {
         let frame = rawFrame
-        rawFrame.removeAll(keepingCapacity: true)
+        clearRawFrame()
         let controlBytes: ArraySlice<UInt8>
         let payloadBytes: ArraySlice<UInt8>
         if let semicolon = frame.firstIndex(of: 0x3B) {
@@ -438,8 +485,7 @@ final class RemoteKittyImageCapture {
         // The protocol requires a client to finish all chunks of a transmission
         // before sending another graphics command, so a fresh start always means
         // any previous in-flight transmission is incomplete — abandon it.
-        pendingImageId = nil
-        pendingBase64.removeAll(keepingCapacity: true)
+        resetPendingTransmission()
 
         let transmissionMedium = keys["t"] ?? "d"
         guard transmissionMedium == "d",
@@ -465,27 +511,53 @@ final class RemoteKittyImageCapture {
 
     private func appendPayload(_ payload: ArraySlice<UInt8>) {
         guard pendingImageId != nil else { return }
-        guard pendingBase64.count + payload.count <= remoteKittyMaxAccumulatedBase64Bytes else {
-            // Overflow: discard the whole in-flight transmission rather than
-            // retain a truncated/mismatched image.
-            pendingImageId = nil
-            pendingBase64.removeAll(keepingCapacity: true)
+        // Reserved against the process-wide pending budget *before* actually
+        // appending, so a chunk that would push either this instance's own
+        // local cap or the shared cross-terminal cap over its bound is never
+        // partially retained — the whole in-flight transmission is discarded
+        // instead, exactly like any other overflow.
+        guard pendingBase64.count + payload.count <= maxAccumulatedBase64Bytes,
+              budget.reservePending(owner: self, additionalBytes: payload.count)
+        else {
+            resetPendingTransmission()
             return
         }
         pendingBase64.append(contentsOf: payload)
     }
 
     private func finalizePending() {
-        defer {
-            pendingImageId = nil
-            pendingBase64.removeAll(keepingCapacity: true)
-        }
+        defer { resetPendingTransmission() }
         guard let imageId = pendingImageId,
               let decoded = Data(base64Encoded: Data(pendingBase64)),
               decoded.count <= remoteKittyMaxDecodedImageBytes,
               Self.validatePNG(decoded)
         else { return }
         retain(imageId: imageId, data: decoded)
+    }
+
+    /// Ends whatever in-flight transmission is currently buffered — on
+    /// success, failure, overflow, a fresh `beginTransmission` abandoning the
+    /// previous one, or an explicit delete/clear — releasing this exact
+    /// buffer's process-wide pending-byte reservation (never partially: the
+    /// whole in-flight transmission is one all-or-nothing unit) and its local
+    /// storage, dropping capacity if it had grown large.
+    private func resetPendingTransmission() {
+        pendingImageId = nil
+        clearPendingBase64()
+        budget.releasePending(owner: self)
+    }
+
+    /// Empties `pendingBase64`, releasing its underlying storage
+    /// (`keepingCapacity: false`) if it had grown past
+    /// `remoteKittyLargeBufferReleaseThreshold` before being discarded — so a
+    /// large in-flight buffer doesn't leave that much capacity pinned per
+    /// terminal indefinitely once its transmission ends.
+    private func clearPendingBase64() {
+        if pendingBase64.count > remoteKittyLargeBufferReleaseThreshold {
+            pendingBase64.removeAll(keepingCapacity: false)
+        } else {
+            pendingBase64.removeAll(keepingCapacity: true)
+        }
     }
 
     /// Requires a structurally *complete* PNG of PNG type — ImageIO only
@@ -525,6 +597,10 @@ final class RemoteKittyImageCapture {
         dataByKey[key] = data
         totalBytes += data.count
         latestVersion[imageId] = version
+        // A fresh retain always installs a new *current* version for
+        // `imageId` (whether or not one existed before), so this always
+        // changes what a scan would currently discover for it.
+        imageAvailabilityGeneration &+= 1
         budget.register(owner: self, imageId: imageId, version: version, bytes: data.count)
         enforceLocalBounds()
     }
@@ -539,6 +615,12 @@ final class RemoteKittyImageCapture {
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         if latestVersion[key.imageId] == key.version {
             latestVersion.removeValue(forKey: key.imageId)
+            // The entry just reclaimed was `imageId`'s *current* version, so
+            // it's now unavailable — a scan would no longer find it, whether
+            // this removal came from local grace-cache eviction, an explicit
+            // delete, or the process-wide budget (including one triggered by
+            // a completely different capture instance sharing it).
+            imageAvailabilityGeneration &+= 1
         }
         if notifyBudget {
             budget.unregister(owner: self, imageId: key.imageId, version: key.version)
@@ -586,6 +668,7 @@ final class RemoteKittyImageCapture {
     }
 
     private func clearAll() {
+        let hadAnyCurrent = !latestVersion.isEmpty
         for key in order {
             budget.unregister(owner: self, imageId: key.imageId, version: key.version)
         }
@@ -593,8 +676,8 @@ final class RemoteKittyImageCapture {
         dataByKey.removeAll()
         latestVersion.removeAll()
         totalBytes = 0
-        pendingImageId = nil
-        pendingBase64.removeAll(keepingCapacity: true)
+        if hadAnyCurrent { imageAvailabilityGeneration &+= 1 }
+        resetPendingTransmission()
     }
 
     private func removeAllVersions(imageId: UInt32) {
@@ -609,10 +692,11 @@ final class RemoteKittyImageCapture {
             }
         }
         order = kept
-        latestVersion.removeValue(forKey: imageId)
+        if latestVersion.removeValue(forKey: imageId) != nil {
+            imageAvailabilityGeneration &+= 1
+        }
         if pendingImageId == imageId {
-            pendingImageId = nil
-            pendingBase64.removeAll(keepingCapacity: true)
+            resetPendingTransmission()
         }
     }
 }
