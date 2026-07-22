@@ -521,10 +521,17 @@ final class AppModel: ObservableObject {
         // Last Copilot session id seen in this tab (written by the hook). If the
         // shell is created fresh after a reboot, the controller resumes this exact
         // agent session; on a normal relaunch dtach reattaches and ignores it.
-        let recordedCopilot = (try? String(contentsOf:
+        let rawRecordedCopilot = (try? String(contentsOf:
             resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-session"),
             encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let recordedCopilot = rawRecordedCopilot.flatMap {
+            TranscriptController.isCopilotSessionQuarantined(
+                sessionId: sessionId,
+                copilotSessionId: $0,
+                directory: resumeMarkerDirectory
+            ) ? nil : $0
+        }
         let allowAllCopilot = (try? String(contentsOf:
             resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-allow-all"),
             encoding: .utf8))?

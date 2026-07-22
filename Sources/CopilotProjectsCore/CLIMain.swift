@@ -21,6 +21,7 @@ public enum CLIMain {
         "screenshot",
         "remote",
         "doctor",
+        "resolve-session",
         "version", "--version", "-v",
         "install-cli",
         "install-hooks", "uninstall-hooks",
@@ -74,6 +75,7 @@ public enum CLIMain {
         case "install-cli":
             return installCLI(rest)
         case "install-hooks":
+            guard installCLI([]) == 0 else { return 1 }
             do {
                 print(try CopilotHooks.install())
                 print(try CopilotExtension.install())
@@ -89,6 +91,8 @@ public enum CLIMain {
             return 0
         case "attach":
             return attachSession(rest)
+        case "resolve-session":
+            return resolveSession(rest)
         default:
             break
         }
@@ -172,6 +176,36 @@ public enum CLIMain {
             fail("\(error)")
             return 1
         }
+    }
+
+    private static func resolveSession(_ args: [String]) -> Int32 {
+        let parsed = parseFlags(args)
+        guard let rawPID = parsed.flags["pid"] ?? parsed.positionals.first,
+              let pid = pid_t(rawPID),
+              pid > 0 else {
+            fail("resolve-session requires --pid <process-id>")
+            return 1
+        }
+        let snapshot = ProcessTree.snapshot()
+        let environment = ProcessTree.inspect(pid).env
+        let sessionsDirectory: URL
+        if let socket = Env.socket(environment) {
+            sessionsDirectory = URL(fileURLWithPath: socket)
+                .deletingLastPathComponent()
+                .appendingPathComponent("sessions", isDirectory: true)
+        } else {
+            sessionsDirectory = Paths.sessionsDir
+        }
+        guard let sessionId = ProcessTree.managedSessionId(
+            for: pid,
+            fallbackSessionId: Env.sessionId(environment),
+            sessionsDirectory: sessionsDirectory,
+            in: snapshot
+        ) else {
+            return 1
+        }
+        print(sessionId)
+        return 0
     }
 
     // MARK: - aliases

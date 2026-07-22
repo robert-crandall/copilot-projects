@@ -1904,7 +1904,9 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertTrue(
             try String(contentsOf: capture, encoding: .utf8)
-                .contains("set-status idle --timestamp 200 --source session-idle")
+                .contains(
+                    "set-status idle --session \(tabId) --timestamp 200 --source session-idle"
+                )
         )
 
         try Data().write(to: backgroundAgents)
@@ -1919,6 +1921,123 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: capability.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: backgroundAgents.path))
+    }
+
+    func testCopilotHookUsesResolvedSessionForFilesAndLiveStatus() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        let resolverDirectory = root.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: resolverDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hookURL = root.appendingPathComponent("copilot-projects-hook.sh")
+        try CopilotHooks.script.write(to: hookURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: hookURL.path
+        )
+
+        let capture = root.appendingPathComponent("cli-args.txt")
+        let fakeCLI = bin.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "$CAPTURE_FILE"
+        """.write(to: fakeCLI, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeCLI.path
+        )
+
+        let stale = "6780CCA3-92AF-4506-95F2-F018A195A1A1"
+        let resolved = "D7A1C176-B80F-4E6A-B0B5-378A70ACE162"
+        let resolver = resolverDirectory.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' '\(resolved)'
+        """.write(to: resolver, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: resolver.path
+        )
+
+        try runHook(
+            hookURL: hookURL,
+            action: "start",
+            payload: #"{"timestamp":100}"#,
+            tabId: stale,
+            root: root,
+            bin: bin,
+            capture: capture
+        )
+
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: sessions.appendingPathComponent("\(resolved).status").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: sessions.appendingPathComponent("\(stale).status").path
+        ))
+        XCTAssertEqual(
+            try cliCallLines(in: capture),
+            ["set-status idle --session \(resolved) --timestamp 100"]
+        )
+    }
+
+    func testCopilotHookSkipsResolverOutsideManagedTerminal() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let resolverDirectory = root.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: resolverDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hookURL = root.appendingPathComponent("copilot-projects-hook.sh")
+        try CopilotHooks.script.write(to: hookURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: hookURL.path
+        )
+        let called = root.appendingPathComponent("resolver-called")
+        let resolver = resolverDirectory.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        : > "$RESOLVER_CALLED"
+        exit 1
+        """.write(to: resolver, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: resolver.path
+        )
+
+        let process = Process()
+        let input = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [hookURL.path, "start"]
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = root.path
+        environment["RESOLVER_CALLED"] = called.path
+        environment["COPILOT_PROJECTS_SESSION"] = nil
+        environment["COPILOT_MUX_SESSION"] = nil
+        environment["COPILOT_PROJECTS_SOCKET"] = nil
+        environment["COPILOT_MUX_SOCKET"] = nil
+        process.environment = environment
+        process.standardInput = input
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        input.fileHandleForWriting.write(Data(#"{"timestamp":100}"#.utf8))
+        try input.fileHandleForWriting.close()
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: called.path))
     }
 
     func testCopilotHookDelegatesSessionEndResumeCleanupToApp() throws {
@@ -1965,7 +2084,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(
             try cliCallLines(in: capture),
-            ["set-status idle --timestamp 200 --source session-end"]
+            ["set-status idle --session \(tabId) --timestamp 200 --source session-end"]
         )
 
         let copilotSessionId = UUID().uuidString
@@ -1981,7 +2100,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertEqual(
             try cliCallLines(in: capture).last,
-            "set-status idle --timestamp 210 --source session-end --copilot-session \(copilotSessionId)"
+            "set-status idle --session \(tabId) --timestamp 210 --source session-end --copilot-session \(copilotSessionId)"
         )
     }
 
@@ -2081,9 +2200,9 @@ final class AppLogicTests: XCTestCase {
         )
         var cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(cliCalls, [
-            "set-status idle --timestamp 100",
-            "set-status idle --timestamp 110 --source session-idle",
-            "set-status waiting --timestamp 120 --notification elicitation",
+            "set-status idle --session \(tabId) --timestamp 100",
+            "set-status idle --session \(tabId) --timestamp 110 --source session-idle",
+            "set-status waiting --session \(tabId) --timestamp 120 --notification elicitation",
         ])
 
         try runHook(
@@ -2096,7 +2215,10 @@ final class AppLogicTests: XCTestCase {
             capture: capture
         )
         cliCalls = try cliCallLines(in: capture)
-        XCTAssertEqual(cliCalls.last, "set-status waiting --timestamp 125")
+        XCTAssertEqual(
+            cliCalls.last,
+            "set-status waiting --session \(tabId) --timestamp 125"
+        )
 
         try runHook(
             hookURL: hookURL,
@@ -2118,8 +2240,8 @@ final class AppLogicTests: XCTestCase {
         )
         cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(cliCalls.suffix(2), [
-            "set-status running --timestamp 130",
-            "set-status idle --timestamp 135 --source agent-stop",
+            "set-status running --session \(tabId) --timestamp 130",
+            "set-status idle --session \(tabId) --timestamp 135 --source agent-stop",
         ])
         try runHook(
             hookURL: hookURL,
@@ -2133,7 +2255,7 @@ final class AppLogicTests: XCTestCase {
         cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(
             cliCalls.last,
-            "set-status idle --timestamp 140 --source session-idle --notification completed"
+            "set-status idle --session \(tabId) --timestamp 140 --source session-idle --notification completed"
         )
         XCTAssertEqual(completionSignals(in: cliCalls), 2)
 
@@ -2158,7 +2280,7 @@ final class AppLogicTests: XCTestCase {
         cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(
             cliCalls.last,
-            "set-status idle --timestamp 160 --source session-idle --notification completed"
+            "set-status idle --session \(tabId) --timestamp 160 --source session-idle --notification completed"
         )
         let completionSignalCount = completionSignals(in: cliCalls)
         XCTAssertEqual(completionSignalCount, 3)
@@ -2185,7 +2307,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(completionSignals(in: cliCalls), completionSignalCount)
         XCTAssertEqual(
             cliCalls.last,
-            "set-status idle --timestamp 180 --source session-idle"
+            "set-status idle --session \(tabId) --timestamp 180 --source session-idle"
         )
 
         try runHook(
@@ -2209,8 +2331,8 @@ final class AppLogicTests: XCTestCase {
         cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(completionSignals(in: cliCalls), completionSignalCount)
         XCTAssertEqual(cliCalls.suffix(2), [
-            "set-status running --timestamp 190",
-            "set-status idle --timestamp 195",
+            "set-status running --session \(tabId) --timestamp 190",
+            "set-status idle --session \(tabId) --timestamp 195",
         ])
         XCTAssertEqual(cliCalls.count, 13)
     }
@@ -2287,10 +2409,18 @@ final class AppLogicTests: XCTestCase {
         )
 
         let calls = try cliCallLines(in: capture)
-        XCTAssertTrue(calls.contains("set-status idle --timestamp 100 --source scheduled-start"))
-        XCTAssertTrue(calls.contains("set-status idle --timestamp 110 --source scheduled-active"))
-        XCTAssertTrue(calls.contains("set-status idle --timestamp 115 --source scheduled-idle"))
-        XCTAssertTrue(calls.contains("set-status idle --timestamp 120 --source session-idle"))
+        XCTAssertTrue(calls.contains(
+            "set-status idle --session \(tabId) --timestamp 100 --source scheduled-start"
+        ))
+        XCTAssertTrue(calls.contains(
+            "set-status idle --session \(tabId) --timestamp 110 --source scheduled-active"
+        ))
+        XCTAssertTrue(calls.contains(
+            "set-status idle --session \(tabId) --timestamp 115 --source scheduled-idle"
+        ))
+        XCTAssertTrue(calls.contains(
+            "set-status idle --session \(tabId) --timestamp 120 --source session-idle"
+        ))
         XCTAssertEqual(
             try String(contentsOf: promptTimestamp, encoding: .utf8),
             "120"
@@ -3435,7 +3565,9 @@ final class AppLogicTests: XCTestCase {
 
         let cliCalls = try cliCallLines(in: capture)
         XCTAssertEqual(cliCalls.count, 3)
-        XCTAssertTrue(cliCalls.contains("set-status running --timestamp 100"))
+        XCTAssertTrue(cliCalls.contains(
+            "set-status running --session \(tabId) --timestamp 100"
+        ))
         XCTAssertEqual(cliCalls.filter { $0.contains("--timestamp 110") }.count, 1)
         XCTAssertEqual(cliCalls.filter { $0.contains("--timestamp 111") }.count, 1)
         XCTAssertTrue((1...2).contains(completionSignals(in: cliCalls)))
@@ -3908,6 +4040,176 @@ final class AppLogicTests: XCTestCase {
 
         let remote = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
         XCTAssertEqual(remote, loaded)
+    }
+
+    @MainActor
+    func testTranscriptControllerClearsWhenOwnerBecomesForeign() async throws {
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        Paths.ensureStateDir()
+
+        let snapshot = TranscriptSnapshot(
+            schemaVersion: 3,
+            updatedAt: Date(),
+            copilotSessionId: UUID().uuidString,
+            turns: []
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(snapshot).write(
+            to: URL(fileURLWithPath: Paths.transcriptSnapshotPath(sessionId: sessionId)),
+            options: .atomic
+        )
+
+        let controller = TranscriptController(sessionId: sessionId)
+        controller.start()
+        for _ in 0 ..< 50 {
+            if controller.snapshot != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNotNil(controller.snapshot)
+
+        try JSONSerialization.data(withJSONObject: [
+            "appSessionId": UUID().uuidString,
+            "copilotSessionId": snapshot.copilotSessionId,
+            "pid": Int(getpid()),
+        ]).write(
+            to: URL(fileURLWithPath: Paths.transcriptOwnerPath(sessionId: sessionId)),
+            options: .atomic
+        )
+        for _ in 0 ..< 50 {
+            if controller.snapshot == nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(controller.snapshot)
+    }
+
+    func testTranscriptOwnerQuarantinesForeignDtachSession() {
+        let owningSession = "D7A1C176-B80F-4E6A-B0B5-378A70ACE162"
+        let selectedSession = "6780CCA3-92AF-4506-95F2-F018A195A1A1"
+        let sessions = URL(fileURLWithPath: "/tmp/state/sessions", isDirectory: true)
+        var snapshot = ProcessTree.Snapshot()
+        snapshot.parentOf = [10: 20, 20: 30, 30: 1]
+        snapshot.nameOf = [10: "copilot", 20: "zsh", 30: "dtach"]
+        let dtach = [
+            ProcessTree.DtachProcess(
+                pid: 30,
+                parentPID: 1,
+                socketPath: sessions
+                    .appendingPathComponent("\(owningSession).sock").path,
+                isMaster: true
+            ),
+        ]
+        let environment = ["COPILOT_PROJECTS_SESSION": selectedSession]
+
+        XCTAssertEqual(
+            TranscriptController.transcriptOwnerMatchesSession(
+                sessionId: selectedSession,
+                ownerPID: 10,
+                snapshot: snapshot,
+                environment: environment,
+                dtachProcesses: dtach,
+                sessionsDirectory: sessions
+            ),
+            false
+        )
+        XCTAssertEqual(
+            TranscriptController.transcriptOwnerMatchesSession(
+                sessionId: owningSession,
+                ownerPID: 10,
+                snapshot: snapshot,
+                environment: environment,
+                dtachProcesses: dtach,
+                sessionsDirectory: sessions
+            ),
+            true
+        )
+    }
+
+    func testRemoteTranscriptPersistentlyQuarantinesForeignOwnerSnapshot() throws {
+        let sessionId = UUID().uuidString
+        let foreignSessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        Paths.ensureStateDir()
+
+        let snapshot = TranscriptSnapshot(
+            schemaVersion: 3,
+            updatedAt: Date(),
+            copilotSessionId: UUID().uuidString,
+            turns: []
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let snapshotURL = URL(
+            fileURLWithPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
+        )
+        try encoder.encode(snapshot).write(to: snapshotURL, options: .atomic)
+        let revisionBeforeOwner = TranscriptController.remoteRevision(
+            sessionId: sessionId
+        )
+        try JSONSerialization.data(withJSONObject: [
+            "appSessionId": foreignSessionId,
+            "copilotSessionId": snapshot.copilotSessionId,
+            "pid": Int(getpid()),
+        ]).write(
+            to: URL(fileURLWithPath: Paths.transcriptOwnerPath(sessionId: sessionId)),
+            options: .atomic
+        )
+        XCTAssertNotEqual(
+            TranscriptController.remoteRevision(sessionId: sessionId),
+            revisionBeforeOwner
+        )
+
+        let remote = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
+        XCTAssertTrue(remote.turns.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: Paths.transcriptQuarantinePath(sessionId: sessionId)
+        ))
+        XCTAssertTrue(TranscriptController.isCopilotSessionQuarantined(
+            sessionId: sessionId,
+            copilotSessionId: snapshot.copilotSessionId
+        ))
+
+        try JSONSerialization.data(withJSONObject: [
+            "appSessionId": UUID().uuidString,
+            "copilotSessionId": UUID().uuidString,
+            "pid": Int(getpid()),
+        ]).write(
+            to: URL(fileURLWithPath: Paths.transcriptOwnerPath(sessionId: sessionId)),
+            options: .atomic
+        )
+        XCTAssertTrue(
+            TranscriptController.loadRemoteSnapshot(sessionId: sessionId).turns.isEmpty
+        )
+        try FileManager.default.removeItem(
+            atPath: Paths.transcriptOwnerPath(sessionId: sessionId)
+        )
+        try encoder.encode(snapshot).write(to: snapshotURL, options: .atomic)
+        let afterOwnerExit = TranscriptController.loadRemoteSnapshot(
+            sessionId: sessionId
+        )
+        XCTAssertTrue(afterOwnerExit.turns.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: snapshotURL.path))
+
+        let replacement = TranscriptSnapshot(
+            schemaVersion: 3,
+            updatedAt: Date(),
+            copilotSessionId: UUID().uuidString,
+            turns: []
+        )
+        try encoder.encode(replacement).write(to: snapshotURL, options: .atomic)
+        let recovered = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
+        XCTAssertEqual(recovered.copilotSessionId, replacement.copilotSessionId)
+        XCTAssertFalse(TranscriptController.isCopilotSessionQuarantined(
+            sessionId: sessionId,
+            copilotSessionId: replacement.copilotSessionId
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: Paths.transcriptQuarantinePath(sessionId: sessionId)
+        ))
     }
 
     @MainActor
@@ -7776,10 +8078,32 @@ final class AppLogicTests: XCTestCase {
         bin: URL,
         capture: URL
     ) throws -> Process {
+        let resolverDirectory = root.appendingPathComponent(
+            ".local/bin",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: resolverDirectory,
+            withIntermediateDirectories: true
+        )
+        let resolver = resolverDirectory.appendingPathComponent("copilot-projects")
+        if !FileManager.default.fileExists(atPath: resolver.path) {
+            try """
+            #!/bin/sh
+            [ "$1" = "resolve-session" ] || exit 1
+            printf '%s\n' "$COPILOT_PROJECTS_SESSION"
+            """.write(to: resolver, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: resolver.path
+            )
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [hookURL.path, action]
         var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = root.path
         environment["COPILOT_PROJECTS_SESSION"] = tabId
         environment["COPILOT_PROJECTS_SOCKET"] = root.appendingPathComponent("control.sock").path
         environment["CAPTURE_FILE"] = capture.path

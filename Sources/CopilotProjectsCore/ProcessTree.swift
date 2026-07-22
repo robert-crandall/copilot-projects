@@ -105,15 +105,86 @@ public enum ProcessTree {
     }
 
     /// Sessions (by COPILOT_PROJECTS_SESSION env) that currently host a live agent
-    /// process. Works regardless of how the shell is wrapped (dtach or direct).
+    /// process. A real dtach ancestor is authoritative over inherited environment
+    /// because nested or long-lived shells can carry another tab's stale session id.
     public static func agentSessions(agentNames: Set<String>, in snap: Snapshot) -> Set<String> {
+        let dtach = dtachProcesses(in: snap)
+        return agentSessions(
+            agentNames: agentNames,
+            in: snap,
+            environmentOf: { inspect($0).env },
+            dtachProcesses: dtach,
+            sessionsDirectory: Paths.sessionsDir
+        )
+    }
+
+    static func agentSessions(
+        agentNames: Set<String>,
+        in snap: Snapshot,
+        environmentOf: (pid_t) -> [String: String],
+        dtachProcesses: [DtachProcess],
+        sessionsDirectory: URL
+    ) -> Set<String> {
         var sessions = Set<String>()
         for (pid, name) in snap.nameOf where agentNames.contains(name) {
-            if let sid = Env.sessionId(inspect(pid).env) {
+            let environment = environmentOf(pid)
+            if let sid = managedSessionId(
+                for: pid,
+                fallbackSessionId: Env.sessionId(environment),
+                sessionsDirectory: sessionsDirectory,
+                in: snap,
+                dtachProcesses: dtachProcesses
+            ) {
                 sessions.insert(sid)
             }
         }
         return sessions
+    }
+
+    /// Resolve the Copilot Projects tab that owns `pid`.
+    ///
+    /// Managed terminals run below a dtach process whose socket filename is the
+    /// authoritative app-session id. Prefer that over inherited environment. A
+    /// direct (non-dtach) terminal may fall back to its environment only when the
+    /// ancestry reaches the Copilot Projects app; a broken/reparented ancestry fails
+    /// closed rather than guessing from the known-stale value.
+    public static func managedSessionId(
+        for pid: pid_t,
+        fallbackSessionId: String?,
+        sessionsDirectory: URL,
+        in snap: Snapshot,
+        dtachProcesses: [DtachProcess]? = nil
+    ) -> String? {
+        guard pid > 0 else { return nil }
+        let dtachByPID = Dictionary(
+            uniqueKeysWithValues: (dtachProcesses ?? self.dtachProcesses(in: snap))
+                .map { ($0.pid, $0) }
+        )
+        let fallback = validSessionId(fallbackSessionId)
+        var current = pid
+        var visited = Set<pid_t>()
+
+        while current > 1, visited.insert(current).inserted {
+            if let process = dtachByPID[current],
+               let socketPath = process.socketPath,
+               let sessionId = sessionId(
+                   fromDtachSocket: socketPath,
+                   sessionsDirectory: sessionsDirectory
+               ) {
+                return sessionId
+            }
+            if let name = snap.nameOf[current],
+               name == "copilot-project"
+                    || name == "copilot-projects"
+                    || name == "copilot-mux" {
+                return fallback
+            }
+            guard let parent = snap.parentOf[current], parent > 0 else {
+                return nil
+            }
+            current = parent
+        }
+        return nil
     }
 
     /// The dtach master owning a given session socket (for kill). A newly-created
@@ -179,5 +250,25 @@ public enum ProcessTree {
             || processes.contains {
                 $0.pid == process.parentPID && $0.socketPath == process.socketPath
             }
+    }
+
+    private static func sessionId(
+        fromDtachSocket socketPath: String,
+        sessionsDirectory: URL
+    ) -> String? {
+        let socket = URL(fileURLWithPath: socketPath).standardizedFileURL
+        let expectedDirectory = sessionsDirectory.standardizedFileURL
+        guard socket.deletingLastPathComponent().path == expectedDirectory.path,
+              socket.pathExtension == "sock" else {
+            return nil
+        }
+        return validSessionId(socket.deletingPathExtension().lastPathComponent)
+    }
+
+    private static func validSessionId(_ value: String?) -> String? {
+        guard let value, value.utf8.count == 36, UUID(uuidString: value) != nil else {
+            return nil
+        }
+        return value
     }
 }

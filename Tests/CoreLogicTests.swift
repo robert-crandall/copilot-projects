@@ -81,7 +81,11 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(CopilotExtension.script.contains("transcript-owner.json"))
         XCTAssertTrue(CopilotExtension.script.contains("transcriptOwnerLockPath"))
         XCTAssertTrue(CopilotExtension.script.contains("owner.pid === process.pid"))
+        XCTAssertTrue(CopilotExtension.script.contains(
+            "appSessionResolution.native ? {appSessionId} : {}"
+        ))
         XCTAssertTrue(CopilotExtension.script.contains("const copilotSessionId = typeof session.sessionId"))
+        XCTAssertTrue(CopilotExtension.script.contains(#""resolve-session", "--pid""#))
         XCTAssertTrue(CopilotExtension.script.contains("schemaVersion: 3"))
         XCTAssertTrue(CopilotExtension.script.contains("publishTranscript();"))
         XCTAssertTrue(CopilotExtension.script.contains("removeFile(temporaryPath)"))
@@ -172,6 +176,63 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertFalse(CopilotExtension.script.contains("joinSession({"))
         XCTAssertFalse(CopilotExtension.script.contains("process.env.SESSION_ID"))
         XCTAssertFalse(CopilotExtension.script.contains("removeFile(transcriptPath)"))
+    }
+
+    func testCopilotExtensionUsesNativeSessionResolver() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let bin = root.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let expected = "D7A1C176-B80F-4E6A-B0B5-378A70ACE162"
+        let resolver = bin.appendingPathComponent("copilot-projects")
+        try """
+        #!/bin/sh
+        printf '%s\n' '\(expected)'
+        """.write(to: resolver, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: resolver.path
+        )
+
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: #"const joinSession = async () => ({sessionId:"copilot-session"});"#
+        )
+        let script = root.appendingPathComponent("resolver.mjs")
+        try (extensionScript + #"""
+
+        console.log(JSON.stringify({appSessionId, native: appSessionResolution.native}));
+        """#).write(to: script, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
+            "COPILOT_PROJECTS_SESSION": "6780CCA3-92AF-4506-95F2-F018A195A1A1",
+            "COPILOT_PROJECTS_SOCKET": "",
+            "COPILOT_MUX_SOCKET": "",
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node resolver failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let result = try JSONSerialization.jsonObject(with: output) as? [String: Any]
+        XCTAssertEqual(result?["appSessionId"] as? String, expected)
+        XCTAssertEqual(result?["native"] as? Bool, true)
     }
 
     func testCopilotExtensionJavaScriptSyntax() throws {
@@ -374,6 +435,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": "12345678-1234-1234-1234-123456789abc",
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -491,6 +553,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": appSessionId,
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -605,6 +668,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": appSessionId,
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -704,6 +768,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": appSessionId,
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -799,6 +864,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": "12345678-1234-1234-1234-123456789abc",
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -913,6 +979,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": appSessionId,
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -1097,6 +1164,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": appSessionId,
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -1340,6 +1408,7 @@ final class CoreLogicTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["node", scriptURL.path]
         process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": appSessionId,
             "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
             "COPILOT_PROJECTS_ROOT": root.path,
@@ -1581,5 +1650,89 @@ final class CoreLogicTests: XCTestCase {
                 pid: 202, parentPID: 1, socketPath: socket, isMaster: false),
         ]
         XCTAssertEqual(ProcessTree.dtachMaster(forSocket: socket, among: processes), 202)
+    }
+
+    func testManagedSessionResolutionPrefersDtachAncestryOverEnvironment() {
+        let expected = "D7A1C176-B80F-4E6A-B0B5-378A70ACE162"
+        let sessions = URL(fileURLWithPath: "/tmp/state/sessions", isDirectory: true)
+        var snapshot = ProcessTree.Snapshot()
+        snapshot.parentOf = [10: 20, 20: 30, 30: 1]
+        snapshot.nameOf = [10: "copilot", 20: "zsh", 30: "dtach"]
+        let dtach = [
+            ProcessTree.DtachProcess(
+                pid: 30,
+                parentPID: 1,
+                socketPath: sessions.appendingPathComponent("\(expected).sock").path,
+                isMaster: true
+            ),
+        ]
+
+        XCTAssertEqual(
+            ProcessTree.managedSessionId(
+                for: 10,
+                fallbackSessionId: "6780CCA3-92AF-4506-95F2-F018A195A1A1",
+                sessionsDirectory: sessions,
+                in: snapshot,
+                dtachProcesses: dtach
+            ),
+            expected
+        )
+    }
+
+    func testManagedSessionResolutionFallsBackOnlyAtAppBoundary() {
+        let fallback = "6780CCA3-92AF-4506-95F2-F018A195A1A1"
+        let sessions = URL(fileURLWithPath: "/tmp/state/sessions", isDirectory: true)
+        var direct = ProcessTree.Snapshot()
+        direct.parentOf = [10: 20, 20: 30, 30: 1]
+        direct.nameOf = [10: "copilot", 20: "zsh", 30: "copilot-project"]
+        XCTAssertEqual(
+            ProcessTree.managedSessionId(
+                for: 10,
+                fallbackSessionId: fallback,
+                sessionsDirectory: sessions,
+                in: direct,
+                dtachProcesses: []
+            ),
+            fallback
+        )
+
+        var indeterminate = ProcessTree.Snapshot()
+        indeterminate.parentOf = [10: 20]
+        indeterminate.nameOf = [10: "copilot", 20: "zsh"]
+        XCTAssertNil(ProcessTree.managedSessionId(
+            for: 10,
+            fallbackSessionId: fallback,
+            sessionsDirectory: sessions,
+            in: indeterminate,
+            dtachProcesses: []
+        ))
+    }
+
+    func testAgentSessionsUseResolvedDtachSession() {
+        let expected = "D7A1C176-B80F-4E6A-B0B5-378A70ACE162"
+        let stale = "6780CCA3-92AF-4506-95F2-F018A195A1A1"
+        let sessions = URL(fileURLWithPath: "/tmp/state/sessions", isDirectory: true)
+        var snapshot = ProcessTree.Snapshot()
+        snapshot.parentOf = [10: 20, 20: 30, 30: 1]
+        snapshot.nameOf = [10: "copilot", 20: "zsh", 30: "dtach"]
+        let dtach = [
+            ProcessTree.DtachProcess(
+                pid: 30,
+                parentPID: 1,
+                socketPath: sessions.appendingPathComponent("\(expected).sock").path,
+                isMaster: true
+            ),
+        ]
+
+        XCTAssertEqual(
+            ProcessTree.agentSessions(
+                agentNames: ["copilot"],
+                in: snapshot,
+                environmentOf: { _ in ["COPILOT_PROJECTS_SESSION": stale] },
+                dtachProcesses: dtach,
+                sessionsDirectory: sessions
+            ),
+            [expected]
+        )
     }
 }

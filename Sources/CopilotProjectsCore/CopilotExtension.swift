@@ -15,14 +15,60 @@ public enum CopilotExtension {
     }
 
     public static let script = #"""
+    import { execFileSync } from "node:child_process";
     import { dirname, join } from "node:path";
-    import { mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from "node:fs";
+    import {
+        existsSync as fileExistsSync,
+        mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync
+    } from "node:fs";
     import { joinSession } from "@github/copilot-sdk/extension";
 
-    const appSessionId = process.env.COPILOT_PROJECTS_SESSION
+    const environmentAppSessionId = process.env.COPILOT_PROJECTS_SESSION
         || process.env.COPILOT_MUX_SESSION;
     const socketPath = process.env.COPILOT_PROJECTS_SOCKET
         || process.env.COPILOT_MUX_SOCKET;
+    const sessionIdPattern = /^[0-9A-Fa-f-]{36}$/;
+
+    // The environment can be stale or cross-contaminated in a long-lived shell.
+    // Ask the installed native helper to resolve this process through the actual
+    // dtach socket ancestry. If the helper is installed but cannot prove ownership,
+    // fail closed; only old installs without the helper retain the env fallback.
+    function resolveAppSessionId() {
+        const home = typeof process.env.HOME === "string" ? process.env.HOME : "";
+        const candidates = home ? [
+            join(home, ".local/bin/copilot-projects"),
+            join(home, ".local/bin/copilot-mux"),
+        ] : [];
+        const resolver = candidates.find((candidate) => fileExistsSync(candidate));
+        if (!resolver) {
+            return {
+                sessionId: sessionIdPattern.test(environmentAppSessionId || "")
+                    ? environmentAppSessionId
+                    : "",
+                native: false,
+            };
+        }
+        try {
+            const resolved = execFileSync(
+                resolver,
+                ["resolve-session", "--pid", String(process.pid)],
+                {
+                    encoding: "utf8",
+                    timeout: 1_000,
+                    stdio: ["ignore", "pipe", "ignore"],
+                }
+            ).trim();
+            return {
+                sessionId: sessionIdPattern.test(resolved) ? resolved : "",
+                native: true,
+            };
+        } catch {
+            return { sessionId: "", native: true };
+        }
+    }
+
+    const appSessionResolution = resolveAppSessionId();
+    const appSessionId = appSessionResolution.sessionId;
     const validSessionId = /^[0-9A-Fa-f-]{36}$/.test(appSessionId || "");
 
     const session = await joinSession();
@@ -200,6 +246,7 @@ public enum CopilotExtension {
                 writeFileSync(
                     transcriptOwnerPath,
                     JSON.stringify({
+                        ...(appSessionResolution.native ? {appSessionId} : {}),
                         copilotSessionId: session.sessionId,
                         pid: process.pid,
                     }),
@@ -216,6 +263,7 @@ public enum CopilotExtension {
                 writeFileSync(
                     transcriptOwnerLockPath,
                     JSON.stringify({
+                        ...(appSessionResolution.native ? {appSessionId} : {}),
                         copilotSessionId: session.sessionId,
                         pid: process.pid,
                     }),

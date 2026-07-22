@@ -179,6 +179,10 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).transcript-owner.json.lock").path
     }
 
+    public static func transcriptQuarantinePath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).transcript-quarantine.json").path
+    }
+
     /// Absolute path to the `copilot` CLI, resolved without relying on an
     /// interactive login shell's rc files. Honors an explicit override
     /// (`COPILOT_PROJECTS_COPILOT`, or the legacy `COPILOT_MUX_COPILOT`), then
