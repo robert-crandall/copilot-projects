@@ -3503,11 +3503,33 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(TerminalController.shellSingleQuote("a'b"), "'a'\\''b'")
         XCTAssertEqual(
             TerminalController.resumeCommand(sessionId: sessionId, allowAll: false),
-            "copilot --no-remote --no-remote-export --resume=\(sessionId)"
+            TerminalController.profiledCopilotCommand(
+                "copilot",
+                arguments: ["--no-remote", "--no-remote-export", "--resume=\(sessionId)"]
+            )
         )
         XCTAssertEqual(
             TerminalController.resumeCommand(sessionId: sessionId, allowAll: true),
-            "copilot --no-remote --no-remote-export --allow-all --resume=\(sessionId)"
+            TerminalController.profiledCopilotCommand(
+                "copilot",
+                arguments: [
+                    "--no-remote",
+                    "--no-remote-export",
+                    "--allow-all",
+                    "--resume=\(sessionId)",
+                ]
+            )
+        )
+        XCTAssertEqual(
+            TerminalController.profiledCopilotCommand(
+                "/opt/my copilot/copilot",
+                arguments: ["--version"]
+            ),
+            "/bin/sh -c "
+                + TerminalController.shellSingleQuote(
+                    #"unset TERM_PROGRAM_VERSION; TERM_PROGRAM=ghostty exec "$0" "$@""#
+                )
+                + " '/opt/my copilot/copilot' '--version'"
         )
         XCTAssertTrue(AppModel.shouldResumeWithAllowAll(
             copilotSessionId: sessionId,
@@ -3550,7 +3572,10 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             TerminalController.launchCommand(executable: executable, shell: shell),
-            "'/opt/my copilot/copilot' --no-remote --no-remote-export"
+            TerminalController.profiledCopilotCommand(
+                executable,
+                arguments: ["--no-remote", "--no-remote-export"]
+            )
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
         )
@@ -3559,7 +3584,10 @@ final class AppLogicTests: XCTestCase {
             TerminalController.launchCommand(
                 executable: executable, shell: shell, allowAll: true
             ),
-            "'/opt/my copilot/copilot' --no-remote --no-remote-export --allow-all"
+            TerminalController.profiledCopilotCommand(
+                executable,
+                arguments: ["--no-remote", "--no-remote-export", "--allow-all"]
+            )
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
         )
@@ -3577,16 +3605,16 @@ final class AppLogicTests: XCTestCase {
         )
         // A recorded resume session ALWAYS wins over a one-shot launch executable.
         let sessionId = UUID().uuidString
+        let resumeExecutable = "/opt/resume copilot/copilot"
         let resumeProgram = TerminalController.startupProgram(
             shell: shell,
             copilotSessionId: sessionId,
             copilotSessionAllowAll: false,
+            resumeCopilotExecutable: resumeExecutable,
             launchCopilotExecutable: executable
         )
         let joined = resumeProgram.joined(separator: " ")
-        XCTAssertTrue(joined.contains(
-            "copilot --no-remote --no-remote-export --resume=\(sessionId)"
-        ))
+        XCTAssertTrue(joined.contains("resume copilot"))
         XCTAssertFalse(joined.contains("my copilot/copilot"))
     }
 
@@ -3610,6 +3638,71 @@ final class AppLogicTests: XCTestCase {
         // Non-leaked vars (the app's own IPC handshake, PATH) must survive.
         XCTAssertEqual(cleaned["PATH"], "/usr/bin")
         XCTAssertEqual(cleaned["COPILOT_PROJECTS_SESSION"], "keep-me")
+    }
+
+    func testProfiledCopilotCommandScopesGhosttyEnvironment() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fakeCopilot = root
+            .appendingPathComponent("Sean's Tools;touch SHOULD_NOT_EXIST", isDirectory: true)
+            .appendingPathComponent("copilot=custom")
+        try FileManager.default.createDirectory(
+            at: fakeCopilot.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try """
+        #!/bin/sh
+        printf '%s\n' \
+          "${TERM_PROGRAM:-unset}" \
+          "${TERM_PROGRAM_VERSION:-unset}" \
+          "$1"
+        """.write(to: fakeCopilot, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeCopilot.path
+        )
+
+        let shellPaths = ["/bin/csh", "/opt/homebrew/bin/fish"].filter {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
+        for shellPath in shellPaths {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shellPath)
+            process.currentDirectoryURL = root
+            process.arguments = [
+                "-c",
+                TerminalController.profiledCopilotCommand(
+                    fakeCopilot.path,
+                    arguments: ["argument with spaces"]
+                ),
+            ]
+            process.environment = [
+                "PATH": "/usr/bin:/bin",
+                "TERM_PROGRAM": "Apple_Terminal",
+                "TERM_PROGRAM_VERSION": "2.14",
+            ]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = Pipe()
+            try process.run()
+            process.waitUntilExit()
+
+            XCTAssertEqual(process.terminationStatus, 0, shellPath)
+            XCTAssertEqual(
+                String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+                "ghostty\nunset\nargument with spaces\n",
+                shellPath
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: root.appendingPathComponent("SHOULD_NOT_EXIST").path
+                ),
+                shellPath
+            )
+        }
     }
 
     func testSessionCreationLedgerIdempotencyTombstoneAndPersistence() throws {

@@ -245,6 +245,13 @@ coexists with other integrations (e.g. cmux) and is safe to leave installed glob
 it with `copilot-projects install-hooks` / `uninstall-hooks`. Start a new Copilot CLI session to
 pick up changes.
 
+App-managed Copilot launches and recorded-session resumes use a Ghostty-compatible profile so
+Copilot CLI emits inline images through SwiftTerm's Kitty graphics support. The profile is scoped
+to the Copilot process; plain shells and unrelated TUIs keep their original terminal identity.
+For a manual shell launch with inline images, run
+`/usr/bin/env -u TERM_PROGRAM_VERSION TERM_PROGRAM=ghostty copilot`. Existing Copilot processes
+must be restarted with that profile; relaunching the app only reattaches their dtach master.
+
 The companion Copilot extension records completed root turns through the supported Copilot SDK
 event API. It atomically writes a bounded per-tab transcript snapshot after each turn, including
 stopped turns and compact tool summaries but excluding raw tool arguments and results. Copilot
