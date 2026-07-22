@@ -22,7 +22,7 @@ let package = Package(
         // the per-frame CoreText bounding-box path.
         .package(
             url: "https://github.com/sirfergy/SwiftTerm",
-            revision: "78c58c75280fa5c57d96b27d34bc3298ba111a45"
+            revision: "1e6a12191a0eb89aec9ed7595ff81667d411b163"
         ),
         .package(
             url: "https://github.com/apple/swift-nio",
