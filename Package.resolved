@@ -218,9 +218,9 @@
     {
       "identity" : "swiftterm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/migueldeicaza/SwiftTerm",
+      "location" : "https://github.com/sirfergy/SwiftTerm",
       "state" : {
-        "revision" : "9adb62463d2264e7403feb7a1471aaf27eaab2f4"
+        "revision" : "75b153d9968e43dc756e578fb0ba95dfcf88d285"
       }
     }
   ],

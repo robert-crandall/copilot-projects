@@ -61,8 +61,9 @@ private let remoteKittyMaxEmittedPlacements = 64
 /// Decodes the Kitty Unicode-placeholder scheme (`U+10EEEE` + foreground color
 /// carrying the low 24 bits of the image id) directly from plain grapheme +
 /// color inputs, so this logic is testable without any SwiftTerm dependency and
-/// matches SwiftTerm's own (private) `KittyPlaceholderDecoder.colorToId` byte
-/// order: `red | green << 8 | blue << 16`.
+/// matches the Kitty protocol and SwiftTerm's
+/// `KittyPlaceholderDecoder.colorToId` byte order:
+/// `(red << 16) | (green << 8) | blue`.
 enum RemoteKittyPlaceholderCell {
     static let baseScalar: UInt32 = 0x10EEEE
 
@@ -78,16 +79,16 @@ enum RemoteKittyPlaceholderCell {
         guard let first = character.unicodeScalars.first, first.value == baseScalar else {
             return nil
         }
-        let imageId = UInt32(foreground.red)
+        let imageId = (UInt32(foreground.red) << 16)
             | (UInt32(foreground.green) << 8)
-            | (UInt32(foreground.blue) << 16)
+            | UInt32(foreground.blue)
         guard imageId >= 1, imageId <= 0xFFFFFF else { return nil }
         return imageId
     }
 
     /// Decodes the low-24-bit placement id encoded in a cell's *underline*
     /// color, using the exact same byte order as `decodeImageId`'s
-    /// foreground decode (`red | green << 8 | blue << 16`) — mirroring
+    /// foreground decode (`red << 16 | green << 8 | blue`) — mirroring
     /// SwiftTerm's own (private) `KittyPlaceholderDecoder.colorToId` applied
     /// to `Attribute.underlineColor` instead of `.fg`. Unlike `decodeImageId`,
     /// this never fails: a cell with no truecolor underline set at all (the
@@ -95,7 +96,9 @@ enum RemoteKittyPlaceholderCell {
     /// `0`, the Kitty spec's implicit default placement, not `nil`.
     static func decodePlacementId(underline: (red: UInt8, green: UInt8, blue: UInt8)?) -> UInt32 {
         guard let underline else { return 0 }
-        return UInt32(underline.red) | (UInt32(underline.green) << 8) | (UInt32(underline.blue) << 16)
+        return (UInt32(underline.red) << 16)
+            | (UInt32(underline.green) << 8)
+            | UInt32(underline.blue)
     }
 }
 

@@ -15,10 +15,12 @@ let package = Package(
     ],
     dependencies: [
         // Pinned past the post-1.13 Metal fixes for stale rows/cursor, window
-        // reparenting, synchronized output, and hidden-scroller layout.
+        // reparenting, synchronized output, and hidden-scroller layout. The
+        // temporary fork also carries the Kitty truecolor placeholder ID fix
+        // proposed upstream in migueldeicaza/SwiftTerm#607.
         .package(
-            url: "https://github.com/migueldeicaza/SwiftTerm",
-            revision: "9adb62463d2264e7403feb7a1471aaf27eaab2f4"
+            url: "https://github.com/sirfergy/SwiftTerm",
+            revision: "75b153d9968e43dc756e578fb0ba95dfcf88d285"
         ),
         .package(
             url: "https://github.com/apple/swift-nio",

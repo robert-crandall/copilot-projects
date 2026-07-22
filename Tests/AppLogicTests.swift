@@ -8536,9 +8536,9 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(
             RemoteKittyPlaceholderCell.decodeImageId(
                 character: placeholder,
-                foreground: (red: 1, green: 0, blue: 0)
+                foreground: (red: 66, green: 172, blue: 138)
             ),
-            1
+            0x42AC8A
         )
         XCTAssertEqual(
             RemoteKittyPlaceholderCell.decodeImageId(
@@ -8550,7 +8550,7 @@ final class AppLogicTests: XCTestCase {
         // Not a placeholder grapheme.
         XCTAssertNil(RemoteKittyPlaceholderCell.decodeImageId(
             character: "A",
-            foreground: (red: 1, green: 0, blue: 0)
+            foreground: (red: 66, green: 172, blue: 138)
         ))
         // No truecolor foreground at all.
         XCTAssertNil(RemoteKittyPlaceholderCell.decodeImageId(
@@ -8562,6 +8562,12 @@ final class AppLogicTests: XCTestCase {
             character: placeholder,
             foreground: (red: 0, green: 0, blue: 0)
         ))
+        XCTAssertEqual(
+            RemoteKittyPlaceholderCell.decodePlacementId(
+                underline: (red: 17, green: 34, blue: 51)
+            ),
+            0x112233
+        )
     }
 
     func testRemoteKittyGraphicsSanitizeLinePreservesLengthAndReplacesPlaceholders() {
@@ -10485,7 +10491,7 @@ final class AppLogicTests: XCTestCase {
         let placeholder = Character(UnicodeScalar(0x10EEEE)!)
         let liveBytes = Array((
             "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
-                + "\u{1B}[38;2;55;0;0m"
+                + "\u{1B}[38;2;0;0;55m"
                 + String(repeating: String(placeholder), count: 4)
                 + "\u{1B}[0m"
         ).utf8)
@@ -10543,7 +10549,7 @@ final class AppLogicTests: XCTestCase {
         let placeholder = Character(UnicodeScalar(0x10EEEE)!)
         let liveBytes = Array((
             "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
-                + "\u{1B}[38;2;91;0;0m"
+                + "\u{1B}[38;2;0;0;91m"
                 + String(repeating: String(placeholder), count: 4)
                 + "\u{1B}[0m"
         ).utf8)
@@ -10637,11 +10643,11 @@ final class AppLogicTests: XCTestCase {
         // color the distinct placement id.
         let liveBytes = Array((
             "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
-                + "\u{1B}[38;2;96;0;0m\u{1B}[58;2;1;0;0m"
+                + "\u{1B}[38;2;0;0;96m\u{1B}[58;2;0;0;1m"
                 + String(repeating: String(placeholder), count: 4)
                 + "\u{1B}[0m"
                 + "\u{1B}[5;1H"
-                + "\u{1B}[38;2;96;0;0m\u{1B}[58;2;2;0;0m"
+                + "\u{1B}[38;2;0;0;96m\u{1B}[58;2;0;0;2m"
                 + String(repeating: String(placeholder), count: 4)
                 + "\u{1B}[0m"
         ).utf8)
@@ -10706,7 +10712,7 @@ final class AppLogicTests: XCTestCase {
         let placeholder = Character(UnicodeScalar(0x10EEEE)!)
         let liveBytes = Array((
             "\u{1B}[?1049h\u{1B}[H"
-                + "\u{1B}[38;2;66;0;0m"
+                + "\u{1B}[38;2;0;0;66m"
                 + String(repeating: String(placeholder), count: 3)
                 + "\u{1B}[0m"
         ).utf8)
@@ -10783,7 +10789,7 @@ final class AppLogicTests: XCTestCase {
             script += "filler-\(i)\r\n"
         }
         for _ in 0 ..< imageRowCount {
-            script += "\u{1B}[38;2;80;0;0m" + String(repeating: String(placeholder), count: 4) + "\u{1B}[0m\r\n"
+            script += "\u{1B}[38;2;0;0;80m" + String(repeating: String(placeholder), count: 4) + "\u{1B}[0m\r\n"
         }
         for i in 0 ..< (rows + 20) {
             script += "filler-after-\(i)\r\n"
@@ -10870,7 +10876,7 @@ final class AppLogicTests: XCTestCase {
             script += "filler-\(i)\r\n"
         }
         for _ in 0 ..< imageRowCount {
-            script += "\u{1B}[38;2;81;0;0m" + String(repeating: String(placeholder), count: 4) + "\u{1B}[0m\r\n"
+            script += "\u{1B}[38;2;0;0;81m" + String(repeating: String(placeholder), count: 4) + "\u{1B}[0m\r\n"
         }
         for i in 0 ..< (rows + 20) {
             script += "filler-after-\(i)\r\n"
@@ -11261,7 +11267,7 @@ final class AppLogicTests: XCTestCase {
         let placeholder = Character(UnicodeScalar(0x10EEEE)!)
         controllerA.terminalView.dataReceived(slice: Array((
             "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
-                + "\u{1B}[38;2;91;0;0m"
+                + "\u{1B}[38;2;0;0;91m"
                 + String(repeating: String(placeholder), count: 4)
                 + "\u{1B}[0m"
         ).utf8)[...])
