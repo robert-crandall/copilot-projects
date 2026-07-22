@@ -129,6 +129,12 @@ final class TranscriptController: ObservableObject {
               snapshot.schemaVersion == 3 else {
             return LoadResult(signature: signature, snapshot: nil)
         }
+        guard transcriptOwnerAllowsSnapshot(
+            sessionId: sessionId,
+            copilotSessionId: snapshot.copilotSessionId
+        ) else {
+            return LoadResult(signature: signature, snapshot: nil)
+        }
         guard transcriptQuarantineAllowsRead(
             sessionId: sessionId,
             snapshot: snapshot,
@@ -172,6 +178,12 @@ final class TranscriptController: ObservableObject {
         let decoder = transcriptDecoder()
         guard let snapshot = try? decoder.decode(TranscriptSnapshot.self, from: data),
               snapshot.schemaVersion == 3 else {
+            return emptyRemoteSnapshot()
+        }
+        guard transcriptOwnerAllowsSnapshot(
+            sessionId: sessionId,
+            copilotSessionId: snapshot.copilotSessionId
+        ) else {
             return emptyRemoteSnapshot()
         }
         guard transcriptQuarantineAllowsRead(
@@ -232,6 +244,41 @@ final class TranscriptController: ObservableObject {
             recordForeignTranscriptQuarantine(
                 sessionId: sessionId,
                 copilotSessionId: owner.copilotSessionId,
+                directory: directory
+            )
+        }
+        return allows
+    }
+
+    /// Cross-checks a just-decoded transcript snapshot against the *current*
+    /// owner marker's recorded Copilot session id. `transcriptOwnerAllowsRead`
+    /// only validates ownership (appSessionId/pid) at the instant it's called;
+    /// it can't detect the narrower race where a dead owner is reclaimed (a
+    /// new, valid `transcript-owner.json` is written) before that new owner's
+    /// first `publishTranscript()` overwrites `transcript.json` — so the bytes
+    /// just decoded can still be the *previous* (possibly foreign) owner's
+    /// content even though the owner file itself now looks legitimate. Reject
+    /// (and quarantine) whenever the owner records a different Copilot session
+    /// id than the transcript we actually read.
+    nonisolated private static func transcriptOwnerAllowsSnapshot(
+        sessionId: String,
+        copilotSessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> Bool {
+        let path = directory
+            .appendingPathComponent("\(sessionId).transcript-owner.json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let owner = try? JSONDecoder().decode(TranscriptOwner.self, from: data),
+              let ownerCopilotSessionId = owner.copilotSessionId else {
+            // No owner recorded (or the owner predates copilotSessionId being
+            // tracked) — nothing further to cross-check against.
+            return true
+        }
+        let allows = ownerCopilotSessionId == copilotSessionId
+        if !allows {
+            recordForeignTranscriptQuarantine(
+                sessionId: sessionId,
+                copilotSessionId: copilotSessionId,
                 directory: directory
             )
         }

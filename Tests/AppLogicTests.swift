@@ -4264,6 +4264,65 @@ final class AppLogicTests: XCTestCase {
         ))
     }
 
+    func testRemoteSnapshotRejectsStaleTranscriptDuringOwnerReclamation() throws {
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        Paths.ensureStateDir()
+
+        // Simulate the tail end of dead-owner reclamation: the extension has
+        // already atomically replaced transcript-owner.json with a new,
+        // legitimate owner (matching appSessionId, new copilotSessionId), but
+        // that new owner's async publishTranscript() hasn't overwritten
+        // transcript.json yet — so the bytes on disk are still the *previous*
+        // (possibly foreign) owner's stale content.
+        let staleSnapshot = TranscriptSnapshot(
+            schemaVersion: 3,
+            updatedAt: Date(),
+            copilotSessionId: UUID().uuidString,
+            turns: []
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let snapshotURL = URL(
+            fileURLWithPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
+        )
+        try encoder.encode(staleSnapshot).write(to: snapshotURL, options: .atomic)
+
+        let newOwnerCopilotSessionId = UUID().uuidString
+        XCTAssertNotEqual(newOwnerCopilotSessionId, staleSnapshot.copilotSessionId)
+        try JSONSerialization.data(withJSONObject: [
+            "appSessionId": sessionId,
+            "copilotSessionId": newOwnerCopilotSessionId,
+            "pid": Int(getpid()),
+        ]).write(
+            to: URL(fileURLWithPath: Paths.transcriptOwnerPath(sessionId: sessionId)),
+            options: .atomic
+        )
+
+        // The owner marker's appSessionId matches this session, so
+        // transcriptOwnerAllowsRead alone would pass — the stale-transcript
+        // cross-check must be what rejects the read.
+        let remote = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
+        XCTAssertTrue(remote.turns.isEmpty)
+        XCTAssertNotEqual(remote.copilotSessionId, staleSnapshot.copilotSessionId)
+        XCTAssertTrue(TranscriptController.isCopilotSessionQuarantined(
+            sessionId: sessionId,
+            copilotSessionId: staleSnapshot.copilotSessionId
+        ))
+
+        // Once the new owner's publishTranscript() catches up and overwrites
+        // transcript.json with matching content, reads should succeed again.
+        let freshSnapshot = TranscriptSnapshot(
+            schemaVersion: 3,
+            updatedAt: Date(),
+            copilotSessionId: newOwnerCopilotSessionId,
+            turns: []
+        )
+        try encoder.encode(freshSnapshot).write(to: snapshotURL, options: .atomic)
+        let recovered = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
+        XCTAssertEqual(recovered.copilotSessionId, newOwnerCopilotSessionId)
+    }
+
     @MainActor
     func testTranscriptControllerRejectsLegacySchemaForDesktopAndRemote() async throws {
         let sessionId = UUID().uuidString
