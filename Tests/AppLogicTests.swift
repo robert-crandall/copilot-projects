@@ -4126,6 +4126,58 @@ final class AppLogicTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testControllerBlocksResumeForForeignOwnerBeforeAnyQuarantineIsRecorded() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = Session(title: "background", cwd: "/tmp")
+        let project = Project(name: "target", cwd: "/tmp", sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+
+        // A foreign owner (a different appSessionId) left this transcript-owner
+        // marker behind. Nothing has ever read the transcript for this session —
+        // it's a background tab, so bootstrap never starts a TranscriptController
+        // for it — so no quarantine file exists yet.
+        let foreignCopilotSession = UUID().uuidString
+        try JSONSerialization.data(withJSONObject: [
+            "appSessionId": UUID().uuidString,
+            "copilotSessionId": foreignCopilotSession,
+            "pid": Int(getpid()),
+        ]).write(
+            to: sessions.appendingPathComponent("\(session.id).transcript-owner.json")
+        )
+        try Data(foreignCopilotSession.utf8).write(
+            to: sessions.appendingPathComponent("\(session.id).copilot-session")
+        )
+        let quarantinePath = sessions
+            .appendingPathComponent("\(session.id).transcript-quarantine.json").path
+        XCTAssertFalse(FileManager.default.fileExists(atPath: quarantinePath))
+
+        let model = AppModel(
+            stateRepository: repository,
+            resumeMarkerDirectory: sessions
+        )
+        // Creating the controller (as bootstrapIfNeeded does for every session in
+        // the selected project, well before any TranscriptController exists) must
+        // validate the owner marker itself instead of relying on a quarantine file
+        // that only a not-yet-started TranscriptController would otherwise populate.
+        _ = model.controller(for: session.id)
+
+        XCTAssertTrue(TranscriptController.isCopilotSessionQuarantined(
+            sessionId: session.id,
+            copilotSessionId: foreignCopilotSession,
+            directory: sessions
+        ))
+    }
+
     func testRemoteTranscriptPersistentlyQuarantinesForeignOwnerSnapshot() throws {
         let sessionId = UUID().uuidString
         let foreignSessionId = UUID().uuidString

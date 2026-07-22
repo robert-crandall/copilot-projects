@@ -525,12 +525,23 @@ final class AppModel: ObservableObject {
             resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-session"),
             encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let recordedCopilot = rawRecordedCopilot.flatMap {
-            TranscriptController.isCopilotSessionQuarantined(
+        // isCopilotSessionQuarantined only sees a foreign owner that some
+        // TranscriptController has already read and recorded — but background
+        // tabs never get a TranscriptController, and at bootstrap the selected
+        // tab's hasn't started yet. Validate the owner marker directly here too
+        // (this also records the quarantine as a side effect) so a foreign
+        // owner can't be resumed before anything else has observed it.
+        let ownerAllowsResume = TranscriptController.transcriptOwnerAllowsRead(
+            sessionId: sessionId,
+            directory: resumeMarkerDirectory
+        )
+        let recordedCopilot = rawRecordedCopilot.flatMap { candidate -> String? in
+            guard ownerAllowsResume else { return nil }
+            return TranscriptController.isCopilotSessionQuarantined(
                 sessionId: sessionId,
-                copilotSessionId: $0,
+                copilotSessionId: candidate,
                 directory: resumeMarkerDirectory
-            ) ? nil : $0
+            ) ? nil : candidate
         }
         let allowAllCopilot = (try? String(contentsOf:
             resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-allow-all"),

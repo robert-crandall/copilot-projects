@@ -184,10 +184,23 @@ final class TranscriptController: ObservableObject {
         return snapshot
     }
 
-    nonisolated private static func transcriptOwnerAllowsRead(
-        sessionId: String
+    /// Synchronously validates whether the process recorded in
+    /// `transcript-owner.json` for `sessionId` is actually this session (rather
+    /// than a foreign tab that inherited its environment/path). Quarantine is
+    /// otherwise only populated lazily as a side effect of reading the
+    /// transcript via `loadRemoteSnapshot`, which background tabs never do (no
+    /// `TranscriptController` is ever started for them) and the selected tab
+    /// may not have done yet at app bootstrap — so callers that are about to
+    /// trust a resume marker (e.g. `AppModel.controller(for:)`) must call this
+    /// directly instead of relying solely on `isCopilotSessionQuarantined`.
+    /// Records the mismatch as a quarantine (matching `loadRemoteSnapshot`'s
+    /// behavior) so subsequent reads stay consistent.
+    nonisolated static func transcriptOwnerAllowsRead(
+        sessionId: String,
+        directory: URL = Paths.sessionsDir
     ) -> Bool {
-        let path = Paths.transcriptOwnerPath(sessionId: sessionId)
+        let path = directory
+            .appendingPathComponent("\(sessionId).transcript-owner.json").path
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let owner = try? JSONDecoder().decode(TranscriptOwner.self, from: data),
               owner.pid > 0 else {
@@ -198,7 +211,8 @@ final class TranscriptController: ObservableObject {
             if !allows {
                 recordForeignTranscriptQuarantine(
                     sessionId: sessionId,
-                    copilotSessionId: owner.copilotSessionId
+                    copilotSessionId: owner.copilotSessionId,
+                    directory: directory
                 )
             }
             return allows
@@ -212,12 +226,13 @@ final class TranscriptController: ObservableObject {
             snapshot: snapshot,
             environment: environment,
             dtachProcesses: ProcessTree.dtachProcesses(in: snapshot),
-            sessionsDirectory: Paths.sessionsDir
+            sessionsDirectory: directory
         ) ?? true
         if !allows {
             recordForeignTranscriptQuarantine(
                 sessionId: sessionId,
-                copilotSessionId: owner.copilotSessionId
+                copilotSessionId: owner.copilotSessionId,
+                directory: directory
             )
         }
         return allows
@@ -261,13 +276,15 @@ final class TranscriptController: ObservableObject {
 
     nonisolated private static func recordForeignTranscriptQuarantine(
         sessionId: String,
-        copilotSessionId: String?
+        copilotSessionId: String?,
+        directory: URL = Paths.sessionsDir
     ) {
         if let copilotSessionId, UUID(uuidString: copilotSessionId) != nil {
             quarantineLock.lock()
             defer { quarantineLock.unlock() }
-            let path = Paths.transcriptQuarantinePath(sessionId: sessionId)
-            let existing = loadQuarantine(sessionId: sessionId)?
+            let path = directory
+                .appendingPathComponent("\(sessionId).transcript-quarantine.json").path
+            let existing = loadQuarantine(sessionId: sessionId, directory: directory)?
                 .foreignCopilotSessionIds ?? []
             guard !existing.contains(copilotSessionId) else { return }
             let quarantine = TranscriptQuarantine(
