@@ -220,7 +220,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sirfergy/SwiftTerm",
       "state" : {
-        "revision" : "75b153d9968e43dc756e578fb0ba95dfcf88d285"
+        "revision" : "1e6a12191a0eb89aec9ed7595ff81667d411b163"
       }
     }
   ],
