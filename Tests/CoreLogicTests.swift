@@ -695,6 +695,216 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertGreaterThan(summary["allowAllChecks"] as? Int ?? 0, 0)
     }
 
+    // Reclaim must be able to swap the marker without any window where a
+    // concurrent reader could observe no marker at all — verified indirectly
+    // here by asserting the write-then-rename temp file never lingers.
+    func testCopilotExtensionReclaimLeavesNoTemporaryOwnerMarkerBehind() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-reclaim-tmp-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+        let copilotSessionId = "22222222-2222-4222-8222-222222222222"
+
+        let prelude = #"""
+        const namedListeners = new Map();
+        const fakeSession = {
+          sessionId: "__COPILOT_SESSION_ID__",
+          rpc: {
+            schedule: { list: async () => ({entries:[]}) },
+            permissions: { getAllowAll: async () => ({ enabled: true }) }
+          },
+          on(name, handler) {
+            if (typeof name !== "function") namedListeners.set(name, handler);
+          },
+          async getEvents() { return []; }
+        };
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: "const joinSession = async () => fakeSession;"
+        )
+        let epilogue = #"""
+
+        const sessionsDir = `${process.env.COPILOT_PROJECTS_ROOT}/sessions`;
+        const ownerPath = `${sessionsDir}/${process.env.COPILOT_PROJECTS_SESSION}.transcript-owner.json`;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        // A dead owner (pid 0 is never a real process) triggers the reclaim
+        // path inside ownsSharedFiles()/reclaimDeadOwner() the next time this
+        // process needs to write shared files.
+        writeFileSync(ownerPath, JSON.stringify({ copilotSessionId: "old-session", pid: 0 }));
+
+        namedListeners.get("assistant.turn_start")({
+          id: "turn",
+          type: "assistant.turn_start",
+          timestamp: "2026-07-12T04:00:00.000Z",
+          data: {}
+        });
+
+        let waited = 0;
+        let owner = null;
+        while (waited < 4000) {
+          try { owner = JSON.parse(readFileSync(ownerPath, "utf8")); } catch {}
+          if (owner && owner.copilotSessionId === "__COPILOT_SESSION_ID__") break;
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+
+        const entries = readdirSync(sessionsDir);
+        console.log(JSON.stringify({
+          leftoverTempFiles: entries.filter((name) => name.endsWith(".tmp")),
+          ownerCopilotSessionId: owner?.copilotSessionId,
+          ownerHasBootTime: typeof owner?.bootTime === "string" && owner.bootTime.length > 0
+        }));
+        process.exit(0);
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let scriptURL = root.appendingPathComponent("reclaim-tmp.mjs")
+        try (
+            "import { readdirSync } from \"node:fs\";\n" + prelude + extensionScript + epilogue
+        ).write(to: scriptURL, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        XCTAssertEqual((summary["leftoverTempFiles"] as? [String])?.isEmpty, true)
+        XCTAssertEqual(summary["ownerCopilotSessionId"] as? String, copilotSessionId)
+        XCTAssertEqual(summary["ownerHasBootTime"] as? Bool, true)
+    }
+
+    // A live-looking pid alone must not permanently block reclamation: after a
+    // reboot the recorded pid can be reassigned to an unrelated process, and
+    // `processAlive` can't tell the difference. Simulate that by recording pid
+    // 1 (always "alive" per process.kill EPERM) together with a boot time that
+    // does not match the current system boot time.
+    func testCopilotExtensionReclaimsOwnershipWhenRecordedPidSurvivesAcrossReboot() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-reboot-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+        let copilotSessionId = "33333333-3333-4333-8333-333333333333"
+
+        let prelude = #"""
+        const namedListeners = new Map();
+        const fakeSession = {
+          sessionId: "__COPILOT_SESSION_ID__",
+          rpc: {
+            schedule: { list: async () => ({entries:[]}) },
+            permissions: { getAllowAll: async () => ({ enabled: true }) }
+          },
+          on(name, handler) {
+            if (typeof name !== "function") namedListeners.set(name, handler);
+          },
+          async getEvents() { return []; }
+        };
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: "const joinSession = async () => fakeSession;"
+        )
+        let epilogue = #"""
+
+        const sessionsDir = `${process.env.COPILOT_PROJECTS_ROOT}/sessions`;
+        const ownerPath = `${sessionsDir}/${process.env.COPILOT_PROJECTS_SESSION}.transcript-owner.json`;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        // pid 1 always looks alive to processAlive(); bootTime is deliberately
+        // wrong so the fix must reclaim anyway instead of blocking forever.
+        writeFileSync(ownerPath, JSON.stringify({
+          copilotSessionId: "old-session",
+          pid: 1,
+          bootTime: "stale-boot-time-from-a-previous-boot"
+        }));
+
+        namedListeners.get("assistant.turn_start")({
+          id: "turn",
+          type: "assistant.turn_start",
+          timestamp: "2026-07-12T04:00:00.000Z",
+          data: {}
+        });
+
+        let waited = 0;
+        let owner = null;
+        while (waited < 4000) {
+          try { owner = JSON.parse(readFileSync(ownerPath, "utf8")); } catch {}
+          if (owner && owner.copilotSessionId === "__COPILOT_SESSION_ID__") break;
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+
+        console.log(JSON.stringify({
+          ownerCopilotSessionId: owner?.copilotSessionId,
+          ownerPidIsCurrent: owner?.pid === process.pid
+        }));
+        process.exit(0);
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let scriptURL = root.appendingPathComponent("reboot.mjs")
+        try (prelude + extensionScript + epilogue).write(
+            to: scriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        // Without the boot-time cross-check, pid 1 looks permanently alive and
+        // this new session would never be able to claim ownership.
+        XCTAssertEqual(summary["ownerCopilotSessionId"] as? String, copilotSessionId)
+        XCTAssertEqual(summary["ownerPidIsCurrent"] as? Bool, true)
+    }
+
     func testCopilotExtensionDiscardsStaleAllowAllRefreshResult() throws {
         try requireNodeForJavaScriptTests()
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)

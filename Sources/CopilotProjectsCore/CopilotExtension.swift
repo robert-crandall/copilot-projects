@@ -214,6 +214,41 @@ public enum CopilotExtension {
             }
         }
 
+        // A live-looking pid doesn't prove it's the same process that wrote the
+        // marker: after a reboot (or once the pid counter wraps) an unrelated
+        // process can be reassigned that exact pid, and `processAlive` alone
+        // would treat that unrelated process as the still-live owner forever,
+        // permanently blocking every new session for this tab from claiming or
+        // publishing shared files. Cross-check the system boot time recorded
+        // alongside the pid; a boot time mismatch proves the recorded process
+        // is gone even though the pid number happens to be in use again.
+        let cachedBootTime;
+        function currentBootTime() {
+            if (cachedBootTime !== undefined) return cachedBootTime;
+            try {
+                cachedBootTime = execFileSync(
+                    "sysctl",
+                    ["-n", "kern.boottime"],
+                    { encoding: "utf8", timeout: 1_000, stdio: ["ignore", "pipe", "ignore"] }
+                ).trim();
+            } catch {
+                cachedBootTime = null;
+            }
+            return cachedBootTime;
+        }
+
+        function ownerProcessAlive(owner) {
+            if (!processAlive(owner.pid)) return false;
+            if (typeof owner.bootTime !== "string" || !owner.bootTime) {
+                // Marker predates boot-time tracking; fall back to pid-only.
+                return true;
+            }
+            const current = currentBootTime();
+            // Fail open (as elsewhere) if we can't determine the current boot
+            // time rather than spuriously reclaiming a live owner.
+            return current === null || current === owner.bootTime;
+        }
+
         function recordedOwner() {
             try {
                 return JSON.parse(readFileSync(transcriptOwnerPath, "utf8"));
@@ -241,19 +276,44 @@ public enum CopilotExtension {
             return ownerMatchesCurrentProcess(recordedOwner());
         }
 
+        function ownerMarkerPayload() {
+            return {
+                ...(appSessionResolution.native ? {appSessionId} : {}),
+                copilotSessionId: session.sessionId,
+                pid: process.pid,
+                bootTime: currentBootTime() ?? undefined,
+            };
+        }
+
         function writeOwnerMarker() {
             try {
                 writeFileSync(
                     transcriptOwnerPath,
-                    JSON.stringify({
-                        ...(appSessionResolution.native ? {appSessionId} : {}),
-                        copilotSessionId: session.sessionId,
-                        pid: process.pid,
-                    }),
+                    JSON.stringify(ownerMarkerPayload()),
                     { flag: "wx", mode: 0o600 }
                 );
                 return true;
             } catch {
+                return false;
+            }
+        }
+
+        // Replaces an existing marker via write-then-rename so a concurrent
+        // reader never observes a moment with no marker present at all (as a
+        // plain remove-then-recreate would produce). `renameSync` within the
+        // same directory is atomic on the filesystems this app supports.
+        function replaceOwnerMarker() {
+            const temporaryPath = `${transcriptOwnerPath}.${process.pid}.tmp`;
+            try {
+                writeFileSync(
+                    temporaryPath,
+                    JSON.stringify(ownerMarkerPayload()),
+                    { mode: 0o600 }
+                );
+                renameSync(temporaryPath, transcriptOwnerPath);
+                return true;
+            } catch {
+                try { rmSync(temporaryPath, { force: true }); } catch {}
                 return false;
             }
         }
@@ -284,10 +344,9 @@ public enum CopilotExtension {
                 const owner = recordedOwner();
                 if (!owner) return writeOwnerMarker();
                 if (ownerMatchesCurrentProcess(owner)) return true;
-                if (processAlive(owner.pid)) return false;
+                if (ownerProcessAlive(owner)) return false;
                 if (!ownerMatches(owner, expectedOwner)) return false;
-                try { rmSync(transcriptOwnerPath, { force: true }); } catch {}
-                return writeOwnerMarker();
+                return replaceOwnerMarker();
             });
         }
 
@@ -305,7 +364,7 @@ public enum CopilotExtension {
                         activateSharedFilesOwnership();
                         return true;
                     }
-                    if (processAlive(owner.pid)) return false;
+                    if (ownerProcessAlive(owner)) return false;
                     if (reclaimDeadOwner(owner)) {
                         activateSharedFilesOwnership(true);
                         return true;
