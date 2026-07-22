@@ -8150,7 +8150,7 @@ final class AppLogicTests: XCTestCase {
             cells: cells,
             firstLine: 0,
             priorityLineRange: remoteKittyAllLinesPriority,
-            currentVersion: { $0 == 9 ? 3 : nil }
+            currentVersion: { imageId, _ in imageId == 9 ? 3 : nil }
         )
         XCTAssertEqual(placements.count, 2)
         XCTAssertEqual(placements[0], RemoteTerminalImagePlacement(
@@ -8168,7 +8168,7 @@ final class AppLogicTests: XCTestCase {
                 cells: cells,
                 firstLine: 0,
                 priorityLineRange: remoteKittyAllLinesPriority,
-                currentVersion: { _ in nil }
+                currentVersion: { _, _ in nil }
             ),
             []
         )
@@ -8185,7 +8185,7 @@ final class AppLogicTests: XCTestCase {
             cells: cells,
             firstLine: 100,
             priorityLineRange: remoteKittyAllLinesPriority,
-            currentVersion: { versions[$0] }
+            currentVersion: { imageId, _ in versions[imageId] }
         )
         XCTAssertEqual(placements.map(\.imageId), [3, 1, 2])
         XCTAssertEqual(placements.map(\.line), [0, 0, 5])
@@ -8218,7 +8218,7 @@ final class AppLogicTests: XCTestCase {
             cells: cells,
             firstLine: 0,
             priorityLineRange: remoteKittyAllLinesPriority,
-            currentVersion: { $0 == 4 ? 7 : nil }
+            currentVersion: { imageId, _ in imageId == 4 ? 7 : nil }
         )
         XCTAssertEqual(placements.count, 64)
 
@@ -8236,7 +8236,7 @@ final class AppLogicTests: XCTestCase {
             cells: cells,
             firstLine: 0,
             priorityLineRange: remoteKittyAllLinesPriority,
-            currentVersion: { $0 == 4 ? 7 : nil }
+            currentVersion: { imageId, _ in imageId == 4 ? 7 : nil }
         )
         XCTAssertEqual(placements, placementsAgain)
     }
@@ -8279,7 +8279,7 @@ final class AppLogicTests: XCTestCase {
                 cells: cells,
                 firstLine: 0,
                 priorityLineRange: remoteKittyAllLinesPriority,
-                currentVersion: { $0 == 1 ? 1 : nil }
+                currentVersion: { imageId, _ in imageId == 1 ? 1 : nil }
             )
             let elapsed = Date().timeIntervalSince(start)
             XCTAssertEqual(placements.count, min(64, cells.count), "emitted-placement cap must still hold")
@@ -8334,7 +8334,7 @@ final class AppLogicTests: XCTestCase {
                 cells: cells,
                 firstLine: 0,
                 priorityLineRange: priorityLineRange,
-                currentVersion: { _ in 1 }
+                currentVersion: { _, _ in 1 }
             )
         }
 
@@ -9079,6 +9079,186 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(capture.imageData(imageId: 40, version: 2), second)
     }
 
+    /// Finding #1: an in-flight `m=1` chunked transmission must never be able
+    /// to finalize *after* an intervening delete — every delete action resets
+    /// the pending transmission before any lifecycle handling, so a slow or
+    /// racy client's eventual final continuation chunk (arriving for a
+    /// transmission the delete already abandoned) is a pure no-op, not a
+    /// resurrection.
+    @MainActor
+    func testRemoteKittyImageCaptureDeleteAbortsPendingTransmissionPreventingLateFinalize() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        let splitIndex = base64.index(base64.startIndex, offsetBy: base64.count / 2)
+        let firstHalf = String(base64[..<splitIndex])
+        let secondHalf = String(base64[splitIndex...])
+
+        // Begin an `m=1` chunked transmission but never send its final chunk.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=70,m=1", base64Payload: firstHalf
+        )[...])
+        XCTAssertNil(capture.currentVersion(for: 70))
+
+        // A delete arrives mid-transmission — it must reset the pending
+        // transmission before any lifecycle handling.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=A")[...])
+
+        // The final `m=0` continuation chunk for the now-abandoned
+        // transmission still arrives: it must be a no-op, never finalizing
+        // and creating a version for id 70.
+        capture.ingest(remoteKittyFrameBytes(control: "m=0", base64Payload: secondHalf)[...])
+        XCTAssertNil(capture.currentVersion(for: 70))
+        XCTAssertNil(capture.imageData(imageId: 70, version: 1))
+
+        // Confirmed by version allocation too: the interrupted transmission
+        // never consumed a version counter — a fresh, complete transmission
+        // for a different id still gets version 1, not 2.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=71", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 71), 1)
+    }
+
+    /// Finding #2: `a=T` (transmit + display) always activates a placement;
+    /// `a=t` (transmit only) stores new bytes/version but never activates a
+    /// placement on its own — it only ever preserves whatever activation
+    /// state already existed.
+    @MainActor
+    func testRemoteKittyImageCaptureTransmitOnlyNeverActivatesButPreservesExistingActivation() {
+        let capture = remoteKittyTestCapture()
+        let first = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let second = remoteKittyTestPNGBytes(width: 3, height: 3)
+
+        // `a=T` activates immediately.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=80", base64Payload: first.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 80), 1)
+
+        // Deactivate the placement; retained bytes are left untouched.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=80")[...])
+        XCTAssertNil(capture.currentVersion(for: 80))
+
+        // `a=t` (transmit-only) stores a *new* version but must never itself
+        // (re)activate a placement that isn't already active.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=t,f=100,t=d,U=1,i=80", base64Payload: second.base64EncodedString()
+        )[...])
+        XCTAssertNil(capture.currentVersion(for: 80))
+        // ...yet the new bytes were indeed stored, fetchable by direct version.
+        XCTAssertEqual(capture.imageData(imageId: 80, version: 2), second)
+
+        // Conversely, an id whose placement is already active: `a=t` on it
+        // preserves that existing activity while updating to the new version.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=81", base64Payload: first.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 81), 3)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=t,f=100,t=d,U=1,i=81", base64Payload: second.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 81), 4)
+    }
+
+    /// Finding #3: `a=p,U=1,i=<id>` re-places using bytes already retained
+    /// from a prior transmission — no new payload/version — reactivating the
+    /// placement (and thus scan-discoverable screen metadata) for an id
+    /// whose placement was previously deleted but whose data is still
+    /// grace-retained.
+    @MainActor
+    func testRemoteKittyImageCapturePlacementReactivatesUsingRetainedBytes() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=90", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 90), 1)
+        let afterT = capture.imageAvailabilityGeneration
+
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=90")[...])
+        XCTAssertNil(capture.currentVersion(for: 90))
+        let afterDelete = capture.imageAvailabilityGeneration
+        XCTAssertNotEqual(afterDelete, afterT)
+
+        // `a=p,U=1,i=90` re-places using the bytes already retained — no new
+        // transmission/version, yet the placement (and thus scan metadata)
+        // comes back.
+        capture.ingest(remoteKittyFrameBytes(control: "a=p,U=1,i=90")[...])
+        XCTAssertEqual(capture.currentVersion(for: 90), 1)
+        XCTAssertNotEqual(capture.imageAvailabilityGeneration, afterDelete)
+
+        // Re-placing an already-advertised id a second time changes nothing a
+        // scan would discover, so the generation must not bump again (no
+        // double-bump, finding #6).
+        let afterReplace = capture.imageAvailabilityGeneration
+        capture.ingest(remoteKittyFrameBytes(control: "a=p,U=1,i=90")[...])
+        XCTAssertEqual(capture.imageAvailabilityGeneration, afterReplace)
+    }
+
+    /// Finding #4: a scoped `d=i,i=<id>,p=<placement>` delete must hide only
+    /// that one placement of a shared image id — never over-delete sibling
+    /// placements of the same id — and `d=i` without `p=` still removes every
+    /// placement's activity for that id.
+    @MainActor
+    func testRemoteKittyImageCaptureScopedPlacementDeleteHidesOnlyThatPlacementNotSiblings() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        // Two distinct, explicitly-placed placements of the *same* image id.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=95,p=1", base64Payload: png.base64EncodedString()
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=95,p=2", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 95, placementId: 1), 2)
+        XCTAssertEqual(capture.currentVersion(for: 95, placementId: 2), 2)
+
+        // Deleting placement 1 alone must never disturb placement 2.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=95,p=1")[...])
+        XCTAssertNil(capture.currentVersion(for: 95, placementId: 1))
+        XCTAssertEqual(capture.currentVersion(for: 95, placementId: 2), 2)
+
+        // `d=i` without `p=` removes *all* remaining activity for the id.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=95")[...])
+        XCTAssertNil(capture.currentVersion(for: 95, placementId: 2))
+    }
+
+    /// Finding #5: wildcard/exact/deleted-placement lifecycle state must stay
+    /// bounded — pruned in lockstep with retained-entry eviction — so a
+    /// long-lived session that churns many distinct image ids through the
+    /// grace cache never accumulates unbounded lifecycle-activity state for
+    /// ids it can no longer even serve data for.
+    @MainActor
+    func testRemoteKittyImageCaptureLifecycleStateStaysBoundedAcrossManyEvictedIds() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        // Churn far more distinct wildcard-active ids through than the local
+        // retained-entry bound (16) so most of them are evicted from the
+        // grace cache entirely.
+        for id: UInt32 in 1 ... 200 {
+            capture.ingest(remoteKittyFrameBytes(
+                control: "a=T,f=100,t=d,U=1,i=\(id)", base64Payload: base64
+            )[...])
+        }
+        XCTAssertLessThanOrEqual(capture.lifecycleActivityStateCountForTesting, 16)
+        XCTAssertGreaterThan(capture.lifecycleActivityStateCountForTesting, 0)
+
+        // Also churn many ids that additionally accumulate a scoped
+        // per-placement deletion exception (populating `deletedPlacements`
+        // alongside the wildcard entry) through eviction — up to two
+        // lifecycle-state entries per id, still bounded to the entry cap.
+        for id: UInt32 in 1_000 ... 1_200 {
+            capture.ingest(remoteKittyFrameBytes(
+                control: "a=T,f=100,t=d,U=1,i=\(id)", base64Payload: base64
+            )[...])
+            capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=\(id),p=1")[...])
+        }
+        XCTAssertLessThanOrEqual(capture.lifecycleActivityStateCountForTesting, 32)
+    }
+
     @MainActor
     func testRemoteKittyImageCaptureEnforcesEntryCountBound() {
         let capture = remoteKittyTestCapture()
@@ -9095,6 +9275,136 @@ final class AppLogicTests: XCTestCase {
         for imageId: UInt32 in 2 ... 17 {
             XCTAssertNotNil(capture.currentVersion(for: imageId), "id \(imageId)")
         }
+    }
+
+    /// A single *retained* image id can still drive `exactActivePlacements`
+    /// unboundedly large on its own via many distinct placement ids, since
+    /// none of that touches the number of distinct retained ids the
+    /// grace-cache entry bound above guards. `a=t` (transmit-only) retains
+    /// the bytes without activating anything, so every subsequent
+    /// `a=p,p=<n>` below creates a genuinely new — never wildcard-redundant
+    /// — exact-active entry, proving `makeRoomForPlacementActivityEntry`
+    /// bounds the combined exact+deleted count even when every entry
+    /// belongs to one id. Also proves the fail-closed pruning it triggers is
+    /// deterministic (an identical replay reaches an identical final state)
+    /// and never crashes, and that a later unscoped retransmit (`a=T`, no
+    /// `p=`) still fully restores wildcard activity afterward regardless of
+    /// how much pruning the preceding churn triggered.
+    @MainActor
+    func testRemoteKittyImageCaptureExactPlacementChurnForOneImageIdStaysBounded() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        let imageId: UInt32 = 500
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=t,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+        )[...])
+        XCTAssertNil(capture.currentVersion(for: imageId, placementId: 1))
+
+        // Churn far more distinct placement ids for this *one* retained
+        // image id than the activity cap via `a=p,p=<n>` — never touching
+        // the grace-cache entry/byte bounds, which govern distinct retained
+        // ids/bytes, not placement-activity entries. `lifecycleActivityStateCountForTesting`
+        // combines the exact/deleted cap with `wildcardActiveImageIds`
+        // (separately bounded by the retained-entry cap, 16 here); this id
+        // never goes wildcard-active in this test, so 256 alone bounds it,
+        // but asserting against the documented overall ceiling (cap +
+        // bounded wildcards) keeps this robust to that detail.
+        for placementId: UInt32 in 1 ... 600 {
+            capture.ingest(remoteKittyFrameBytes(control: "a=p,U=1,i=\(imageId),p=\(placementId)")[...])
+            XCTAssertLessThanOrEqual(capture.lifecycleActivityStateCountForTesting, 256 + 16, "placementId \(placementId)")
+        }
+        // The most recent activation must still have survived the churn —
+        // fail-closed pruning drops *older* entries to make room, never the
+        // one the caller is actively trying to add.
+        XCTAssertEqual(capture.currentVersion(for: imageId, placementId: 600), 1)
+
+        // Deterministic: replaying the exact same churn from a fresh
+        // capture reaches the exact same final advertised state and entry
+        // count.
+        let replay = remoteKittyTestCapture()
+        replay.ingest(remoteKittyFrameBytes(
+            control: "a=t,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+        )[...])
+        for placementId: UInt32 in 1 ... 600 {
+            replay.ingest(remoteKittyFrameBytes(control: "a=p,U=1,i=\(imageId),p=\(placementId)")[...])
+        }
+        XCTAssertEqual(replay.currentVersion(for: imageId, placementId: 600), 1)
+        XCTAssertEqual(replay.lifecycleActivityStateCountForTesting, capture.lifecycleActivityStateCountForTesting)
+
+        // A later unscoped retransmit (`a=T`, no explicit `p=`) still fully
+        // restores wildcard activity for every placement of this id — the
+        // underlying retained data was never touched by any of the
+        // activity-only churn above, only re-transmitted here to also bump
+        // the version, so both a placement id the churn above visited and
+        // one it never did are advertised again identically.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: imageId, placementId: 1), 2)
+        XCTAssertEqual(capture.currentVersion(for: imageId, placementId: 12_345), 2)
+    }
+
+    /// The `deletedPlacements` counterpart of the churn above: many distinct
+    /// scoped `d=i,i=<id>,p=<n>` deletes under one wildcard-active image id
+    /// each create a fresh deletion-exception entry, so this alone must
+    /// stay bounded too — independent of, and via the same fail-closed
+    /// pruning as, the exact-active-entry churn covered above.
+    @MainActor
+    func testRemoteKittyImageCaptureScopedDeleteChurnForOneImageIdStaysBounded() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        let imageId: UInt32 = 600
+
+        // `a=T` with no explicit `p=` makes every placement of this id
+        // wildcard-active.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: imageId, placementId: 1), 1)
+
+        // Scoped-delete far more distinct placement ids under the same
+        // wildcard-active image id than the activity cap — each is a fresh
+        // `deletedPlacements` exception rather than a distinct retained
+        // image id. `lifecycleActivityStateCountForTesting` also includes
+        // this id's own single `wildcardActiveImageIds` entry (separately
+        // bounded by the retained-entry cap, 16 here), so the overall
+        // ceiling asserted here is the documented cap-plus-bounded-
+        // wildcards total, never just the exact/deleted cap alone.
+        for placementId: UInt32 in 1 ... 600 {
+            capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=\(imageId),p=\(placementId)")[...])
+            XCTAssertLessThanOrEqual(capture.lifecycleActivityStateCountForTesting, 256 + 16, "placementId \(placementId)")
+        }
+        // Every deleted placement id must remain non-advertised — the whole
+        // point of the delete — even after fail-closed pruning reset this
+        // id's wildcard activity entirely partway through the churn.
+        XCTAssertNil(capture.currentVersion(for: imageId, placementId: 600))
+        XCTAssertNil(capture.currentVersion(for: imageId, placementId: 1))
+
+        // Deterministic: replaying the exact same churn reaches the exact
+        // same final advertised state and entry count.
+        let replay = remoteKittyTestCapture()
+        replay.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+        )[...])
+        for placementId: UInt32 in 1 ... 600 {
+            replay.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=\(imageId),p=\(placementId)")[...])
+        }
+        XCTAssertNil(replay.currentVersion(for: imageId, placementId: 600))
+        XCTAssertEqual(replay.lifecycleActivityStateCountForTesting, capture.lifecycleActivityStateCountForTesting)
+
+        // Retransmit (`a=T`, no explicit `p=`) still restores wildcard
+        // activity for every placement, including ones this loop
+        // scoped-deleted — a fresh unscoped activation supersedes every
+        // prior deletion exception, and the underlying retained data was
+        // never touched by any of the activity-only churn above.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: imageId, placementId: 600), 2)
+        XCTAssertEqual(capture.currentVersion(for: imageId, placementId: 1), 2)
     }
 
     // MARK: - Remote Kitty per-capture epoch (finding #2: version uniqueness across lifetimes)
@@ -9628,6 +9938,94 @@ final class AppLogicTests: XCTestCase {
         let reactivatedScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
         XCTAssertEqual(reactivatedScreen.images, [RemoteTerminalImagePlacement(
             imageId: 91, contentVersion: secondVersion, line: 2, column: 0, rows: 1, columns: 4
+        )])
+    }
+
+    /// Finding #4/#7 end-to-end: two distinct placements (`p=1`, `p=2`) of the
+    /// *same* image id, each drawn at its own screen location via the exact
+    /// same real byte stream fed to both the Mac's own SwiftTerm-backed
+    /// terminal (underline color carries the placement id, mirroring
+    /// SwiftTerm's own private placeholder decoder) and this session's
+    /// `RemoteKittyImageCapture` (remote metadata). Deleting one placement's
+    /// activity (`d=i,i=<id>,p=<placement>`) must hide only that one
+    /// placeholder while the other, sharing the same image id, keeps being
+    /// advertised — Mac and remote metadata agree at every step.
+    @MainActor
+    func testAppModelRemoteScreenTwoPlacementsSameImageDeleteOneHidesOnlyThatPlacement() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        // Transmit the same image id twice, once per explicit placement id —
+        // both placements reference whatever bytes/version the id most
+        // recently retained.
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=96,p=1", base64Payload: png.base64EncodedString()
+        )[...])
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=96,p=2", base64Payload: png.base64EncodedString()
+        )[...])
+
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        // Placement 1 at row index 2, placement 2 at row index 4 — each
+        // cell's foreground carries the shared image id (96), its underline
+        // color the distinct placement id.
+        let liveBytes = Array((
+            "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
+                + "\u{1B}[38;2;96;0;0m\u{1B}[58;2;1;0;0m"
+                + String(repeating: String(placeholder), count: 4)
+                + "\u{1B}[0m"
+                + "\u{1B}[5;1H"
+                + "\u{1B}[38;2;96;0;0m\u{1B}[58;2;2;0;0m"
+                + String(repeating: String(placeholder), count: 4)
+                + "\u{1B}[0m"
+        ).utf8)
+        controller.terminalView.dataReceived(slice: liveBytes[...])
+
+        let version = try XCTUnwrap(controller.terminalView.kittyImageCapture.currentVersion(for: 96, placementId: 1))
+        XCTAssertEqual(controller.terminalView.kittyImageCapture.currentVersion(for: 96, placementId: 2), version)
+
+        let initialScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        // Mac SwiftTerm and remote metadata agree: both placements are up
+        // and showing, at their own distinct locations. The scanner's
+        // deterministic sort (line, column, imageId) puts placement 1
+        // (line 2) before placement 2 (line 4).
+        XCTAssertEqual(initialScreen.images, [
+            RemoteTerminalImagePlacement(imageId: 96, contentVersion: version, line: 2, column: 0, rows: 1, columns: 4),
+            RemoteTerminalImagePlacement(imageId: 96, contentVersion: version, line: 4, column: 0, rows: 1, columns: 4),
+        ])
+
+        // Scoped delete: only placement 1 is targeted.
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(control: "a=d,d=i,i=96,p=1")[...])
+
+        XCTAssertNil(controller.terminalView.kittyImageCapture.currentVersion(for: 96, placementId: 1))
+        XCTAssertEqual(controller.terminalView.kittyImageCapture.currentVersion(for: 96, placementId: 2), version)
+
+        // The placeholder grid cells for *both* placements are deliberately
+        // left untouched (never overwritten/erased) — proving the fix gates
+        // on the capture's own per-placement activity tracking, not on
+        // grid content. Only placement 1 disappears from the scan; the
+        // sibling placement sharing the same image id keeps being
+        // advertised untouched.
+        let afterDeleteScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(afterDeleteScreen.images, [RemoteTerminalImagePlacement(
+            imageId: 96, contentVersion: version, line: 4, column: 0, rows: 1, columns: 4
         )])
     }
 

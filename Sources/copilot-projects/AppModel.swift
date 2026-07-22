@@ -997,8 +997,8 @@ final class AppModel: ObservableObject {
         }
         let terminalScroll = terminal.isCurrentBufferAlternate
             || liveAgentSessions.contains(sessionId)
-        let currentVersion = { (imageId: UInt32) in
-            view.kittyImageCapture.currentVersion(for: imageId)
+        let currentVersion = { (imageId: UInt32, placementId: UInt32) in
+            view.kittyImageCapture.currentVersion(for: imageId, placementId: placementId)
         }
         if terminalScroll {
             let screen = RemoteTerminalScreen.captureVisible(
