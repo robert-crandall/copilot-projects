@@ -260,6 +260,18 @@ public struct RemoteTerminalScreen: Codable, Equatable, Sendable {
     public let liveTopLine: Int
     public let reset: Bool
     public let lines: [String]
+    /// Kitty Unicode-placeholder images visible in `lines`, keyed to the exact
+    /// bytes fetchable via `RemoteTerminalImageContract.path`. Optional only
+    /// so older clients can decode screens encoded before this field existed
+    /// — but a host that scans the full retained history (every host as of
+    /// this writing) always encodes a *present* array here, `[]` included
+    /// when nothing is currently placed. `nil` therefore means specifically
+    /// "an older host that never scanned for images at all" (nothing can be
+    /// concluded about what's actually on screen), while a present array —
+    /// even empty — is the definitive, authoritative current set: a client
+    /// can safely drop any previously-shown placement that isn't in it,
+    /// rather than assuming it might still be there.
+    public let images: [RemoteTerminalImagePlacement]?
 
     public init(
         sessionId: String,
@@ -270,7 +282,8 @@ public struct RemoteTerminalScreen: Codable, Equatable, Sendable {
         firstLine: Int,
         liveTopLine: Int,
         reset: Bool,
-        lines: [String]
+        lines: [String],
+        images: [RemoteTerminalImagePlacement]? = nil
     ) {
         self.sessionId = sessionId
         self.cols = cols
@@ -281,6 +294,7 @@ public struct RemoteTerminalScreen: Codable, Equatable, Sendable {
         self.liveTopLine = liveTopLine
         self.reset = reset
         self.lines = lines
+        self.images = images
     }
 }
 

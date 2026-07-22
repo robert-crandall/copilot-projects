@@ -1015,8 +1015,11 @@ final class AppModel: ObservableObject {
         }
         let terminalScroll = terminal.isCurrentBufferAlternate
             || liveAgentSessions.contains(sessionId)
+        let currentVersion = { (imageId: UInt32, placementId: UInt32) in
+            view.kittyImageCapture.currentVersion(for: imageId, placementId: placementId)
+        }
         if terminalScroll {
-            return RemoteTerminalScreen.captureVisible(
+            let screen = RemoteTerminalScreen.captureVisible(
                 sessionId: sessionId,
                 cols: terminal.cols,
                 rows: terminal.rows,
@@ -1028,8 +1031,28 @@ final class AppModel: ObservableObject {
                     )
                 }
             )
+            // Live/alternate-screen mode: `getLine(row:)` is keyed by viewport
+            // row, matching `firstLine == 0` in the emitted screen.
+            let gridLines = (0 ..< terminal.rows).compactMap { row in
+                terminal.getLine(row: row).map { (lineId: row, line: $0) }
+            }
+            // Live/alternate-screen mode: the entire viewport is "the current
+            // screen window", so every discovered placement is priority.
+            let placements = RemoteKittyPlacementScanner.scan(
+                cells: RemoteKittyPlacementScanner.gridCells(from: gridLines, terminal: terminal),
+                firstLine: 0,
+                priorityLineRange: 0 ..< terminal.rows,
+                currentVersion: currentVersion
+            )
+            // Always attach a present array (even `[]`), never `nil`: this
+            // host scans the *full* retained history on every screen, so an
+            // empty result is a definitive "nothing retained anywhere" —
+            // letting a client distinguish that from an older host that
+            // omits the field entirely (and safely drop any placement it
+            // was previously showing instead of assuming it's still there).
+            return screen.withImages(placements)
         }
-        return RemoteTerminalScreen.captureHistory(
+        let screen = RemoteTerminalScreen.captureHistory(
             sessionId: sessionId,
             cols: terminal.cols,
             rows: terminal.rows,
@@ -1040,6 +1063,35 @@ final class AppModel: ObservableObject {
             lineExists: { terminal.getScrollInvariantLine(row: $0) != nil },
             lineAt: translate
         )
+        // History mode: recompute against the screen's own `firstLine` (never a
+        // stale value from a prior live/history capture) using scroll-invariant
+        // absolute row ids, matching how its lines were captured above. The scan
+        // window covers the *entire* retained history range
+        // `[historyStartLine, liveTopLine + rows)` — not just the emitted text
+        // window padded by a fixed number of rows — so any image retained
+        // anywhere in that window (including one taller than the viewport, or
+        // one that straddles an incremental `afterLine`-narrowed window
+        // boundary) is discovered in full: only its *emitted* `line` stays
+        // relative to `screen.firstLine` (so it can go negative for rows above
+        // the emitted window), never the scan itself.
+        let scanLowerBound = screen.historyStartLine
+        let scanUpperBound = screen.liveTopLine + screen.rows
+        let gridLines = (scanLowerBound ..< max(scanLowerBound, scanUpperBound)).compactMap { row in
+            terminal.getScrollInvariantLine(row: row).map { (lineId: row, line: $0) }
+        }
+        // The current/emitted incremental text window (`screen.firstLine ..<
+        // screen.firstLine + screen.lines.count`) is the priority tier: a
+        // placement a client can actually see right now must never be
+        // starved out of the cap by older, merely-still-retained history.
+        let placements = RemoteKittyPlacementScanner.scan(
+            cells: RemoteKittyPlacementScanner.gridCells(from: gridLines, terminal: terminal),
+            firstLine: screen.firstLine,
+            priorityLineRange: screen.firstLine ..< (screen.firstLine + screen.lines.count),
+            currentVersion: currentVersion
+        )
+        // Always attach a present array (even `[]`), never `nil` — see the
+        // matching comment in the live branch above.
+        return screen.withImages(placements)
     }
 
     func sendRemoteInput(sessionId: String, value: String) {

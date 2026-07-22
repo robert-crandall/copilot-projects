@@ -5,8 +5,19 @@ import NIOPosix
 import NIOHTTP1
 import CopilotProjectsProtocol
 
-fileprivate struct RemoteTerminalRevision: Equatable, Sendable {
+struct RemoteTerminalRevision: Equatable, Sendable {
     let contentGeneration: UInt64
+    /// The advertising session's own `RemoteKittyImageCapture.imageAvailabilityGeneration`
+    /// at the moment this revision was computed. Bumped not only by that
+    /// session's own capture activity but also whenever the process-wide
+    /// `RemoteKittyImageCaptureBudget` reclaims one of *this* session's
+    /// currently-advertised images to satisfy a different session's request —
+    /// so a cached screen here is correctly invalidated by cross-session
+    /// global eviction, even though nothing about this session's own terminal
+    /// content changed. Without this, a stale cached screen could keep
+    /// advertising a placement whose backing image the global budget already
+    /// evicted, and a client fetching it would 404.
+    let imageAvailabilityGeneration: UInt64
     let cols: Int
     let rows: Int
     let terminalScroll: Bool
@@ -43,12 +54,13 @@ final class RemoteModelBridge: @unchecked Sendable {
         model?.createRemoteSession(request) ?? .unavailable
     }
 
-    fileprivate func screenRevision(sessionId: String) -> RemoteTerminalRevision? {
+    func screenRevision(sessionId: String) -> RemoteTerminalRevision? {
         guard let model,
               let view = model.controller(for: sessionId)?.terminalView,
               let terminal = view.terminal else { return nil }
         return RemoteTerminalRevision(
             contentGeneration: view.remoteContentGeneration,
+            imageAvailabilityGeneration: view.kittyImageCapture.imageAvailabilityGeneration,
             cols: terminal.cols,
             rows: terminal.rows,
             terminalScroll: terminal.isCurrentBufferAlternate
@@ -56,7 +68,7 @@ final class RemoteModelBridge: @unchecked Sendable {
         )
     }
 
-    fileprivate func screen(
+    func screen(
         sessionId: String,
         revision: RemoteTerminalRevision,
         afterLine: Int?
@@ -126,6 +138,20 @@ final class RemoteModelBridge: @unchecked Sendable {
         answer: RemoteElicitationAnswer
     ) -> RemoteUserInputResult {
         model?.answerElicitation(sessionId: sessionId, answer: answer) ?? .invalid
+    }
+
+    /// The exact retained PNG bytes for `(imageId, version)` in `sessionId`'s
+    /// terminal, or `nil` if the session, id, or exact version isn't (or is no
+    /// longer) available.
+    func terminalImageData(
+        sessionId: String,
+        imageId: UInt32,
+        version: UInt64
+    ) -> Data? {
+        model?.controller(for: sessionId)?.terminalView.kittyImageCapture.imageData(
+            imageId: imageId,
+            version: version
+        )
     }
 }
 
@@ -219,7 +245,8 @@ final class RemoteGateway: @unchecked Sendable {
         port: Int,
         webPushService: WebPushService? = nil,
         apnsService: APNsService? = nil,
-        notificationSync: NotificationSyncService? = nil
+        notificationSync: NotificationSyncService? = nil,
+        imageResponseBudget: RemoteImageResponseBudget = .shared
     ) throws -> Int {
         if let boundPort = channel?.localAddress?.port { return boundPort }
         let auth = RemoteRequestAuth(
@@ -246,7 +273,8 @@ final class RemoteGateway: @unchecked Sendable {
                             leases: leases,
                             webPushService: webPushService,
                             apnsService: apnsService,
-                            notificationSync: notificationSync
+                            notificationSync: notificationSync,
+                            imageResponseBudget: imageResponseBudget
                         )
                     )
                 }
@@ -427,6 +455,7 @@ private final class RemoteHTTPHandler:
     private let webPushService: WebPushService?
     private let apnsService: APNsService?
     private let notificationSync: NotificationSyncService?
+    private let imageResponseBudget: RemoteImageResponseBudget
 
     private var head: HTTPRequestHead?
     private var body: [UInt8] = []
@@ -452,7 +481,8 @@ private final class RemoteHTTPHandler:
         leases: RemoteWriterLeases,
         webPushService: WebPushService?,
         apnsService: APNsService?,
-        notificationSync: NotificationSyncService?
+        notificationSync: NotificationSyncService?,
+        imageResponseBudget: RemoteImageResponseBudget
     ) {
         self.auth = auth
         self.bridge = bridge
@@ -460,6 +490,7 @@ private final class RemoteHTTPHandler:
         self.webPushService = webPushService
         self.apnsService = apnsService
         self.notificationSync = notificationSync
+        self.imageResponseBudget = imageResponseBudget
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -596,6 +627,8 @@ private final class RemoteHTTPHandler:
             )
         case "/transcript":
             handleTranscript(context: context, head: head)
+        case "/\(RemoteTerminalImageContract.path)":
+            handleTerminalImage(context: context, head: head)
         case "/events":
             if head.method == .HEAD {
                 respond(context: context, method: .HEAD, status: .ok,
@@ -668,6 +701,109 @@ private final class RemoteHTTPHandler:
                 )
             }
         }
+    }
+
+    /// Serves the exact PNG bytes for a captured Kitty inline image placement.
+    /// Requires the session, id, and version to match exactly (no partial/latest
+    /// fallback), so a client always renders precisely the bytes a `screen`
+    /// event advertised. Never embeds image bytes in the SSE JSON itself.
+    private func handleTerminalImage(
+        context: ChannelHandlerContext,
+        head: HTTPRequestHead
+    ) {
+        let query = RemoteRequestAuth.queryItems(head.uri)
+        guard let sessionId = query["s"],
+              !sessionId.isEmpty,
+              sessionId.utf8.count <= 64,
+              let idString = query["i"],
+              idString.utf8.count <= 16,
+              let imageId = UInt32(idString),
+              imageId >= 1, imageId <= 0xFFFFFF,
+              let versionString = query["v"],
+              versionString.utf8.count <= 20,
+              let version = UInt64(versionString) else {
+            respond(context: context, method: head.method, status: .badRequest,
+                    contentType: "text/plain", body: "Bad request")
+            return
+        }
+        let channel = context.channel
+        let method = head.method
+        Task { @MainActor in
+            guard self.bridge.hasSession(sessionId) else {
+                channel.eventLoop.execute {
+                    self.respond(
+                        channel: channel,
+                        method: method,
+                        status: .notFound,
+                        contentType: "text/plain",
+                        body: Data("Not found".utf8)
+                    )
+                }
+                return
+            }
+            guard let data = self.bridge.terminalImageData(
+                sessionId: sessionId,
+                imageId: imageId,
+                version: version
+            ) else {
+                channel.eventLoop.execute {
+                    self.respond(
+                        channel: channel,
+                        method: method,
+                        status: .notFound,
+                        contentType: "text/plain",
+                        body: Data("Not found".utf8)
+                    )
+                }
+                return
+            }
+            channel.eventLoop.execute {
+                self.respondWithTerminalImage(channel: channel, method: method, data: data)
+            }
+        }
+    }
+
+    /// Serves `data` as the terminal-image response body, enforcing the
+    /// process/gateway-wide `imageResponseBudget` (finding: image response
+    /// backpressure). A `HEAD` request never reserves anything — `respond`
+    /// never queues an actual body for it regardless of `Content-Length` —
+    /// but every `GET` first requires the channel to currently be writable
+    /// (rejecting outright, rather than adding to an already-backed-up
+    /// connection's outbound buffer) and reserves `data.count` bytes of the
+    /// shared budget before ever copying/writing it. Excess demand — either
+    /// a channel that isn't accepting more writes, or a shared budget that's
+    /// already fully reserved by other concurrent image responses — is
+    /// rejected with 503/429 instead of being queued. The reservation is
+    /// released exactly once, only when the body write's own future
+    /// completes or fails (see `respond(channel:...:onBodyWriteComplete:)`),
+    /// never merely once this function returns.
+    private func respondWithTerminalImage(channel: Channel, method: HTTPMethod, data: Data) {
+        guard method != .HEAD else {
+            respond(channel: channel, method: method, status: .ok, contentType: "image/png", body: data)
+            return
+        }
+        guard channel.isWritable else {
+            respond(channel: channel, method: method, status: .serviceUnavailable,
+                    contentType: "text/plain", body: Data("Unavailable".utf8))
+            return
+        }
+        guard imageResponseBudget.reserve(bytes: data.count) else {
+            respond(channel: channel, method: method, status: .tooManyRequests,
+                    contentType: "text/plain", body: Data("Too many requests".utf8))
+            return
+        }
+        let budget = imageResponseBudget
+        let reservedBytes = data.count
+        respond(
+            channel: channel,
+            method: method,
+            status: .ok,
+            contentType: "image/png",
+            body: data,
+            onBodyWriteComplete: { _ in
+                budget.release(bytes: reservedBytes)
+            }
+        )
     }
 
     // MARK: - Control (POST)
@@ -1357,12 +1493,21 @@ private final class RemoteHTTPHandler:
         context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
     }
 
+    /// - Parameter onBodyWriteComplete: If provided, invoked exactly once
+    ///   with the result of the body write specifically (not the subsequent
+    ///   `.end` frame) — immediately, synchronously, with `.success(())` if
+    ///   no body was actually queued (a `HEAD` request or an empty `body`),
+    ///   since nothing was reserved for those in the first place. Lets a
+    ///   caller release a byte-budget reservation exactly once the bytes it
+    ///   guarded have actually left (successfully or not) the channel's own
+    ///   outbound buffer, never merely once this call returns.
     private func respond(
         channel: Channel,
         method: HTTPMethod,
         status: HTTPResponseStatus,
         contentType: String,
-        body: Data
+        body: Data,
+        onBodyWriteComplete: (@Sendable (Result<Void, Error>) -> Void)? = nil
     ) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: contentType)
@@ -1379,10 +1524,18 @@ private final class RemoteHTTPHandler:
         if method != .HEAD && !body.isEmpty {
             var buffer = channel.allocator.buffer(capacity: body.count)
             buffer.writeBytes(body)
-            channel.write(
-                HTTPServerResponsePart.body(.byteBuffer(buffer)),
-                promise: nil
-            )
+            if let onBodyWriteComplete {
+                let promise = channel.eventLoop.makePromise(of: Void.self)
+                promise.futureResult.whenComplete(onBodyWriteComplete)
+                channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: promise)
+            } else {
+                channel.write(
+                    HTTPServerResponsePart.body(.byteBuffer(buffer)),
+                    promise: nil
+                )
+            }
+        } else {
+            onBodyWriteComplete?(.success(()))
         }
         channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
     }

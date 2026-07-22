@@ -27,9 +27,13 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
     /// Enter fires, so an overlapping remote prompt can't interleave its paste
     /// bytes into a half-submitted one. Main-actor only.
     private var isSubmittingRemotePrompt = false
+    /// Captures this session's Kitty inline images for remote clients. One
+    /// instance per terminal view (never shared/global), fed on the main actor.
+    let kittyImageCapture = RemoteKittyImageCapture()
 
     override func dataReceived(slice: ArraySlice<UInt8>) {
         remoteContentGeneration &+= 1
+        kittyImageCapture.ingest(slice)
         super.dataReceived(slice: slice)
     }
 
