@@ -8041,4 +8041,659 @@ final class AppLogicTests: XCTestCase {
         }
         return fd
     }
+
+    // MARK: - Remote terminal image protocol
+
+    func testRemoteTerminalScreenDecodesOldJSONMissingImages() throws {
+        let oldJSON = """
+        {
+            "sessionId": "session",
+            "cols": 80,
+            "rows": 24,
+            "scrollMode": "terminal",
+            "historyStartLine": 0,
+            "firstLine": 0,
+            "liveTopLine": 0,
+            "reset": true,
+            "lines": ["a", "b"]
+        }
+        """
+        let decoded = try JSONDecoder().decode(
+            RemoteTerminalScreen.self,
+            from: Data(oldJSON.utf8)
+        )
+        XCTAssertNil(decoded.images)
+        XCTAssertEqual(decoded.lines, ["a", "b"])
+    }
+
+    func testRemoteTerminalScreenEncodesAndDecodesImages() throws {
+        let screen = RemoteTerminalScreen(
+            sessionId: "session",
+            cols: 10,
+            rows: 5,
+            scrollMode: .terminal,
+            historyStartLine: 0,
+            firstLine: 0,
+            liveTopLine: 0,
+            reset: true,
+            lines: ["a"],
+            images: [RemoteTerminalImagePlacement(
+                imageId: 7,
+                contentVersion: 3,
+                line: 0,
+                column: 1,
+                rows: 2,
+                columns: 2
+            )]
+        )
+        let data = try JSONEncoder().encode(screen)
+        let decoded = try JSONDecoder().decode(RemoteTerminalScreen.self, from: data)
+        XCTAssertEqual(decoded, screen)
+    }
+
+    // MARK: - Remote Kitty placeholder decode + sanitize (pure)
+
+    func testRemoteKittyPlaceholderDecodeImageIdValidatesInputs() {
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        XCTAssertEqual(
+            RemoteKittyPlaceholderCell.decodeImageId(
+                character: placeholder,
+                foreground: (red: 1, green: 0, blue: 0)
+            ),
+            1
+        )
+        XCTAssertEqual(
+            RemoteKittyPlaceholderCell.decodeImageId(
+                character: placeholder,
+                foreground: (red: 255, green: 255, blue: 255)
+            ),
+            0xFFFFFF
+        )
+        // Not a placeholder grapheme.
+        XCTAssertNil(RemoteKittyPlaceholderCell.decodeImageId(
+            character: "A",
+            foreground: (red: 1, green: 0, blue: 0)
+        ))
+        // No truecolor foreground at all.
+        XCTAssertNil(RemoteKittyPlaceholderCell.decodeImageId(
+            character: placeholder,
+            foreground: nil
+        ))
+        // Decoded id 0 is out of the 1...0xFFFFFF range our capture assigns.
+        XCTAssertNil(RemoteKittyPlaceholderCell.decodeImageId(
+            character: placeholder,
+            foreground: (red: 0, green: 0, blue: 0)
+        ))
+    }
+
+    func testRemoteKittyGraphicsSanitizeLinePreservesLengthAndReplacesPlaceholders() {
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        let line = "a\(placeholder)\(placeholder)b"
+        let sanitized = RemoteKittyGraphics.sanitizeLine(line)
+        XCTAssertEqual(sanitized, "a  b")
+        XCTAssertEqual(sanitized.count, line.count)
+        XCTAssertEqual(RemoteKittyGraphics.sanitizeLine("plain text"), "plain text")
+    }
+
+    // MARK: - Remote Kitty placement scanner (pure)
+
+    func testRemoteKittyPlacementScannerSplitsDisjointComponents() {
+        let clusterA = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        let clusterB = [(5, 10), (5, 11), (6, 10), (6, 11)]
+        let cells = (clusterA + clusterB).map {
+            RemoteKittyGridCell(lineId: $0.0, col: $0.1, imageId: 9)
+        }
+        let placements = RemoteKittyPlacementScanner.scan(
+            cells: cells,
+            firstLine: 0,
+            currentVersion: { $0 == 9 ? 3 : nil }
+        )
+        XCTAssertEqual(placements.count, 2)
+        XCTAssertEqual(placements[0], RemoteTerminalImagePlacement(
+            imageId: 9, contentVersion: 3, line: 0, column: 0, rows: 2, columns: 2
+        ))
+        XCTAssertEqual(placements[1], RemoteTerminalImagePlacement(
+            imageId: 9, contentVersion: 3, line: 5, column: 10, rows: 2, columns: 2
+        ))
+    }
+
+    func testRemoteKittyPlacementScannerOnlyEmitsForRetainedVersions() {
+        let cells = [RemoteKittyGridCell(lineId: 0, col: 0, imageId: 1)]
+        XCTAssertEqual(
+            RemoteKittyPlacementScanner.scan(cells: cells, firstLine: 0, currentVersion: { _ in nil }),
+            []
+        )
+    }
+
+    func testRemoteKittyPlacementScannerSortsDeterministicallyAndTranslatesFirstLine() {
+        let cells = [
+            RemoteKittyGridCell(lineId: 105, col: 4, imageId: 2),
+            RemoteKittyGridCell(lineId: 100, col: 8, imageId: 1),
+            RemoteKittyGridCell(lineId: 100, col: 2, imageId: 3),
+        ]
+        let versions: [UInt32: UInt64] = [1: 10, 2: 20, 3: 30]
+        let placements = RemoteKittyPlacementScanner.scan(
+            cells: cells,
+            firstLine: 100,
+            currentVersion: { versions[$0] }
+        )
+        XCTAssertEqual(placements.map(\.imageId), [3, 1, 2])
+        XCTAssertEqual(placements.map(\.line), [0, 0, 5])
+        XCTAssertEqual(placements.map(\.column), [2, 8, 4])
+    }
+
+    // MARK: - Remote Kitty APC capture (byte-level parser, bounded + fail-closed)
+
+    @MainActor
+    func testRemoteKittyImageCaptureParsesSingleFrameAcrossArbitraryBoundaries() {
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let frame = remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=42",
+            base64Payload: png.base64EncodedString()
+        )
+        for chunkSize in [1, 2, 3, 7, 1_000] {
+            let capture = RemoteKittyImageCapture()
+            remoteKittyIngest(capture, frame, chunkSize: chunkSize)
+            XCTAssertEqual(capture.currentVersion(for: 42), 1, "chunkSize \(chunkSize)")
+            XCTAssertEqual(capture.imageData(imageId: 42, version: 1), png, "chunkSize \(chunkSize)")
+        }
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureParsesChunkedTransmissionAcrossArbitraryBoundaries() {
+        let png = remoteKittyTestPNGBytes(width: 3, height: 3)
+        let base64 = png.base64EncodedString()
+        let midpoint = base64.index(base64.startIndex, offsetBy: base64.count / 2)
+        let firstHalf = String(base64[..<midpoint])
+        let secondHalf = String(base64[midpoint...])
+        var frame = remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=7,m=1",
+            base64Payload: firstHalf
+        )
+        frame += remoteKittyFrameBytes(control: "m=0", base64Payload: secondHalf)
+        for chunkSize in [1, 2, 5, 11, 4_096] {
+            let capture = RemoteKittyImageCapture()
+            remoteKittyIngest(capture, frame, chunkSize: chunkSize)
+            XCTAssertEqual(capture.currentVersion(for: 7), 1, "chunkSize \(chunkSize)")
+            XCTAssertEqual(capture.imageData(imageId: 7, version: 1), png, "chunkSize \(chunkSize)")
+        }
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureIgnoresUnsupportedTransmissionSubset() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        // Unsupported: not direct transmission (t=f, file-based).
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=f,U=1,i=1", base64Payload: base64
+        )[...])
+        // Unsupported: not PNG (f=32, raw RGB).
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=32,t=d,U=1,i=2", base64Payload: base64
+        )[...])
+        // Unsupported: no unicode placeholder (U key missing).
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,i=3", base64Payload: base64
+        )[...])
+        // Unsupported: id out of the 1...0xFFFFFF range.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=0", base64Payload: base64
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=16777216", base64Payload: base64
+        )[...])
+        for imageId: UInt32 in [1, 2, 3, 0, 16_777_216] {
+            XCTAssertNil(capture.currentVersion(for: imageId))
+        }
+        // A subsequent well-formed frame still parses correctly.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=9", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 9), 1)
+        XCTAssertEqual(capture.imageData(imageId: 9, version: 1), png)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureRecoversFromMalformedFraming() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        // Wrong APC marker (not 'G'): the entire frame is skipped verbatim.
+        var wrongMarker: [UInt8] = [0x1B, 0x5F, 0x58] // ESC _ X
+        wrongMarker.append(contentsOf: Array("bogus".utf8))
+        wrongMarker.append(contentsOf: [0x1B, 0x5C])
+        capture.ingest(wrongMarker[...])
+
+        // ESC inside an in-flight APC frame not followed by ST ('\'): aborts and
+        // resynchronizes instead of getting stuck mid-frame.
+        var aborted: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G
+        aborted.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=11".utf8))
+        aborted.append(contentsOf: [0x1B, 0x41]) // ESC 'A' (not ST)
+        capture.ingest(aborted[...])
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=11", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 11), 1)
+        XCTAssertEqual(capture.imageData(imageId: 11, version: 1), png)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureOversizedRawFrameIsBoundedAndRecovers() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        var bytes: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G
+        // Exceeds the 96 KiB raw-frame bound with no ESC bytes inside, so the
+        // parser must discard/resynchronize instead of growing unboundedly.
+        bytes.append(contentsOf: [UInt8](repeating: 0x61, count: 96 * 1_024 + 4_096))
+        bytes.append(contentsOf: [0x1B, 0x5C]) // resynchronize back to ground
+        capture.ingest(bytes[...])
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=13", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 13), 1)
+        XCTAssertEqual(capture.imageData(imageId: 13, version: 1), png)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureOversizedAccumulatedBase64DiscardsAndRecovers() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=20,m=1", base64Payload: "AAAA"
+        )[...])
+        // A single continuation payload exceeding the 8 MiB accumulated bound
+        // discards the whole in-flight transmission rather than retaining a
+        // truncated/mismatched image.
+        let huge = String(repeating: "A", count: 8 * 1_024 * 1_024 + 16)
+        capture.ingest(remoteKittyFrameBytes(control: "m=1", base64Payload: huge)[...])
+        capture.ingest(remoteKittyFrameBytes(control: "m=0", base64Payload: "AAAA")[...])
+        XCTAssertNil(capture.currentVersion(for: 20))
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=21", base64Payload: base64
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 21), 1)
+        XCTAssertEqual(capture.imageData(imageId: 21, version: 1), png)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureRejectsOversizedIHDR() {
+        let capture = RemoteKittyImageCapture()
+
+        let tooWide = remoteKittyTestPNGBytes(width: 5_000, height: 10)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=30", base64Payload: tooWide.base64EncodedString()
+        )[...])
+        XCTAssertNil(capture.currentVersion(for: 30))
+
+        let tooManyPixels = remoteKittyTestPNGBytes(width: 4_000, height: 4_001)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=31", base64Payload: tooManyPixels.base64EncodedString()
+        )[...])
+        XCTAssertNil(capture.currentVersion(for: 31))
+
+        // Right at the bound (4096 x 1024 = 4,194,304 <= 16M pixels) is accepted.
+        let ok = remoteKittyTestPNGBytes(width: 4_096, height: 1_024)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=32", base64Payload: ok.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 32), 1)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureDeleteAllClearsData() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=1", base64Payload: base64
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=2", base64Payload: base64
+        )[...])
+        // The version counter is global (monotonic across the whole capture
+        // instance), so the second-ingested id gets the second version.
+        XCTAssertEqual(capture.currentVersion(for: 1), 1)
+        XCTAssertEqual(capture.currentVersion(for: 2), 2)
+
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=A")[...])
+        XCTAssertNil(capture.currentVersion(for: 1))
+        XCTAssertNil(capture.currentVersion(for: 2))
+        XCTAssertNil(capture.imageData(imageId: 1, version: 1))
+        XCTAssertNil(capture.imageData(imageId: 2, version: 2))
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureDeleteByIdRemovesOnlyThatImage() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=5", base64Payload: base64
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=6", base64Payload: base64
+        )[...])
+
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=I,i=5")[...])
+        XCTAssertNil(capture.currentVersion(for: 5))
+        XCTAssertEqual(capture.currentVersion(for: 6), 2)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureLowercaseDeleteDoesNotRemoveData() {
+        let capture = RemoteKittyImageCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=8", base64Payload: png.base64EncodedString()
+        )[...])
+        // Lowercase 'i': placement-only delete. Must not remove retained data —
+        // placements are derived live from the grid, not from this store.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=8")[...])
+        XCTAssertEqual(capture.currentVersion(for: 8), 1)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureRetainsGraceVersionsAfterRetransmit() {
+        let capture = RemoteKittyImageCapture()
+        let first = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let second = remoteKittyTestPNGBytes(width: 3, height: 3)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=40", base64Payload: first.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 40), 1)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=40", base64Payload: second.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 40), 2)
+        // The just-superseded version is still fetchable (grace retention), so a
+        // client racing a retransmit doesn't 404 on the version it was just told
+        // about.
+        XCTAssertEqual(capture.imageData(imageId: 40, version: 1), first)
+        XCTAssertEqual(capture.imageData(imageId: 40, version: 2), second)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureEnforcesEntryCountBound() {
+        let capture = RemoteKittyImageCapture()
+        for imageId: UInt32 in 1 ... 17 {
+            let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+            capture.ingest(remoteKittyFrameBytes(
+                control: "a=T,f=100,t=d,U=1,i=\(imageId)",
+                base64Payload: png.base64EncodedString()
+            )[...])
+        }
+        // Only the 16 most-recently-retained entries survive; the oldest (id 1)
+        // was evicted to enforce the <=16-entry grace-cache bound.
+        XCTAssertNil(capture.currentVersion(for: 1))
+        for imageId: UInt32 in 2 ... 17 {
+            XCTAssertNotNil(capture.currentVersion(for: imageId), "id \(imageId)")
+        }
+    }
+
+    // MARK: - AppModel.remoteScreen image placement attachment (live + history)
+
+    @MainActor
+    func testAppModelRemoteScreenAttachesLiveImagePlacementFromKittyCapture() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=55", base64Payload: png.base64EncodedString()
+        )[...])
+        // Enter the alternate screen buffer (live/terminal-scroll mode), home
+        // the cursor, move to row index 2, and draw the placeholder grapheme a
+        // real Kitty client would emit itself (virtual/unicode placement never
+        // has the terminal draw it for us).
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        let liveBytes = Array((
+            "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
+                + "\u{1B}[38;2;55;0;0m"
+                + String(repeating: String(placeholder), count: 4)
+                + "\u{1B}[0m"
+        ).utf8)
+        controller.terminalView.dataReceived(slice: liveBytes[...])
+
+        let screen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(screen.scrollMode, .terminal)
+        XCTAssertEqual(screen.images, [RemoteTerminalImagePlacement(
+            imageId: 55, contentVersion: 1, line: 2, column: 0, rows: 1, columns: 4
+        )])
+    }
+
+    @MainActor
+    func testAppModelRemoteScreenDoesNotReuseStalePlacementsAcrossModes() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=66", base64Payload: png.base64EncodedString()
+        )[...])
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        let liveBytes = Array((
+            "\u{1B}[?1049h\u{1B}[H"
+                + "\u{1B}[38;2;66;0;0m"
+                + String(repeating: String(placeholder), count: 3)
+                + "\u{1B}[0m"
+        ).utf8)
+        controller.terminalView.dataReceived(slice: liveBytes[...])
+
+        let liveScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(liveScreen.scrollMode, .terminal)
+        XCTAssertEqual(liveScreen.images?.first?.imageId, 66)
+        XCTAssertEqual(liveScreen.images?.first?.line, 0)
+
+        // Leave the alternate buffer: the normal buffer never had the
+        // placeholder written into it, so a fresh scan must NOT carry over the
+        // live screen's placement — proving coordinates are recomputed per
+        // screen rather than cached/reused across the live -> history switch.
+        controller.terminalView.dataReceived(slice: Array("\u{1B}[?1049l".utf8)[...])
+        let historyScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(historyScreen.scrollMode, .history)
+        XCTAssertNil(historyScreen.images)
+    }
+
+    // MARK: - RemoteGateway terminal image route
+
+    @MainActor
+    func testRemoteGatewayTerminalImageRoute() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=99", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(controller.terminalView.kittyImageCapture.currentVersion(for: 99), 1)
+
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { Date() },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0,
+            webPushService: nil,
+            apnsService: nil
+        )
+        do {
+            let (response, data) = try await remoteHTTPResponseWithBody(
+                port: port,
+                path: "/terminal-image?s=\(sessionId)&i=99&v=1",
+                token: token
+            )
+            XCTAssertEqual(response.statusCode, 200)
+            XCTAssertEqual(response.value(forHTTPHeaderField: "Content-Type"), "image/png")
+            XCTAssertEqual(response.value(forHTTPHeaderField: "Cache-Control"), "no-store")
+            XCTAssertEqual(data, png)
+
+            let wrongVersion = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=99&v=2", token: token
+            )
+            XCTAssertEqual(wrongVersion, 404)
+
+            let unknownId = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=100&v=1", token: token
+            )
+            XCTAssertEqual(unknownId, 404)
+
+            let unknownSession = try await remoteHTTPStatus(
+                port: port,
+                path: "/terminal-image?s=\(UUID().uuidString)&i=99&v=1",
+                token: token
+            )
+            XCTAssertEqual(unknownSession, 404)
+
+            let missingQuery = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=99", token: token
+            )
+            XCTAssertEqual(missingQuery, 400)
+
+            let nonNumericId = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=abc&v=1", token: token
+            )
+            XCTAssertEqual(nonNumericId, 400)
+
+            let outOfRangeId = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=99999999&v=1", token: token
+            )
+            XCTAssertEqual(outOfRangeId, 400)
+
+            let noAuth = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=99&v=1"
+            )
+            XCTAssertEqual(noAuth, 403)
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
+    }
+}
+
+// MARK: - Remote Kitty test helpers
+
+/// Builds a minimal PNG whose signature + IHDR chunk (the only bytes
+/// `RemoteKittyImageCapture.validatePNG` inspects) declare `width` x `height`,
+/// without any real compressed pixel data.
+private func remoteKittyTestPNGBytes(width: UInt32, height: UInt32) -> Data {
+    var bytes: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    bytes.append(contentsOf: [0, 0, 0, 13]) // chunk length (unchecked by validatePNG)
+    bytes.append(contentsOf: Array("IHDR".utf8))
+    bytes.append(UInt8((width >> 24) & 0xFF))
+    bytes.append(UInt8((width >> 16) & 0xFF))
+    bytes.append(UInt8((width >> 8) & 0xFF))
+    bytes.append(UInt8(width & 0xFF))
+    bytes.append(UInt8((height >> 24) & 0xFF))
+    bytes.append(UInt8((height >> 16) & 0xFF))
+    bytes.append(UInt8((height >> 8) & 0xFF))
+    bytes.append(UInt8(height & 0xFF))
+    return Data(bytes)
+}
+
+/// Builds one 7-bit APC Kitty graphics frame: `ESC _ G <control>[;<base64>] ESC \`.
+private func remoteKittyFrameBytes(control: String, base64Payload: String = "") -> [UInt8] {
+    var bytes: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G
+    bytes.append(contentsOf: Array(control.utf8))
+    if !base64Payload.isEmpty {
+        bytes.append(0x3B) // ';'
+        bytes.append(contentsOf: Array(base64Payload.utf8))
+    }
+    bytes.append(contentsOf: [0x1B, 0x5C]) // ESC \ (ST)
+    return bytes
+}
+
+/// Feeds `bytes` to `capture` split into arbitrary `chunkSize`-sized slices, so
+/// tests can confirm parsing is independent of how the underlying byte stream
+/// happens to be chunked by the pty/process pipe.
+@MainActor
+private func remoteKittyIngest(
+    _ capture: RemoteKittyImageCapture,
+    _ bytes: [UInt8],
+    chunkSize: Int
+) {
+    var index = 0
+    while index < bytes.count {
+        let end = min(index + chunkSize, bytes.count)
+        capture.ingest(bytes[index ..< end])
+        index = end
+    }
 }

@@ -260,6 +260,10 @@ public struct RemoteTerminalScreen: Codable, Equatable, Sendable {
     public let liveTopLine: Int
     public let reset: Bool
     public let lines: [String]
+    /// Kitty Unicode-placeholder images visible in `lines`, keyed to the exact
+    /// bytes fetchable via `RemoteTerminalImageContract.path`. Optional (and
+    /// omitted when absent) so older clients decode screens without this field.
+    public let images: [RemoteTerminalImagePlacement]?
 
     public init(
         sessionId: String,
@@ -270,7 +274,8 @@ public struct RemoteTerminalScreen: Codable, Equatable, Sendable {
         firstLine: Int,
         liveTopLine: Int,
         reset: Bool,
-        lines: [String]
+        lines: [String],
+        images: [RemoteTerminalImagePlacement]? = nil
     ) {
         self.sessionId = sessionId
         self.cols = cols
@@ -281,6 +286,7 @@ public struct RemoteTerminalScreen: Codable, Equatable, Sendable {
         self.liveTopLine = liveTopLine
         self.reset = reset
         self.lines = lines
+        self.images = images
     }
 }
 

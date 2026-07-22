@@ -997,8 +997,11 @@ final class AppModel: ObservableObject {
         }
         let terminalScroll = terminal.isCurrentBufferAlternate
             || liveAgentSessions.contains(sessionId)
+        let currentVersion = { (imageId: UInt32) in
+            view.kittyImageCapture.currentVersion(for: imageId)
+        }
         if terminalScroll {
-            return RemoteTerminalScreen.captureVisible(
+            let screen = RemoteTerminalScreen.captureVisible(
                 sessionId: sessionId,
                 cols: terminal.cols,
                 rows: terminal.rows,
@@ -1010,8 +1013,19 @@ final class AppModel: ObservableObject {
                     )
                 }
             )
+            // Live/alternate-screen mode: `getLine(row:)` is keyed by viewport
+            // row, matching `firstLine == 0` in the emitted screen.
+            let gridLines = (0 ..< terminal.rows).compactMap { row in
+                terminal.getLine(row: row).map { (lineId: row, line: $0) }
+            }
+            let placements = RemoteKittyPlacementScanner.scan(
+                cells: RemoteKittyPlacementScanner.gridCells(from: gridLines, terminal: terminal),
+                firstLine: 0,
+                currentVersion: currentVersion
+            )
+            return screen.withImages(placements.isEmpty ? nil : placements)
         }
-        return RemoteTerminalScreen.captureHistory(
+        let screen = RemoteTerminalScreen.captureHistory(
             sessionId: sessionId,
             cols: terminal.cols,
             rows: terminal.rows,
@@ -1022,6 +1036,18 @@ final class AppModel: ObservableObject {
             lineExists: { terminal.getScrollInvariantLine(row: $0) != nil },
             lineAt: translate
         )
+        // History mode: recompute against the screen's own `firstLine` (never a
+        // stale value from a prior live/history capture) using scroll-invariant
+        // absolute row ids, matching how its lines were captured above.
+        let gridLines = (screen.firstLine ..< (screen.firstLine + screen.lines.count)).compactMap { row in
+            terminal.getScrollInvariantLine(row: row).map { (lineId: row, line: $0) }
+        }
+        let placements = RemoteKittyPlacementScanner.scan(
+            cells: RemoteKittyPlacementScanner.gridCells(from: gridLines, terminal: terminal),
+            firstLine: screen.firstLine,
+            currentVersion: currentVersion
+        )
+        return screen.withImages(placements.isEmpty ? nil : placements)
     }
 
     func sendRemoteInput(sessionId: String, value: String) {

@@ -11,9 +11,9 @@ extension RemoteTerminalScreen {
         var lines: [String] = []
         lines.reserveCapacity(rows)
         for row in 0 ..< rows {
-            lines.append(
+            lines.append(RemoteKittyGraphics.sanitizeLine(
                 (lineAt(row) ?? "").replacingOccurrences(of: "\u{0}", with: " ")
-            )
+            ))
         }
         return RemoteTerminalScreen(
             sessionId: sessionId,
@@ -65,7 +65,9 @@ extension RemoteTerminalScreen {
         lines.reserveCapacity(max(0, absoluteEnd - firstLine))
         for line in firstLine ..< absoluteEnd {
             guard let value = lineAt(line) else { break }
-            lines.append(value.replacingOccurrences(of: "\u{0}", with: " "))
+            lines.append(RemoteKittyGraphics.sanitizeLine(
+                value.replacingOccurrences(of: "\u{0}", with: " ")
+            ))
         }
         return RemoteTerminalScreen(
             sessionId: sessionId,
@@ -77,6 +79,24 @@ extension RemoteTerminalScreen {
             liveTopLine: max(historyStart, absoluteEnd - rows),
             reset: reset,
             lines: lines
+        )
+    }
+
+    /// Attaches `images` (or clears them) without altering any other field —
+    /// used to attach freshly recomputed Kitty placements to an already-captured
+    /// screen so live/history text and scroll semantics are untouched.
+    func withImages(_ images: [RemoteTerminalImagePlacement]?) -> RemoteTerminalScreen {
+        RemoteTerminalScreen(
+            sessionId: sessionId,
+            cols: cols,
+            rows: rows,
+            scrollMode: scrollMode,
+            historyStartLine: historyStartLine,
+            firstLine: firstLine,
+            liveTopLine: liveTopLine,
+            reset: reset,
+            lines: lines,
+            images: images
         )
     }
 }

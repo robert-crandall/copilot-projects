@@ -127,6 +127,20 @@ final class RemoteModelBridge: @unchecked Sendable {
     ) -> RemoteUserInputResult {
         model?.answerElicitation(sessionId: sessionId, answer: answer) ?? .invalid
     }
+
+    /// The exact retained PNG bytes for `(imageId, version)` in `sessionId`'s
+    /// terminal, or `nil` if the session, id, or exact version isn't (or is no
+    /// longer) available.
+    func terminalImageData(
+        sessionId: String,
+        imageId: UInt32,
+        version: UInt64
+    ) -> Data? {
+        model?.controller(for: sessionId)?.terminalView.kittyImageCapture.imageData(
+            imageId: imageId,
+            version: version
+        )
+    }
 }
 
 /// Writer leases ensure only one remote client injects input into a given
@@ -596,6 +610,8 @@ private final class RemoteHTTPHandler:
             )
         case "/transcript":
             handleTranscript(context: context, head: head)
+        case "/\(RemoteTerminalImageContract.path)":
+            handleTerminalImage(context: context, head: head)
         case "/events":
             if head.method == .HEAD {
                 respond(context: context, method: .HEAD, status: .ok,
@@ -664,6 +680,72 @@ private final class RemoteHTTPHandler:
                     method: method,
                     status: .ok,
                     contentType: "application/json",
+                    body: data
+                )
+            }
+        }
+    }
+
+    /// Serves the exact PNG bytes for a captured Kitty inline image placement.
+    /// Requires the session, id, and version to match exactly (no partial/latest
+    /// fallback), so a client always renders precisely the bytes a `screen`
+    /// event advertised. Never embeds image bytes in the SSE JSON itself.
+    private func handleTerminalImage(
+        context: ChannelHandlerContext,
+        head: HTTPRequestHead
+    ) {
+        let query = RemoteRequestAuth.queryItems(head.uri)
+        guard let sessionId = query["s"],
+              !sessionId.isEmpty,
+              sessionId.utf8.count <= 64,
+              let idString = query["i"],
+              idString.utf8.count <= 16,
+              let imageId = UInt32(idString),
+              imageId >= 1, imageId <= 0xFFFFFF,
+              let versionString = query["v"],
+              versionString.utf8.count <= 20,
+              let version = UInt64(versionString) else {
+            respond(context: context, method: head.method, status: .badRequest,
+                    contentType: "text/plain", body: "Bad request")
+            return
+        }
+        let channel = context.channel
+        let method = head.method
+        Task { @MainActor in
+            guard self.bridge.hasSession(sessionId) else {
+                channel.eventLoop.execute {
+                    self.respond(
+                        channel: channel,
+                        method: method,
+                        status: .notFound,
+                        contentType: "text/plain",
+                        body: Data("Not found".utf8)
+                    )
+                }
+                return
+            }
+            guard let data = self.bridge.terminalImageData(
+                sessionId: sessionId,
+                imageId: imageId,
+                version: version
+            ) else {
+                channel.eventLoop.execute {
+                    self.respond(
+                        channel: channel,
+                        method: method,
+                        status: .notFound,
+                        contentType: "text/plain",
+                        body: Data("Not found".utf8)
+                    )
+                }
+                return
+            }
+            channel.eventLoop.execute {
+                self.respond(
+                    channel: channel,
+                    method: method,
+                    status: .ok,
+                    contentType: "image/png",
                     body: data
                 )
             }

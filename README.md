@@ -251,6 +251,11 @@ to the Copilot process; plain shells and unrelated TUIs keep their original term
 For a manual shell launch with inline images, run
 `/usr/bin/env -u TERM_PROGRAM_VERSION TERM_PROGRAM=ghostty copilot`. Existing Copilot processes
 must be restarted with that profile; relaunching the app only reattaches their dtach master.
+Independent of that local rendering, each terminal session bounds-checks and retains the same
+Kitty-transmitted PNGs (fail-closed on anything outside the exact subset Copilot CLI emits) so a
+remote client can fetch a captured image's exact bytes over the authenticated gateway once its
+placement appears in a `screen` event; the image bytes themselves are never inlined into the SSE
+JSON stream.
 
 The companion Copilot extension records completed root turns through the supported Copilot SDK
 event API. It atomically writes a bounded per-tab transcript snapshot after each turn, including
