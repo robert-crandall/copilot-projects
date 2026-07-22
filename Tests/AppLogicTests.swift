@@ -8927,16 +8927,136 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
-    func testRemoteKittyImageCaptureLowercaseDeleteDoesNotRemoveData() {
+    func testRemoteKittyImageCaptureLowercaseIDeleteRemovesActivePlacementButRetainsData() {
         let capture = remoteKittyTestCapture()
         let png = remoteKittyTestPNGBytes(width: 2, height: 2)
         capture.ingest(remoteKittyFrameBytes(
             control: "a=T,f=100,t=d,U=1,i=8", base64Payload: png.base64EncodedString()
         )[...])
-        // Lowercase 'i': placement-only delete. Must not remove retained data —
-        // placements are derived live from the grid, not from this store.
-        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=8")[...])
         XCTAssertEqual(capture.currentVersion(for: 8), 1)
+
+        // Lowercase 'i': placement-only delete. Must remove the *active*
+        // placement (fixing the ghost — a scan should no longer discover this
+        // id) while leaving the retained PNG bytes fetchable, mirroring the
+        // Kitty spec's own placement-vs-data distinction.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=8")[...])
+        XCTAssertNil(capture.currentVersion(for: 8))
+        XCTAssertEqual(capture.imageData(imageId: 8, version: 1), png)
+
+        // A fresh transmission for the same id reactivates its placement.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=8", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 8), 2)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureLowercaseADeleteClearsEveryActivePlacementButRetainsData() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=11", base64Payload: png.base64EncodedString()
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=12", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 11), 1)
+        XCTAssertEqual(capture.currentVersion(for: 12), 2)
+
+        // Lowercase 'a' (also the default when `d` is omitted entirely):
+        // clears every id's active placement, never their retained data.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=a")[...])
+        XCTAssertNil(capture.currentVersion(for: 11))
+        XCTAssertNil(capture.currentVersion(for: 12))
+        XCTAssertEqual(capture.imageData(imageId: 11, version: 1), png)
+        XCTAssertEqual(capture.imageData(imageId: 12, version: 2), png)
+
+        // Retransmitting id 11 alone reactivates only that id.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=11", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 11), 3)
+        XCTAssertNil(capture.currentVersion(for: 12))
+    }
+
+    /// Any lowercase delete mode this capture doesn't specifically scope
+    /// (column/row/z-index/point/animation-frame targeted deletes — anything
+    /// besides `a`/`i`) is handled fail-closed: since it can't reason about
+    /// exactly which placements such a delete would target, it conservatively
+    /// clears every active placement rather than risk leaving a ghost.
+    @MainActor
+    func testRemoteKittyImageCaptureUnrecognizedLowercaseDeleteModeConservativelyClearsActivePlacements() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=13", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 13), 1)
+
+        // 'z' (delete by z-index) isn't a mode this id-keyed capture can
+        // correctly scope — fail closed instead of risking a ghost.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=z")[...])
+        XCTAssertNil(capture.currentVersion(for: 13))
+        XCTAssertEqual(capture.imageData(imageId: 13, version: 1), png)
+    }
+
+    /// The uppercase counterpart of the fail-closed default above: an
+    /// unrecognized *uppercase* delete mode also deletes underlying data per
+    /// the Kitty spec, so the fail-closed fallback must clear retained bytes
+    /// too, not just active placements.
+    @MainActor
+    func testRemoteKittyImageCaptureUnrecognizedUppercaseDeleteModeConservativelyClearsData() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=14", base64Payload: png.base64EncodedString()
+        )[...])
+        XCTAssertEqual(capture.currentVersion(for: 14), 1)
+
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=Z")[...])
+        XCTAssertNil(capture.currentVersion(for: 14))
+        XCTAssertNil(capture.imageData(imageId: 14, version: 1))
+    }
+
+    /// `imageAvailabilityGeneration` must bump exactly once for a change that
+    /// actually alters what a scan would currently discover, and must NOT
+    /// bump again for a subsequent operation that doesn't — e.g. deleting an
+    /// already-inactive id's placement a second time, or letting its retained
+    /// (but already un-advertised) data quietly age out of the grace cache.
+    @MainActor
+    func testRemoteKittyImageCaptureAvailabilityGenerationDoesNotDoubleBump() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=20", base64Payload: png.base64EncodedString()
+        )[...])
+        let afterRetain = capture.imageAvailabilityGeneration
+        XCTAssertEqual(capture.currentVersion(for: 20), 1)
+
+        // First lowercase 'i' delete: was active + retained, so this must
+        // change the generation exactly once.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=20")[...])
+        let afterFirstDelete = capture.imageAvailabilityGeneration
+        XCTAssertNotEqual(afterFirstDelete, afterRetain)
+        XCTAssertNil(capture.currentVersion(for: 20))
+
+        // A second lowercase 'i' delete for the same, already-inactive id:
+        // nothing a scan could discover changes, so the generation must not
+        // bump again.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=20")[...])
+        XCTAssertEqual(capture.imageAvailabilityGeneration, afterFirstDelete)
+
+        // Likewise, a lowercase 'a' clear-all with no active ids left at all
+        // must not bump either.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=a")[...])
+        XCTAssertEqual(capture.imageAvailabilityGeneration, afterFirstDelete)
+
+        // The retained (but already un-advertised, since inactive) data for
+        // id 20 is still fetchable — evicting it via `d=I` (which does target
+        // this id's data) must also not bump, since it wasn't advertised.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=I,i=20")[...])
+        XCTAssertEqual(capture.imageAvailabilityGeneration, afterFirstDelete)
+        XCTAssertNil(capture.imageData(imageId: 20, version: 1))
     }
 
     @MainActor
@@ -9421,6 +9541,93 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(screen.scrollMode, .terminal)
         XCTAssertEqual(screen.images, [RemoteTerminalImagePlacement(
             imageId: 55, contentVersion: actualVersion, line: 2, column: 0, rows: 1, columns: 4
+        )])
+    }
+
+    /// End-to-end regression for the ghost-image bug: a real APC transmit
+    /// followed by a real placeholder grid write (the exact same byte stream
+    /// `ProjectsTerminalView.dataReceived` feeds to *both* the real,
+    /// SwiftTerm-backed terminal (what Mac's own local rendering sees) and
+    /// this session's `RemoteKittyImageCapture` (remote metadata)), then a
+    /// lowercase Kitty delete that only retires the *placement*, never the
+    /// underlying retained bytes. Deliberately leaves the placeholder
+    /// characters sitting in the grid untouched after the delete (mirroring
+    /// a real client that relies on the delete op itself, not clearing grid
+    /// text, to stop display) — proving the fix gates on the capture's own
+    /// active-placement tracking, not merely on whatever characters still
+    /// happen to be in the grid. A subsequent retransmit reactivates it.
+    @MainActor
+    func testAppModelRemoteScreenClearsGhostPlacementAfterLowercaseDeleteAndReactivatesOnRetransmit() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=91", base64Payload: png.base64EncodedString()
+        )[...])
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        let liveBytes = Array((
+            "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
+                + "\u{1B}[38;2;91;0;0m"
+                + String(repeating: String(placeholder), count: 4)
+                + "\u{1B}[0m"
+        ).utf8)
+        controller.terminalView.dataReceived(slice: liveBytes[...])
+
+        let firstVersion = try XCTUnwrap(controller.terminalView.kittyImageCapture.currentVersion(for: 91))
+        let initialScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        // Mac SwiftTerm and remote metadata agree the placement is up and
+        // showing: both drive off the exact same `dataReceived` byte stream.
+        XCTAssertEqual(initialScreen.images, [RemoteTerminalImagePlacement(
+            imageId: 91, contentVersion: firstVersion, line: 2, column: 0, rows: 1, columns: 4
+        )])
+
+        // Lowercase 'i' delete: real clients send this to retire a placement.
+        // The placeholder characters themselves are deliberately left in the
+        // grid (never overwritten/erased) to prove the fix, not grid content,
+        // is what stops the ghost.
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(control: "a=d,d=i,i=91")[...])
+
+        // The exact retained version is still fetchable...
+        XCTAssertEqual(
+            controller.terminalView.kittyImageCapture.imageData(imageId: 91, version: firstVersion), png
+        )
+        // ...but it's no longer active, so both the capture's own metadata
+        // and the next remote screen scan agree there's nothing to show —
+        // an empty (not `nil`) images array, since this host always scans the
+        // live/terminal screen.
+        XCTAssertNil(controller.terminalView.kittyImageCapture.currentVersion(for: 91))
+        let afterDeleteScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(afterDeleteScreen.images, [])
+
+        // Retransmitting the same id reactivates it with a fresh version —
+        // Mac SwiftTerm and remote metadata agree again, now that both the
+        // placeholder grid cells (never removed) and an active capture
+        // placement exist together.
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=91", base64Payload: png.base64EncodedString()
+        )[...])
+        let secondVersion = try XCTUnwrap(controller.terminalView.kittyImageCapture.currentVersion(for: 91))
+        XCTAssertNotEqual(secondVersion, firstVersion)
+        let reactivatedScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(reactivatedScreen.images, [RemoteTerminalImagePlacement(
+            imageId: 91, contentVersion: secondVersion, line: 2, column: 0, rows: 1, columns: 4
         )])
     }
 

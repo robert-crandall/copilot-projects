@@ -362,6 +362,21 @@ final class RemoteKittyImageCapture {
     private var totalBytes = 0
     private var latestVersion: [UInt32: UInt64] = [:]
 
+    // Ids with a currently *active* Unicode-placeholder placement — tracked
+    // separately from `latestVersion`/`dataByKey` (retained PNG bytes) so the
+    // two lifecycles (placement vs. data) can be deleted independently, as
+    // the Kitty spec itself distinguishes: a lowercase delete (`d=i`/`d=a`)
+    // only ever retires a *placement*, never the underlying transmitted
+    // bytes, while an uppercase one (`d=I`/`d=A`) retires both. Before this
+    // separation, `currentVersion(for:)` advertised any retained id
+    // regardless of whether its placement had been deleted — a ghost: a
+    // client that deleted a placement (but never re-transmitted) would keep
+    // seeing it in scans of the grid indefinitely, since retained bytes
+    // (kept around for the grace-retention window) were the only signal.
+    // An id only ever advertises via `currentVersion(for:)` when it's both
+    // active *and* still has retained data.
+    private var activeImageIds: Set<UInt32> = []
+
     // Content versions are `(epoch << 32) | counter`: `epoch` is fixed for this
     // instance's whole lifetime and `counter` is monotonic within it, so two
     // `RemoteKittyImageCapture` instances for the same session (e.g. the first
@@ -429,10 +444,13 @@ final class RemoteKittyImageCapture {
         }
     }
 
-    /// The newest version currently retained for `imageId`, or `nil` if nothing
-    /// (or nothing still-retained) has been captured for it.
+    /// The newest version currently retained for `imageId`, or `nil` if that
+    /// id has no active Unicode-placeholder placement, or has one but no
+    /// longer has any retained data for it (e.g. reclaimed by grace-cache/
+    /// budget eviction) — either way, nothing a fresh scan should discover.
     func currentVersion(for imageId: UInt32) -> UInt64? {
-        latestVersion[imageId]
+        guard activeImageIds.contains(imageId) else { return nil }
+        return latestVersion[imageId]
     }
 
     /// Exposes this instance's fixed epoch (otherwise `private`) so tests can
@@ -782,9 +800,14 @@ final class RemoteKittyImageCapture {
         dataByKey[key] = data
         totalBytes += data.count
         latestVersion[imageId] = version
+        // A finalized, validly-transmitted image always (re)activates its
+        // placement — whether `imageId` was previously active, had its
+        // placement deleted but was still retained, or is being seen for the
+        // first time entirely.
+        activeImageIds.insert(imageId)
         // A fresh retain always installs a new *current* version for
-        // `imageId` (whether or not one existed before), so this always
-        // changes what a scan would currently discover for it.
+        // `imageId` and (re)activates it, so this always changes what a scan
+        // would currently discover for it.
         imageAvailabilityGeneration &+= 1
         budget.register(owner: self, imageId: imageId, version: version, bytes: data.count)
         enforceLocalBounds()
@@ -800,12 +823,17 @@ final class RemoteKittyImageCapture {
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         if latestVersion[key.imageId] == key.version {
             latestVersion.removeValue(forKey: key.imageId)
-            // The entry just reclaimed was `imageId`'s *current* version, so
-            // it's now unavailable — a scan would no longer find it, whether
-            // this removal came from local grace-cache eviction, an explicit
-            // delete, or the process-wide budget (including one triggered by
-            // a completely different capture instance sharing it).
-            imageAvailabilityGeneration &+= 1
+            // The entry just reclaimed was `imageId`'s *current* version. A
+            // scan would no longer find it *only if* the id was still active
+            // (an already-inactive id was never advertised in the first
+            // place, so its data quietly aging out here doesn't change what
+            // a scan would currently discover — bumping would be a pointless
+            // extra generation bump). The active set itself is untouched:
+            // per the spec, retained-data eviction never implies a placement
+            // was deleted, only that it can no longer be served.
+            if activeImageIds.contains(key.imageId) {
+                imageAvailabilityGeneration &+= 1
+            }
         }
         if notifyBudget {
             budget.unregister(owner: self, imageId: key.imageId, version: key.version)
@@ -841,27 +869,76 @@ final class RemoteKittyImageCapture {
     // MARK: Deletion
 
     private func handleDelete(keys: [String: String]) {
-        switch keys["d"] ?? "a" {
+        let mode = keys["d"] ?? "a"
+        switch mode {
         case "A":
             clearAll()
         case "I":
             guard let idString = keys["i"], let imageId = UInt32(idString) else { return }
             removeAllVersions(imageId: imageId)
+        case "a":
+            clearAllActivePlacements()
+        case "i":
+            guard let idString = keys["i"], let imageId = UInt32(idString) else { return }
+            clearActivePlacement(imageId: imageId)
         default:
-            break // lowercase targets only delete placements, not retained data
+            // Every other delete mode this instance doesn't specifically
+            // understand the scoping of (column/row/z-index/point/animation-
+            // frame targeted deletes, upper- or lowercase) is handled fail
+            // closed rather than silently ignored: an uppercase mode also
+            // deletes underlying data per the Kitty spec, and since this
+            // capture can't reason about exactly *which* placements/data such
+            // a delete would target, it conservatively treats it the same as
+            // the one fully-scoped delete it does understand at that same
+            // tier (`A` for uppercase, `a` for lowercase) — clearing more
+            // than a real terminal might have, but never leaving a ghost.
+            if mode.first?.isUppercase == true {
+                clearAll()
+            } else {
+                clearAllActivePlacements()
+            }
         }
     }
 
+    /// Removes only `imageId`'s active-placement flag — its retained PNG
+    /// bytes (all still-grace-retained versions) are left untouched. Mirrors
+    /// the Kitty spec's lowercase `d=i`: a placement delete, not a data
+    /// delete. `currentVersion(for:)` returns `nil` for this id afterward
+    /// (no more ghost) until a fresh transmission reactivates it.
+    private func clearActivePlacement(imageId: UInt32) {
+        guard activeImageIds.remove(imageId) != nil else { return }
+        if latestVersion[imageId] != nil {
+            // Was actually advertised (active *and* retained) before this
+            // delete — now it isn't, so a scan's discoverable state changed.
+            imageAvailabilityGeneration &+= 1
+        }
+    }
+
+    /// Removes every id's active-placement flag — retained PNG bytes for
+    /// every id are left untouched. Mirrors the Kitty spec's lowercase
+    /// `d=a`, and is also the fail-closed fallback for any other lowercase
+    /// delete mode this capture doesn't specifically scope.
+    private func clearAllActivePlacements() {
+        guard !activeImageIds.isEmpty else { return }
+        // Only ids that were both active *and* still had retained data were
+        // actually advertised before this clear — anything else clearing
+        // here doesn't change what a scan would currently discover.
+        let hadAnyAdvertised = activeImageIds.contains { latestVersion[$0] != nil }
+        activeImageIds.removeAll()
+        if hadAnyAdvertised { imageAvailabilityGeneration &+= 1 }
+    }
+
     private func clearAll() {
-        let hadAnyCurrent = !latestVersion.isEmpty
+        let hadAnyAdvertised = activeImageIds.contains { latestVersion[$0] != nil }
         for key in order {
             budget.unregister(owner: self, imageId: key.imageId, version: key.version)
         }
         order.removeAll()
         dataByKey.removeAll()
         latestVersion.removeAll()
+        activeImageIds.removeAll()
         totalBytes = 0
-        if hadAnyCurrent { imageAvailabilityGeneration &+= 1 }
+        if hadAnyAdvertised { imageAvailabilityGeneration &+= 1 }
         resetPendingTransmission()
     }
 
@@ -877,7 +954,13 @@ final class RemoteKittyImageCapture {
             }
         }
         order = kept
-        if latestVersion.removeValue(forKey: imageId) != nil {
+        let hadData = latestVersion.removeValue(forKey: imageId) != nil
+        let wasActive = activeImageIds.remove(imageId) != nil
+        // Advertised availability only changes if `imageId` was both active
+        // and had retained data before this — either alone means it wasn't
+        // currently discoverable by a scan, so removing the other half here
+        // doesn't change anything a scan would see.
+        if wasActive && hadData {
             imageAvailabilityGeneration &+= 1
         }
         if pendingImageId == imageId {
