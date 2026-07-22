@@ -147,26 +147,68 @@ final class RemoteKittyImageCaptureBudget {
     // owner's whole in-flight buffer is tracked as a single reservation that
     // grows/shrinks with each chunk rather than one entry per chunk.
     private var pendingByOwner: [ObjectIdentifier: PendingEntry] = [:]
+    // Oldest-first, mirroring `order` for retained entries above and kept in
+    // lockstep with `pendingByOwner`'s keys, so eviction can always find the
+    // oldest *other* in-flight owner deterministically rather than at the
+    // mercy of dictionary iteration order.
+    private var pendingOrder: [ObjectIdentifier] = []
 
     private(set) var totalPendingBytes = 0
 
     /// Attempts to reserve `additionalBytes` more in-flight bytes on top of
-    /// whatever `owner` already has reserved. Returns `false` (reserving
-    /// nothing) if that would push the process-wide pending total over
-    /// `maxTotalPendingBytes` — the caller must abort its in-flight
-    /// transmission rather than let unaccounted memory grow, since (unlike
-    /// the retained-bytes budget) there is nothing safe to evict here: a
-    /// still-in-flight, not-yet-validated transmission isn't real data any
-    /// other owner could be relying on yet.
+    /// whatever `owner` already has reserved. If that would push the
+    /// process-wide pending total over `maxTotalPendingBytes`, this first
+    /// tries to make room by aborting the oldest *other* in-flight owner(s)
+    /// — safe to discard unconditionally, since unvalidated pending data
+    /// isn't real data any other owner could be relying on yet, unlike the
+    /// retained-bytes budget above which must pick an eviction victim
+    /// carefully. Only if every other owner has been aborted and `owner`'s
+    /// own reservation still wouldn't fit does this return `false`, in which
+    /// case the caller must abort its own in-flight transmission instead —
+    /// this prevents one stalled/never-finalized transfer from permanently
+    /// monopolizing the shared pending budget and starving every other
+    /// terminal's ability to ever complete one.
     func reservePending(owner: RemoteKittyImageCapture, additionalBytes: Int) -> Bool {
         pruneOrphanedPendingOwners()
         guard additionalBytes > 0 else { return true }
-        guard totalPendingBytes + additionalBytes <= maxTotalPendingBytes else { return false }
         let key = ObjectIdentifier(owner)
+        if totalPendingBytes + additionalBytes > maxTotalPendingBytes {
+            evictOldestOtherPendingOwners(except: key, toFit: additionalBytes)
+        }
+        guard totalPendingBytes + additionalBytes <= maxTotalPendingBytes else {
+            // Only `owner` itself (or nobody) is left reserved and it still
+            // doesn't fit — nothing left to sacrifice.
+            return false
+        }
+        if pendingByOwner[key] == nil {
+            pendingOrder.append(key)
+        }
         let current = pendingByOwner[key]?.bytes ?? 0
         pendingByOwner[key] = PendingEntry(owner: owner, bytes: current + additionalBytes)
         totalPendingBytes += additionalBytes
         return true
+    }
+
+    /// Aborts oldest *other* (never `exceptKey`, the owner making the new
+    /// reservation) in-flight owners, one at a time, until `additionalBytes`
+    /// more would fit within `maxTotalPendingBytes` or there's no other owner
+    /// left to abort.
+    private func evictOldestOtherPendingOwners(except exceptKey: ObjectIdentifier, toFit additionalBytes: Int) {
+        for candidateKey in pendingOrder where candidateKey != exceptKey {
+            guard totalPendingBytes + additionalBytes > maxTotalPendingBytes else { break }
+            abortPendingEntry(for: candidateKey)
+        }
+    }
+
+    /// Removes one owner's pending accounting and tells it to abort its own
+    /// in-flight transmission — the pending-bytes counterpart to `evict(_:)`
+    /// for retained entries above. Never called for the owner currently
+    /// reserving (see `evictOldestOtherPendingOwners`).
+    private func abortPendingEntry(for key: ObjectIdentifier) {
+        guard let entry = pendingByOwner.removeValue(forKey: key) else { return }
+        totalPendingBytes -= entry.bytes
+        if let index = pendingOrder.firstIndex(of: key) { pendingOrder.remove(at: index) }
+        entry.owner?.abortPendingForBudget()
     }
 
     /// Releases every pending byte currently reserved for `owner` — the exact
@@ -178,6 +220,7 @@ final class RemoteKittyImageCaptureBudget {
         let key = ObjectIdentifier(owner)
         guard let entry = pendingByOwner.removeValue(forKey: key) else { return }
         totalPendingBytes -= entry.bytes
+        if let index = pendingOrder.firstIndex(of: key) { pendingOrder.remove(at: index) }
     }
 
     /// A deallocated owner (its terminal session closed mid-transmission)
@@ -188,6 +231,7 @@ final class RemoteKittyImageCaptureBudget {
         for (key, entry) in orphaned {
             totalPendingBytes -= entry.bytes
             pendingByOwner.removeValue(forKey: key)
+            if let index = pendingOrder.firstIndex(of: key) { pendingOrder.remove(at: index) }
         }
     }
 }

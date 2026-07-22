@@ -111,6 +111,19 @@ enum RemoteKittyPlacementScanner {
         let col: Int
     }
 
+    /// One fully flood-filled connected component, still tagged with its
+    /// bounding box in the caller's line-id coordinate space (not yet
+    /// translated relative to `firstLine`) so priority classification and
+    /// bottom-first sorting can both work directly off `minLine`.
+    private struct Component {
+        let imageId: UInt32
+        let version: UInt64
+        let minLine: Int
+        let maxLine: Int
+        let minCol: Int
+        let maxCol: Int
+    }
+
     /// Groups `cells` by image id, splits each id's cells into 4-neighbor
     /// connected components (so two disjoint placements sharing an id never
     /// merge into one bounding box), and emits one placement per component —
@@ -119,17 +132,33 @@ enum RemoteKittyPlacementScanner {
     /// relative to the emitted screen. Sorted deterministically by
     /// (line, column, imageId) so repeated scans of the same grid are stable.
     ///
-    /// Emits at most `remoteKittyMaxEmittedPlacements` placements: image ids
-    /// are visited in ascending order and, within an id, components are
-    /// seeded deterministically (smallest `(lineId, col)` first) rather than
-    /// via `Set`'s unordered iteration, so which components are discovered
-    /// before the cap is hit — and therefore which ones are emitted — never
-    /// depends on hashing/iteration order. Component discovery itself stops
-    /// the instant the cap is reached, so a pathological grid never pays for
-    /// flood-filling components that would just be discarded.
+    /// Emits at most `remoteKittyMaxEmittedPlacements` placements, chosen in
+    /// two priority tiers so a producer scanning the *entire* retained
+    /// history can never let old/stale history starve the current/new
+    /// content a client actually asked for:
+    ///
+    /// 1. Every component that intersects `priorityLineRange` (any one of its
+    ///    cells has a `lineId` inside that range) — i.e. the screen window a
+    ///    client is actually looking at right now (the whole viewport for a
+    ///    live scan, or just the emitted incremental text window for a
+    ///    history scan). These are always considered first, sorted
+    ///    deterministically ascending by `(minLine, minCol, imageId)`, and
+    ///    truncated to the cap if even this tier alone exceeds it.
+    /// 2. Whatever cap budget remains (if any) is spent on every other,
+    ///    non-intersecting component — the rest of the retained history —
+    ///    sorted deterministically newest/bottom-first (descending
+    ///    `minLine`, since a larger scroll-invariant row id is always more
+    ///    recent), so among old history that doesn't fit, the *most* recent
+    ///    of it is kept over the oldest.
+    ///
+    /// Either way a component is always emitted whole or not at all — the
+    /// cap only ever drops entire components, never truncates one — and the
+    /// final returned order is always the same (line, column, imageId) sort
+    /// regardless of which tier a placement was selected from.
     static func scan(
         cells: [RemoteKittyGridCell],
         firstLine: Int,
+        priorityLineRange: Range<Int>,
         currentVersion: (UInt32) -> UInt64?
     ) -> [RemoteTerminalImagePlacement] {
         guard !cells.isEmpty else { return [] }
@@ -139,15 +168,21 @@ enum RemoteKittyPlacementScanner {
             byImage[cell.imageId, default: []].insert(Coordinate(lineId: cell.lineId, col: cell.col))
         }
 
-        var placements: [RemoteTerminalImagePlacement] = []
-        imageLoop: for imageId in byImage.keys.sorted() {
+        var priorityComponents: [Component] = []
+        var otherComponents: [Component] = []
+
+        for imageId in byImage.keys.sorted() {
             guard let version = currentVersion(imageId), var remaining = byImage[imageId] else { continue }
             while !remaining.isEmpty {
-                if placements.count >= remoteKittyMaxEmittedPlacements { break imageLoop }
+                // Seeded deterministically (smallest `(lineId, col)` first)
+                // rather than via `Set`'s unordered iteration, so which
+                // component is discovered next never depends on
+                // hashing/iteration order.
                 let start = remaining.min { ($0.lineId, $0.col) < ($1.lineId, $1.col) }!
                 remaining.remove(start)
                 var component: [Coordinate] = [start]
                 var frontier = [start]
+                var intersectsPriority = priorityLineRange.contains(start.lineId)
                 while let coordinate = frontier.popLast() {
                     let neighbors = [
                         Coordinate(lineId: coordinate.lineId - 1, col: coordinate.col),
@@ -159,21 +194,51 @@ enum RemoteKittyPlacementScanner {
                         remaining.remove(neighbor)
                         component.append(neighbor)
                         frontier.append(neighbor)
+                        if priorityLineRange.contains(neighbor.lineId) { intersectsPriority = true }
                     }
                 }
                 let lineIds = component.map(\.lineId)
                 let cols = component.map(\.col)
                 guard let minLine = lineIds.min(), let maxLine = lineIds.max(),
                       let minCol = cols.min(), let maxCol = cols.max() else { continue }
-                placements.append(RemoteTerminalImagePlacement(
-                    imageId: imageId,
-                    contentVersion: version,
-                    line: minLine - firstLine,
-                    column: minCol,
-                    rows: maxLine - minLine + 1,
-                    columns: maxCol - minCol + 1
-                ))
+                let entry = Component(
+                    imageId: imageId, version: version,
+                    minLine: minLine, maxLine: maxLine, minCol: minCol, maxCol: maxCol
+                )
+                if intersectsPriority {
+                    priorityComponents.append(entry)
+                } else {
+                    otherComponents.append(entry)
+                }
             }
+        }
+
+        priorityComponents.sort {
+            if $0.minLine != $1.minLine { return $0.minLine < $1.minLine }
+            if $0.minCol != $1.minCol { return $0.minCol < $1.minCol }
+            return $0.imageId < $1.imageId
+        }
+        otherComponents.sort {
+            if $0.minLine != $1.minLine { return $0.minLine > $1.minLine }
+            if $0.minCol != $1.minCol { return $0.minCol < $1.minCol }
+            return $0.imageId < $1.imageId
+        }
+
+        var selected = Array(priorityComponents.prefix(remoteKittyMaxEmittedPlacements))
+        let remainingBudget = remoteKittyMaxEmittedPlacements - selected.count
+        if remainingBudget > 0 {
+            selected.append(contentsOf: otherComponents.prefix(remainingBudget))
+        }
+
+        let placements = selected.map {
+            RemoteTerminalImagePlacement(
+                imageId: $0.imageId,
+                contentVersion: $0.version,
+                line: $0.minLine - firstLine,
+                column: $0.minCol,
+                rows: $0.maxLine - $0.minLine + 1,
+                columns: $0.maxCol - $0.minCol + 1
+            )
         }
         return placements.sorted {
             if $0.line != $1.line { return $0.line < $1.line }
@@ -231,6 +296,14 @@ enum RemoteKittyPlacementScanner {
 /// capture never throws, never grows without bound, and a later well-formed
 /// frame always parses correctly because every overflow discards and
 /// resynchronizes rather than wedging the scanner's state.
+///
+/// Every other terminal string type that can carry its own `ESC` bytes — OSC
+/// (`ESC ]`), DCS (`ESC P`), and PM (`ESC ^`) — is also tracked (its payload
+/// entirely ignored) up to its own real terminator (BEL or ST for OSC, ST
+/// only for DCS/PM), so a `ESC _ G` byte sequence that merely happens to
+/// appear *inside* one of their payloads (e.g. inside base64-ish OSC title
+/// data) can never be misparsed as the start of our own Kitty APC: the
+/// scanner only ever looks for a fresh APC from `.ground`, never mid-string.
 @MainActor
 final class RemoteKittyImageCapture {
     private struct StoredKey: Hashable {
@@ -246,6 +319,19 @@ final class RemoteKittyImageCapture {
         case apcAccumulatingEsc
         case apcSkipping
         case apcSkippingEsc
+        /// Inside an OSC (`ESC ]`), DCS (`ESC P`), or PM (`ESC ^`) string
+        /// whose payload is being ignored outright — never parsed as our own
+        /// Kitty subset, and never able to nest one. `allowsBEL` is true only
+        /// for OSC, whose payload may additionally terminate on a bare BEL
+        /// (`0x07`) rather than requiring the full ST (`ESC \`) every other
+        /// string type here requires.
+        case controlStringSkipping(allowsBEL: Bool)
+        /// One `ESC` seen while skipping a control string: resolves to
+        /// either the real ST terminator (`\`, ending the string) or, for
+        /// anything else, right back into the string body — so a byte that
+        /// merely happens to look like the start of our own APC (`_`) inside
+        /// someone else's string payload is never treated as one.
+        case controlStringSkippingEsc(allowsBEL: Bool)
     }
 
     private var state: ScanState = .ground
@@ -358,6 +444,12 @@ final class RemoteKittyImageCapture {
                 state = .apcAwaitingMarker
             } else if byte == 0x1B {
                 state = .sawEsc // a fresh ESC restarts the lookahead window
+            } else if byte == 0x5D { // ']' — OSC start (BEL- or ST-terminated)
+                state = .controlStringSkipping(allowsBEL: true)
+            } else if byte == 0x50 { // 'P' — DCS start (ST-terminated only)
+                state = .controlStringSkipping(allowsBEL: false)
+            } else if byte == 0x5E { // '^' — PM start (ST-terminated only)
+                state = .controlStringSkipping(allowsBEL: false)
             } else {
                 state = .ground
             }
@@ -403,6 +495,27 @@ final class RemoteKittyImageCapture {
             } else if byte != 0x1B {
                 state = .apcSkipping
             }
+        case .controlStringSkipping(let allowsBEL):
+            if allowsBEL && byte == 0x07 { // BEL — OSC's alternate terminator
+                state = .ground
+            } else if byte == 0x1B {
+                state = .controlStringSkippingEsc(allowsBEL: allowsBEL)
+            }
+            // Any other byte — including one that would otherwise look like
+            // our own APC start (`_`) or its marker (`G`) — is just more of
+            // this string's payload: a string sequence never nests, so only
+            // its own terminator (checked above/below) can ever end it.
+        case .controlStringSkippingEsc(let allowsBEL):
+            if byte == 0x5C { // '\' — ST, string complete
+                state = .ground
+            } else if byte != 0x1B {
+                // Not a real ST after all: back into the string body, and
+                // this byte (which could itself be `_`) is simply more
+                // payload, never a fresh APC/OSC/DCS/PM marker.
+                state = .controlStringSkipping(allowsBEL: allowsBEL)
+            }
+            // else: a fresh ESC keeps this lookahead window open, mirroring
+            // `.sawEsc`'s own handling of consecutive ESCs.
         }
     }
 
@@ -545,6 +658,20 @@ final class RemoteKittyImageCapture {
         pendingImageId = nil
         clearPendingBase64()
         budget.releasePending(owner: self)
+    }
+
+    /// Called by `RemoteKittyImageCaptureBudget` when it needs to abort this
+    /// exact owner's in-flight transmission to make room for a different
+    /// owner's pending reservation (see `RemoteKittyImageCaptureBudget
+    /// .reservePending`) — the pending-bytes counterpart to `evictForBudget`
+    /// for retained entries. Safe unconditionally: unvalidated pending bytes
+    /// aren't real data any other owner could be relying on yet. Never
+    /// re-notifies the budget (it already removed this owner's reservation
+    /// on its side, which is what triggered this call in the first place) —
+    /// calling `resetPendingTransmission` here instead would double-release.
+    func abortPendingForBudget() {
+        pendingImageId = nil
+        clearPendingBase64()
     }
 
     /// Empties `pendingBase64`, releasing its underlying storage

@@ -8149,6 +8149,7 @@ final class AppLogicTests: XCTestCase {
         let placements = RemoteKittyPlacementScanner.scan(
             cells: cells,
             firstLine: 0,
+            priorityLineRange: remoteKittyAllLinesPriority,
             currentVersion: { $0 == 9 ? 3 : nil }
         )
         XCTAssertEqual(placements.count, 2)
@@ -8163,7 +8164,12 @@ final class AppLogicTests: XCTestCase {
     func testRemoteKittyPlacementScannerOnlyEmitsForRetainedVersions() {
         let cells = [RemoteKittyGridCell(lineId: 0, col: 0, imageId: 1)]
         XCTAssertEqual(
-            RemoteKittyPlacementScanner.scan(cells: cells, firstLine: 0, currentVersion: { _ in nil }),
+            RemoteKittyPlacementScanner.scan(
+                cells: cells,
+                firstLine: 0,
+                priorityLineRange: remoteKittyAllLinesPriority,
+                currentVersion: { _ in nil }
+            ),
             []
         )
     }
@@ -8178,6 +8184,7 @@ final class AppLogicTests: XCTestCase {
         let placements = RemoteKittyPlacementScanner.scan(
             cells: cells,
             firstLine: 100,
+            priorityLineRange: remoteKittyAllLinesPriority,
             currentVersion: { versions[$0] }
         )
         XCTAssertEqual(placements.map(\.imageId), [3, 1, 2])
@@ -8189,7 +8196,9 @@ final class AppLogicTests: XCTestCase {
     /// components than `remoteKittyMaxEmittedPlacements` (64) must still
     /// return exactly the cap, deterministically (the same 64 components
     /// every time — the first 64 in ascending (line, column) raster order —
-    /// never an arbitrary/hash-order-dependent subset).
+    /// never an arbitrary/hash-order-dependent subset). Every cell here is
+    /// inside `priorityLineRange`, so this exercises only the priority
+    /// tier's own (ascending raster order) cap/truncation behavior.
     func testRemoteKittyPlacementScannerCapsEmittedPlacementsDeterministicallyOnCheckerboard() {
         // A 20x20 checkerboard where only "black" cells belong to the image:
         // every such cell's 4 orthogonal neighbors are always the opposite
@@ -8208,6 +8217,7 @@ final class AppLogicTests: XCTestCase {
         let placements = RemoteKittyPlacementScanner.scan(
             cells: cells,
             firstLine: 0,
+            priorityLineRange: remoteKittyAllLinesPriority,
             currentVersion: { $0 == 4 ? 7 : nil }
         )
         XCTAssertEqual(placements.count, 64)
@@ -8225,9 +8235,56 @@ final class AppLogicTests: XCTestCase {
         let placementsAgain = RemoteKittyPlacementScanner.scan(
             cells: cells,
             firstLine: 0,
+            priorityLineRange: remoteKittyAllLinesPriority,
             currentVersion: { $0 == 4 ? 7 : nil }
         )
         XCTAssertEqual(placements, placementsAgain)
+    }
+
+    /// Producer cap priority (new-host full-history scan hardening): when the
+    /// current/emitted screen window contributes only one placement but the
+    /// rest of retained history alone would already exceed the 64-placement
+    /// cap, the current-window placement must still always be included —
+    /// never starved out by old history — with the remaining cap budget
+    /// spent on the *newest* (bottom-first) old-history components,
+    /// deterministically dropping the single oldest one to make room.
+    func testRemoteKittyPlacementScannerPrioritizesCurrentWindowOverOldHistory() {
+        // 64 disjoint single-cell "old history" components, each its own
+        // distinct image id (so none of them can ever merge into another's
+        // component regardless of spatial adjacency), at lines 0...63 —
+        // entirely outside the priority window below.
+        var cells: [RemoteKittyGridCell] = (0 ..< 64).map { line in
+            RemoteKittyGridCell(lineId: line, col: 0, imageId: UInt32(line + 1))
+        }
+        // One additional placement that *does* fall inside the current
+        // screen window.
+        let currentImageId: UInt32 = 999
+        cells.append(RemoteKittyGridCell(lineId: 200, col: 0, imageId: currentImageId))
+
+        let priorityLineRange = 200 ..< 201
+        func run() -> [RemoteTerminalImagePlacement] {
+            RemoteKittyPlacementScanner.scan(
+                cells: cells,
+                firstLine: 0,
+                priorityLineRange: priorityLineRange,
+                currentVersion: { _ in 1 }
+            )
+        }
+
+        let placements = run()
+        XCTAssertEqual(placements.count, 64, "total emitted must still respect the cap")
+        XCTAssertTrue(
+            placements.contains { $0.imageId == currentImageId },
+            "the current-window placement must never be starved out by old history"
+        )
+        // Exactly one old-history placement was sacrificed to make room —
+        // deterministically the very oldest one (smallest line / lowest
+        // image id), never an arbitrary one.
+        XCTAssertFalse(placements.contains { $0.imageId == 1 })
+        XCTAssertTrue(placements.contains { $0.imageId == 64 })
+
+        // Re-scanning the identical input is byte-for-byte reproducible.
+        XCTAssertEqual(placements, run())
     }
 
     // MARK: - Remote Kitty APC capture (byte-level parser, bounded + fail-closed)
@@ -8392,6 +8449,96 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(capture.currentVersion(for: 70))
         XCTAssertEqual(capture.currentVersion(for: 71), 1, "the immediately-following valid frame must still parse")
         XCTAssertEqual(capture.imageData(imageId: 71, version: 1), png)
+    }
+
+    /// Parser string-state drift: an OSC (`ESC ]`) string's own payload —
+    /// never itself parsed, just scanned for its terminator — can contain
+    /// byte sequences that merely *look like* the start of our own Kitty APC
+    /// (`ESC _ G`). Because the scanner tracks that it's inside the OSC
+    /// string (rather than forgetting and falling back to `.ground` the
+    /// moment `ESC ]` is seen), those embedded bytes are never misparsed as
+    /// a real APC start; only the OSC's own real terminator — BEL here, one
+    /// of the two OSC accepts — ends it, after which a genuinely separate,
+    /// valid Kitty frame still parses correctly.
+    @MainActor
+    func testRemoteKittyImageCaptureIgnoresFakeKittyBytesInsideOSCString() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x5D] // ESC ] — OSC start
+        bytes.append(contentsOf: Array("0;fake-title-".utf8))
+        // Fake Kitty APC bytes embedded *inside* the OSC payload — with no ST
+        // of their own, so they never end the OSC prematurely — that an old,
+        // string-state-unaware parser would have misread as a real APC start
+        // the instant it (incorrectly) fell back to `.ground` after `ESC ]`.
+        bytes.append(contentsOf: [0x1B, 0x5F, 0x47]) // ESC _ G
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=999;bogus-payload-data".utf8))
+        bytes.append(0x07) // BEL — OSC's own real terminator
+
+        // A genuinely separate, valid Kitty frame immediately follows.
+        bytes.append(contentsOf: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=42", base64Payload: png.base64EncodedString()
+        ))
+        capture.ingest(bytes[...])
+
+        XCTAssertNil(
+            capture.currentVersion(for: 999),
+            "bytes embedded inside the OSC string must never be parsed as a Kitty APC"
+        )
+        XCTAssertEqual(capture.currentVersion(for: 42), 1, "the real frame after the OSC must still parse")
+        XCTAssertEqual(capture.imageData(imageId: 42, version: 1), png)
+    }
+
+    /// The same drift, but for a DCS (`ESC P`) string, which — unlike OSC —
+    /// is only ever terminated by a full ST (`ESC \`), never a bare BEL.
+    @MainActor
+    func testRemoteKittyImageCaptureIgnoresFakeKittyBytesInsideDCSString() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x50] // ESC P — DCS start
+        bytes.append(contentsOf: Array("0;dcs-noise-".utf8))
+        bytes.append(contentsOf: [0x1B, 0x5F, 0x47]) // fake ESC _ G embedded in the DCS payload
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=998;bogus-payload-data".utf8))
+        bytes.append(contentsOf: [0x1B, 0x5C]) // ESC \ — DCS's own real ST terminator
+
+        bytes.append(contentsOf: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=43", base64Payload: png.base64EncodedString()
+        ))
+        capture.ingest(bytes[...])
+
+        XCTAssertNil(
+            capture.currentVersion(for: 998),
+            "bytes embedded inside the DCS string must never be parsed as a Kitty APC"
+        )
+        XCTAssertEqual(capture.currentVersion(for: 43), 1, "the real frame after the DCS must still parse")
+        XCTAssertEqual(capture.imageData(imageId: 43, version: 1), png)
+    }
+
+    /// PM (`ESC ^`) strings terminate like DCS (ST-only) — the same embedded
+    /// -fake-APC-bytes drift must be ignored there too.
+    @MainActor
+    func testRemoteKittyImageCaptureIgnoresFakeKittyBytesInsidePMString() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x5E] // ESC ^ — PM start
+        bytes.append(contentsOf: Array("pm-noise-".utf8))
+        bytes.append(contentsOf: [0x1B, 0x5F, 0x47])
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=997;bogus-payload-data".utf8))
+        bytes.append(contentsOf: [0x1B, 0x5C]) // ST
+
+        bytes.append(contentsOf: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=44", base64Payload: png.base64EncodedString()
+        ))
+        capture.ingest(bytes[...])
+
+        XCTAssertNil(
+            capture.currentVersion(for: 997),
+            "bytes embedded inside the PM string must never be parsed as a Kitty APC"
+        )
+        XCTAssertEqual(capture.currentVersion(for: 44), 1, "the real frame after the PM string must still parse")
+        XCTAssertEqual(capture.imageData(imageId: 44, version: 1), png)
     }
 
     @MainActor
@@ -8879,6 +9026,79 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(budget.totalPendingBytes, 0)
     }
 
+    /// Pending fairness: unlike the "reject the new reservation" behavior
+    /// above (which only ever discards the *new* attempt), one stalled/never
+    /// -finalized transfer must never be able to permanently monopolize the
+    /// shared pending budget and starve every other terminal from ever
+    /// completing a transmission. When a new reservation would overflow the
+    /// bound, the oldest *other* in-flight owner is aborted first — safe
+    /// unconditionally, since unvalidated pending bytes aren't real data
+    /// anyone could be relying on yet — and the new reservation proceeds.
+    @MainActor
+    func testRemoteKittyImageCaptureBudgetPendingFairnessAbortsOldestOtherOwnerForNewReservation() throws {
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        // Comfortably enough room for B's whole transmission on its own, but
+        // not enough for B's alongside A's still-stalled 50-byte reservation.
+        let cap = base64.utf8.count + 10
+        let budget = RemoteKittyImageCaptureBudget(maxTotalPendingBytes: cap)
+        let captureA = RemoteKittyImageCapture(epoch: 0xA, budget: budget)
+        let captureB = RemoteKittyImageCapture(epoch: 0xB, budget: budget)
+
+        // A starts (but never finishes) a stalled transmission — comfortably
+        // under the shared cap on its own.
+        let stalledChunk = String(repeating: "A", count: 50)
+        captureA.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=1,m=1", base64Payload: stalledChunk
+        )[...])
+        XCTAssertEqual(budget.totalPendingBytes, 50)
+
+        // B starts its own, single-frame, ultimately-valid transmission whose
+        // full payload doesn't fit *alongside* A's still-stalled reservation
+        // — so A (the oldest *other* in-flight owner) is aborted to make
+        // room, and B's own reservation still succeeds.
+        captureB.ingest(remoteKittyFrameBytes(control: "a=T,f=100,t=d,U=1,i=2", base64Payload: base64)[...])
+
+        // B completed successfully — its stalled sibling never monopolized
+        // the shared budget. Each capture uses a distinct epoch, so read
+        // back the actual assigned version rather than assuming any fixed
+        // number.
+        let versionB = try XCTUnwrap(captureB.currentVersion(for: 2), "B must complete despite A's stalled sibling")
+        XCTAssertEqual(captureB.imageData(imageId: 2, version: versionB), png)
+
+        // A was aborted: it never registers anything, even if it later tries
+        // to "complete" its now-discarded chunk.
+        XCTAssertNil(captureA.currentVersion(for: 1))
+        captureA.ingest(remoteKittyFrameBytes(control: "m=0", base64Payload: "")[...])
+        XCTAssertNil(captureA.currentVersion(for: 1))
+
+        // The shared bound was never exceeded, and nothing is left
+        // outstanding once both transmissions have ended.
+        XCTAssertLessThanOrEqual(budget.totalPendingBytes, budget.maxTotalPendingBytes)
+        XCTAssertEqual(budget.totalPendingBytes, 0)
+    }
+
+    /// When no *other* owner is in flight to sacrifice — the reserving
+    /// owner is the only one with anything pending — a reservation that
+    /// still can't fit must simply fail, exactly as before fairness
+    /// eviction was added: there's nothing safe left to abort besides the
+    /// reservation itself.
+    @MainActor
+    func testRemoteKittyImageCaptureBudgetPendingReservationFailsWhenOnlyCurrentOwnerRemains() {
+        let budget = RemoteKittyImageCaptureBudget(maxTotalPendingBytes: 4)
+        let capture = RemoteKittyImageCapture(epoch: 0, budget: budget)
+
+        // A single chunk larger than the entire shared pending cap, with no
+        // other owner in flight to sacrifice: nothing can be evicted to make
+        // room, so the reservation itself must fail and the transmission is
+        // abandoned rather than letting unaccounted memory grow.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=1,m=1", base64Payload: "AAAAAAAAAA"
+        )[...])
+        XCTAssertEqual(budget.totalPendingBytes, 0)
+        XCTAssertNil(capture.currentVersion(for: 1))
+    }
+
     // MARK: - AppModel.remoteScreen image placement attachment (live + history)
 
     @MainActor
@@ -8974,10 +9194,13 @@ final class AppLogicTests: XCTestCase {
         // placeholder written into it, so a fresh scan must NOT carry over the
         // live screen's placement — proving coordinates are recomputed per
         // screen rather than cached/reused across the live -> history switch.
+        // A present-but-empty array (never `nil`): this host always scans the
+        // full retained history, so an empty result is a definitive "nothing
+        // found", not an older host omitting the field.
         controller.terminalView.dataReceived(slice: Array("\u{1B}[?1049l".utf8)[...])
         let historyScreen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
         XCTAssertEqual(historyScreen.scrollMode, .history)
-        XCTAssertNil(historyScreen.images)
+        XCTAssertEqual(historyScreen.images, [])
     }
 
     /// Finding #6: a real incremental (`afterLine`-narrowed) history fetch
@@ -9401,6 +9624,12 @@ final class AppLogicTests: XCTestCase {
 }
 
 // MARK: - Remote Kitty test helpers
+
+/// A `priorityLineRange` covering every possible line id, so every discovered
+/// component is treated as "priority" — used by scanner tests that only care
+/// about the pre-existing (ascending raster order) selection/cap behavior and
+/// aren't specifically exercising the priority-vs-old-history split.
+private let remoteKittyAllLinesPriority = Int.min ..< Int.max
 
 /// Constructs a `RemoteKittyImageCapture` isolated from every other test: a
 /// fixed epoch (0) keeps hardcoded expected version numbers (`1`, `2`, ...)

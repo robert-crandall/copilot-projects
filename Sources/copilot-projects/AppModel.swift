@@ -1018,12 +1018,21 @@ final class AppModel: ObservableObject {
             let gridLines = (0 ..< terminal.rows).compactMap { row in
                 terminal.getLine(row: row).map { (lineId: row, line: $0) }
             }
+            // Live/alternate-screen mode: the entire viewport is "the current
+            // screen window", so every discovered placement is priority.
             let placements = RemoteKittyPlacementScanner.scan(
                 cells: RemoteKittyPlacementScanner.gridCells(from: gridLines, terminal: terminal),
                 firstLine: 0,
+                priorityLineRange: 0 ..< terminal.rows,
                 currentVersion: currentVersion
             )
-            return screen.withImages(placements.isEmpty ? nil : placements)
+            // Always attach a present array (even `[]`), never `nil`: this
+            // host scans the *full* retained history on every screen, so an
+            // empty result is a definitive "nothing retained anywhere" —
+            // letting a client distinguish that from an older host that
+            // omits the field entirely (and safely drop any placement it
+            // was previously showing instead of assuming it's still there).
+            return screen.withImages(placements)
         }
         let screen = RemoteTerminalScreen.captureHistory(
             sessionId: sessionId,
@@ -1052,12 +1061,19 @@ final class AppModel: ObservableObject {
         let gridLines = (scanLowerBound ..< max(scanLowerBound, scanUpperBound)).compactMap { row in
             terminal.getScrollInvariantLine(row: row).map { (lineId: row, line: $0) }
         }
+        // The current/emitted incremental text window (`screen.firstLine ..<
+        // screen.firstLine + screen.lines.count`) is the priority tier: a
+        // placement a client can actually see right now must never be
+        // starved out of the cap by older, merely-still-retained history.
         let placements = RemoteKittyPlacementScanner.scan(
             cells: RemoteKittyPlacementScanner.gridCells(from: gridLines, terminal: terminal),
             firstLine: screen.firstLine,
+            priorityLineRange: screen.firstLine ..< (screen.firstLine + screen.lines.count),
             currentVersion: currentVersion
         )
-        return screen.withImages(placements.isEmpty ? nil : placements)
+        // Always attach a present array (even `[]`), never `nil` — see the
+        // matching comment in the live branch above.
+        return screen.withImages(placements)
     }
 
     func sendRemoteInput(sessionId: String, value: String) {

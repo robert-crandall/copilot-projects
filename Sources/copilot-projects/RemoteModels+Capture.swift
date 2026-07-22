@@ -84,7 +84,11 @@ extension RemoteTerminalScreen {
 
     /// Attaches `images` (or clears them) without altering any other field —
     /// used to attach freshly recomputed Kitty placements to an already-captured
-    /// screen so live/history text and scroll semantics are untouched.
+    /// screen so live/history text and scroll semantics are untouched. Callers
+    /// scanning the full retained history should always pass a present array
+    /// (`[]` included when nothing was found), never `nil` — see
+    /// `RemoteTerminalScreen.images`'s doc comment for why that distinction
+    /// matters to a client.
     func withImages(_ images: [RemoteTerminalImagePlacement]?) -> RemoteTerminalScreen {
         RemoteTerminalScreen(
             sessionId: sessionId,
