@@ -9224,6 +9224,93 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(capture.currentVersion(for: 95, placementId: 2))
     }
 
+    /// Finding: an *uppercase* `d=I,i=<id>,p=<placement>` must mirror
+    /// SwiftTerm's own placement scoping (`deletePlacementsByImageId` +
+    /// `cleanupUnusedKittyImages`) — remove only the named placement's
+    /// activity first, then free the underlying retained bytes/versions only
+    /// if *no* sibling placement of the same image id is still active
+    /// afterward. While a sibling survives, the data (and the sibling's own
+    /// current version) must stay retained and advertised; only once the
+    /// final sibling is also scoped-deleted does the data actually go away.
+    @MainActor
+    func testRemoteKittyImageCaptureUppercaseScopedPlacementDeleteFreesDataOnlyWhenNoSiblingPlacementsRemain() throws {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        // Two distinct, explicitly-placed placements of the same image id —
+        // exactly like the lowercase-scoping test above, but exercising the
+        // uppercase (data-freeing) delete mode instead.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=97,p=1", base64Payload: png.base64EncodedString()
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=97,p=2", base64Payload: png.base64EncodedString()
+        )[...])
+        let version = try XCTUnwrap(capture.currentVersion(for: 97, placementId: 2))
+        XCTAssertEqual(capture.currentVersion(for: 97, placementId: 1), version)
+        XCTAssertEqual(capture.imageData(imageId: 97, version: version), png)
+        let generationAfterRetains = capture.imageAvailabilityGeneration
+
+        // Deleting placement 1 via the uppercase, data-freeing mode must
+        // still leave placement 2 (the sibling) — and the underlying
+        // bytes/current version it depends on — completely untouched, since
+        // freeing data must wait until *no* placement references it any
+        // more. The generation must bump exactly once for this change
+        // (placement 1 stopped being advertised).
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=I,i=97,p=1")[...])
+        XCTAssertNil(capture.currentVersion(for: 97, placementId: 1))
+        XCTAssertEqual(capture.currentVersion(for: 97, placementId: 2), version)
+        XCTAssertEqual(capture.imageData(imageId: 97, version: version), png)
+        let generationAfterFirstPlacementDelete = capture.imageAvailabilityGeneration
+        XCTAssertNotEqual(generationAfterFirstPlacementDelete, generationAfterRetains)
+
+        // Deleting the final surviving sibling (placement 2) must now also
+        // free the retained bytes/version, since no active placement of
+        // this image id remains afterward — exactly one more generation
+        // bump for this second advertised change.
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=I,i=97,p=2")[...])
+        XCTAssertNil(capture.currentVersion(for: 97, placementId: 2))
+        XCTAssertNil(capture.imageData(imageId: 97, version: version))
+        XCTAssertNotEqual(capture.imageAvailabilityGeneration, generationAfterFirstPlacementDelete)
+    }
+
+    /// The pending-transmission-reset guarantee (finding #1) must still hold
+    /// for the newly-scoped uppercase `d=I,...,p=` path too: an in-flight
+    /// `m=1` chunked transmission is abandoned by *any* delete, including
+    /// one scoped to a single sibling placement of a different image id.
+    @MainActor
+    func testRemoteKittyImageCaptureUppercaseScopedPlacementDeleteAbortsPendingTransmission() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        let splitIndex = base64.index(base64.startIndex, offsetBy: base64.count / 2)
+        let firstHalf = String(base64[..<splitIndex])
+        let secondHalf = String(base64[splitIndex...])
+
+        // A sibling placement so the scoped uppercase delete below doesn't
+        // free any data (proving the pending-transmission reset happens
+        // independent of whether data ends up freed).
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=98,p=1", base64Payload: base64
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=98,p=2", base64Payload: base64
+        )[...])
+
+        // Begin an unrelated `m=1` chunked transmission but never send its
+        // final chunk.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=99,m=1", base64Payload: firstHalf
+        )[...])
+        XCTAssertNil(capture.currentVersion(for: 99))
+
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=I,i=98,p=1")[...])
+
+        // The abandoned transmission's late final chunk must be a no-op.
+        capture.ingest(remoteKittyFrameBytes(control: "m=0", base64Payload: secondHalf)[...])
+        XCTAssertNil(capture.currentVersion(for: 99))
+        XCTAssertNil(capture.imageData(imageId: 99, version: 3))
+    }
+
     /// Finding #5: wildcard/exact/deleted-placement lifecycle state must stay
     /// bounded — pruned in lockstep with retained-entry eviction — so a
     /// long-lived session that churns many distinct image ids through the
@@ -9275,6 +9362,74 @@ final class AppLogicTests: XCTestCase {
         for imageId: UInt32 in 2 ... 17 {
             XCTAssertNotNil(capture.currentVersion(for: imageId), "id \(imageId)")
         }
+    }
+
+    /// Finding: this instance's own *local* "prefer evicting superseded
+    /// entries" victim selection (`enforceLocalBounds`/`pickEvictionVictim`)
+    /// must also be placement-agnostic via `isCurrentlyAdvertised`, not a
+    /// bare `latestVersion` comparison — otherwise a fully-inactive "ghost"
+    /// entry (an id whose only retained version is still `latestVersion`,
+    /// but whose placement was deleted so nothing can discover it any more)
+    /// is indistinguishable from a genuinely current one, and the fallback
+    /// (`order.first`) can end up sacrificing the oldest *actually visible*
+    /// entry instead of the ghost that's actually obsolete.
+    @MainActor
+    func testRemoteKittyImageCapturePrefersEvictingGhostOverCurrentLocallyEvenWhenCurrentOnlyAtNonDefaultPlacement() throws {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        // Oldest entry: genuinely current via the default placement. Must
+        // survive — it's actually still discoverable by a scan.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=1", base64Payload: base64
+        )[...])
+        let keepVersion = try XCTUnwrap(capture.currentVersion(for: 1))
+
+        // Second-oldest entry: a "ghost" — its data is still retained (and
+        // still `latestVersion`, since no second version was ever
+        // transmitted), but its only placement was explicitly deleted, so
+        // no scan can discover it any more. This is the entry that must
+        // actually be evicted first, ahead of anything still visible.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=2", base64Payload: base64
+        )[...])
+        let ghostVersion = try XCTUnwrap(capture.currentVersion(for: 2))
+        capture.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=2")[...])
+        XCTAssertNil(capture.currentVersion(for: 2))
+        XCTAssertEqual(capture.imageData(imageId: 2, version: ghostVersion), png)
+
+        // Third entry: current, but *only* advertised via explicit
+        // placement 5 — never the default placement. Must never be treated
+        // as fair game for eviction just because it isn't shown via
+        // placement 0.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=3,p=5", base64Payload: base64
+        )[...])
+        let nonDefaultVersion = try XCTUnwrap(capture.currentVersion(for: 3, placementId: 5))
+
+        // Fill up to the 16-entry local bound with ordinary, currently
+        // advertised filler ids (4 ... 16 inclusive is 13 more, for 16
+        // total: ids 1, 2, 3, 4 ... 16).
+        for imageId: UInt32 in 4 ... 16 {
+            capture.ingest(remoteKittyFrameBytes(
+                control: "a=T,f=100,t=d,U=1,i=\(imageId)", base64Payload: base64
+            )[...])
+        }
+
+        // One more entry breaches the 16-entry bound, forcing exactly one
+        // eviction.
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=17", base64Payload: base64
+        )[...])
+
+        // The ghost (id 2) — not the oldest-but-genuinely-current id 1, nor
+        // the current-only-at-placement-5 id 3 — must be the one reclaimed.
+        XCTAssertNil(capture.imageData(imageId: 2, version: ghostVersion))
+        XCTAssertEqual(capture.currentVersion(for: 1), keepVersion)
+        XCTAssertEqual(capture.imageData(imageId: 1, version: keepVersion), png)
+        XCTAssertEqual(capture.currentVersion(for: 3, placementId: 5), nonDefaultVersion)
+        XCTAssertEqual(capture.imageData(imageId: 3, version: nonDefaultVersion), png)
     }
 
     /// A single *retained* image id can still drive `exactActivePlacements`
@@ -9548,6 +9703,65 @@ final class AppLogicTests: XCTestCase {
         // The superseded version was reclaimed specifically via the global
         // budget's eviction callback (`evictForBudget`), not merely absent.
         XCTAssertNil(captureA.imageData(imageId: 200, version: aVersion1))
+    }
+
+    /// Finding: `RemoteKittyImageCaptureBudget`'s "prefer evicting superseded
+    /// entries" victim selection must be placement-agnostic. Before
+    /// `isCurrentlyAdvertised`, it asked `owner.currentVersion(for:
+    /// entry.imageId)` — which only ever checks the Kitty spec's implicit
+    /// *default* placement (`0`) — so an id shown only via some other
+    /// explicit placement (`a=T,p=5`) looked entirely non-current and got
+    /// evicted ahead of a genuinely obsolete version elsewhere in the
+    /// process, purely because its own placement wasn't the default one.
+    @MainActor
+    func testRemoteKittyImageCaptureBudgetPrefersEvictingSupersededOverCurrentGloballyWhenCurrentOnlyAtNonDefaultPlacement() throws {
+        // Only one eviction is needed (4 registered entries against a
+        // 3-entry bound) so the single victim chosen unambiguously proves
+        // which entry the selection logic actually preferred.
+        let budget = RemoteKittyImageCaptureBudget(maxTotalBytes: 1024 * 1024, maxTotalEntries: 3)
+        let captureA = RemoteKittyImageCapture(epoch: 0x1, budget: budget)
+        let captureB = RemoteKittyImageCapture(epoch: 0x2, budget: budget)
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        // Oldest: B/id=100, current via the default placement.
+        captureB.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=100", base64Payload: base64
+        )[...])
+        let bVersion = try XCTUnwrap(captureB.currentVersion(for: 100))
+
+        // A/id=200: current, but *only* advertised via explicit placement 5
+        // — never the default placement. Must never be picked as the
+        // eviction victim just because it isn't shown via placement 0.
+        captureA.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=200,p=5", base64Payload: base64
+        )[...])
+        let aVersion200 = try XCTUnwrap(captureA.currentVersion(for: 200, placementId: 5))
+
+        // A/id=300 v1, immediately superseded by v2 below — the *only*
+        // genuinely obsolete entry, and the one that must actually be
+        // evicted.
+        captureA.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=300", base64Payload: base64
+        )[...])
+        let aVersion300v1 = try XCTUnwrap(captureA.currentVersion(for: 300))
+        captureA.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=300", base64Payload: base64
+        )[...])
+        let aVersion300v2 = try XCTUnwrap(captureA.currentVersion(for: 300))
+        XCTAssertNotEqual(aVersion300v1, aVersion300v2)
+
+        // 4 entries registered against a 3-entry bound: B/100 (current,
+        // default placement), A/200 (current, placement 5 only), A/300 v1
+        // (obsolete), A/300 v2 (current). Only A/300 v1 may be evicted.
+        XCTAssertLessThanOrEqual(budget.totalEntries, 3)
+        XCTAssertEqual(captureB.currentVersion(for: 100), bVersion)
+        XCTAssertEqual(captureB.imageData(imageId: 100, version: bVersion), png)
+        XCTAssertEqual(captureA.currentVersion(for: 200, placementId: 5), aVersion200)
+        XCTAssertEqual(captureA.imageData(imageId: 200, version: aVersion200), png)
+        XCTAssertEqual(captureA.currentVersion(for: 300), aVersion300v2)
+        XCTAssertEqual(captureA.imageData(imageId: 300, version: aVersion300v2), png)
+        XCTAssertNil(captureA.imageData(imageId: 300, version: aVersion300v1))
     }
 
     // MARK: - Remote Kitty process-wide pending (in-flight) byte budget (finding #1)

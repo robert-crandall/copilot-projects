@@ -111,17 +111,24 @@ final class RemoteKittyImageCaptureBudget {
         for key in orphaned { remove(key) }
     }
 
-    /// Oldest-first, but a still-live owner's already-superseded version
-    /// (i.e. not that id's `currentVersion` any more) is always preferred for
+    /// Oldest-first, but a still-live owner's already-superseded (or
+    /// otherwise not-currently-advertised) version is always preferred for
     /// eviction over any still-current entry, no matter how much older that
     /// current entry is — so hitting the shared bound never drops a version a
     /// client might currently be looking at as long as some obsolete version
     /// exists anywhere in the process to sacrifice instead.
+    ///
+    /// Uses `isCurrentlyAdvertised`, not `currentVersion(for:)` — the latter
+    /// only ever checks the Kitty spec's implicit *default* placement (`0`),
+    /// so an id currently shown only via some other explicit placement
+    /// (`a=T,p=5`) would look not-current at all and get evicted ahead of a
+    /// genuinely obsolete version elsewhere in the process, purely because
+    /// this id's placement isn't the default one.
     private func pickEvictionVictim() -> GlobalKey? {
         guard !order.isEmpty else { return nil }
         for key in order {
             guard let entry = entries[key], let owner = entry.owner else { continue }
-            if owner.currentVersion(for: entry.imageId) != entry.version {
+            if !owner.isCurrentlyAdvertised(imageId: entry.imageId, version: entry.version) {
                 return key
             }
         }

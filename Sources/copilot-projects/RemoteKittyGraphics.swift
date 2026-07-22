@@ -608,6 +608,28 @@ final class RemoteKittyImageCapture {
         latestVersion[imageId] != nil && isPlacementActive(imageId: imageId, placementId: placementId)
     }
 
+    /// Placement-agnostic version of "is this currently advertised": true
+    /// iff `version` is `imageId`'s newest still-retained version *and* the
+    /// id has *any* active placement at all — wildcard or exact, and taking
+    /// `deletedPlacements` exceptions into account — regardless of which
+    /// specific placement id that happens to be.
+    ///
+    /// Exists because `currentVersion(for:placementId:)` only ever answers
+    /// "is this current *for the Kitty spec's implicit default placement
+    /// (`0`)*" — fine for a scan of a specific placement, but wrong for
+    /// deciding an eviction victim: an id shown only via some other explicit
+    /// placement (`a=T,p=5`, say) is every bit as current/visible as one
+    /// shown via the default placement, yet `currentVersion(for:)` (called
+    /// with its default `placementId: 0`) would report it as not current at
+    /// all, making its retained bytes look like fair game for eviction ahead
+    /// of some other id's *actually* obsolete version. Both the process-wide
+    /// budget's and this instance's own local "prefer evicting superseded
+    /// entries" victim selection use this instead.
+    func isCurrentlyAdvertised(imageId: UInt32, version: UInt64) -> Bool {
+        guard latestVersion[imageId] == version else { return false }
+        return isAnyPlacementActive(imageId: imageId)
+    }
+
     /// Activates a placement for `imageId`: either the wildcard (every
     /// placement active, and any prior scoped per-placement deletion
     /// exceptions *and* now-redundant exact-active entries for this id are
@@ -1191,9 +1213,15 @@ final class RemoteKittyImageCapture {
     /// grace-retained entry) over any still-current one, so bumping into the
     /// bound never drops a version a client might currently be looking at as
     /// long as some obsolete version is available to sacrifice instead.
+    /// Uses the placement-agnostic `isCurrentlyAdvertised` rather than
+    /// comparing directly against `latestVersion` so this also correctly
+    /// prefers evicting a fully-inactive "ghost" entry (an id whose only
+    /// retained version is still `latestVersion`, but whose placement was
+    /// deleted, so nothing can discover it any more) over a genuinely
+    /// still-advertised entry belonging to some other id.
     private func pickEvictionVictim() -> StoredKey? {
         guard !order.isEmpty else { return nil }
-        for key in order where latestVersion[key.imageId] != key.version {
+        for key in order where !isCurrentlyAdvertised(imageId: key.imageId, version: key.version) {
             return key
         }
         return order.first
@@ -1217,7 +1245,27 @@ final class RemoteKittyImageCapture {
             clearAll()
         case "I":
             guard let idString = keys["i"], let imageId = UInt32(idString) else { return }
-            removeAllVersions(imageId: imageId)
+            if let placementId = explicitPlacementId {
+                // `d=I,i=<id>,p=<placement>`: mirrors SwiftTerm's own
+                // uppercase scoping — remove only *this* placement's
+                // activity first (exactly like the lowercase `d=i,...,p=`
+                // scoped delete above), then free the underlying retained
+                // bytes/versions too, but only if no sibling placement of
+                // this same image id is still active afterward. If a
+                // sibling (wildcard or another exact placement) survives,
+                // the bytes/current version must remain retained and
+                // advertised for it — an uppercase delete scoped to one
+                // placement must never nuke data another still-visible
+                // placement of the same id depends on.
+                clearSpecificPlacement(imageId: imageId, placementId: placementId)
+                if !isAnyPlacementActive(imageId: imageId) {
+                    removeAllVersions(imageId: imageId)
+                }
+            } else {
+                // `d=I,i=<id>` with no `p=`: removes every placement *and*
+                // all retained data/versions for this id.
+                removeAllVersions(imageId: imageId)
+            }
         case "a":
             clearAllActivePlacements()
         case "i":
