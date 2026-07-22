@@ -1225,7 +1225,16 @@ public enum CopilotExtension {
                 writeTranscriptSnapshot();
                 removeFile(snapshotPath);
                 removeFile(scheduledTurnPath);
-                removeFile(transcriptOwnerPath);
+                // Deliberately keep transcriptOwnerPath: it records this process's
+                // appSessionId/copilotSessionId provenance for the transcript that
+                // was just flushed. If we deleted it here, a foreign reader that
+                // arrives after this exit (but before any new owner claims the
+                // file) would find no owner marker and default to allowing the
+                // read, silently accepting a wrong-tab snapshot without ever
+                // recording the quarantine. Leaving the marker in place lets
+                // ownsSharedFiles()/reclaimDeadOwner() reclaim it safely once this
+                // pid is confirmed dead, while still letting readers verify
+                // provenance in the meantime.
                 removeFile(userInputResponsePath);
                 removeFile(elicitationResponsePath);
             }
