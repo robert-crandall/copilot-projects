@@ -1,6 +1,8 @@
 import Foundation
 import SwiftTerm
 import CopilotProjectsProtocol
+import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Bounds
 
@@ -15,11 +17,22 @@ private let remoteKittyMaxAccumulatedBase64Bytes = 8 * 1_024 * 1_024
 private let remoteKittyMaxDecodedImageBytes = 5 * 1_024 * 1_024
 private let remoteKittyMaxImageDimension = 4_096
 private let remoteKittyMaxImagePixels = 16_000_000
-/// Total bytes retained across all (id, version) entries in the grace cache.
-private let remoteKittyMaxTotalRetainedBytes = 24 * 1_024 * 1_024
-/// Entry count cap for the grace cache (independent of the byte cap, so a burst
-/// of tiny images can't accumulate unboundedly either).
+/// Total bytes retained per-*session* (per `RemoteKittyImageCapture` instance)
+/// across all its (id, version) entries in the grace cache. Deliberately much
+/// smaller than `RemoteKittyImageCaptureBudget`'s process-wide bound below —
+/// this only guards a single busy terminal, while the shared budget guards the
+/// whole process across every open terminal.
+private let remoteKittyMaxTotalRetainedBytes = 8 * 1_024 * 1_024
+/// Entry count cap for the per-session grace cache (independent of the byte
+/// cap, so a burst of tiny images can't accumulate unboundedly either), also
+/// deliberately smaller than the process-wide entry cap.
 private let remoteKittyMaxRetainedEntries = 16
+/// Hard cap on placements emitted by a single scan, so a pathological grid
+/// (e.g. hundreds of disjoint single-cell placeholder fragments) can't make a
+/// scan (or its JSON payload) unbounded. Connected-component work stops the
+/// moment this many placements have been found, rather than discovering every
+/// component and truncating only the final list.
+private let remoteKittyMaxEmittedPlacements = 64
 
 // MARK: - Placeholder grapheme decoding (pure, SwiftTerm-independent)
 
@@ -96,6 +109,15 @@ enum RemoteKittyPlacementScanner {
     /// `firstLine` converts the caller's absolute/viewport line ids into rows
     /// relative to the emitted screen. Sorted deterministically by
     /// (line, column, imageId) so repeated scans of the same grid are stable.
+    ///
+    /// Emits at most `remoteKittyMaxEmittedPlacements` placements: image ids
+    /// are visited in ascending order and, within an id, components are
+    /// seeded deterministically (smallest `(lineId, col)` first) rather than
+    /// via `Set`'s unordered iteration, so which components are discovered
+    /// before the cap is hit — and therefore which ones are emitted — never
+    /// depends on hashing/iteration order. Component discovery itself stops
+    /// the instant the cap is reached, so a pathological grid never pays for
+    /// flood-filling components that would just be discarded.
     static func scan(
         cells: [RemoteKittyGridCell],
         firstLine: Int,
@@ -109,10 +131,11 @@ enum RemoteKittyPlacementScanner {
         }
 
         var placements: [RemoteTerminalImagePlacement] = []
-        for (imageId, coordinates) in byImage {
-            guard let version = currentVersion(imageId) else { continue }
-            var remaining = coordinates
-            while let start = remaining.first {
+        imageLoop: for imageId in byImage.keys.sorted() {
+            guard let version = currentVersion(imageId), var remaining = byImage[imageId] else { continue }
+            while !remaining.isEmpty {
+                if placements.count >= remoteKittyMaxEmittedPlacements { break imageLoop }
+                let start = remaining.min { ($0.lineId, $0.col) < ($1.lineId, $1.col) }!
                 remaining.remove(start)
                 var component: [Coordinate] = [start]
                 var frontier = [start]
@@ -186,9 +209,13 @@ enum RemoteKittyPlacementScanner {
 /// bytes, independent of SwiftTerm's own (private, display-only) Kitty state.
 ///
 /// One instance is owned per terminal session (`ProjectsTerminalView`) — never a
-/// shared/global store — and every mutating access happens on the main actor, so
-/// there is no cross-session identity confusion and no data race with the
-/// terminal's own main-actor-only rendering.
+/// shared/global identity-bearing store — and every mutating access happens on
+/// the main actor, so there is no cross-session identity confusion and no data
+/// race with the terminal's own main-actor-only rendering. Retained bytes are
+/// additionally accounted against a process-wide `RemoteKittyImageCaptureBudget`
+/// (also main-actor-only), so no fixed number of open terminals can be relied
+/// upon to keep total memory bounded — the shared budget enforces that across
+/// every instance regardless of how many terminals are open.
 ///
 /// Anything outside the supported subset (unsupported compression/transmission
 /// medium/format/id, malformed or oversized frames) is silently ignored: the
@@ -225,7 +252,39 @@ final class RemoteKittyImageCapture {
     private var dataByKey: [StoredKey: Data] = [:]
     private var totalBytes = 0
     private var latestVersion: [UInt32: UInt64] = [:]
-    private var nextVersion: UInt64 = 1
+
+    // Content versions are `(epoch << 32) | counter`: `epoch` is fixed for this
+    // instance's whole lifetime and `counter` is monotonic within it, so two
+    // `RemoteKittyImageCapture` instances for the same session (e.g. the first
+    // recreated after a relaunch) never hand out the same version number for
+    // the same image id — a client can't have a stale cached fetch URL from
+    // the old instance accidentally resolve against the new one's data.
+    private let epoch: UInt32
+    private var nextCounter: UInt64 = 1
+    private let budget: RemoteKittyImageCaptureBudget
+
+    /// - Parameters:
+    ///   - epoch: The high 32 bits every version handed out by this instance
+    ///     carries. Defaults to a fresh random value per instance (production
+    ///     behavior); tests inject a fixed value for deterministic version
+    ///     assertions and to prove distinct epochs never collide.
+    ///   - budget: The process-wide budget this instance's retained bytes are
+    ///     accounted against. Defaults to the real shared singleton; tests
+    ///     inject an isolated instance so cross-test process state can never
+    ///     leak into an assertion about global bounds.
+    init(
+        epoch: UInt32 = UInt32.random(in: UInt32.min ... UInt32.max),
+        budget: RemoteKittyImageCaptureBudget? = nil
+    ) {
+        self.epoch = epoch
+        // `budget`'s default can't be spelled as `= .shared` in the parameter
+        // list itself: default-argument expressions aren't evaluated in the
+        // enclosing (main-actor) isolation context, so referencing a
+        // main-actor-isolated static there is a Swift 6 isolation error.
+        // Resolving it here, inside the (main-actor-isolated) initializer
+        // body, is equivalent for every real caller.
+        self.budget = budget ?? .shared
+    }
 
     /// Feeds raw terminal output bytes. Safe to call with any chunking of the
     /// underlying byte stream — the scanner carries state across calls, so a
@@ -241,6 +300,11 @@ final class RemoteKittyImageCapture {
     func currentVersion(for imageId: UInt32) -> UInt64? {
         latestVersion[imageId]
     }
+
+    /// Exposes this instance's fixed epoch (otherwise `private`) so tests can
+    /// assert distinct/random epochs without duplicating the version-bit
+    /// layout. Not used by any production call site.
+    var epochForTesting: UInt32 { epoch }
 
     /// The exact PNG bytes for `(imageId, version)`, or `nil` if that exact pair
     /// isn't (or is no longer) retained.
@@ -294,17 +358,33 @@ final class RemoteKittyImageCapture {
         case .apcSkippingEsc:
             if byte == 0x5C {
                 state = .ground
+            } else if byte == 0x5F {
+                // '_' immediately after the ESC we were watching as a possible
+                // ST: this is the universal APC-start marker, so a fresh frame
+                // begins right here rather than being swallowed back into skip
+                // mode (which would otherwise let this frame's own terminator
+                // masquerade as the end of the abandoned one).
+                rawFrame.removeAll(keepingCapacity: true)
+                state = .apcAwaitingMarker
             } else if byte != 0x1B {
                 state = .apcSkipping
             }
         }
     }
 
-    /// Discards any partially buffered frame and resynchronizes to `.ground`,
-    /// then reprocesses `byte` there — so a byte that turned out not to be a
-    /// valid ST (or a fresh ESC/`_`/`G`) is never silently swallowed.
+    /// Discards any partially buffered frame and resynchronizes, then
+    /// reprocesses `byte` — so a byte that turned out not to be a valid ST is
+    /// never silently swallowed. Special-cased for `byte == '_'`: since the
+    /// ESC that led here was already consumed, falling through to `.ground`
+    /// and reprocessing `_` there would lose the "ESC _" prefix entirely
+    /// (`.ground` only reacts to a *subsequent* ESC) — so a fresh APC starts
+    /// directly instead, exactly as `.apcSkippingEsc` does for the same byte.
     private func abortAPC(reprocessing byte: UInt8) {
         rawFrame.removeAll(keepingCapacity: true)
+        if byte == 0x5F {
+            state = .apcAwaitingMarker
+            return
+        }
         state = .ground
         process(byte)
     }
@@ -408,45 +488,87 @@ final class RemoteKittyImageCapture {
         retain(imageId: imageId, data: decoded)
     }
 
+    /// Requires a structurally *complete* PNG of PNG type — ImageIO only
+    /// parses the container's chunks/metadata here (`CGImageSourceGetStatusAtIndex`),
+    /// it never decodes/allocates the full pixel bitmap, so this stays cheap
+    /// even for large images while still rejecting truncated/malformed data
+    /// that a signature+IHDR-only check would have accepted.
     private static func validatePNG(_ data: Data) -> Bool {
-        let bytes = [UInt8](data)
-        let signature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
-        guard bytes.count >= 24, Array(bytes[0 ..< 8]) == signature else { return false }
-        guard Array(bytes[12 ..< 16]) == Array("IHDR".utf8) else { return false }
-        let width = (UInt32(bytes[16]) << 24) | (UInt32(bytes[17]) << 16)
-            | (UInt32(bytes[18]) << 8) | UInt32(bytes[19])
-        let height = (UInt32(bytes[20]) << 24) | (UInt32(bytes[21]) << 16)
-            | (UInt32(bytes[22]) << 8) | UInt32(bytes[23])
-        guard width > 0, height > 0,
-              width <= UInt32(remoteKittyMaxImageDimension),
-              height <= UInt32(remoteKittyMaxImageDimension)
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) == 1,
+              let type = CGImageSourceGetType(source), type as String == UTType.png.identifier,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int
         else { return false }
-        guard UInt64(width) * UInt64(height) <= UInt64(remoteKittyMaxImagePixels) else { return false }
+        guard width > 0, height > 0,
+              width <= remoteKittyMaxImageDimension,
+              height <= remoteKittyMaxImageDimension
+        else { return false }
+        guard width * height <= remoteKittyMaxImagePixels else { return false }
         return true
     }
 
+    /// Allocates this instance's next version: monotonic `counter` in the low
+    /// 32 bits, this instance's fixed `epoch` in the high 32 bits.
+    private func nextVersion() -> UInt64 {
+        let version = (UInt64(epoch) << 32) | nextCounter
+        nextCounter += 1
+        return version
+    }
+
     private func retain(imageId: UInt32, data: Data) {
-        let version = nextVersion
-        nextVersion += 1
+        let version = nextVersion()
         let key = StoredKey(imageId: imageId, version: version)
         order.append(key)
         dataByKey[key] = data
         totalBytes += data.count
         latestVersion[imageId] = version
-        enforceBounds()
+        budget.register(owner: self, imageId: imageId, version: version, bytes: data.count)
+        enforceLocalBounds()
     }
 
-    private func enforceBounds() {
-        while order.count > remoteKittyMaxRetainedEntries || totalBytes > remoteKittyMaxTotalRetainedBytes {
-            guard !order.isEmpty else { break }
-            let evicted = order.removeFirst()
-            if let evictedData = dataByKey.removeValue(forKey: evicted) {
-                totalBytes -= evictedData.count
-            }
-            if latestVersion[evicted.imageId] == evicted.version {
-                latestVersion.removeValue(forKey: evicted.imageId)
-            }
+    /// Removes a single retained entry, keeping `order`/`dataByKey`/`totalBytes`/
+    /// `latestVersion` in lockstep. `notifyBudget` is false only when this is
+    /// itself being called *from* the budget manager's own eviction (avoiding a
+    /// pointless unregister-of-something-it-just-removed callback).
+    private func removeStoredKey(_ key: StoredKey, notifyBudget: Bool) {
+        guard let data = dataByKey.removeValue(forKey: key) else { return }
+        totalBytes -= data.count
+        if let index = order.firstIndex(of: key) { order.remove(at: index) }
+        if latestVersion[key.imageId] == key.version {
+            latestVersion.removeValue(forKey: key.imageId)
         }
+        if notifyBudget {
+            budget.unregister(owner: self, imageId: key.imageId, version: key.version)
+        }
+    }
+
+    /// Called by `RemoteKittyImageCaptureBudget` when it needs to reclaim this
+    /// exact entry to enforce the process-wide bound. Never re-notifies the
+    /// budget (it's already accounted for the removal on its side).
+    func evictForBudget(imageId: UInt32, version: UInt64) {
+        removeStoredKey(StoredKey(imageId: imageId, version: version), notifyBudget: false)
+    }
+
+    private func enforceLocalBounds() {
+        while order.count > remoteKittyMaxRetainedEntries || totalBytes > remoteKittyMaxTotalRetainedBytes {
+            guard let victim = pickEvictionVictim() else { break }
+            removeStoredKey(victim, notifyBudget: true)
+        }
+    }
+
+    /// Prefers evicting the oldest already-superseded version (an id's older,
+    /// grace-retained entry) over any still-current one, so bumping into the
+    /// bound never drops a version a client might currently be looking at as
+    /// long as some obsolete version is available to sacrifice instead.
+    private func pickEvictionVictim() -> StoredKey? {
+        guard !order.isEmpty else { return nil }
+        for key in order where latestVersion[key.imageId] != key.version {
+            return key
+        }
+        return order.first
     }
 
     // MARK: Deletion
@@ -464,6 +586,9 @@ final class RemoteKittyImageCapture {
     }
 
     private func clearAll() {
+        for key in order {
+            budget.unregister(owner: self, imageId: key.imageId, version: key.version)
+        }
         order.removeAll()
         dataByKey.removeAll()
         latestVersion.removeAll()
@@ -478,6 +603,7 @@ final class RemoteKittyImageCapture {
         for key in order {
             if key.imageId == imageId {
                 if let data = dataByKey.removeValue(forKey: key) { totalBytes -= data.count }
+                budget.unregister(owner: self, imageId: key.imageId, version: key.version)
             } else {
                 kept.append(key)
             }
