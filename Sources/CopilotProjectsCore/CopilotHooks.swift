@@ -37,14 +37,12 @@ public enum CopilotHooks {
 
     emit() { printf '{}\n'; }   # neutral hook result
 
-    session_id="${COPILOT_PROJECTS_SESSION:-${COPILOT_MUX_SESSION:-}}"
+    environment_session_id="${COPILOT_PROJECTS_SESSION:-${COPILOT_MUX_SESSION:-}}"
     socket="${COPILOT_PROJECTS_SOCKET:-${COPILOT_MUX_SOCKET:-}}"
-    if [ -z "$session_id" ]; then emit; exit 0; fi
-    # The session id becomes a filesystem path component below; a hostile env could
-    # otherwise path-traverse the marker writes. Accept only a bare UUID charset +
-    # length so nothing with "/" or ".." (or anything else) escapes the sessions dir.
-    case "$session_id" in *[!0-9A-Fa-f-]*) emit; exit 0 ;; esac
-    [ ${#session_id} -eq 36 ] || { emit; exit 0; }
+    if [ -z "$environment_session_id" ] && [ -z "$socket" ]; then
+      emit
+      exit 0
+    fi
 
     # Derive the state dir from whichever socket env is present; otherwise fall back
     # to the storage root that matches the session's vintage.
@@ -55,6 +53,23 @@ public enum CopilotHooks {
     else
       state_dir="$HOME/.local/state/copilot-projects"
     fi
+
+    # A long-lived or nested shell can carry another tab's stale session env. The
+    # native helper resolves the hook's parent through the actual dtach socket
+    # ancestry. If the installed resolver cannot prove ownership, fail closed; only
+    # old installs without the resolver retain the environment fallback.
+    resolver="$HOME/.local/bin/copilot-projects"
+    [ ! -x "$resolver" ] && resolver="$HOME/.local/bin/copilot-mux"
+    if [ -x "$resolver" ]; then
+      session_id="$("$resolver" resolve-session --pid "$PPID" 2>/dev/null)" \
+        || { emit; exit 0; }
+    else
+      session_id="$environment_session_id"
+    fi
+    # The session id becomes a filesystem path component below; a hostile env or
+    # malformed resolver output must not escape the sessions directory.
+    case "$session_id" in *[!0-9A-Fa-f-]*) emit; exit 0 ;; esac
+    [ ${#session_id} -eq 36 ] || { emit; exit 0; }
 
     cli="$(command -v copilot-projects 2>/dev/null || true)"
     [ -z "$cli" ] && [ -x "$HOME/.local/bin/copilot-projects" ] && cli="$HOME/.local/bin/copilot-projects"
@@ -122,7 +137,7 @@ public enum CopilotHooks {
       # overwritten by a late "running". The CLI bounds this call with a socket
       # timeout, so a hung app can't block the hook past its deny-triggering timeout.
       if [ -n "$cli" ]; then
-        args=(set-status "$1")
+        args=(set-status "$1" --session "$session_id")
         [ -z "${2:-}" ] || args+=(--timestamp "$2")
         [ -z "${3:-}" ] || args+=(--source "$3")
         [ -z "${4:-}" ] || args+=(--notification "$4")

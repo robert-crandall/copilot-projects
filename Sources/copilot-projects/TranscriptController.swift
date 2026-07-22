@@ -6,8 +6,29 @@ import CopilotProjectsProtocol
 
 @MainActor
 final class TranscriptController: ObservableObject {
+    nonisolated private static let quarantineLock = NSLock()
+
+    private struct TranscriptOwner: Decodable {
+        let appSessionId: String?
+        let copilotSessionId: String?
+        let pid: pid_t
+    }
+
+    private struct TranscriptQuarantine: Codable {
+        static let currentSchemaVersion = 1
+
+        let schemaVersion: Int
+        let foreignCopilotSessionIds: Set<String>
+    }
+
+    private struct LoadSignature: Equatable, Sendable {
+        let transcript: FileSignature
+        let owner: FileSignature?
+        let quarantine: FileSignature?
+    }
+
     private struct LoadResult: Sendable {
-        let signature: FileSignature?
+        let signature: LoadSignature?
         let snapshot: TranscriptSnapshot?
     }
 
@@ -17,7 +38,7 @@ final class TranscriptController: ObservableObject {
 
     private var directorySource: DispatchSourceFileSystemObject?
     private var fallbackTimer: Timer?
-    private var signature: FileSignature?
+    private var signature: LoadSignature?
     private var reloadGeneration = 0
     private var started = false
 
@@ -63,7 +84,8 @@ final class TranscriptController: ObservableObject {
         reloadGeneration += 1
         let generation = reloadGeneration
         let previousSignature = signature
-        let path = Paths.transcriptSnapshotPath(sessionId: sessionId)
+        let currentSessionId = sessionId
+        let path = Paths.transcriptSnapshotPath(sessionId: currentSessionId)
         Task.detached {
             if delay > 0 {
                 try? await Task.sleep(
@@ -71,6 +93,7 @@ final class TranscriptController: ObservableObject {
                 )
             }
             guard let result = Self.load(
+                sessionId: currentSessionId,
                 path: path,
                 previousSignature: previousSignature
             ) else { return }
@@ -83,16 +106,21 @@ final class TranscriptController: ObservableObject {
     }
 
     nonisolated private static func load(
+        sessionId: String,
         path: String,
-        previousSignature: FileSignature?
+        previousSignature: LoadSignature?
     ) -> LoadResult? {
-        let fileManager = FileManager.default
-        guard let attributes = try? fileManager.attributesOfItem(atPath: path) else {
+        guard let signature = loadSignature(
+            sessionId: sessionId,
+            transcriptPath: path
+        ) else {
             guard previousSignature != nil else { return nil }
             return LoadResult(signature: nil, snapshot: nil)
         }
-        let signature = FileSignature(attributes: attributes)
         guard signature != previousSignature else { return nil }
+        guard transcriptOwnerAllowsRead(sessionId: sessionId) else {
+            return LoadResult(signature: signature, snapshot: nil)
+        }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             return nil
         }
@@ -101,24 +129,48 @@ final class TranscriptController: ObservableObject {
               snapshot.schemaVersion == 3 else {
             return LoadResult(signature: signature, snapshot: nil)
         }
+        guard transcriptOwnerAllowsSnapshot(
+            sessionId: sessionId,
+            copilotSessionId: snapshot.copilotSessionId
+        ) else {
+            return LoadResult(signature: signature, snapshot: nil)
+        }
+        guard transcriptQuarantineAllowsRead(
+            sessionId: sessionId,
+            snapshot: snapshot,
+            expectedSignature: signature
+        ) else {
+            let current = loadSignature(sessionId: sessionId, transcriptPath: path)
+            return LoadResult(
+                signature: current == signature ? signature : nil,
+                snapshot: nil
+            )
+        }
         return LoadResult(signature: signature, snapshot: snapshot)
     }
 
     nonisolated static func remoteRevision(sessionId: String) -> RemoteTranscriptRevision {
-        let path = Paths.transcriptSnapshotPath(sessionId: sessionId)
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-        else {
-            return RemoteTranscriptRevision(sessionId: sessionId, generation: "missing")
-        }
-        let signature = FileSignature(attributes: attributes)
         return RemoteTranscriptRevision(
             sessionId: sessionId,
-            generation: "\(signature.fileNumber):\(signature.size):\(signature.modifiedAt)"
+            generation: [
+                fileGeneration(Paths.transcriptSnapshotPath(sessionId: sessionId)),
+                fileGeneration(Paths.transcriptOwnerPath(sessionId: sessionId)),
+                fileGeneration(Paths.transcriptQuarantinePath(sessionId: sessionId)),
+            ].joined(separator: "|")
         )
     }
 
     nonisolated static func loadRemoteSnapshot(sessionId: String) -> TranscriptSnapshot {
         let path = Paths.transcriptSnapshotPath(sessionId: sessionId)
+        guard let signature = loadSignature(
+            sessionId: sessionId,
+            transcriptPath: path
+        ) else {
+            return emptyRemoteSnapshot()
+        }
+        guard transcriptOwnerAllowsRead(sessionId: sessionId) else {
+            return emptyRemoteSnapshot()
+        }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               data.count <= 6 * 1_024 * 1_024 else {
             return emptyRemoteSnapshot()
@@ -128,7 +180,239 @@ final class TranscriptController: ObservableObject {
               snapshot.schemaVersion == 3 else {
             return emptyRemoteSnapshot()
         }
+        guard transcriptOwnerAllowsSnapshot(
+            sessionId: sessionId,
+            copilotSessionId: snapshot.copilotSessionId
+        ) else {
+            return emptyRemoteSnapshot()
+        }
+        guard transcriptQuarantineAllowsRead(
+            sessionId: sessionId,
+            snapshot: snapshot,
+            expectedSignature: signature
+        ) else {
+            return emptyRemoteSnapshot()
+        }
         return snapshot
+    }
+
+    /// Synchronously validates whether the process recorded in
+    /// `transcript-owner.json` for `sessionId` is actually this session (rather
+    /// than a foreign tab that inherited its environment/path). Quarantine is
+    /// otherwise only populated lazily as a side effect of reading the
+    /// transcript via `loadRemoteSnapshot`, which background tabs never do (no
+    /// `TranscriptController` is ever started for them) and the selected tab
+    /// may not have done yet at app bootstrap — so callers that are about to
+    /// trust a resume marker (e.g. `AppModel.controller(for:)`) must call this
+    /// directly instead of relying solely on `isCopilotSessionQuarantined`.
+    /// Records the mismatch as a quarantine (matching `loadRemoteSnapshot`'s
+    /// behavior) so subsequent reads stay consistent.
+    nonisolated static func transcriptOwnerAllowsRead(
+        sessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> Bool {
+        let path = directory
+            .appendingPathComponent("\(sessionId).transcript-owner.json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let owner = try? JSONDecoder().decode(TranscriptOwner.self, from: data),
+              owner.pid > 0 else {
+            return true
+        }
+        if let ownerSessionId = owner.appSessionId {
+            let allows = ownerSessionId.caseInsensitiveCompare(sessionId) == .orderedSame
+            if !allows {
+                recordForeignTranscriptQuarantine(
+                    sessionId: sessionId,
+                    copilotSessionId: owner.copilotSessionId,
+                    directory: directory
+                )
+            }
+            return allows
+        }
+        let snapshot = ProcessTree.snapshot()
+        guard snapshot.nameOf[owner.pid] != nil else { return true }
+        let environment = ProcessTree.inspect(owner.pid).env
+        let allows = transcriptOwnerMatchesSession(
+            sessionId: sessionId,
+            ownerPID: owner.pid,
+            snapshot: snapshot,
+            environment: environment,
+            dtachProcesses: ProcessTree.dtachProcesses(in: snapshot),
+            sessionsDirectory: directory
+        ) ?? true
+        if !allows {
+            recordForeignTranscriptQuarantine(
+                sessionId: sessionId,
+                copilotSessionId: owner.copilotSessionId,
+                directory: directory
+            )
+        }
+        return allows
+    }
+
+    /// Cross-checks a just-decoded transcript snapshot against the *current*
+    /// owner marker's recorded Copilot session id. `transcriptOwnerAllowsRead`
+    /// only validates ownership (appSessionId/pid) at the instant it's called;
+    /// it can't detect the narrower race where a dead owner is reclaimed (a
+    /// new, valid `transcript-owner.json` is written) before that new owner's
+    /// first `publishTranscript()` overwrites `transcript.json` — so the bytes
+    /// just decoded can still be the *previous* (possibly foreign) owner's
+    /// content even though the owner file itself now looks legitimate. Reject
+    /// (and quarantine) whenever the owner records a different Copilot session
+    /// id than the transcript we actually read.
+    nonisolated private static func transcriptOwnerAllowsSnapshot(
+        sessionId: String,
+        copilotSessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> Bool {
+        let path = directory
+            .appendingPathComponent("\(sessionId).transcript-owner.json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let owner = try? JSONDecoder().decode(TranscriptOwner.self, from: data),
+              let ownerCopilotSessionId = owner.copilotSessionId else {
+            // No owner recorded (or the owner predates copilotSessionId being
+            // tracked) — nothing further to cross-check against.
+            return true
+        }
+        let allows = ownerCopilotSessionId == copilotSessionId
+        if !allows {
+            recordForeignTranscriptQuarantine(
+                sessionId: sessionId,
+                copilotSessionId: copilotSessionId,
+                directory: directory
+            )
+        }
+        return allows
+    }
+
+    nonisolated static func transcriptOwnerMatchesSession(
+        sessionId: String,
+        ownerPID: pid_t,
+        snapshot: ProcessTree.Snapshot,
+        environment: [String: String],
+        dtachProcesses: [ProcessTree.DtachProcess],
+        sessionsDirectory: URL
+    ) -> Bool? {
+        guard let resolved = ProcessTree.managedSessionId(
+            for: ownerPID,
+            fallbackSessionId: Env.sessionId(environment),
+            sessionsDirectory: sessionsDirectory,
+            in: snapshot,
+            dtachProcesses: dtachProcesses
+        ) else {
+            return nil
+        }
+        return resolved.caseInsensitiveCompare(sessionId) == .orderedSame
+    }
+
+    nonisolated static func isCopilotSessionQuarantined(
+        sessionId: String,
+        copilotSessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> Bool {
+        quarantineLock.lock()
+        defer { quarantineLock.unlock() }
+        guard let quarantine = loadQuarantine(
+            sessionId: sessionId,
+            directory: directory
+        ) else {
+            return false
+        }
+        return quarantine.foreignCopilotSessionIds.contains(copilotSessionId)
+    }
+
+    nonisolated private static func recordForeignTranscriptQuarantine(
+        sessionId: String,
+        copilotSessionId: String?,
+        directory: URL = Paths.sessionsDir
+    ) {
+        if let copilotSessionId, UUID(uuidString: copilotSessionId) != nil {
+            quarantineLock.lock()
+            defer { quarantineLock.unlock() }
+            let path = directory
+                .appendingPathComponent("\(sessionId).transcript-quarantine.json").path
+            let existing = loadQuarantine(sessionId: sessionId, directory: directory)?
+                .foreignCopilotSessionIds ?? []
+            guard !existing.contains(copilotSessionId) else { return }
+            let quarantine = TranscriptQuarantine(
+                schemaVersion: TranscriptQuarantine.currentSchemaVersion,
+                foreignCopilotSessionIds: existing.union([copilotSessionId])
+            )
+            if let data = try? JSONEncoder().encode(quarantine) {
+                try? data.write(
+                    to: URL(fileURLWithPath: path),
+                    options: .atomic
+                )
+            }
+        }
+    }
+
+    nonisolated private static func transcriptQuarantineAllowsRead(
+        sessionId: String,
+        snapshot: TranscriptSnapshot,
+        expectedSignature: LoadSignature
+    ) -> Bool {
+        quarantineLock.lock()
+        defer { quarantineLock.unlock() }
+        guard loadSignature(
+            sessionId: sessionId,
+            transcriptPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
+        ) == expectedSignature else {
+            return false
+        }
+        let path = Paths.transcriptQuarantinePath(sessionId: sessionId)
+        guard let quarantine = loadQuarantine(sessionId: sessionId) else {
+            return true
+        }
+        guard quarantine.foreignCopilotSessionIds.contains(
+            snapshot.copilotSessionId
+        ) else {
+            try? FileManager.default.removeItem(atPath: path)
+            return true
+        }
+        return false
+    }
+
+    nonisolated private static func fileGeneration(_ path: String) -> String {
+        guard let signature = fileSignature(path) else { return "missing" }
+        return "\(signature.fileNumber):\(signature.size):\(signature.modifiedAt)"
+    }
+
+    nonisolated private static func loadSignature(
+        sessionId: String,
+        transcriptPath: String
+    ) -> LoadSignature? {
+        guard let transcript = fileSignature(transcriptPath) else { return nil }
+        return LoadSignature(
+            transcript: transcript,
+            owner: fileSignature(Paths.transcriptOwnerPath(sessionId: sessionId)),
+            quarantine: fileSignature(Paths.transcriptQuarantinePath(sessionId: sessionId))
+        )
+    }
+
+    nonisolated private static func fileSignature(_ path: String) -> FileSignature? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        else {
+            return nil
+        }
+        return FileSignature(attributes: attributes)
+    }
+
+    nonisolated private static func loadQuarantine(
+        sessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> TranscriptQuarantine? {
+        let path = directory
+            .appendingPathComponent("\(sessionId).transcript-quarantine.json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let quarantine = try? JSONDecoder().decode(
+                  TranscriptQuarantine.self,
+                  from: data
+              ),
+              quarantine.schemaVersion == TranscriptQuarantine.currentSchemaVersion else {
+            return nil
+        }
+        return quarantine
     }
 
     nonisolated private static func emptyRemoteSnapshot() -> TranscriptSnapshot {

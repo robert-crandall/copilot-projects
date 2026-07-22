@@ -146,6 +146,7 @@ enum SessionArtifacts {
             Paths.transcriptSnapshotPath(sessionId: sessionId),
             Paths.transcriptOwnerPath(sessionId: sessionId),
             Paths.transcriptOwnerLockPath(sessionId: sessionId),
+            Paths.transcriptQuarantinePath(sessionId: sessionId),
         ] {
             try? fm.removeItem(atPath: path)
         }

@@ -521,10 +521,28 @@ final class AppModel: ObservableObject {
         // Last Copilot session id seen in this tab (written by the hook). If the
         // shell is created fresh after a reboot, the controller resumes this exact
         // agent session; on a normal relaunch dtach reattaches and ignores it.
-        let recordedCopilot = (try? String(contentsOf:
+        let rawRecordedCopilot = (try? String(contentsOf:
             resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-session"),
             encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // isCopilotSessionQuarantined only sees a foreign owner that some
+        // TranscriptController has already read and recorded — but background
+        // tabs never get a TranscriptController, and at bootstrap the selected
+        // tab's hasn't started yet. Validate the owner marker directly here too
+        // (this also records the quarantine as a side effect) so a foreign
+        // owner can't be resumed before anything else has observed it.
+        let ownerAllowsResume = TranscriptController.transcriptOwnerAllowsRead(
+            sessionId: sessionId,
+            directory: resumeMarkerDirectory
+        )
+        let recordedCopilot = rawRecordedCopilot.flatMap { candidate -> String? in
+            guard ownerAllowsResume else { return nil }
+            return TranscriptController.isCopilotSessionQuarantined(
+                sessionId: sessionId,
+                copilotSessionId: candidate,
+                directory: resumeMarkerDirectory
+            ) ? nil : candidate
+        }
         let allowAllCopilot = (try? String(contentsOf:
             resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-allow-all"),
             encoding: .utf8))?

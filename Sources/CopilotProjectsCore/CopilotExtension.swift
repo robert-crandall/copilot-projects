@@ -15,14 +15,60 @@ public enum CopilotExtension {
     }
 
     public static let script = #"""
+    import { execFileSync } from "node:child_process";
     import { dirname, join } from "node:path";
-    import { mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from "node:fs";
+    import {
+        existsSync as fileExistsSync,
+        mkdirSync, readFileSync, renameSync, rmSync, watch, writeFileSync
+    } from "node:fs";
     import { joinSession } from "@github/copilot-sdk/extension";
 
-    const appSessionId = process.env.COPILOT_PROJECTS_SESSION
+    const environmentAppSessionId = process.env.COPILOT_PROJECTS_SESSION
         || process.env.COPILOT_MUX_SESSION;
     const socketPath = process.env.COPILOT_PROJECTS_SOCKET
         || process.env.COPILOT_MUX_SOCKET;
+    const sessionIdPattern = /^[0-9A-Fa-f-]{36}$/;
+
+    // The environment can be stale or cross-contaminated in a long-lived shell.
+    // Ask the installed native helper to resolve this process through the actual
+    // dtach socket ancestry. If the helper is installed but cannot prove ownership,
+    // fail closed; only old installs without the helper retain the env fallback.
+    function resolveAppSessionId() {
+        const home = typeof process.env.HOME === "string" ? process.env.HOME : "";
+        const candidates = home ? [
+            join(home, ".local/bin/copilot-projects"),
+            join(home, ".local/bin/copilot-mux"),
+        ] : [];
+        const resolver = candidates.find((candidate) => fileExistsSync(candidate));
+        if (!resolver) {
+            return {
+                sessionId: sessionIdPattern.test(environmentAppSessionId || "")
+                    ? environmentAppSessionId
+                    : "",
+                native: false,
+            };
+        }
+        try {
+            const resolved = execFileSync(
+                resolver,
+                ["resolve-session", "--pid", String(process.pid)],
+                {
+                    encoding: "utf8",
+                    timeout: 1_000,
+                    stdio: ["ignore", "pipe", "ignore"],
+                }
+            ).trim();
+            return {
+                sessionId: sessionIdPattern.test(resolved) ? resolved : "",
+                native: true,
+            };
+        } catch {
+            return { sessionId: "", native: true };
+        }
+    }
+
+    const appSessionResolution = resolveAppSessionId();
+    const appSessionId = appSessionResolution.sessionId;
     const validSessionId = /^[0-9A-Fa-f-]{36}$/.test(appSessionId || "");
 
     const session = await joinSession();
@@ -168,6 +214,41 @@ public enum CopilotExtension {
             }
         }
 
+        // A live-looking pid doesn't prove it's the same process that wrote the
+        // marker: after a reboot (or once the pid counter wraps) an unrelated
+        // process can be reassigned that exact pid, and `processAlive` alone
+        // would treat that unrelated process as the still-live owner forever,
+        // permanently blocking every new session for this tab from claiming or
+        // publishing shared files. Cross-check the system boot time recorded
+        // alongside the pid; a boot time mismatch proves the recorded process
+        // is gone even though the pid number happens to be in use again.
+        let cachedBootTime;
+        function currentBootTime() {
+            if (cachedBootTime !== undefined) return cachedBootTime;
+            try {
+                cachedBootTime = execFileSync(
+                    "sysctl",
+                    ["-n", "kern.boottime"],
+                    { encoding: "utf8", timeout: 1_000, stdio: ["ignore", "pipe", "ignore"] }
+                ).trim();
+            } catch {
+                cachedBootTime = null;
+            }
+            return cachedBootTime;
+        }
+
+        function ownerProcessAlive(owner) {
+            if (!processAlive(owner.pid)) return false;
+            if (typeof owner.bootTime !== "string" || !owner.bootTime) {
+                // Marker predates boot-time tracking; fall back to pid-only.
+                return true;
+            }
+            const current = currentBootTime();
+            // Fail open (as elsewhere) if we can't determine the current boot
+            // time rather than spuriously reclaiming a live owner.
+            return current === null || current === owner.bootTime;
+        }
+
         function recordedOwner() {
             try {
                 return JSON.parse(readFileSync(transcriptOwnerPath, "utf8"));
@@ -195,18 +276,44 @@ public enum CopilotExtension {
             return ownerMatchesCurrentProcess(recordedOwner());
         }
 
+        function ownerMarkerPayload() {
+            return {
+                ...(appSessionResolution.native ? {appSessionId} : {}),
+                copilotSessionId: session.sessionId,
+                pid: process.pid,
+                bootTime: currentBootTime() ?? undefined,
+            };
+        }
+
         function writeOwnerMarker() {
             try {
                 writeFileSync(
                     transcriptOwnerPath,
-                    JSON.stringify({
-                        copilotSessionId: session.sessionId,
-                        pid: process.pid,
-                    }),
+                    JSON.stringify(ownerMarkerPayload()),
                     { flag: "wx", mode: 0o600 }
                 );
                 return true;
             } catch {
+                return false;
+            }
+        }
+
+        // Replaces an existing marker via write-then-rename so a concurrent
+        // reader never observes a moment with no marker present at all (as a
+        // plain remove-then-recreate would produce). `renameSync` within the
+        // same directory is atomic on the filesystems this app supports.
+        function replaceOwnerMarker() {
+            const temporaryPath = `${transcriptOwnerPath}.${process.pid}.tmp`;
+            try {
+                writeFileSync(
+                    temporaryPath,
+                    JSON.stringify(ownerMarkerPayload()),
+                    { mode: 0o600 }
+                );
+                renameSync(temporaryPath, transcriptOwnerPath);
+                return true;
+            } catch {
+                try { rmSync(temporaryPath, { force: true }); } catch {}
                 return false;
             }
         }
@@ -216,6 +323,7 @@ public enum CopilotExtension {
                 writeFileSync(
                     transcriptOwnerLockPath,
                     JSON.stringify({
+                        ...(appSessionResolution.native ? {appSessionId} : {}),
                         copilotSessionId: session.sessionId,
                         pid: process.pid,
                     }),
@@ -236,10 +344,9 @@ public enum CopilotExtension {
                 const owner = recordedOwner();
                 if (!owner) return writeOwnerMarker();
                 if (ownerMatchesCurrentProcess(owner)) return true;
-                if (processAlive(owner.pid)) return false;
+                if (ownerProcessAlive(owner)) return false;
                 if (!ownerMatches(owner, expectedOwner)) return false;
-                try { rmSync(transcriptOwnerPath, { force: true }); } catch {}
-                return writeOwnerMarker();
+                return replaceOwnerMarker();
             });
         }
 
@@ -257,7 +364,7 @@ public enum CopilotExtension {
                         activateSharedFilesOwnership();
                         return true;
                     }
-                    if (processAlive(owner.pid)) return false;
+                    if (ownerProcessAlive(owner)) return false;
                     if (reclaimDeadOwner(owner)) {
                         activateSharedFilesOwnership(true);
                         return true;
@@ -1177,7 +1284,16 @@ public enum CopilotExtension {
                 writeTranscriptSnapshot();
                 removeFile(snapshotPath);
                 removeFile(scheduledTurnPath);
-                removeFile(transcriptOwnerPath);
+                // Deliberately keep transcriptOwnerPath: it records this process's
+                // appSessionId/copilotSessionId provenance for the transcript that
+                // was just flushed. If we deleted it here, a foreign reader that
+                // arrives after this exit (but before any new owner claims the
+                // file) would find no owner marker and default to allowing the
+                // read, silently accepting a wrong-tab snapshot without ever
+                // recording the quarantine. Leaving the marker in place lets
+                // ownsSharedFiles()/reclaimDeadOwner() reclaim it safely once this
+                // pid is confirmed dead, while still letting readers verify
+                // provenance in the meantime.
                 removeFile(userInputResponsePath);
                 removeFile(elicitationResponsePath);
             }
