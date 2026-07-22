@@ -156,12 +156,15 @@ final class RemoteKittyImageCaptureBudget {
     private(set) var totalPendingBytes = 0
 
     /// Attempts to reserve `additionalBytes` more in-flight bytes on top of
-    /// whatever `owner` already has reserved. If that would push the
-    /// process-wide pending total over `maxTotalPendingBytes`, this first
-    /// tries to make room by aborting the oldest *other* in-flight owner(s)
-    /// — safe to discard unconditionally, since unvalidated pending data
-    /// isn't real data any other owner could be relying on yet, unlike the
-    /// retained-bytes budget above which must pick an eviction victim
+    /// whatever `owner` already has reserved. If `owner`'s own request alone
+    /// (its existing reservation plus `additionalBytes`) already exceeds
+    /// `maxTotalPendingBytes`, this fails immediately without touching any
+    /// other owner's reservation — see the fast-path check below. Otherwise,
+    /// if the process-wide pending total would be pushed over the bound,
+    /// this next tries to make room by aborting the oldest *other* in-flight
+    /// owner(s) — safe to discard unconditionally, since unvalidated pending
+    /// data isn't real data any other owner could be relying on yet, unlike
+    /// the retained-bytes budget above which must pick an eviction victim
     /// carefully. Only if every other owner has been aborted and `owner`'s
     /// own reservation still wouldn't fit does this return `false`, in which
     /// case the caller must abort its own in-flight transmission instead —
@@ -172,6 +175,16 @@ final class RemoteKittyImageCaptureBudget {
         pruneOrphanedPendingOwners()
         guard additionalBytes > 0 else { return true }
         let key = ObjectIdentifier(owner)
+        // Fast path: if `owner`'s own existing reservation plus this request
+        // already exceeds the whole shared bound on its own, no amount of
+        // evicting *other* owners can ever make it fit — so bail out before
+        // touching any of them. Without this check, an owner requesting an
+        // unsatisfiable reservation would first collaterally abort every
+        // other innocent in-flight owner's transmission (each a real,
+        // independent client's in-progress upload) for no benefit whatsoever,
+        // since the reservation was always going to fail regardless.
+        let currentOwnerBytes = pendingByOwner[key]?.bytes ?? 0
+        guard currentOwnerBytes + additionalBytes <= maxTotalPendingBytes else { return false }
         if totalPendingBytes + additionalBytes > maxTotalPendingBytes {
             evictOldestOtherPendingOwners(except: key, toFit: additionalBytes)
         }

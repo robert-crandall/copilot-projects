@@ -245,7 +245,8 @@ final class RemoteGateway: @unchecked Sendable {
         port: Int,
         webPushService: WebPushService? = nil,
         apnsService: APNsService? = nil,
-        notificationSync: NotificationSyncService? = nil
+        notificationSync: NotificationSyncService? = nil,
+        imageResponseBudget: RemoteImageResponseBudget = .shared
     ) throws -> Int {
         if let boundPort = channel?.localAddress?.port { return boundPort }
         let auth = RemoteRequestAuth(
@@ -272,7 +273,8 @@ final class RemoteGateway: @unchecked Sendable {
                             leases: leases,
                             webPushService: webPushService,
                             apnsService: apnsService,
-                            notificationSync: notificationSync
+                            notificationSync: notificationSync,
+                            imageResponseBudget: imageResponseBudget
                         )
                     )
                 }
@@ -453,6 +455,7 @@ private final class RemoteHTTPHandler:
     private let webPushService: WebPushService?
     private let apnsService: APNsService?
     private let notificationSync: NotificationSyncService?
+    private let imageResponseBudget: RemoteImageResponseBudget
 
     private var head: HTTPRequestHead?
     private var body: [UInt8] = []
@@ -478,7 +481,8 @@ private final class RemoteHTTPHandler:
         leases: RemoteWriterLeases,
         webPushService: WebPushService?,
         apnsService: APNsService?,
-        notificationSync: NotificationSyncService?
+        notificationSync: NotificationSyncService?,
+        imageResponseBudget: RemoteImageResponseBudget
     ) {
         self.auth = auth
         self.bridge = bridge
@@ -486,6 +490,7 @@ private final class RemoteHTTPHandler:
         self.webPushService = webPushService
         self.apnsService = apnsService
         self.notificationSync = notificationSync
+        self.imageResponseBudget = imageResponseBudget
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -753,15 +758,52 @@ private final class RemoteHTTPHandler:
                 return
             }
             channel.eventLoop.execute {
-                self.respond(
-                    channel: channel,
-                    method: method,
-                    status: .ok,
-                    contentType: "image/png",
-                    body: data
-                )
+                self.respondWithTerminalImage(channel: channel, method: method, data: data)
             }
         }
+    }
+
+    /// Serves `data` as the terminal-image response body, enforcing the
+    /// process/gateway-wide `imageResponseBudget` (finding: image response
+    /// backpressure). A `HEAD` request never reserves anything — `respond`
+    /// never queues an actual body for it regardless of `Content-Length` —
+    /// but every `GET` first requires the channel to currently be writable
+    /// (rejecting outright, rather than adding to an already-backed-up
+    /// connection's outbound buffer) and reserves `data.count` bytes of the
+    /// shared budget before ever copying/writing it. Excess demand — either
+    /// a channel that isn't accepting more writes, or a shared budget that's
+    /// already fully reserved by other concurrent image responses — is
+    /// rejected with 503/429 instead of being queued. The reservation is
+    /// released exactly once, only when the body write's own future
+    /// completes or fails (see `respond(channel:...:onBodyWriteComplete:)`),
+    /// never merely once this function returns.
+    private func respondWithTerminalImage(channel: Channel, method: HTTPMethod, data: Data) {
+        guard method != .HEAD else {
+            respond(channel: channel, method: method, status: .ok, contentType: "image/png", body: data)
+            return
+        }
+        guard channel.isWritable else {
+            respond(channel: channel, method: method, status: .serviceUnavailable,
+                    contentType: "text/plain", body: Data("Unavailable".utf8))
+            return
+        }
+        guard imageResponseBudget.reserve(bytes: data.count) else {
+            respond(channel: channel, method: method, status: .tooManyRequests,
+                    contentType: "text/plain", body: Data("Too many requests".utf8))
+            return
+        }
+        let budget = imageResponseBudget
+        let reservedBytes = data.count
+        respond(
+            channel: channel,
+            method: method,
+            status: .ok,
+            contentType: "image/png",
+            body: data,
+            onBodyWriteComplete: { _ in
+                budget.release(bytes: reservedBytes)
+            }
+        )
     }
 
     // MARK: - Control (POST)
@@ -1451,12 +1493,21 @@ private final class RemoteHTTPHandler:
         context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
     }
 
+    /// - Parameter onBodyWriteComplete: If provided, invoked exactly once
+    ///   with the result of the body write specifically (not the subsequent
+    ///   `.end` frame) — immediately, synchronously, with `.success(())` if
+    ///   no body was actually queued (a `HEAD` request or an empty `body`),
+    ///   since nothing was reserved for those in the first place. Lets a
+    ///   caller release a byte-budget reservation exactly once the bytes it
+    ///   guarded have actually left (successfully or not) the channel's own
+    ///   outbound buffer, never merely once this call returns.
     private func respond(
         channel: Channel,
         method: HTTPMethod,
         status: HTTPResponseStatus,
         contentType: String,
-        body: Data
+        body: Data,
+        onBodyWriteComplete: (@Sendable (Result<Void, Error>) -> Void)? = nil
     ) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: contentType)
@@ -1473,10 +1524,18 @@ private final class RemoteHTTPHandler:
         if method != .HEAD && !body.isEmpty {
             var buffer = channel.allocator.buffer(capacity: body.count)
             buffer.writeBytes(body)
-            channel.write(
-                HTTPServerResponsePart.body(.byteBuffer(buffer)),
-                promise: nil
-            )
+            if let onBodyWriteComplete {
+                let promise = channel.eventLoop.makePromise(of: Void.self)
+                promise.futureResult.whenComplete(onBodyWriteComplete)
+                channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: promise)
+            } else {
+                channel.write(
+                    HTTPServerResponsePart.body(.byteBuffer(buffer)),
+                    promise: nil
+                )
+            }
+        } else {
+            onBodyWriteComplete?(.success(()))
         }
         channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
     }

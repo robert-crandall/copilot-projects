@@ -172,13 +172,27 @@ enum RemoteKittyPlacementScanner {
         var otherComponents: [Component] = []
 
         for imageId in byImage.keys.sorted() {
-            guard let version = currentVersion(imageId), var remaining = byImage[imageId] else { continue }
-            while !remaining.isEmpty {
-                // Seeded deterministically (smallest `(lineId, col)` first)
-                // rather than via `Set`'s unordered iteration, so which
-                // component is discovered next never depends on
-                // hashing/iteration order.
-                let start = remaining.min { ($0.lineId, $0.col) < ($1.lineId, $1.col) }!
+            guard let version = currentVersion(imageId), let coordinates = byImage[imageId] else { continue }
+            // Seeded deterministically (smallest `(lineId, col)` first) —
+            // sorted once per image id up front, rather than repeatedly
+            // scanning the shrinking `remaining` set for its minimum before
+            // every single component. That repeated-`.min()` approach made
+            // discovery cost O(component count) *per component*, which for a
+            // checkerboard grid (every marked cell its own disjoint
+            // single-cell component, so component count == cell count) is
+            // O(n^2) in total cells for that image id. Sorting once is
+            // O(n log n); `remaining` still gives O(1) flood-fill
+            // neighbor membership/removal, and each sorted seed is visited or
+            // skipped (already claimed by an earlier component) exactly
+            // once, so the whole seed walk is O(n) on top of the sort.
+            // Component membership, priority-tier classification, and the
+            // final deterministic sort/cap below are all unchanged — the
+            // *set* of coordinates flood-filled into each component never
+            // depends on which of its members was chosen as the seed.
+            var remaining = coordinates
+            let sortedSeeds = coordinates.sorted { ($0.lineId, $0.col) < ($1.lineId, $1.col) }
+            for start in sortedSeeds {
+                guard remaining.contains(start) else { continue }
                 remaining.remove(start)
                 var component: [Coordinate] = [start]
                 var frontier = [start]
@@ -435,6 +449,18 @@ final class RemoteKittyImageCapture {
     // MARK: Byte-level APC scanning
 
     private func process(_ byte: UInt8) {
+        // CAN (0x18) / SUB (0x1A) are wired as an "anywhere" rule in
+        // SwiftTerm's own VT500 transition table — they fire from every
+        // parser state and always cancel back to ground, never completing
+        // whatever escape sequence or control string was in progress. Mirror
+        // that here so this scanner can never wedge on a byte stream that
+        // happens to contain one mid-OSC/DCS/PM-skip or mid-APC-accumulation:
+        // the in-progress sequence is unconditionally discarded (not
+        // completed), exactly as a real terminal would resync.
+        if byte == 0x18 || byte == 0x1A {
+            cancelSequence()
+            return
+        }
         switch state {
         case .ground:
             if byte == 0x1B { state = .sawEsc }
@@ -458,12 +484,26 @@ final class RemoteKittyImageCapture {
                 state = .apcAccumulating
             } else if byte == 0x1B {
                 abortAPC(reprocessing: byte)
+            } else if byte == 0x9C || byte == 0x07 {
+                // C1 ST or BEL arriving before the command marker: no command
+                // byte was ever accumulated, so — mirroring SwiftTerm, whose
+                // shared apc/oscEnd action never dispatches an empty payload
+                // — there's nothing to complete, only to abandon.
+                clearRawFrame()
+                state = .ground
             } else {
                 state = .apcSkipping // some other APC payload; not our subset
             }
         case .apcAccumulating:
             if byte == 0x1B {
                 state = .apcAccumulatingEsc
+            } else if byte == 0x9C || byte == 0x07 {
+                // C1 ST (0x9C) or BEL (0x07): SwiftTerm's own table treats
+                // both, alongside the 7-bit `ESC \` handled below, as valid
+                // terminators for an APC string, so a frame ending on either
+                // completes successfully exactly like a full ST would.
+                completeFrame()
+                state = .ground
             } else if rawFrame.count >= remoteKittyMaxRawFrameBytes {
                 // Overflow: drop the frame and resynchronize on the next
                 // terminator so a later valid frame still parses.
@@ -480,7 +520,15 @@ final class RemoteKittyImageCapture {
                 abortAPC(reprocessing: byte)
             }
         case .apcSkipping:
-            if byte == 0x1B { state = .apcSkippingEsc }
+            if byte == 0x1B {
+                state = .apcSkippingEsc
+            } else if byte == 0x9C || byte == 0x07 {
+                // Terminates the abandoned (unsupported-subset) frame, same
+                // as `ESC \` would via `.apcSkippingEsc` below — discarded,
+                // never completed, since it was never our own Kitty subset.
+                clearRawFrame()
+                state = .ground
+            }
         case .apcSkippingEsc:
             if byte == 0x5C {
                 state = .ground
@@ -497,6 +545,8 @@ final class RemoteKittyImageCapture {
             }
         case .controlStringSkipping(let allowsBEL):
             if allowsBEL && byte == 0x07 { // BEL — OSC's alternate terminator
+                state = .ground
+            } else if byte == 0x9C { // C1 ST — terminates OSC/DCS/PM alike
                 state = .ground
             } else if byte == 0x1B {
                 state = .controlStringSkippingEsc(allowsBEL: allowsBEL)
@@ -534,6 +584,14 @@ final class RemoteKittyImageCapture {
         }
         state = .ground
         process(byte)
+    }
+
+    /// CAN/SUB "anywhere" cancellation (see `process(_:)`): unconditionally
+    /// discards any partially buffered frame and resets to `.ground`, never
+    /// completing or reprocessing the cancelling byte itself.
+    private func cancelSequence() {
+        clearRawFrame()
+        state = .ground
     }
 
     /// Empties `rawFrame`, releasing its underlying storage

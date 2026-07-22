@@ -8241,6 +8241,73 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(placements, placementsAgain)
     }
 
+    /// Release finding: `scan` used to reseed each connected component by
+    /// scanning `remaining.min()` over the *entire remaining coordinate set*
+    /// every single time — O(remaining count) per seed pick. For a
+    /// checkerboard grid (every marked cell is its own disjoint single-cell
+    /// component, since no two orthogonally-adjacent cells share the same
+    /// "color"), that made total scan cost O(n^2) in the number of marked
+    /// cells for that image id.
+    ///
+    /// Rather than asserting any absolute wall-clock duration (flaky across
+    /// differently-provisioned CI machines), this measures the same scan at
+    /// two grid sizes whose marked-cell counts differ by a fixed ~9x factor
+    /// and asserts the *growth ratio* stays well under quadratic: tripling
+    /// the grid's linear dimension triples its marked-cell count, so a
+    /// linear/linearithmic algorithm's cost should grow only modestly more
+    /// than 9x, while a quadratic algorithm's would grow roughly 81x. A
+    /// generous absolute backstop is also asserted, purely as a secondary
+    /// sanity check against a totally unrelated regression making the whole
+    /// scan slow regardless of shape.
+    func testRemoteKittyPlacementScannerCheckerboardScansNearLinearithmicallyNotQuadratically() {
+        func checkerboardCells(side: Int) -> [RemoteKittyGridCell] {
+            var cells: [RemoteKittyGridCell] = []
+            cells.reserveCapacity(side * side / 2 + side)
+            for line in 0 ..< side {
+                for col in 0 ..< side where (line + col) % 2 == 0 {
+                    cells.append(RemoteKittyGridCell(lineId: line, col: col, imageId: 1))
+                }
+            }
+            return cells
+        }
+
+        @discardableResult
+        func measure(side: Int) -> TimeInterval {
+            let cells = checkerboardCells(side: side)
+            let start = Date()
+            let placements = RemoteKittyPlacementScanner.scan(
+                cells: cells,
+                firstLine: 0,
+                priorityLineRange: remoteKittyAllLinesPriority,
+                currentVersion: { $0 == 1 ? 1 : nil }
+            )
+            let elapsed = Date().timeIntervalSince(start)
+            XCTAssertEqual(placements.count, min(64, cells.count), "emitted-placement cap must still hold")
+            return elapsed
+        }
+
+        // Warm up (allocator/first-call overhead) before timing anything.
+        measure(side: 40)
+
+        let smallSide = 300 // ~45,000 marked cells
+        let largeSide = 900 // ~405,000 marked cells (~9x `smallSide`'s count)
+        let smallElapsed = max(measure(side: smallSide), 0.000_001)
+        let largeElapsed = measure(side: largeSide)
+
+        // A truly O(n^2) algorithm would take roughly 81x as long for a 9x
+        // increase in marked cells; assert comfortably under that (well
+        // above the ~9-11x a linear/linearithmic algorithm should show, to
+        // absorb system noise) so this fails clearly for the old quadratic
+        // implementation without being flaky for the fixed one.
+        XCTAssertLessThan(
+            largeElapsed, smallElapsed * 30,
+            "scan must not regress to quadratic behavior on a large checkerboard grid " +
+            "(small: \(smallElapsed)s, large: \(largeElapsed)s)"
+        )
+        // Generous absolute backstop, independent of the ratio above.
+        XCTAssertLessThan(largeElapsed, 5.0, "scan of a large checkerboard grid took too long: \(largeElapsed)s")
+    }
+
     /// Producer cap priority (new-host full-history scan hardening): when the
     /// current/emitted screen window contributes only one placement but the
     /// rest of retained history alone would already exceed the 64-placement
@@ -8539,6 +8606,153 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(capture.currentVersion(for: 44), 1, "the real frame after the PM string must still parse")
         XCTAssertEqual(capture.imageData(imageId: 44, version: 1), png)
+    }
+
+    /// Release finding #3 (parser control-string termination): CAN (0x18)
+    /// unconditionally cancels an in-progress OSC string — mirroring
+    /// SwiftTerm's own "anywhere" CAN/SUB rule — never requiring its usual
+    /// BEL/ST terminator. A genuinely separate, valid Kitty frame
+    /// immediately following must still parse correctly.
+    @MainActor
+    func testRemoteKittyImageCaptureCancelsOSCStringOnCANAndResyncsToValidFrame() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x5D] // ESC ] — OSC start
+        bytes.append(contentsOf: Array("0;fake-title-".utf8))
+        bytes.append(contentsOf: [0x1B, 0x5F, 0x47]) // fake APC start embedded in the OSC payload
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=996;bogus-payload-data".utf8))
+        bytes.append(0x18) // CAN — cancels the OSC string outright, never its BEL/ST
+
+        bytes.append(contentsOf: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=45", base64Payload: png.base64EncodedString()
+        ))
+        capture.ingest(bytes[...])
+
+        XCTAssertNil(
+            capture.currentVersion(for: 996),
+            "bytes embedded inside the CAN-cancelled OSC string must never be parsed as a Kitty APC"
+        )
+        XCTAssertEqual(capture.currentVersion(for: 45), 1, "the frame after a CAN-cancelled OSC must still parse")
+        XCTAssertEqual(capture.imageData(imageId: 45, version: 1), png)
+    }
+
+    /// The same CAN/SUB "anywhere" cancellation, but for a DCS (`ESC P`)
+    /// string cancelled by SUB (0x1A) instead — DCS otherwise only ever
+    /// terminates on a full ST, never a bare BEL, so this proves CAN/SUB
+    /// specifically bypass that ST-only requirement too.
+    @MainActor
+    func testRemoteKittyImageCaptureCancelsDCSStringOnSUBAndResyncsToValidFrame() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x50] // ESC P — DCS start
+        bytes.append(contentsOf: Array("0;dcs-noise-".utf8))
+        bytes.append(contentsOf: [0x1B, 0x5F, 0x47]) // fake APC start embedded in the DCS payload
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=995;bogus-payload-data".utf8))
+        bytes.append(0x1A) // SUB — cancels the DCS string outright, never a real ST
+
+        bytes.append(contentsOf: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=46", base64Payload: png.base64EncodedString()
+        ))
+        capture.ingest(bytes[...])
+
+        XCTAssertNil(
+            capture.currentVersion(for: 995),
+            "bytes embedded inside the SUB-cancelled DCS string must never be parsed as a Kitty APC"
+        )
+        XCTAssertEqual(capture.currentVersion(for: 46), 1, "the frame after a SUB-cancelled DCS must still parse")
+        XCTAssertEqual(capture.imageData(imageId: 46, version: 1), png)
+    }
+
+    /// A bare C1 ST (0x9C) — with no leading 7-bit `ESC \` — must terminate
+    /// and successfully *complete* a valid, in-progress Kitty APC frame,
+    /// mirroring SwiftTerm's shared apc/osc terminator set. A subsequent
+    /// frame still parses correctly afterward.
+    @MainActor
+    func testRemoteKittyImageCaptureCompletesValidAPCFrameOnBareC1STTerminator() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G — APC start
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=47".utf8))
+        bytes.append(0x3B) // ';'
+        bytes.append(contentsOf: Array(png.base64EncodedString().utf8))
+        bytes.append(0x9C) // C1 ST — completes the frame directly, no `ESC \` needed
+        capture.ingest(bytes[...])
+
+        XCTAssertEqual(
+            capture.currentVersion(for: 47), 1,
+            "a bare C1 ST must terminate and complete a valid, otherwise-well-formed APC frame"
+        )
+        XCTAssertEqual(capture.imageData(imageId: 47, version: 1), png)
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=48", base64Payload: png.base64EncodedString()
+        )[...])
+        // Version counters are monotonic per *capture instance* (not per
+        // image id), so this instance's second-ever successful retain is
+        // version 2, not 1.
+        XCTAssertEqual(capture.currentVersion(for: 48), 2, "a subsequent frame must still parse correctly")
+        XCTAssertEqual(capture.imageData(imageId: 48, version: 2), png)
+    }
+
+    /// The same as above, but terminated by a bare BEL (0x07) instead —
+    /// SwiftTerm's transition table treats BEL as a valid APC terminator
+    /// too, not just OSC's.
+    @MainActor
+    func testRemoteKittyImageCaptureCompletesValidAPCFrameOnBELTerminator() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        var bytes: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G — APC start
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=49".utf8))
+        bytes.append(0x3B) // ';'
+        bytes.append(contentsOf: Array(png.base64EncodedString().utf8))
+        bytes.append(0x07) // BEL — also a valid APC terminator, mirroring SwiftTerm
+        capture.ingest(bytes[...])
+
+        XCTAssertEqual(
+            capture.currentVersion(for: 49), 1,
+            "a bare BEL must terminate and complete a valid, otherwise-well-formed APC frame"
+        )
+        XCTAssertEqual(capture.imageData(imageId: 49, version: 1), png)
+
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=50", base64Payload: png.base64EncodedString()
+        )[...])
+        // Version counters are monotonic per *capture instance* (not per
+        // image id), so this instance's second-ever successful retain is
+        // version 2, not 1.
+        XCTAssertEqual(capture.currentVersion(for: 50), 2, "a subsequent frame must still parse correctly")
+        XCTAssertEqual(capture.imageData(imageId: 50, version: 2), png)
+    }
+
+    /// Unlike C1 ST/BEL (which *complete* an in-progress frame — see above),
+    /// CAN must always *abort* one instead, discarding it, even mid our own
+    /// Kitty APC accumulation — proving CAN/SUB's cancel behavior is
+    /// distinct from (never conflated with) a real terminator's complete
+    /// behavior. A genuinely separate, valid frame afterward still parses.
+    @MainActor
+    func testRemoteKittyImageCaptureAbortsInProgressAPCFrameOnCANAndResyncs() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+
+        var bytes: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G — APC start
+        bytes.append(contentsOf: Array("a=T,f=100,t=d,U=1,i=51".utf8))
+        bytes.append(0x3B)
+        bytes.append(contentsOf: Array(base64.utf8))
+        bytes.append(0x18) // CAN — aborts, never completes, the in-progress frame
+
+        bytes.append(contentsOf: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=52", base64Payload: base64
+        ))
+        capture.ingest(bytes[...])
+
+        XCTAssertNil(capture.currentVersion(for: 51), "CAN must abort, never complete, an in-progress APC frame")
+        XCTAssertEqual(capture.currentVersion(for: 52), 1, "the frame after CAN must still parse")
+        XCTAssertEqual(capture.imageData(imageId: 52, version: 1), png)
     }
 
     @MainActor
@@ -9099,6 +9313,65 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(capture.currentVersion(for: 1))
     }
 
+    /// Release finding #4 (pending fairness fast-path): when the *reserving*
+    /// owner's own request alone — its existing reservation plus the new
+    /// bytes — already exceeds the entire shared bound, no amount of
+    /// aborting *other* in-flight owners could ever make it fit. This must
+    /// be checked, and the reservation rejected, *before* any other owner's
+    /// in-flight transmission is touched — so an unsatisfiable request from
+    /// one owner never collaterally evicts an innocent, well-behaved
+    /// reservation belonging to a completely different owner.
+    @MainActor
+    func testRemoteKittyImageCaptureBudgetPendingFairnessFastPathPreservesInnocentOwnerForImpossibleReservation() throws {
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let base64 = png.base64EncodedString()
+        // Comfortably enough room for A's whole (both-chunk) transmission,
+        // but deliberately far smaller than the single, impossible chunk B
+        // is about to request.
+        let cap = base64.utf8.count + 20
+        let budget = RemoteKittyImageCaptureBudget(maxTotalPendingBytes: cap)
+        let captureA = RemoteKittyImageCapture(epoch: 0xA, budget: budget)
+        let captureB = RemoteKittyImageCapture(epoch: 0xB, budget: budget)
+
+        // A starts (but doesn't yet finish) a small, well-behaved stalled
+        // transmission — its first chunk comfortably under the shared cap
+        // on its own.
+        let firstHalf = String(base64.prefix(base64.count / 2))
+        let secondHalf = String(base64.dropFirst(firstHalf.count))
+        captureA.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=1,m=1", base64Payload: firstHalf
+        )[...])
+        XCTAssertEqual(budget.totalPendingBytes, firstHalf.utf8.count)
+
+        // B's own single chunk alone — with no prior reservation of its own
+        // — already exceeds the *entire* shared cap, so no amount of
+        // aborting *other* owners (i.e. A) could ever make it fit. The fast
+        // path must reject it immediately, before ever touching A's
+        // innocent reservation.
+        let impossibleChunk = String(repeating: "B", count: cap + 50)
+        captureB.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=2,m=1", base64Payload: impossibleChunk
+        )[...])
+        XCTAssertNil(captureB.currentVersion(for: 2), "B's own-alone-impossible reservation must fail")
+
+        // A's innocent, well-behaved reservation must be completely
+        // untouched by B's failed, unsatisfiable request.
+        XCTAssertEqual(
+            budget.totalPendingBytes, firstHalf.utf8.count,
+            "an impossible request from another owner must never collaterally evict an innocent pending owner"
+        )
+
+        // A can still complete normally afterward, proving its reservation
+        // was never aborted by B's failed attempt.
+        captureA.ingest(remoteKittyFrameBytes(control: "m=0", base64Payload: secondHalf)[...])
+        let versionA = try XCTUnwrap(
+            captureA.currentVersion(for: 1),
+            "A must still complete normally — its reservation was never touched by B's impossible request"
+        )
+        XCTAssertEqual(captureA.imageData(imageId: 1, version: versionA), png)
+        XCTAssertEqual(budget.totalPendingBytes, 0)
+    }
+
     // MARK: - AppModel.remoteScreen image placement attachment (live + history)
 
     @MainActor
@@ -9497,6 +9770,172 @@ final class AppLogicTests: XCTestCase {
                 port: port, path: "/terminal-image?s=\(sessionId)&i=99&v=1"
             )
             XCTAssertEqual(noAuth, 403)
+        } catch {
+            await gateway.stop()
+            throw error
+        }
+        await gateway.stop()
+    }
+
+    // MARK: - Image response backpressure: process-wide queued-body byte budget (finding #2)
+
+    /// `RemoteImageResponseBudget` bounds the total bytes of terminal-image
+    /// response bodies concurrently reserved (queued for write) at once,
+    /// independent of any single connection. Pipelining several ~5 MiB
+    /// -equivalent reservations (as several concurrent `/terminal-image`
+    /// requests would) must stay bounded — rejecting (reserving nothing at
+    /// all) once the shared cap would be exceeded — and releasing any one
+    /// of them must free exactly that much room back up for a subsequent
+    /// reservation, never more or less.
+    @MainActor
+    func testRemoteImageResponseBudgetBoundsPipelinedReservationsAndReleasesExactly() {
+        let fiveMiB = 5 * 1_024 * 1_024
+        let budget = RemoteImageResponseBudget(maxTotalBytes: 16 * 1_024 * 1_024)
+
+        // Three separate ~5 MiB-equivalent image responses pipelined
+        // concurrently (15 MiB total) comfortably fit under the 16 MiB bound.
+        XCTAssertTrue(budget.reserve(bytes: fiveMiB))
+        XCTAssertTrue(budget.reserve(bytes: fiveMiB))
+        XCTAssertTrue(budget.reserve(bytes: fiveMiB))
+        XCTAssertEqual(budget.totalReservedBytes, 3 * fiveMiB)
+
+        // A 4th concurrent ~5 MiB reservation would push the total to 20
+        // MiB, over the 16 MiB bound: it must be rejected outright,
+        // reserving nothing at all (never a partial amount).
+        XCTAssertFalse(budget.reserve(bytes: fiveMiB))
+        XCTAssertEqual(
+            budget.totalReservedBytes, 3 * fiveMiB,
+            "a rejected reservation must never reserve anything, not even partially"
+        )
+
+        // Releasing exactly one of the three in-flight responses' bytes (as
+        // if only that one's write future just completed) frees exactly
+        // that much room — enough for the previously-rejected 4th request
+        // to now succeed.
+        budget.release(bytes: fiveMiB)
+        XCTAssertEqual(budget.totalReservedBytes, 2 * fiveMiB)
+        XCTAssertTrue(budget.reserve(bytes: fiveMiB))
+        XCTAssertEqual(budget.totalReservedBytes, 3 * fiveMiB)
+
+        // Releasing every remaining reservation returns the budget to fully
+        // idle — nothing leaks.
+        budget.release(bytes: fiveMiB)
+        budget.release(bytes: fiveMiB)
+        budget.release(bytes: fiveMiB)
+        XCTAssertEqual(budget.totalReservedBytes, 0)
+    }
+
+    /// `RemoteGateway`'s NIO event loop group can service more than one
+    /// connection's write completion on a different thread than the one
+    /// that issued the matching reservation, so `RemoteImageResponseBudget`
+    /// must genuinely be safe to call concurrently from many threads at
+    /// once (finding: "safe across NIO event loops"), not just from a
+    /// single actor/queue. Hammering matched reserve/release pairs from a
+    /// large number of concurrent threads must never lose an update to a
+    /// race — every successful reservation is exactly undone by its
+    /// release, so the budget must end up back at precisely zero.
+    func testRemoteImageResponseBudgetIsSafeUnderConcurrentReserveRelease() {
+        let budget = RemoteImageResponseBudget(maxTotalBytes: 1_000_000)
+        DispatchQueue.concurrentPerform(iterations: 4_000) { _ in
+            if budget.reserve(bytes: 100) {
+                budget.release(bytes: 100)
+            }
+        }
+        XCTAssertEqual(
+            budget.totalReservedBytes, 0,
+            "every successful reserve must be exactly undone by its release even under heavy concurrency, with no lost updates"
+        )
+    }
+
+    /// End-to-end at the route level: a gateway wired with a shared
+    /// `imageResponseBudget` far too small to ever hold even a single
+    /// terminal-image response body must reject a `GET` with 429 rather
+    /// than ever copying/queuing the body — and must never leak a
+    /// reservation for the request it rejected. A `HEAD` for the exact same
+    /// resource, however, needs no body-byte reservation at all (finding:
+    /// "HEAD need not reserve body bytes") and so must succeed regardless of
+    /// how exhausted/small the response-body budget is.
+    @MainActor
+    func testRemoteGatewayTerminalImageRouteRejectsWithTooManyRequestsWhenResponseBudgetExhausted() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=99", base64Payload: png.base64EncodedString()
+        )[...])
+        let actualVersion = try XCTUnwrap(controller.terminalView.kittyImageCapture.currentVersion(for: 99))
+
+        let config = CloudflareAccessConfig(
+            teamDomain: "team.cloudflareaccess.com",
+            audTag: "expected-aud",
+            allowedEmail: "user@example.com"
+        )
+        let verifier = CloudflareAccessVerifier(
+            config: config,
+            now: { Date() },
+            fetch: { _ in nil }
+        )
+        let (privateKey, publicKey) = try makeRSAKeyPair()
+        verifier.installKey(kid: "test-key", key: publicKey)
+        let token = try accessToken(
+            kid: "test-key",
+            claims: [
+                "iss": config.issuer,
+                "aud": config.audTag,
+                "email": config.allowedEmail,
+                "exp": Date().timeIntervalSince1970 + 3_600,
+            ],
+            privateKey: privateKey
+        )
+
+        // Deliberately too small to ever hold this one response body, so the
+        // 429 path is exercised deterministically rather than depending on
+        // a timing-sensitive race between two truly concurrent requests.
+        let responseBudget = RemoteImageResponseBudget(maxTotalBytes: png.count - 1)
+        let gateway = RemoteGateway()
+        let port = try gateway.start(
+            bridge: RemoteModelBridge(model: model),
+            expectedHost: "127.0.0.1",
+            expectedOrigin: "https://projects.example.com",
+            verifier: verifier,
+            port: 0,
+            webPushService: nil,
+            apnsService: nil,
+            imageResponseBudget: responseBudget
+        )
+        do {
+            let status = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=99&v=\(actualVersion)", token: token
+            )
+            XCTAssertEqual(status, 429)
+            XCTAssertEqual(
+                responseBudget.totalReservedBytes, 0,
+                "a rejected reservation must never leak reserved bytes"
+            )
+
+            // HEAD never reserves any body bytes at all, so it must succeed
+            // regardless of how small/exhausted the response-body budget is.
+            let headStatus = try await remoteHTTPStatus(
+                port: port, path: "/terminal-image?s=\(sessionId)&i=99&v=\(actualVersion)",
+                method: "HEAD", token: token
+            )
+            XCTAssertEqual(headStatus, 200)
+            XCTAssertEqual(responseBudget.totalReservedBytes, 0, "HEAD must never reserve any body bytes")
         } catch {
             await gateway.stop()
             throw error
