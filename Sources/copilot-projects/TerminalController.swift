@@ -156,7 +156,6 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         let shell = processEnv["SHELL"] ?? "/bin/zsh"
         let shellName = (shell as NSString).lastPathComponent
 
-        var env = processEnv
         // The Copilot CLI tags its process tree with per-session/loader/supervisor
         // env vars. If this app was launched from a copilot session (e.g.
         // `copilot ... --resume` that ran `open`), they leak in and get inherited by
@@ -164,11 +163,12 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         // managed/supervised child: its `/restart` shuts down (COPILOT_SUPERVISED)
         // or defers to the launcher's (wrong, often gone) loader instead of
         // re-spawning. Strip them so each session's copilot owns its own lifecycle.
-        env = Self.sessionEnvironment(from: env)
-        for (k, v) in extraEnvironment { env[k] = v }
+        var env = Self.sessionEnvironment(from: processEnv)
+        for (key, value) in extraEnvironment { env[key] = value }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        let resumeCopilotExecutable = launchCopilotExecutable ?? Paths.copilotExecutable
 
         let envArray = env.map { "\($0.key)=\($0.value)" }
         let dir = cwd.isEmpty ? Paths.defaultStartupDir : Paths.normalizedDirectory(cwd)
@@ -188,6 +188,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
                 shell: shell,
                 copilotSessionId: copilotSessionId,
                 copilotSessionAllowAll: copilotSessionAllowAll,
+                resumeCopilotExecutable: resumeCopilotExecutable,
                 launchCopilotExecutable: launchCopilotExecutable
             )
             terminalView.startProcess(
@@ -230,11 +231,17 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         UUID(uuidString: s) != nil
     }
 
-    nonisolated static func resumeCommand(sessionId: String, allowAll: Bool) -> String {
+    nonisolated static func resumeCommand(
+        sessionId: String,
+        allowAll: Bool,
+        executable: String = "copilot"
+    ) -> String {
         // Pass both flags because the CLI can otherwise inherit persisted remote
         // steering on resume even when event export was explicitly disabled.
-        "copilot --no-remote --no-remote-export "
-            + "\(allowAll ? "--allow-all " : "")--resume=\(sessionId)"
+        var arguments = ["--no-remote", "--no-remote-export"]
+        if allowAll { arguments.append("--allow-all") }
+        arguments.append("--resume=\(sessionId)")
+        return profiledCopilotCommand(executable, arguments: arguments)
     }
 
     /// Copilot loader/supervisor env vars that leak in when this app was itself
@@ -260,6 +267,18 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         return env
     }
 
+    /// Copilot currently enables inline images for Ghostty-compatible terminals.
+    /// Scope that profile to Copilot itself so unrelated TUIs keep the real terminal
+    /// identity, while Copilot and its `/restart` descendants inherit the profile.
+    nonisolated static func profiledCopilotCommand(
+        _ executable: String,
+        arguments: [String]
+    ) -> String {
+        let script = #"unset TERM_PROGRAM_VERSION; TERM_PROGRAM=ghostty exec "$0" "$@""#
+        let operands = ([executable] + arguments).map(shellSingleQuote).joined(separator: " ")
+        return "/bin/sh -c \(shellSingleQuote(script)) \(operands)"
+    }
+
     /// The dtach `-E` program: the argv run only when dtach creates a FRESH master.
     /// A recorded Copilot session id always wins (resume takes precedence over a
     /// one-shot launch), so a resumed tab never double-launches; otherwise a valid
@@ -269,12 +288,17 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         shell: String,
         copilotSessionId: String?,
         copilotSessionAllowAll: Bool,
+        resumeCopilotExecutable: String? = nil,
         launchCopilotExecutable: String?
     ) -> [String] {
         if let cid = copilotSessionId, isSafeSessionId(cid) {
             // Quote the shell path (spaces/apostrophes) and warn — without blocking
             // the shell fallback — if the session can't be resumed (e.g. deleted).
-            let resume = resumeCommand(sessionId: cid, allowAll: copilotSessionAllowAll)
+            let resume = resumeCommand(
+                sessionId: cid,
+                allowAll: copilotSessionAllowAll,
+                executable: resumeCopilotExecutable ?? "copilot"
+            )
                 + " || printf '\\n[Copilot Projects] could not resume Copilot session \(cid)\\n'"
             return [shell, "-l", "-c", "\(resume); exec \(shellSingleQuote(shell)) -l"]
         }
@@ -297,8 +321,9 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         shell: String,
         allowAll: Bool = false
     ) -> String {
-        "\(shellSingleQuote(executable)) --no-remote --no-remote-export"
-            + "\(allowAll ? " --allow-all" : "")"
+        var arguments = ["--no-remote", "--no-remote-export"]
+        if allowAll { arguments.append("--allow-all") }
+        return profiledCopilotCommand(executable, arguments: arguments)
             + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
             + " exec \(shellSingleQuote(shell)) -l"
     }
