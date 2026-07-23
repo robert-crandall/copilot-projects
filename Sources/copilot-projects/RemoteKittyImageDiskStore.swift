@@ -1154,6 +1154,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                       && $0.imageId >= 1
                       && $0.imageId <= 0xFFFFFF
                       && $0.version > 0
+                      && ($0.placementId.map { $0 > 0 } ?? true)
                       && $0.rows > 0
                       && $0.columns > 0
                       && $0.rows <= 4_096

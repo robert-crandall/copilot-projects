@@ -12150,6 +12150,42 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteKittyImageCaptureNormalizesZeroPlacementIdToImplicit() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "zero-placement"
+        let capture = RemoteKittyImageCapture(
+            sessionId: sessionId,
+            epoch: 0,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store
+        )
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(ArraySlice(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=14,c=2,r=1",
+            base64Payload: png.base64EncodedString()
+        )))
+        capture.ingest(ArraySlice(remoteKittyFrameBytes(
+            control: "a=p,U=1,i=14,p=0,c=4,r=3"
+        )))
+        await store.flush()
+
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertEqual(restored.currentSelections, [RemoteKittyRestoredSelection(
+            imageId: 14,
+            version: 1,
+            placementId: nil,
+            rows: 3,
+            columns: 4,
+            x: nil,
+            y: nil,
+            z: nil
+        )])
+    }
+
+    @MainActor
     func testRemoteKittyImageCapturePersistsEvictionOfNewTransmitOnlyVictimAfterRetain() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

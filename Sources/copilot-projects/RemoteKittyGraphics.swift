@@ -1189,7 +1189,9 @@ final class RemoteKittyImageCapture {
         // activity already existed for `imageId` regardless of which action
         // this is, so a plain `t` on an already-active id keeps showing it.
         pendingActivates = (keys["a"] == "T")
-        pendingPlacementId = keys["p"].flatMap { UInt32($0) }
+        pendingPlacementId = keys["p"].flatMap { UInt32($0) }.flatMap {
+            $0 > 0 ? $0 : nil
+        }
         pendingRows = keys["r"].flatMap { Int($0) }.flatMap {
             $0 > 0 && $0 <= remoteKittyMaxImageDimension ? $0 : nil
         }
@@ -1224,7 +1226,9 @@ final class RemoteKittyImageCapture {
         else { return }
 
         let wasAdvertised = isAnyPlacementAdvertised(imageId: imageId)
-        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }
+        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }.flatMap {
+            $0 > 0 ? $0 : nil
+        }
         if let rows = keys["r"].flatMap({ Int($0) }),
            let columns = keys["c"].flatMap({ Int($0) }),
            rows > 0, columns > 0,
@@ -1494,7 +1498,9 @@ final class RemoteKittyImageCapture {
         resetPendingTransmission()
 
         let mode = keys["d"] ?? "a"
-        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }
+        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }.flatMap {
+            $0 > 0 ? $0 : nil
+        }
         switch mode {
         case "A":
             clearAll()
@@ -1819,8 +1825,9 @@ final class RemoteKittyImageCapture {
         imageId: UInt32,
         placementId: UInt32?
     ) -> RemoteKittyPersistedPlacementSelection? {
-        persistedSelections(imageId: imageId).first {
-            ($0.placementId ?? 0) == (placementId ?? 0)
+        let normalizedPlacementId = placementId.flatMap { $0 > 0 ? $0 : nil }
+        return persistedSelections(imageId: imageId).first {
+            ($0.placementId ?? 0) == (normalizedPlacementId ?? 0)
         }
     }
 
@@ -1890,13 +1897,14 @@ final class RemoteKittyImageCapture {
         guard isRestoring else { return false }
         let key = StoredKey(imageId: imageId, version: version)
         guard dataByKey[key] != nil else { return false }
+        let normalizedPlacementId = placementId.flatMap { $0 > 0 ? $0 : nil }
         if let rows, let columns,
            rows > 0, columns > 0,
            rows <= remoteKittyMaxImageDimension,
            columns <= remoteKittyMaxImageDimension {
             let geometryKey = PlacementGeometryKey(
                 imageId: imageId,
-                placementId: placementId
+                placementId: normalizedPlacementId
             )
             makeRoomForPlacementGeometry(geometryKey)
             placementDimensions[geometryKey] = PlacementDimensions(
@@ -1909,7 +1917,7 @@ final class RemoteKittyImageCapture {
         }
         let wasAdvertised = latestVersion[imageId] != nil && isAnyPlacementActive(imageId: imageId)
         latestVersion[imageId] = version
-        activatePlacement(imageId: imageId, explicitPlacementId: placementId)
+        activatePlacement(imageId: imageId, explicitPlacementId: normalizedPlacementId)
         if !wasAdvertised { restoreAdvertisedChanged = true }
         return true
     }
