@@ -2685,6 +2685,11 @@ enum RemoteWebAssets {
         node.el.removeAttribute('src');
       });
       retryCapacityBlockedTerminalImages();
+      // A different visible node may have been waiting only on the aggregate
+      // decoded-pixel cap (not compressed-cache capacity). Invalidating this
+      // image frees those pixels, so always reconcile even when the
+      // capacity-blocked set is empty.
+      scheduleTerminalImageReconcile();
     }
 
     function mountTerminalImageSource(node, cacheEntry, key) {

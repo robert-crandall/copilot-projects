@@ -7168,6 +7168,12 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(js.contains("retryCapacityBlockedTerminalImages();"))
         XCTAssertTrue(js.contains("terminalImageDecodeFailures.has(key)"))
         XCTAssertTrue(js.contains("addBoundedTerminalImageKey(terminalImageDecodeFailures, key);"))
+        XCTAssertTrue(js.contains(
+            """
+            retryCapacityBlockedTerminalImages();
+              // A different visible node may have been waiting only on the aggregate
+            """
+        ))
     }
 
     /// Executes the actual validation/dedup/PNG/streamed-cap/404-vs-transient
