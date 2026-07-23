@@ -650,7 +650,8 @@ final class AppLogicTests: XCTestCase {
         let model = AppModel(
             stateRepository: repository,
             isAppActive: { false },
-            agentActivityDirectory: root
+            agentActivityDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
 
         XCTAssertTrue(model.closeRemoteSession(sessionId: session.id))
@@ -5400,7 +5401,8 @@ final class AppLogicTests: XCTestCase {
         let model = AppModel(
             stateRepository: repository,
             isAppActive: { false },
-            agentActivityDirectory: root
+            agentActivityDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let config = CloudflareAccessConfig(
             teamDomain: "team.cloudflareaccess.com",
@@ -10476,7 +10478,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
 
@@ -10538,7 +10541,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
 
@@ -10622,7 +10626,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
 
@@ -10701,7 +10706,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
 
@@ -10759,7 +10765,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
         let terminal = try XCTUnwrap(controller.terminalView.terminal)
@@ -10852,7 +10859,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
         let terminal = try XCTUnwrap(controller.terminalView.terminal)
@@ -10933,7 +10941,8 @@ final class AppLogicTests: XCTestCase {
         let model = AppModel(
             stateRepository: repository,
             isAppActive: { false },
-            agentActivityDirectory: root
+            agentActivityDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
         let png = remoteKittyTestPNGBytes(width: 2, height: 2)
@@ -11131,7 +11140,8 @@ final class AppLogicTests: XCTestCase {
         let model = AppModel(
             stateRepository: repository,
             isAppActive: { false },
-            agentActivityDirectory: root
+            agentActivityDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controller = try XCTUnwrap(model.controller(for: sessionId))
         let png = remoteKittyTestPNGBytes(width: 2, height: 2)
@@ -11203,6 +11213,1216 @@ final class AppLogicTests: XCTestCase {
         await gateway.stop()
     }
 
+    // MARK: - Durable Kitty image persistence (RemoteKittyImageDiskStore)
+
+    /// A fresh, test-isolated `RemoteKittyImageDiskStore` rooted at a unique
+    /// temp directory, so no test can ever perturb (or be perturbed by)
+    /// another test's — or the real app's — persisted state.
+    private func makeIsolatedKittyImageDiskStore() -> (store: RemoteKittyImageDiskStore, root: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        return (RemoteKittyImageDiskStore(root: root), root)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreRoundTripsExactEntriesAndDistinguishesCurrentFromGraceSelections() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = UUID().uuidString
+
+        let gracePng = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let currentPng = remoteKittyTestPNGBytes(width: 4, height: 3)
+        store.persistRetain(sessionId: sessionId, imageId: 42, version: 100, data: gracePng)
+        store.persistRetain(sessionId: sessionId, imageId: 42, version: 101, data: currentPng)
+        store.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 42,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: 101, placementId: nil, rows: 1, columns: 4, x: nil, y: nil, z: nil
+            )]
+        )
+        await store.barrierForTesting()
+
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertEqual(Set(restored.entries.map(\.version)), [100, 101], "both the grace and current version must survive")
+        XCTAssertEqual(restored.entries.first { $0.version == 100 }?.data, gracePng)
+        XCTAssertEqual(restored.entries.first { $0.version == 101 }?.data, currentPng)
+        XCTAssertEqual(restored.currentSelections, [RemoteKittyRestoredSelection(
+            imageId: 42, version: 101, placementId: nil, rows: 1, columns: 4, x: nil, y: nil, z: nil
+        )], "only the current version is selected, never the grace one")
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreRejectsCorruptDataAtPersistTime() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        store.persistRetain(sessionId: "s", imageId: 1, version: 1, data: Data([0x00, 0x01, 0x02, 0x03]))
+        await store.barrierForTesting()
+        let count = await store.totalEntryCountForTesting()
+        XCTAssertEqual(count, 0, "non-PNG bytes must never be written/manifested")
+    }
+
+    /// Corrupt/truncated PNGs must be structurally revalidated before ever
+    /// being restored — reusing the same `RemoteKittyPNGValidation` a live
+    /// transmission's decode already requires, never a weaker check.
+    @MainActor
+    func testRemoteKittyImageDiskStoreFailsClosedOnCorruptedBytesAtRestoreTime() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = "s"
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        store.persistRetain(sessionId: sessionId, imageId: 9, version: 1, data: png)
+        store.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 9,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: 1, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await store.barrierForTesting()
+
+        // Corrupt the bytes directly on disk — untrusted, even though the
+        // manifest still references them.
+        let path = store.dataFileURLForTesting(sessionId: sessionId, imageId: 9, version: 1)
+        try Data([0xFF, 0xFF, 0xFF]).write(to: path)
+
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertTrue(restored.entries.isEmpty)
+        XCTAssertTrue(restored.currentSelections.isEmpty)
+
+        // The corrupt entry/selection/file is pruned from the manifest for
+        // good, not merely skipped for this one restore call.
+        let stillExists = await store.entryExistsForTesting(sessionId: sessionId, imageId: 9, version: 1)
+        XCTAssertFalse(stillExists)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
+    }
+
+    /// The global cap (finding: hard process-wide disk bound) is enforced
+    /// across every session combined, always sacrificing a superseded
+    /// (non-current) entry before any current one — even one far older by
+    /// insertion order.
+    @MainActor
+    func testRemoteKittyImageDiskStoreEnforcesGlobalEntryCapPreferringSupersededEviction() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for i in 0 ..< 31 {
+            let sessionId = "current-\(i)"
+            let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+            store.persistRetain(sessionId: sessionId, imageId: 1, version: 1, data: png)
+            store.replaceCurrentSelections(
+                sessionId: sessionId, imageId: 1,
+                selections: [RemoteKittyPersistedPlacementSelection(
+                    version: 1, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+                )]
+            )
+        }
+        // One more session with both a superseded (grace) and a current
+        // version — 33 entries total now, 1 over the cap.
+        let victimSessionId = "victim"
+        store.persistRetain(
+            sessionId: victimSessionId, imageId: 1, version: 1,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        store.persistRetain(
+            sessionId: victimSessionId, imageId: 1, version: 2,
+            data: remoteKittyTestPNGBytes(width: 3, height: 3)
+        )
+        store.replaceCurrentSelections(
+            sessionId: victimSessionId, imageId: 1,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: 2, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await store.barrierForTesting()
+
+        let totalEntries = await store.totalEntryCountForTesting()
+        XCTAssertEqual(totalEntries, RemoteKittyImageDiskStore.maxTotalEntries)
+
+        let graceStillExists = await store.entryExistsForTesting(
+            sessionId: victimSessionId, imageId: 1, version: 1
+        )
+        XCTAssertFalse(graceStillExists, "the one superseded entry anywhere must be sacrificed first")
+        let currentStillExists = await store.entryExistsForTesting(
+            sessionId: victimSessionId, imageId: 1, version: 2
+        )
+        XCTAssertTrue(currentStillExists)
+        for i in 0 ..< 31 {
+            let exists = await store.entryExistsForTesting(sessionId: "current-\(i)", imageId: 1, version: 1)
+            XCTAssertTrue(exists, "current entry \(i) must never be evicted while a superseded entry existed")
+        }
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreRetainsNewCurrentEntryWhenAllExistingEntriesAreCurrent() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        for index in 0 ..< RemoteKittyImageDiskStore.maxTotalEntries {
+            let sessionId = "current-\(index)"
+            store.persistRetain(
+                sessionId: sessionId,
+                imageId: 1,
+                version: 1,
+                data: png,
+                currentSelections: [RemoteKittyPersistedPlacementSelection(
+                    version: 1,
+                    placementId: nil,
+                    rows: 1,
+                    columns: 1,
+                    x: nil,
+                    y: nil,
+                    z: nil
+                )]
+            )
+        }
+        let newestSession = "new-current"
+        store.persistRetain(
+            sessionId: newestSession,
+            imageId: 2,
+            version: 2,
+            data: png,
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: 2,
+                placementId: nil,
+                rows: 1,
+                columns: 1,
+                x: nil,
+                y: nil,
+                z: nil
+            )]
+        )
+        await store.barrierForTesting()
+
+        let totalEntries = await store.totalEntryCountForTesting()
+        let oldestExists = await store.entryExistsForTesting(
+            sessionId: "current-0",
+            imageId: 1,
+            version: 1
+        )
+        let newestExists = await store.entryExistsForTesting(
+            sessionId: newestSession,
+            imageId: 2,
+            version: 2
+        )
+        XCTAssertEqual(totalEntries, RemoteKittyImageDiskStore.maxTotalEntries)
+        XCTAssertFalse(oldestExists)
+        XCTAssertTrue(newestExists)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreFailedReplacementWriteKeepsExistingEntries() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: root.appendingPathComponent("data").path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        for index in 0 ..< RemoteKittyImageDiskStore.maxTotalEntries {
+            store.persistRetain(
+                sessionId: "current-\(index)",
+                imageId: 1,
+                version: 1,
+                data: png,
+                currentSelections: [RemoteKittyPersistedPlacementSelection(
+                    version: 1,
+                    placementId: nil,
+                    rows: 1,
+                    columns: 1,
+                    x: nil,
+                    y: nil,
+                    z: nil
+                )]
+            )
+        }
+        await store.flush()
+
+        let dataDir = root.appendingPathComponent("data")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dataDir.path)
+        store.persistRetain(
+            sessionId: "replacement",
+            imageId: 2,
+            version: 2,
+            data: png,
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: 2,
+                placementId: nil,
+                rows: 1,
+                columns: 1,
+                x: nil,
+                y: nil,
+                z: nil
+            )]
+        )
+        await store.flush()
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dataDir.path)
+
+        let totalEntries = await store.totalEntryCountForTesting()
+        let oldestExists = await store.entryExistsForTesting(
+            sessionId: "current-0",
+            imageId: 1,
+            version: 1
+        )
+        let replacementExists = await store.entryExistsForTesting(
+            sessionId: "replacement",
+            imageId: 2,
+            version: 2
+        )
+        XCTAssertEqual(totalEntries, RemoteKittyImageDiskStore.maxTotalEntries)
+        XCTAssertTrue(oldestExists)
+        XCTAssertFalse(replacementExists)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreDropsGlobalPressureMutationWithoutDisablingSession() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(
+            root: root,
+            maxQueuedRetainBytes: 1,
+            maxQueuedMutations: 1
+        )
+        let sessionId = "overloaded"
+        store.persistRetain(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        await store.flush()
+
+        XCTAssertFalse(store.isPersistenceDisabledForTesting(sessionId: sessionId))
+        XCTAssertEqual(store.queuedRetainBytesForTesting, 0)
+        let totalEntries = await store.totalEntryCountForTesting()
+        XCTAssertEqual(totalEntries, 0)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreGlobalPressureFailClosesDestructiveMutation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store1 = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "destructive-pressure"
+        store1.persistRetain(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2),
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: 1,
+                placementId: nil,
+                rows: 1,
+                columns: 1,
+                x: nil,
+                y: nil,
+                z: nil
+            )]
+        )
+        await store1.flush()
+
+        let store2 = RemoteKittyImageDiskStore(
+            root: root,
+            maxQueuedRetainBytes: RemoteKittyImageDiskStore.maxQueuedRetainBytes,
+            maxQueuedMutations: 0
+        )
+        store2.replaceCurrentSelections(sessionId: sessionId, imageId: 1, selections: [])
+        await store2.flush()
+
+        let entryExists = await store2.entryExistsForTesting(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1
+        )
+        XCTAssertFalse(entryExists)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreRejectsOversizedManifestBeforeDecoding() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(repeating: 0x20, count: RemoteKittyImageDiskStore.maxManifestBytes + 1)
+            .write(to: root.appendingPathComponent("manifest.json"))
+
+        let store = RemoteKittyImageDiskStore(root: root)
+        store.activate()
+        await store.flush()
+        let totalEntries = await store.totalEntryCountForTesting()
+        XCTAssertEqual(totalEntries, 0)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreDoesNotCleanDiskBeforePrimaryActivation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataDir = root.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        let orphan = dataDir.appendingPathComponent("orphan.png")
+        try remoteKittyTestPNGBytes(width: 2, height: 2).write(to: orphan)
+
+        let store = RemoteKittyImageDiskStore(root: root)
+        await store.flush()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphan.path))
+
+        store.activate()
+        await store.flush()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+    }
+
+    /// Startup (and restart) cleanup must be fail-closed against every kind
+    /// of on-disk inconsistency at once: a corrupted entry, an orphan data
+    /// file no manifest entry references, and a staging leftover from a
+    /// crash mid-write.
+    @MainActor
+    func testRemoteKittyImageDiskStoreStartupCleanupRemovesOrphanCorruptAndStagingFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store1 = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "s"
+        let goodPng = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let toBeCorruptedPng = remoteKittyTestPNGBytes(width: 3, height: 3)
+        store1.persistRetain(sessionId: sessionId, imageId: 1, version: 1, data: goodPng)
+        store1.persistRetain(sessionId: sessionId, imageId: 2, version: 1, data: toBeCorruptedPng)
+        await store1.barrierForTesting()
+
+        let corruptPath = store1.dataFileURLForTesting(sessionId: sessionId, imageId: 2, version: 1)
+        try Data("not a png".utf8).write(to: corruptPath)
+
+        let dataDir = root.appendingPathComponent("data", isDirectory: true)
+        let orphanPath = dataDir.appendingPathComponent("orphan-never-in-any-manifest-entry.png")
+        try goodPng.write(to: orphanPath)
+        let stagingPath = dataDir.appendingPathComponent(".tmp-leftover-from-a-crash")
+        try Data("partial write".utf8).write(to: stagingPath)
+
+        // A fresh activated instance over the same root simulates the primary
+        // process acquiring its single-instance lock on the next launch.
+        let store2 = RemoteKittyImageDiskStore(root: root)
+        store2.activate()
+        await store2.barrierForTesting()
+
+        let entry1Exists = await store2.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        XCTAssertTrue(entry1Exists)
+        let entry2Exists = await store2.entryExistsForTesting(sessionId: sessionId, imageId: 2, version: 1)
+        XCTAssertFalse(entry2Exists)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanPath.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingPath.path))
+    }
+
+    /// Deliberate session destruction must synchronously tombstone before
+    /// any other teardown, and the destroyed session's images must never
+    /// again be resurrected by any later restore.
+    @MainActor
+    func testSessionArtifactsDestroyTombstonesSynchronouslyAndPreventsResurrection() async throws {
+        let (store, root) = makeIsolatedKittyImageDiskStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = "victim"
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        store.persistRetain(sessionId: sessionId, imageId: 1, version: 1, data: png)
+        store.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 1,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: 1, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await store.barrierForTesting()
+        let existsBeforeDestroy = await store.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        XCTAssertTrue(existsBeforeDestroy)
+
+        SessionArtifacts.destroy(sessionId: sessionId, kittyImageDiskStore: store)
+        // The marker is written *synchronously* — asserted here with no
+        // `await` at all, immediately after `destroy` returns.
+        XCTAssertTrue(store.isTombstonedForTesting(sessionId: sessionId))
+
+        await store.barrierForTesting()
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertTrue(restored.entries.isEmpty)
+        XCTAssertTrue(restored.currentSelections.isEmpty)
+        let existsAfterDestroy = await store.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        XCTAssertFalse(existsAfterDestroy)
+        XCTAssertTrue(
+            store.isTombstonedForTesting(sessionId: sessionId),
+            "the marker may be removed after cleanup, but this process must keep rejecting late writes"
+        )
+
+        store.persistRetain(
+            sessionId: sessionId,
+            imageId: 2,
+            version: 2,
+            data: remoteKittyTestPNGBytes(width: 3, height: 3)
+        )
+        store.replaceCurrentSelections(
+            sessionId: sessionId,
+            imageId: 2,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: 2, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await store.barrierForTesting()
+        let lateEntryExists = await store.entryExistsForTesting(
+            sessionId: sessionId,
+            imageId: 2,
+            version: 2
+        )
+        XCTAssertFalse(
+            lateEntryExists,
+            "writes queued after completed cleanup must not resurrect a destroyed session"
+        )
+    }
+
+    /// The tombstone marker must survive even an *immediate* app exit right
+    /// after the synchronous write, before its enqueued async cleanup ever
+    /// gets a chance to run — so the next launch's startup cleanup still
+    /// finishes the job and can never resurrect the destroyed session.
+    @MainActor
+    func testRemoteKittyImageDiskStoreTombstoneSurvivesImmediateRestartBeforeAsyncCleanupCompletes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store1 = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "victim"
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        store1.persistRetain(sessionId: sessionId, imageId: 1, version: 1, data: png)
+        store1.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 1,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: 1, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await store1.barrierForTesting()
+
+        // Tombstone, but deliberately never await store1's own enqueued
+        // cleanup — simulating a quit immediately after the synchronous
+        // marker write.
+        store1.tombstone(sessionId: sessionId)
+        XCTAssertTrue(store1.isTombstonedForTesting(sessionId: sessionId))
+
+        // A fresh store over the same root simulates the next app launch.
+        let store2 = RemoteKittyImageDiskStore(root: root)
+        store2.activate()
+        await store2.barrierForTesting()
+        let restored = await store2.restore(sessionId: sessionId)
+        XCTAssertTrue(restored.entries.isEmpty)
+        let existsAfterRestart = await store2.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        XCTAssertFalse(existsAfterRestart)
+        XCTAssertFalse(
+            store2.isTombstonedForTesting(sessionId: sessionId),
+            "after startup finishes the durable purge, no old producer exists to resurrect it"
+        )
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreKeepsTombstoneUntilFailedDeletionCanRetry() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: root.appendingPathComponent("data").path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store1 = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "delete-failure"
+        store1.persistRetain(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        await store1.flush()
+
+        let dataDir = root.appendingPathComponent("data")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dataDir.path)
+        store1.tombstone(sessionId: sessionId)
+        await store1.flush()
+
+        XCTAssertTrue(store1.tombstoneMarkerExistsForTesting(sessionId: sessionId))
+        let entryRemainsAfterFailure = await store1.entryExistsForTesting(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1
+        )
+        XCTAssertTrue(entryRemainsAfterFailure)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dataDir.path)
+        let store2 = RemoteKittyImageDiskStore(root: root)
+        store2.activate()
+        await store2.flush()
+
+        XCTAssertFalse(store2.tombstoneMarkerExistsForTesting(sessionId: sessionId))
+        let entryRemainsAfterRetry = await store2.entryExistsForTesting(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1
+        )
+        XCTAssertFalse(entryRemainsAfterRetry)
+    }
+
+    @MainActor
+    func testRemoteKittyImageDiskStoreOrdinaryClearNeverRestoresUndeletableBytes() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: root.appendingPathComponent("data").path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "ordinary-clear"
+        store.persistRetain(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        await store.flush()
+
+        let dataDir = root.appendingPathComponent("data")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dataDir.path)
+        store.persistClearSession(sessionId: sessionId)
+        await store.flush()
+
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertTrue(restored.entries.isEmpty)
+        XCTAssertTrue(restored.currentSelections.isEmpty)
+    }
+
+    // MARK: - Durable Kitty image persistence (RemoteKittyImageCapture restore API)
+
+    @MainActor
+    func testRemoteKittyImageCaptureRestoreInstallsEntriesAndCurrentSelectionBumpingGenerationOnce() {
+        let capture = remoteKittyTestCapture()
+        let genBefore = capture.imageAvailabilityGeneration
+        let gracePng = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let currentPng = remoteKittyTestPNGBytes(width: 3, height: 3)
+
+        capture.beginRestoring()
+        XCTAssertTrue(capture.restoreEntry(imageId: 5, version: 100, data: gracePng))
+        XCTAssertTrue(capture.restoreEntry(imageId: 5, version: 101, data: currentPng))
+        XCTAssertTrue(capture.restoreCurrentSelection(imageId: 5, version: 101, placementId: nil))
+        capture.finishRestoring()
+
+        XCTAssertEqual(capture.currentVersion(for: 5), 101)
+        XCTAssertEqual(capture.imageData(imageId: 5, version: 100), gracePng, "grace version must remain fetchable")
+        XCTAssertEqual(capture.imageData(imageId: 5, version: 101), currentPng)
+        XCTAssertEqual(
+            capture.imageAvailabilityGeneration, genBefore &+ 1,
+            "generation bumps exactly once for the whole restored batch"
+        )
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureRestoreRejectsInvalidPNGAndRequiresBeginRestoringWindow() {
+        let capture = remoteKittyTestCapture()
+        // Outside a `beginRestoring()`/`finishRestoring()` window, the
+        // restore-only API is rejected outright.
+        XCTAssertFalse(capture.restoreEntry(imageId: 1, version: 1, data: remoteKittyTestPNGBytes(width: 2, height: 2)))
+        XCTAssertFalse(capture.restoreCurrentSelection(imageId: 1, version: 1, placementId: nil))
+
+        capture.beginRestoring()
+        // Corrupt/non-PNG bytes are rejected fail-closed, exactly like a
+        // live transmission's own decode.
+        XCTAssertFalse(capture.restoreEntry(imageId: 1, version: 1, data: Data([0x00, 0x01])))
+        capture.finishRestoring()
+        XCTAssertNil(capture.currentVersion(for: 1))
+    }
+
+    /// Restoring previously-persisted state must never recursively re-persist
+    /// it back to the very store it came from.
+    @MainActor
+    func testRemoteKittyImageCaptureRestoreNeverPersistsRecursively() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let capture = RemoteKittyImageCapture(
+            sessionId: "s", epoch: 0, budget: RemoteKittyImageCaptureBudget(), diskStore: store
+        )
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+
+        capture.beginRestoring()
+        XCTAssertTrue(capture.restoreEntry(imageId: 7, version: 1, data: png))
+        XCTAssertTrue(capture.restoreCurrentSelection(imageId: 7, version: 1, placementId: nil))
+        capture.finishRestoring()
+
+        await store.barrierForTesting()
+        let entryCount = await store.totalEntryCountForTesting()
+        XCTAssertEqual(entryCount, 0, "restore must never re-persist state back to the store it was read from")
+    }
+
+    @MainActor
+    func testRemoteKittyImageCaptureDisablePersistenceFencesLateTerminalCallbacks() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let capture = RemoteKittyImageCapture(
+            sessionId: "closing",
+            epoch: 0,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store
+        )
+        capture.disablePersistence()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=1,c=1,r=1",
+            base64Payload: png.base64EncodedString()
+        )[...])
+        await store.flush()
+
+        let totalEntries = await store.totalEntryCountForTesting()
+        XCTAssertEqual(totalEntries, 0)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCapturePersistsPlacementGeometryFromPutNotTransmitOnly() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "geometry"
+        let capture = RemoteKittyImageCapture(
+            sessionId: sessionId,
+            epoch: 0,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store
+        )
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=t,f=100,t=d,U=1,i=9,c=99,r=99",
+            base64Payload: png.base64EncodedString()
+        )[...])
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=p,U=1,i=9,p=4,c=4,r=2,X=3,Y=5,z=7"
+        )[...])
+        await store.flush()
+
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertEqual(restored.currentSelections, [RemoteKittyRestoredSelection(
+            imageId: 9,
+            version: 1,
+            placementId: 4,
+            rows: 2,
+            columns: 4,
+            x: 3,
+            y: 5,
+            z: 7
+        )])
+    }
+
+    @MainActor
+    func testRemoteKittyImageCapturePersistsEvictionOfNewTransmitOnlyVictimAfterRetain() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "local-bound"
+        let capture = RemoteKittyImageCapture(
+            sessionId: sessionId,
+            epoch: 0,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store
+        )
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        for imageId: UInt32 in 1 ... 16 {
+            capture.ingest(remoteKittyFrameBytes(
+                control: "a=T,f=100,t=d,U=1,i=\(imageId),c=1,r=1",
+                base64Payload: png.base64EncodedString()
+            )[...])
+        }
+        capture.ingest(remoteKittyFrameBytes(
+            control: "a=t,f=100,t=d,U=1,i=99",
+            base64Payload: png.base64EncodedString()
+        )[...])
+        await store.flush()
+
+        XCTAssertNil(capture.imageData(imageId: 99, version: 17))
+        let diskEntryExists = await store.entryExistsForTesting(
+            sessionId: sessionId,
+            imageId: 99,
+            version: 17
+        )
+        XCTAssertFalse(diskEntryExists)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCapturePersistsEvictionsTriggeredWhileFinishingRestore() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "restore-bound"
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        for imageId: UInt32 in 1 ... 17 {
+            store.persistRetain(
+                sessionId: sessionId,
+                imageId: imageId,
+                version: UInt64(imageId),
+                data: png
+            )
+        }
+        await store.flush()
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertEqual(restored.entries.count, 17)
+
+        let capture = RemoteKittyImageCapture(
+            sessionId: sessionId,
+            epoch: 0,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store
+        )
+        capture.beginRestoring()
+        for entry in restored.entries {
+            XCTAssertTrue(capture.restoreEntry(
+                imageId: entry.imageId,
+                version: entry.version,
+                data: entry.data
+            ))
+        }
+        capture.finishRestoring()
+        await store.flush()
+
+        let totalEntries = await store.totalEntryCountForTesting()
+        let oldestExists = await store.entryExistsForTesting(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1
+        )
+        XCTAssertEqual(totalEntries, 16)
+        XCTAssertFalse(oldestExists)
+    }
+
+    // MARK: - Restore replay encoding (pure)
+
+    /// The exact bytes a restore replays into SwiftTerm must themselves be
+    /// valid, parseable Kitty APC frames — proven here by feeding them into
+    /// an independent, fresh `RemoteKittyImageCapture` (acting purely as a
+    /// reference decoder) and confirming it reconstructs the same image and
+    /// the exact explicit placement id, never an implicit/omitted one.
+    @MainActor
+    func testRemoteKittyReplayEncodingProducesFramesDecodableAsTransmitThenPlacement() throws {
+        let referenceCapture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 3, height: 2)
+        var bytes = RemoteKittyReplayEncoding.transmitOnlyFrames(imageId: 77, data: png)
+        bytes += RemoteKittyReplayEncoding.placementFrame(
+            imageId: 77, placementId: 1, rows: 2, columns: 3, x: 5, y: 6, z: 1
+        )
+        referenceCapture.ingest(bytes[...])
+        let version = try XCTUnwrap(referenceCapture.currentVersion(for: 77, placementId: 1))
+        XCTAssertEqual(referenceCapture.imageData(imageId: 77, version: version), png)
+    }
+
+    // MARK: - ProjectsTerminalView startup restore/buffering integration
+
+    /// End-to-end proof that a disk-restored current selection is
+    /// discoverable by the exact same remote-screen placeholder scan a live
+    /// transmission would be — without ever live-retransmitting anything —
+    /// and that doing so never mints a new version (which live replay
+    /// through `dataReceived` would have) nor recursively re-persists.
+    @MainActor
+    func testAppModelRemoteScreenDiscoversRestoredPlacementWithoutLiveRetransmitOrNewVersion() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+
+        // Simulates a prior run's persisted state — a deliberately
+        // distinctive version far outside any fresh instance's own
+        // (epoch, counter) range, so if restore ever minted a *new* version
+        // instead of installing this exact one, this assertion would catch it.
+        let oldVersion: UInt64 = 0xABCDEF_00_00000001
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        diskStore.persistRetain(sessionId: sessionId, imageId: 77, version: oldVersion, data: png)
+        diskStore.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 77,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: oldVersion, placementId: nil, rows: 1, columns: 4, x: nil, y: nil, z: nil
+            )]
+        )
+        await diskStore.barrierForTesting()
+
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: diskStore
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+        await controller.terminalView.waitForImageRestoreForTesting()
+
+        XCTAssertEqual(controller.terminalView.kittyImageCapture.currentVersion(for: 77), oldVersion)
+
+        // Only the placeholder glyphs a real client would have printed —
+        // never any Kitty graphics command — so the placement can only be
+        // discovered here because restore already installed the current
+        // version, never because of any live retransmission.
+        let placeholder = Character(UnicodeScalar(0x10EEEE)!)
+        controller.terminalView.dataReceived(slice: Array((
+            "\u{1B}[?1049h\u{1B}[H\u{1B}[3;1H"
+                + "\u{1B}[38;2;0;0;77m"
+                + String(repeating: String(placeholder), count: 4)
+                + "\u{1B}[0m"
+        ).utf8)[...])
+
+        let screen = try XCTUnwrap(model.remoteScreen(sessionId: sessionId, afterLine: nil))
+        XCTAssertEqual(screen.images, [RemoteTerminalImagePlacement(
+            imageId: 77, contentVersion: oldVersion, line: 2, column: 0, rows: 1, columns: 4
+        )])
+    }
+
+    /// Startup ordering: live PTY bytes arriving while restoration is
+    /// pending — including a delete and a fresh retransmit for the very same
+    /// image id — must never interleave with the restore replay, and must
+    /// apply, in original stream order, only *after* it completes. The live
+    /// retransmit naturally wins (a fresh transmission always supersedes
+    /// whatever restore installed), while the grace (superseded) version
+    /// restore installed remains endpoint-fetchable — never a "delete before
+    /// restore" zombie, and never silently dropped either.
+    @MainActor
+    func testProjectsTerminalViewBuffersLiveDeleteAndRetransmitDuringRestoreThenAppliesThemAfterInOrder() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+
+        let oldVersion: UInt64 = 0x1111_0000_00000001
+        let oldPng = remoteKittyTestPNGBytes(width: 2, height: 2)
+        diskStore.persistRetain(sessionId: sessionId, imageId: 55, version: oldVersion, data: oldPng)
+        diskStore.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 55,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: oldVersion, placementId: nil, rows: 1, columns: 4, x: nil, y: nil, z: nil
+            )]
+        )
+        await diskStore.barrierForTesting()
+
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: diskStore
+        )
+        // `controller(for:)` synchronously starts this session's restore
+        // `Task`, which — under Swift concurrency's cooperative, non
+        // -preemptive scheduling — cannot possibly have run even its first
+        // line yet: nothing here has awaited or yielded control back to the
+        // scheduler. Every `dataReceived` call immediately below is
+        // therefore deterministically guaranteed to observe restoration
+        // still pending, never a timing-dependent race.
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+        XCTAssertTrue(controller.terminalView.isRestoringImages, "restore must still be pending here")
+        XCTAssertNil(
+            controller.terminalView.kittyImageCapture.currentVersion(for: 55),
+            "nothing has been installed yet — restoration hasn't replayed"
+        )
+
+        // Buffered while pending: a delete of the (not-yet-installed)
+        // placement, then a fresh live retransmit of the same image id.
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(control: "a=d,d=i,i=55")[...])
+        let newPng = remoteKittyTestPNGBytes(width: 5, height: 5)
+        controller.terminalView.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=55", base64Payload: newPng.base64EncodedString()
+        )[...])
+        XCTAssertTrue(controller.terminalView.isRestoringImages, "still pending: nothing has been flushed yet")
+
+        await controller.terminalView.waitForImageRestoreForTesting()
+        XCTAssertFalse(controller.terminalView.isRestoringImages)
+
+        let finalVersion = try XCTUnwrap(controller.terminalView.kittyImageCapture.currentVersion(for: 55))
+        XCTAssertNotEqual(finalVersion, oldVersion, "the live retransmit must win, not the restored version")
+        XCTAssertEqual(controller.terminalView.kittyImageCapture.imageData(imageId: 55, version: finalVersion), newPng)
+        // The lowercase delete only ever retires the *placement*, never the
+        // underlying bytes — the restored grace version stays fetchable.
+        XCTAssertEqual(controller.terminalView.kittyImageCapture.imageData(imageId: 55, version: oldVersion), oldPng)
+    }
+
+    /// If buffering this session's share of live bytes during restore would
+    /// overflow the shared hard cap, restoration is abandoned for *this*
+    /// session only: the buffered-then-live stream flushes through the
+    /// normal path immediately, and the eventual (late) disk-restore result
+    /// is ignored rather than resurrecting/overwriting the live state.
+    @MainActor
+    func testProjectsTerminalViewAbandonsRestoreOnBufferOverflowAndIgnoresLateRestoreResult() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root)
+        let sessionId = UUID().uuidString
+
+        let oldVersion: UInt64 = 0x2222_0000_00000001
+        diskStore.persistRetain(
+            sessionId: sessionId, imageId: 66, version: oldVersion,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        diskStore.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 66,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: oldVersion, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await diskStore.barrierForTesting()
+
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
+        let tinyBudget = RemoteKittyRestoreBufferBudget(maxTotalBytes: 4)
+        view.configureImagePersistence(sessionId: sessionId, diskStore: diskStore, restoreBufferBudget: tinyBudget)
+        XCTAssertTrue(view.isRestoringImages)
+
+        // A live retransmit far larger than the 4-byte buffer cap, fed
+        // before the restore `Task` can possibly have run — deterministically
+        // overflows and abandons restoration for this session synchronously.
+        let livePng = remoteKittyTestPNGBytes(width: 5, height: 5)
+        view.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=66", base64Payload: livePng.base64EncodedString()
+        )[...])
+        XCTAssertFalse(view.isRestoringImages, "overflow must abandon restoration synchronously")
+
+        let liveVersion = try XCTUnwrap(view.kittyImageCapture.currentVersion(for: 66))
+        XCTAssertNotEqual(liveVersion, oldVersion)
+        XCTAssertEqual(view.kittyImageCapture.imageData(imageId: 66, version: liveVersion), livePng)
+
+        // The late disk-restore result must never resurrect/overwrite the
+        // live state once it eventually arrives.
+        await view.waitForImageRestoreForTesting()
+        XCTAssertEqual(view.kittyImageCapture.currentVersion(for: 66), liveVersion)
+        XCTAssertEqual(tinyBudget.totalBytes, 0)
+    }
+
+    @MainActor
+    func testProjectsTerminalViewReleasesInjectedBufferBudgetAfterSuccessfulRestore() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root)
+        let sessionId = UUID().uuidString
+        let version: UInt64 = 123
+        diskStore.persistRetain(
+            sessionId: sessionId,
+            imageId: 7,
+            version: version,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2),
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: version,
+                placementId: nil,
+                rows: 1,
+                columns: 1,
+                x: nil,
+                y: nil,
+                z: nil
+            )]
+        )
+        await diskStore.barrierForTesting()
+
+        let budget = RemoteKittyRestoreBufferBudget(maxTotalBytes: 1_024)
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
+        view.configureImagePersistence(
+            sessionId: sessionId,
+            diskStore: diskStore,
+            restoreBufferBudget: budget
+        )
+        view.dataReceived(slice: Array("pending".utf8)[...])
+        XCTAssertEqual(budget.totalBytes, 7)
+
+        await view.waitForImageRestoreForTesting()
+        XCTAssertEqual(budget.totalBytes, 0)
+    }
+
+    @MainActor
+    func testProjectsTerminalViewReplaysRestoredPlacementIntoBufferedAlternateScreen() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root)
+        let sessionId = UUID().uuidString
+        let version: UInt64 = 321
+        diskStore.persistRetain(
+            sessionId: sessionId,
+            imageId: 8,
+            version: version,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2),
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: version,
+                placementId: nil,
+                rows: 1,
+                columns: 1,
+                x: nil,
+                y: nil,
+                z: nil
+            )]
+        )
+        await diskStore.flush()
+
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
+        view.configureImagePersistence(sessionId: sessionId, diskStore: diskStore)
+        view.dataReceived(slice: Array("\u{1B}[?1049h".utf8)[...])
+        await view.waitForImageRestoreForTesting()
+        view.replayRestoredPlacementsForTesting()
+
+        XCTAssertEqual(view.terminal?.isCurrentBufferAlternate, true)
+        XCTAssertEqual(view.restoredPlacementBufferWasAlternateForTesting, true)
+    }
+
+    @MainActor
+    func testProjectsTerminalViewUsesLivePlacementGeometryForDelayedRestoreReplay() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root)
+        let sessionId = UUID().uuidString
+        let version: UInt64 = 654
+        diskStore.persistRetain(
+            sessionId: sessionId,
+            imageId: 10,
+            version: version,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2),
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: version,
+                placementId: 7,
+                rows: 1,
+                columns: 1,
+                x: nil,
+                y: nil,
+                z: nil
+            )]
+        )
+        await diskStore.flush()
+
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
+        view.configureImagePersistence(sessionId: sessionId, diskStore: diskStore)
+        view.dataReceived(slice: remoteKittyFrameBytes(
+            control: "a=p,U=1,i=10,p=7,c=4,r=3"
+        )[...])
+        await view.waitForImageRestoreForTesting()
+        view.replayRestoredPlacementsForTesting()
+
+        XCTAssertEqual(
+            view.kittyImageCapture.currentPersistedSelection(imageId: 10, placementId: 7),
+            RemoteKittyPersistedPlacementSelection(
+                version: version,
+                placementId: 7,
+                rows: 3,
+                columns: 4,
+                x: nil,
+                y: nil,
+                z: nil
+            )
+        )
+    }
+
+    @MainActor
+    func testProjectsTerminalViewCancelRestoreReleasesBufferedBudget() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root)
+        let sessionId = UUID().uuidString
+        diskStore.persistRetain(
+            sessionId: sessionId,
+            imageId: 9,
+            version: 1,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        await diskStore.flush()
+
+        let budget = RemoteKittyRestoreBufferBudget(maxTotalBytes: 1_024)
+        let view = ProjectsTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 480))
+        view.configureImagePersistence(
+            sessionId: sessionId,
+            diskStore: diskStore,
+            restoreBufferBudget: budget
+        )
+        view.dataReceived(slice: Array("pending".utf8)[...])
+        XCTAssertEqual(budget.totalBytes, 7)
+
+        view.cancelImageRestore()
+        XCTAssertEqual(budget.totalBytes, 0)
+        XCTAssertFalse(view.isRestoringImages)
+    }
+
+    // MARK: - Retryable pending behavior for remote clients
+
+    /// While a session's durable image restore is still pending, remote
+    /// clients must never observe a definitive false absence: exact image
+    /// data isn't available *yet* (not a 404-worthy permanent absence), and
+    /// `RemoteGateway` maps this distinction to a retryable status rather
+    /// than "not found" (see `RemoteGateway.handleTerminalImage`).
+    @MainActor
+    func testRemoteModelBridgeReportsPendingRestorationAndWithholdsImageDataUntilComplete() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let diskStore = RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
+
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let session = Session(id: sessionId, title: "Test Session", cwd: root.path)
+        let project = Project(id: "pid", name: "Project", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: "pid"))
+
+        let oldVersion: UInt64 = 0x3333_0000_00000001
+        diskStore.persistRetain(
+            sessionId: sessionId, imageId: 88, version: oldVersion,
+            data: remoteKittyTestPNGBytes(width: 2, height: 2)
+        )
+        diskStore.replaceCurrentSelections(
+            sessionId: sessionId, imageId: 88,
+            selections: [RemoteKittyPersistedPlacementSelection(
+                version: oldVersion, placementId: nil, rows: 1, columns: 1, x: nil, y: nil, z: nil
+            )]
+        )
+        await diskStore.barrierForTesting()
+
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: diskStore
+        )
+        let controller = try XCTUnwrap(model.controller(for: sessionId))
+        let bridge = RemoteModelBridge(model: model)
+
+        XCTAssertTrue(bridge.isRestoringImages(sessionId: sessionId))
+        XCTAssertNil(
+            bridge.screenRevision(sessionId: sessionId),
+            "remote clients must not cache a definitive image-empty screen while restore is pending"
+        )
+        XCTAssertNil(
+            bridge.terminalImageData(sessionId: sessionId, imageId: 88, version: oldVersion),
+            "must withhold — not definitively 404 — while pending"
+        )
+
+        await controller.terminalView.waitForImageRestoreForTesting()
+
+        XCTAssertFalse(bridge.isRestoringImages(sessionId: sessionId))
+        XCTAssertNotNil(bridge.screenRevision(sessionId: sessionId))
+        XCTAssertNotNil(bridge.terminalImageData(sessionId: sessionId, imageId: 88, version: oldVersion))
+    }
+
     // MARK: - Cross-session global-budget eviction invalidates a session's cached screen (finding #2)
 
     /// Every remote session's `RemoteKittyImageCapture` instance defaults to
@@ -11249,7 +12469,8 @@ final class AppLogicTests: XCTestCase {
             stateRepository: repository,
             isAppActive: { false },
             agentActivityDirectory: root,
-            resumeMarkerDirectory: root
+            resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("kitty-images", isDirectory: true))
         )
         let controllerA = try XCTUnwrap(model.controller(for: sessionIdA))
 

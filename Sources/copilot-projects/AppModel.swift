@@ -183,6 +183,12 @@ final class AppModel: ObservableObject {
     private var controllers: [String: TerminalController] = [:]
     private var selectedTranscriptController: TranscriptController?
     private let stateRepository: StateRepository
+    /// The durable Kitty-image disk store every session's terminal is wired
+    /// to. Defaults to the real process-wide singleton; tests inject an
+    /// isolated instance (a fresh temp-directory-backed store) so a test
+    /// session's images can never touch — or be perturbed by — the real
+    /// user's persisted state.
+    private let kittyImageDiskStore: RemoteKittyImageDiskStore
     private lazy var controlRouter = ControlCommandRouter(actions: .init(
         listProjects: { [unowned self] in self.renderProjects() },
         listStatus: { [unowned self] in self.renderStatus() },
@@ -366,7 +372,8 @@ final class AppModel: ObservableObject {
         agentActivityScanObserver: (() -> Void)? = nil,
         webPushService: WebPushService? = nil,
         apnsService: APNsService? = nil,
-        notificationSync: NotificationSyncService? = nil
+        notificationSync: NotificationSyncService? = nil,
+        kittyImageDiskStore: RemoteKittyImageDiskStore = .shared
     ) {
         self.stateRepository = stateRepository
         self.completionNotificationDelayNanoseconds = completionNotificationDelayNanoseconds
@@ -383,6 +390,7 @@ final class AppModel: ObservableObject {
         self.agentActivityRefreshThrottle = agentActivityRefreshThrottle
         self.agentActivityCooldownScheduler = agentActivityCooldownScheduler
         self.agentActivityScanObserver = agentActivityScanObserver
+        self.kittyImageDiskStore = kittyImageDiskStore
         remoteAccess = RemoteAccessController(
             webPushService: webPushService,
             apnsService: apnsService,
@@ -395,6 +403,10 @@ final class AppModel: ObservableObject {
 
     func attach(notifications: any NotificationPosting) {
         self.notifications = notifications
+    }
+
+    func activateKittyImagePersistence() {
+        kittyImageDiskStore.activate()
     }
 
     func bootstrapIfNeeded() {
@@ -512,6 +524,7 @@ final class AppModel: ObservableObject {
         launchWithAllowAll: Bool = false
     ) -> TerminalController? {
         if let c = controllers[sessionId] { return c }
+        guard !isTerminating else { return nil }
         guard let loc = locateIndex(sessionId) else { return nil }
         let project = projects[loc.p]
         let session = project.sessions[loc.s]
@@ -559,7 +572,8 @@ final class AppModel: ObservableObject {
             dtachSocket: socket,
             copilotSessionId: (recordedCopilot?.isEmpty == false) ? recordedCopilot : nil,
             copilotSessionAllowAll: resumeWithAllowAll || launchWithAllowAll,
-            launchCopilotExecutable: launchCopilotIfCreated ? copilotExecutable : nil
+            launchCopilotExecutable: launchCopilotIfCreated ? copilotExecutable : nil,
+            kittyImageDiskStore: kittyImageDiskStore
         )
         c.onTitle = { [weak self] title in self?.updateTitle(sessionId: sessionId, title: title) }
         c.onDirectory = { [weak self] dir in self?.updateCwd(sessionId: sessionId, dir: dir) }
@@ -887,7 +901,11 @@ final class AppModel: ObservableObject {
     /// Permanently end a session: kill its dtach master (so it does not resume),
     /// remove its socket, and drop it from the model.
     private func destroySession(projectId pid: String, sessionId sid: String) {
-        SessionArtifacts.destroy(sessionId: sid)
+        controllers[sid]?.terminalView.kittyImageCapture.disablePersistence()
+        guard SessionArtifacts.destroy(
+            sessionId: sid,
+            kittyImageDiskStore: kittyImageDiskStore
+        ) else { return }
         closeSession(projectId: pid, sessionId: sid)
     }
 
@@ -898,6 +916,21 @@ final class AppModel: ObservableObject {
             controller.terminate()
         }
         controllers.removeAll()
+    }
+
+    func detachAllClientsAndDrain() async {
+        let activeControllers = Array(controllers.values)
+        for controller in activeControllers {
+            controller.beginTerminationDrain()
+        }
+        for controller in activeControllers {
+            await controller.finishTerminationDrain()
+        }
+        controllers.removeAll()
+    }
+
+    func flushKittyImagePersistence() async {
+        await kittyImageDiskStore.flush()
     }
 
     func beginTermination() {
@@ -1003,6 +1036,7 @@ final class AppModel: ObservableObject {
     ) -> RemoteTerminalScreen? {
         guard locateIndex(sessionId) != nil,
               let view = controller(for: sessionId)?.terminalView,
+              !view.isRestoringImages,
               let terminal = view.terminal else {
             return nil
         }
@@ -1552,9 +1586,18 @@ final class AppModel: ObservableObject {
 
     func closeProject(_ pid: String) {
         guard let pi = projectIndex(pid) else { return }
+        for session in projects[pi].sessions {
+            controllers[session.id]?.terminalView.kittyImageCapture.disablePersistence()
+            guard kittyImageDiskStore.tombstone(sessionId: session.id) else { return }
+        }
         let snapshot = Paths.dtachExecutable != nil ? ProcessTree.snapshot() : nil
         for session in projects[pi].sessions {
-            SessionArtifacts.destroy(sessionId: session.id, snapshot: snapshot)
+            SessionArtifacts.destroy(
+                sessionId: session.id,
+                snapshot: snapshot,
+                kittyImageDiskStore: kittyImageDiskStore,
+                alreadyTombstoned: true
+            )
             controllers[session.id]?.terminate()
             controllers[session.id] = nil
             if selectedTranscriptController?.sessionId == session.id {
@@ -2631,6 +2674,7 @@ final class AppModel: ObservableObject {
         projects[loc.p].sessions[loc.s].backgroundAgentsActive = false
         backgroundAgentsSuppressed.remove(sessionId)
         let projectId = projects[loc.p].id
+        guard kittyImageDiskStore.tombstone(sessionId: sessionId) else { return }
         SessionArtifacts.removeFiles(sessionId: sessionId)
         closeSession(projectId: projectId, sessionId: sessionId)
     }

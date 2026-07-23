@@ -29,12 +29,299 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
     private var isSubmittingRemotePrompt = false
     /// Captures this session's Kitty inline images for remote clients. One
     /// instance per terminal view (never shared/global), fed on the main actor.
-    let kittyImageCapture = RemoteKittyImageCapture()
+    /// Replaced (once) by `configureImagePersistence` with a session/disk-store
+    /// -aware instance before any PTY bytes can possibly arrive.
+    private(set) var kittyImageCapture = RemoteKittyImageCapture()
+
+    /// True from construction until this session's durable image restore
+    /// (see `configureImagePersistence`) completes or is abandoned. While
+    /// true, incoming PTY bytes are buffered (never fed to
+    /// `kittyImageCapture.ingest`/`super.dataReceived`) so a live retransmit
+    /// or delete can never interleave with the restore replay — see
+    /// `bufferDuringImageRestore`. A session never configured for
+    /// persistence (`configureImagePersistence` never called — e.g. any
+    /// existing test that constructs this view directly) stays `false`
+    /// forever, matching prior (pre-persistence) behavior exactly.
+    private(set) var isRestoringImages = false
+    private var pendingImageRestoreBuffer: [UInt8] = []
+    /// Injectable so tests can prove overflow-abandonment deterministically
+    /// with a tiny cap, instead of needing megabytes of real data to exceed
+    /// the real process-wide default. Defaults to the real shared singleton.
+    private var restoreBufferBudget: RemoteKittyRestoreBufferBudget = .shared
+    /// Exposed only so tests can deterministically await this session's
+    /// disk-restore Task instead of relying on a sleep. Not used by any
+    /// production call site.
+    private(set) var imageRestoreTaskForTesting: Task<Void, Never>?
+    private var restoredSelectionsAwaitingPlacement: [RemoteKittyRestoredSelection] = []
+    private var restoredPlacementReplayGeneration = 0
+    private var restoredPlacementBufferWasAlternate: Bool?
 
     override func dataReceived(slice: ArraySlice<UInt8>) {
         remoteContentGeneration &+= 1
+        guard !isRestoringImages else {
+            bufferDuringImageRestore(slice)
+            return
+        }
         kittyImageCapture.ingest(slice)
         super.dataReceived(slice: slice)
+        scheduleRestoredPlacementReplayIfNeeded()
+    }
+
+    /// Wires this view up to durable Kitty-image persistence for `sessionId`
+    /// and kicks off its async disk restore. Must be called exactly once,
+    /// strictly before any PTY bytes can arrive (i.e. before the owning
+    /// `TerminalController` starts the shell/dtach process) — `TerminalController
+    /// .init` guarantees this ordering. A no-op on any later call, so it's
+    /// safe to call defensively.
+    func configureImagePersistence(
+        sessionId: String,
+        diskStore: RemoteKittyImageDiskStore = .shared,
+        restoreBufferBudget: RemoteKittyRestoreBufferBudget? = nil
+    ) {
+        guard !isRestoringImages, kittyImageCapture.sessionId != sessionId else { return }
+        kittyImageCapture = RemoteKittyImageCapture(sessionId: sessionId, diskStore: diskStore)
+        // `restoreBufferBudget`'s default can't be spelled as `= .shared` in
+        // the parameter list itself: default-argument expressions aren't
+        // evaluated in the enclosing (main-actor) isolation context, so
+        // referencing a main-actor-isolated static there is a Swift 6
+        // isolation error (mirrors `RemoteKittyImageCapture.init`'s own
+        // `budget` parameter for the same reason). Resolving it here, inside
+        // this already-main-actor-isolated method body, is equivalent for
+        // every real caller.
+        self.restoreBufferBudget = restoreBufferBudget ?? .shared
+        // The overwhelmingly common case — a brand-new session, or any
+        // session that has simply never had a Kitty image persisted for it —
+        // has nothing at all to restore. Skip the async restore/buffering
+        // path entirely rather than unconditionally pay for it (and its
+        // inherently non-deterministic `Task` scheduling) only to resolve to
+        // a no-op: `dataReceived` behaves exactly as it did before this
+        // feature existed for every such session.
+        guard diskStore.hasPersistedEntriesSynchronously(sessionId: sessionId) else { return }
+        isRestoringImages = true
+        imageRestoreTaskForTesting = Task { @MainActor [weak self] in
+            let result = await diskStore.restore(sessionId: sessionId)
+            guard let self, self.isRestoringImages, self.kittyImageCapture.sessionId == sessionId else {
+                return // abandoned (buffer overflow) or superseded: ignore this late result
+            }
+            self.completeImageRestore(result)
+        }
+    }
+
+    /// Buffers PTY bytes that arrive while this session's disk image-restore
+    /// is still pending, under the (possibly test-injected)
+    /// `RemoteKittyRestoreBufferBudget` hard cap — never feeding them to
+    /// `kittyImageCapture.ingest`/`super.dataReceived` yet, so a live
+    /// retransmit or delete can never interleave with (and corrupt) the
+    /// eventual restore replay. Reservation failure (this session's share of
+    /// the shared cap would overflow) abandons restoration for *this session
+    /// only*: every other still-restoring session is unaffected, and this
+    /// session's buffered-then-live stream is flushed through the normal path
+    /// immediately, in original order — the late disk-restore result (once it
+    /// eventually arrives) is then ignored (see `configureImagePersistence`).
+    private func bufferDuringImageRestore(_ slice: ArraySlice<UInt8>) {
+        guard restoreBufferBudget.reserve(slice.count) else {
+            abandonImageRestore(flushingLive: slice)
+            return
+        }
+        pendingImageRestoreBuffer.append(contentsOf: slice)
+    }
+
+    private func abandonImageRestore(flushingLive slice: ArraySlice<UInt8>) {
+        isRestoringImages = false
+        let buffered = pendingImageRestoreBuffer
+        pendingImageRestoreBuffer = []
+        restoreBufferBudget.release(buffered.count)
+        if !buffered.isEmpty {
+            kittyImageCapture.ingest(buffered[...])
+            super.dataReceived(slice: buffered[...])
+        }
+        kittyImageCapture.ingest(slice)
+        super.dataReceived(slice: slice)
+    }
+
+    private func completeImageRestore(_ result: RemoteKittyRestoredSessionImages) {
+        isRestoringImages = false
+        applyRestoredImages(result)
+        let buffered = pendingImageRestoreBuffer
+        pendingImageRestoreBuffer = []
+        restoreBufferBudget.release(buffered.count)
+        if !buffered.isEmpty {
+            kittyImageCapture.ingest(buffered[...])
+            super.dataReceived(slice: buffered[...])
+            scheduleRestoredPlacementReplayIfNeeded()
+        }
+    }
+
+    /// Installs every restored `(imageId, version)` entry and current
+    /// selection directly into `kittyImageCapture`'s in-memory state (never
+    /// through `ingest`, which would mint fresh versions and recursively
+    /// re-persist), replays each restored current selection's exact pixels
+    /// and placement directly into SwiftTerm (never through `dataReceived`),
+    /// then refreshes this view's own content generation once so any cached
+    /// remote screen/revision is invalidated to reflect the newly-restored
+    /// availability.
+    private func applyRestoredImages(_ result: RemoteKittyRestoredSessionImages) {
+        guard !result.entries.isEmpty else { return }
+        kittyImageCapture.beginRestoring()
+        for entry in result.entries {
+            kittyImageCapture.restoreEntry(imageId: entry.imageId, version: entry.version, data: entry.data)
+        }
+        for selection in result.currentSelections {
+            kittyImageCapture.restoreCurrentSelection(
+                imageId: selection.imageId,
+                version: selection.version,
+                placementId: selection.placementId,
+                rows: selection.rows,
+                columns: selection.columns,
+                x: selection.x,
+                y: selection.y,
+                z: selection.z
+            )
+        }
+        kittyImageCapture.finishRestoring()
+        let currentSelections = result.currentSelections.filter {
+            kittyImageCapture.currentVersion(
+                for: $0.imageId,
+                placementId: $0.placementId ?? 0
+            ) == $0.version
+        }
+        var transmitted: Set<RestoredImageKey> = []
+        for selection in currentSelections {
+            let key = RestoredImageKey(imageId: selection.imageId, version: selection.version)
+            guard transmitted.insert(key).inserted,
+                  let data = kittyImageCapture.imageData(
+                      imageId: selection.imageId,
+                      version: selection.version
+                  )
+            else { continue }
+            terminal?.feed(byteArray: RemoteKittyReplayEncoding.transmitOnlyFrames(
+                imageId: selection.imageId,
+                data: data
+            ))
+        }
+        restoredSelectionsAwaitingPlacement = currentSelections
+        restoredPlacementBufferWasAlternate = nil
+        remoteContentGeneration &+= 1
+        refreshSurface()
+    }
+
+    private struct RestoredImageKey: Hashable {
+        let imageId: UInt32
+        let version: UInt64
+    }
+
+    /// Virtual placement records are buffer-specific in SwiftTerm. Delay their
+    /// replay until the live dtach redraw has gone quiet, so a startup
+    /// `CSI ?1049h` switch lands first and the restored records are attached to
+    /// the buffer that actually contains the placeholder cells. Keep the
+    /// selections around so a later normal/alternate-buffer switch can replay
+    /// them once into that newly-active buffer too.
+    private func scheduleRestoredPlacementReplayIfNeeded() {
+        guard !restoredSelectionsAwaitingPlacement.isEmpty, terminal != nil else { return }
+        let isAlternate = terminal?.isCurrentBufferAlternate ?? false
+        guard restoredPlacementBufferWasAlternate != isAlternate else { return }
+        restoredPlacementReplayGeneration += 1
+        let generation = restoredPlacementReplayGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self,
+                  self.restoredPlacementReplayGeneration == generation
+            else { return }
+            self.replayRestoredPlacementsNow()
+        }
+    }
+
+    private func replayRestoredPlacementsNow() {
+        guard let terminal else { return }
+        let activeBufferIsAlternate = terminal.isCurrentBufferAlternate
+        guard restoredPlacementBufferWasAlternate != activeBufferIsAlternate else { return }
+
+        var currentSelections: [RemoteKittyRestoredSelection] = []
+        for restored in restoredSelectionsAwaitingPlacement {
+            guard let current = kittyImageCapture.currentPersistedSelection(
+                imageId: restored.imageId,
+                placementId: restored.placementId
+            ),
+                current.version == restored.version
+            else { continue }
+            currentSelections.append(RemoteKittyRestoredSelection(
+                imageId: restored.imageId,
+                version: current.version,
+                placementId: current.placementId,
+                rows: current.rows,
+                columns: current.columns,
+                x: current.x,
+                y: current.y,
+                z: current.z
+            ))
+        }
+        restoredSelectionsAwaitingPlacement = currentSelections
+        for selection in currentSelections {
+            terminal.feed(byteArray: RemoteKittyReplayEncoding.placementFrame(
+                imageId: selection.imageId,
+                // SwiftTerm treats p=0 as "unset" and allocates a fresh id on
+                // every replay. A stable positive id replaces the prior
+                // implicit record instead of leaking one per buffer switch;
+                // placeholder cells with id 0 intentionally match any record.
+                placementId: selection.placementId ?? 1,
+                rows: selection.rows,
+                columns: selection.columns,
+                x: selection.x,
+                y: selection.y,
+                z: selection.z
+            ))
+        }
+        restoredPlacementBufferWasAlternate = activeBufferIsAlternate
+        refreshSurface()
+    }
+
+    var restoredPlacementBufferWasAlternateForTesting: Bool? {
+        restoredPlacementBufferWasAlternate
+    }
+
+    func replayRestoredPlacementsForTesting() {
+        replayRestoredPlacementsNow()
+    }
+
+    /// Releases any startup bytes reserved for a restore that is being torn
+    /// down before its async disk load completes. Dropping them is correct:
+    /// this terminal client is closing, while its dtach master remains the
+    /// source of truth for the next attachment.
+    func cancelImageRestore() {
+        restoredPlacementReplayGeneration += 1
+        restoredSelectionsAwaitingPlacement.removeAll(keepingCapacity: false)
+        restoredPlacementBufferWasAlternate = nil
+        imageRestoreTaskForTesting?.cancel()
+        imageRestoreTaskForTesting = nil
+        guard isRestoringImages || !pendingImageRestoreBuffer.isEmpty else { return }
+        isRestoringImages = false
+        restoreBufferBudget.release(pendingImageRestoreBuffer.count)
+        pendingImageRestoreBuffer.removeAll(keepingCapacity: false)
+    }
+
+    /// Normal app termination must preserve any PTY bytes already buffered by
+    /// this view before the process reader is stopped. Abandon the disk restore
+    /// but flush those bytes through the normal capture/terminal path first;
+    /// the late restore result is ignored because `isRestoringImages` is false.
+    func flushImageRestoreBufferForTermination() {
+        imageRestoreTaskForTesting?.cancel()
+        imageRestoreTaskForTesting = nil
+        guard isRestoringImages || !pendingImageRestoreBuffer.isEmpty else { return }
+        isRestoringImages = false
+        let buffered = pendingImageRestoreBuffer
+        pendingImageRestoreBuffer.removeAll(keepingCapacity: false)
+        restoreBufferBudget.release(buffered.count)
+        guard !buffered.isEmpty else { return }
+        kittyImageCapture.ingest(buffered[...])
+        super.dataReceived(slice: buffered[...])
+    }
+
+    /// Awaits this session's disk-restore `Task` directly (not a sleep), so
+    /// tests can deterministically observe post-restore state. A no-op if
+    /// `configureImagePersistence` never engaged the async path at all (the
+    /// common "nothing to restore" case) — not used by any production call
+    /// site.
+    func waitForImageRestoreForTesting() async {
+        await imageRestoreTaskForTesting?.value
     }
 
     func sendRemoteInput(_ value: String) {
@@ -477,5 +764,44 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
             // never isHidden, so hiding it here sticks.
             subview.isHidden = true
         }
+    }
+}
+
+/// Process-wide hard cap on bytes buffered across every session currently
+/// waiting on its async disk image-restore (see `ProjectsTerminalView
+/// .bufferDuringImageRestore`) — independent of any single session's own PTY
+/// output volume, so many sessions restoring at once (e.g. right after an app
+/// relaunch) can never collectively pin unbounded memory before their loads
+/// complete. Main-actor-only, matching every caller.
+@MainActor
+final class RemoteKittyRestoreBufferBudget {
+    /// The real process-wide instance every `ProjectsTerminalView` uses by
+    /// default. Tests inject their own isolated instance instead, so an
+    /// assertion about this bound is never at the mercy of unrelated tests'
+    /// leftover reservations.
+    static let shared = RemoteKittyRestoreBufferBudget()
+
+    /// Comfortably larger than any single session's own in-flight Kitty
+    /// pending-transmission budget, but still a hard, deliberately small
+    /// bound: real shell startup output before a restore completes is tiny,
+    /// so hitting this at all should be rare — and correctness (never
+    /// interleaving buffered bytes with a stale disk-restore replay) matters
+    /// far more than tolerating an unbounded buffer.
+    let maxTotalBytes: Int
+    private(set) var totalBytes = 0
+
+    init(maxTotalBytes: Int = 16 * 1_024 * 1_024) {
+        self.maxTotalBytes = maxTotalBytes
+    }
+
+    func reserve(_ bytes: Int) -> Bool {
+        guard bytes > 0 else { return true }
+        guard totalBytes + bytes <= maxTotalBytes else { return false }
+        totalBytes += bytes
+        return true
+    }
+
+    func release(_ bytes: Int) {
+        totalBytes = max(0, totalBytes - bytes)
     }
 }

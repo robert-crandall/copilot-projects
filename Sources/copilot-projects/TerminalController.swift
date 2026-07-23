@@ -20,6 +20,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     var onExit: ((Int32?) -> Void)?
 
     private(set) var exited = false
+    private var isDrainingForTermination = false
 
     /// What the Copilot CLI's own footer says it's doing. While a turn runs the
     /// footer shows "… Working   esc cancel"; back at the prompt it shows
@@ -113,7 +114,8 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
 
     init(sessionId: String, cwd: String, extraEnvironment: [String: String],
          dtachExecutable: String?, dtachSocket: String?, copilotSessionId: String? = nil,
-         copilotSessionAllowAll: Bool = false, launchCopilotExecutable: String? = nil) {
+         copilotSessionAllowAll: Bool = false, launchCopilotExecutable: String? = nil,
+         kittyImageDiskStore: RemoteKittyImageDiskStore = .shared) {
         self.sessionId = sessionId
         self.terminalView = ProjectsTerminalView(
             frame: NSRect(x: 0, y: 0, width: 800, height: 480))
@@ -140,6 +142,12 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
         // focus ring around it (a line along the top + right edges). The selected tab
         // already shows which session is active, so suppress the ring.
         terminalView.focusRingType = .none
+        // Wires durable Kitty-image persistence for this exact session and
+        // kicks off its async disk restore *before* `start(...)` below can
+        // possibly spawn the shell/dtach process — so no live PTY byte can
+        // ever reach `dataReceived` before restoration begins buffering it
+        // (see `ProjectsTerminalView.configureImagePersistence`).
+        terminalView.configureImagePersistence(sessionId: sessionId, diskStore: kittyImageDiskStore)
         start(cwd: cwd, extraEnvironment: extraEnvironment,
               dtachExecutable: dtachExecutable, dtachSocket: dtachSocket,
               copilotSessionId: copilotSessionId,
@@ -220,7 +228,38 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     }
 
     func terminate() {
+        MainActor.assumeIsolated {
+            terminalView.kittyImageCapture.disablePersistence()
+            terminalView.cancelImageRestore()
+            terminalView.terminate()
+        }
+    }
+
+    @MainActor
+    func beginTerminationDrain() {
+        isDrainingForTermination = true
+        terminalView.flushImageRestoreBufferForTermination()
         terminalView.terminate()
+    }
+
+    @MainActor
+    func finishTerminationDrain() async {
+        var lastGeneration = terminalView.remoteContentGeneration
+        var quietTicks = 0
+        for _ in 0 ..< 50 {
+            try? await Task.sleep(for: .milliseconds(20))
+            let generation = terminalView.remoteContentGeneration
+            if generation == lastGeneration {
+                quietTicks += 1
+                if quietTicks >= 3 { break }
+            } else {
+                lastGeneration = generation
+                quietTicks = 0
+            }
+        }
+        terminalView.kittyImageCapture.disablePersistence()
+        terminalView.cancelImageRestore()
+        isDrainingForTermination = false
     }
 
     /// Whether a recorded Copilot session id is a strict UUID (the only form the
@@ -348,7 +387,13 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     }
 
     func processTerminated(source: TerminalView, exitCode: Int32?) {
-        exited = true
-        onExit?(exitCode)
+        MainActor.assumeIsolated {
+            if !isDrainingForTermination {
+                terminalView.kittyImageCapture.disablePersistence()
+                terminalView.cancelImageRestore()
+            }
+            exited = true
+            onExit?(exitCode)
+        }
     }
 }
