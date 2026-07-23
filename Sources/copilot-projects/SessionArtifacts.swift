@@ -125,9 +125,8 @@ enum SessionArtifacts {
         // this destroy can never resurrect data this call already committed
         // to discard. The (potentially larger) actual cleanup is enqueued
         // asynchronously by `tombstone(sessionId:)` itself.
-        guard alreadyTombstoned || kittyImageDiskStore.tombstone(sessionId: sessionId) else {
-            return false
-        }
+        let imageCleanupScheduled = alreadyTombstoned
+            || kittyImageDiskStore.tombstone(sessionId: sessionId)
         let socket = Paths.dtachSocketPath(sessionId: sessionId)
         if Paths.dtachExecutable != nil {
             let processes = snapshot ?? ProcessTree.snapshot()
@@ -140,7 +139,7 @@ enum SessionArtifacts {
             }
         }
         removeFiles(sessionId: sessionId)
-        return true
+        return imageCleanupScheduled
     }
 
     static func removeFiles(sessionId: String) {

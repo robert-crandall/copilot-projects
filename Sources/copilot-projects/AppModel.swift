@@ -902,10 +902,10 @@ final class AppModel: ObservableObject {
     /// remove its socket, and drop it from the model.
     private func destroySession(projectId pid: String, sessionId sid: String) {
         controllers[sid]?.terminalView.kittyImageCapture.disablePersistence()
-        guard SessionArtifacts.destroy(
+        _ = SessionArtifacts.destroy(
             sessionId: sid,
             kittyImageDiskStore: kittyImageDiskStore
-        ) else { return }
+        )
         closeSession(projectId: pid, sessionId: sid)
     }
 
@@ -1587,11 +1587,11 @@ final class AppModel: ObservableObject {
     func closeProject(_ pid: String) {
         guard let pi = projectIndex(pid) else { return }
         for session in projects[pi].sessions {
-            controllers[session.id]?.terminalView.kittyImageCapture.disablePersistence()
-            guard kittyImageDiskStore.tombstone(sessionId: session.id) else { return }
+            _ = kittyImageDiskStore.tombstone(sessionId: session.id)
         }
         let snapshot = Paths.dtachExecutable != nil ? ProcessTree.snapshot() : nil
         for session in projects[pi].sessions {
+            controllers[session.id]?.terminalView.kittyImageCapture.disablePersistence()
             SessionArtifacts.destroy(
                 sessionId: session.id,
                 snapshot: snapshot,
@@ -2674,7 +2674,7 @@ final class AppModel: ObservableObject {
         projects[loc.p].sessions[loc.s].backgroundAgentsActive = false
         backgroundAgentsSuppressed.remove(sessionId)
         let projectId = projects[loc.p].id
-        guard kittyImageDiskStore.tombstone(sessionId: sessionId) else { return }
+        _ = kittyImageDiskStore.tombstone(sessionId: sessionId)
         SessionArtifacts.removeFiles(sessionId: sessionId)
         closeSession(projectId: projectId, sessionId: sessionId)
     }
