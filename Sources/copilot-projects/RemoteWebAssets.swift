@@ -73,7 +73,15 @@ enum RemoteWebAssets {
               <span id="lease">view only</span>
             </div>
             <div id="terminal" role="region" aria-live="off"
-              aria-label="Terminal output" tabindex="0">Select a session</div>
+              aria-label="Terminal output" tabindex="0">
+              <div id="terminal-grid">
+                <div id="terminal-lines" class="terminal-lines">Select a session</div>
+                <div id="terminal-image-overlay" class="terminal-image-overlay"
+                  aria-hidden="true"></div>
+              </div>
+            </div>
+            <div id="terminal-cell-probe" class="terminal-cell-probe"
+              aria-hidden="true">MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM</div>
             <form id="input-form">
               <input id="input" autocomplete="off" autocapitalize="none" spellcheck="false"
                 aria-label="Command input" placeholder="Send a command">
@@ -270,13 +278,29 @@ enum RemoteWebAssets {
     button { background:#2c2c2c; color:#eee; border:1px solid #444; border-radius:6px;
       padding:7px 10px; }
     #lease { margin-left:auto; color:#999; font-size:12px; }
+    #terminal-pane { --terminal-font: 13px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; }
     #terminal { flex:1; min-height:0; overflow:auto; -webkit-overflow-scrolling:touch;
       overscroll-behavior:contain; margin:0; padding:10px; outline:none;
-      font: 13px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre;
-      touch-action:pan-y; }
+      font:var(--terminal-font); white-space:pre; touch-action:pan-y; }
     #terminal.terminal-scroll { touch-action:none; }
+    #terminal-grid { position:relative; min-width:max-content; }
+    .terminal-lines { position:relative; z-index:1; }
     .terminal-line { min-height:1.25em; }
     .terminal-link { color:#58a6ff; text-decoration:underline; text-underline-offset:2px; }
+    /* Persistent overlay: reconciled DOM nodes for on-screen terminal images
+       are added/moved/removed here without ever replacing `.terminal-lines`,
+       so an in-flight image load survives an unrelated text-only re-render.
+       `overflow:hidden` clips images to the terminal's own content area. */
+    .terminal-image-overlay { position:absolute; inset:0; overflow:hidden; z-index:2;
+      pointer-events:none; }
+    .terminal-image { position:absolute; top:0; left:0; pointer-events:none;
+      object-fit:contain; object-position:top left; }
+    /* Hidden fixed-length monospace probe used only to measure the terminal's
+       actual cell width (rect.width / probe length) and a line-height
+       fallback; `position:fixed` keeps it out of `#terminal`'s own scroll
+       area entirely rather than merely invisible inside it. */
+    .terminal-cell-probe { position:fixed; left:-9999px; top:-9999px; visibility:hidden;
+      white-space:pre; font:var(--terminal-font); pointer-events:none; }
     #notifications.enabled { color:#3fb950; border-color:#238636; }
     #notifications.unsupported, #notifications.denied { opacity:.55; }
     #input-form { flex:0 0 auto; display:flex; gap:8px; padding:8px; border-top:1px solid #333;
@@ -381,7 +405,8 @@ enum RemoteWebAssets {
       main { grid-template-columns: 92px minmax(0, 1fr); }
       nav { padding:4px; }
       nav button { padding:7px 5px; font-size:12px; }
-      #terminal { font-size:10px; padding:6px; }
+      #terminal, .terminal-cell-probe { font-size:10px; }
+      #terminal { padding:6px; }
       #toolbar button { padding:6px 8px; }
       #toolbar { flex-wrap:wrap; height:auto; }
       .pivot-tab { padding:6px 11px; }
@@ -1235,10 +1260,228 @@ enum RemoteWebAssets {
     }
     """#
 
+    // Terminal image rendering (Kitty inline image placements advertised via
+    // `RemoteTerminalScreen.images`). Kept isolated from DOM-touching code
+    // below so the validation/dedup/PNG/byte-cap logic can be exercised
+    // directly under Node without a DOM, mirroring `markdownJavascript`.
+    static let terminalImageJavascript = #"""
+    // A wire placement's `line`/`column` are relative to the emitted screen
+    // (see RemoteTerminalImagePlacement's doc comment); the host's full
+    // retained-history scan can report a placement above or below the
+    // emitted `lines` window, bounded by this same slack the host itself
+    // tolerates, so a client must accept (not reject) that bounded range
+    // rather than only ever trusting in-window placements.
+    const TERMINAL_IMAGE_RETAINED_LINE_SLACK = 1024;
+    // Mirrors the host's own `remoteKittyMaxEmittedPlacements` cap
+    // (RemoteKittyGraphics.swift) as defense-in-depth against a malformed or
+    // hostile payload, never relying solely on the host to have enforced it.
+    const TERMINAL_IMAGE_MAX_PLACEMENTS = 64;
+    const TERMINAL_IMAGE_MAX_RENDERED_NODES = 8;
+    const TERMINAL_IMAGE_FETCH_TIMEOUT_MS = 15_000;
+    const TERMINAL_IMAGE_MAX_IN_FLIGHT = 16;
+    const TERMINAL_IMAGE_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+    const TERMINAL_IMAGE_MAX_POSITIVE_CACHE_ENTRIES = 16;
+    const TERMINAL_IMAGE_MAX_POSITIVE_CACHE_BYTES = 24 * 1024 * 1024;
+    const TERMINAL_IMAGE_MAX_NEGATIVE_CACHE_ENTRIES = 128;
+    const TERMINAL_IMAGE_MAX_BACKOFF_ENTRIES = 128;
+    const TERMINAL_IMAGE_MAX_DECODED_PIXELS = 16_000_000;
+    const TERMINAL_IMAGE_MAX_DIMENSION = 4096;
+    const TERMINAL_IMAGE_MAX_PIXELS = 16_000_000;
+    const TERMINAL_IMAGE_BACKOFF_BASE_MS = 1000;
+    const TERMINAL_IMAGE_BACKOFF_MAX_MS = 30_000;
+
+    function terminalImageCacheKey(sessionId, imageId, version) {
+      return `${sessionId}:${imageId}:${version}`;
+    }
+
+    function terminalImageBackoffDelayMs(failureCount) {
+      const exponent = Math.max(0, failureCount - 1);
+      return Math.min(
+        TERMINAL_IMAGE_BACKOFF_BASE_MS * (2 ** exponent),
+        TERMINAL_IMAGE_BACKOFF_MAX_MS
+      );
+    }
+
+    // Validates one wire placement against the *emitted* screen it arrived
+    // with (never a cached/prior screen), converting its screen-relative
+    // `line` to an absolute, scroll-invariant line number. Returns `null` for
+    // anything unsafe rather than throwing, so one bad entry can't break the
+    // rest of an otherwise-valid authoritative array.
+    function validateTerminalImagePlacement(raw, screen) {
+      if (!raw || typeof raw !== 'object') return null;
+      const { imageId, contentVersion, contentVersionText, line, column, rows, columns } = raw;
+      if (!Number.isSafeInteger(imageId) || imageId < 1 || imageId > 0xFFFFFF) return null;
+      const exactVersion = typeof contentVersionText === 'string'
+        && /^[1-9][0-9]{0,19}$/.test(contentVersionText)
+        ? contentVersionText
+        : (Number.isSafeInteger(contentVersion) && contentVersion > 0
+          ? String(contentVersion) : null);
+      if (!exactVersion) return null;
+      if (!Number.isSafeInteger(rows) || rows <= 0 || rows > 1024) return null;
+      if (!Number.isSafeInteger(columns) || columns <= 0) return null;
+      if (!Number.isSafeInteger(column) || column < 0) return null;
+      if (!Number.isSafeInteger(line)) return null;
+      const linesLength = Array.isArray(screen?.lines) ? screen.lines.length : 0;
+      const lowerBound = -TERMINAL_IMAGE_RETAINED_LINE_SLACK;
+      const upperBound = linesLength + TERMINAL_IMAGE_RETAINED_LINE_SLACK;
+      if (line < lowerBound || line >= upperBound) return null;
+      const rightEdge = column + columns;
+      if (!Number.isSafeInteger(rightEdge) || rightEdge > screen.cols) return null;
+      if (!Number.isSafeInteger(screen?.firstLine)) return null;
+      const absoluteLine = screen.firstLine + line;
+      if (!Number.isSafeInteger(absoluteLine)) return null;
+      const bottomEdge = absoluteLine + rows;
+      if (!Number.isSafeInteger(bottomEdge)) return null;
+      return {
+        imageId,
+        contentVersion: exactVersion,
+        absoluteLine,
+        column,
+        rows,
+        columns,
+        key: `${imageId}:${exactVersion}:${absoluteLine}:${column}:${rows}:${columns}`
+      };
+    }
+
+    // Deterministic validate + dedupe + cap: processes the wire array in
+    // order, keeps the first occurrence of each distinct placement, and stops
+    // once the cap is reached — so the same input always yields the same
+    // output regardless of platform/engine.
+    function buildTerminalImagePlacements(screen) {
+      const raw = Array.isArray(screen?.images) ? screen.images : [];
+      const seen = new Set();
+      const result = [];
+      for (const item of raw) {
+        if (result.length >= TERMINAL_IMAGE_MAX_PLACEMENTS) break;
+        const placement = validateTerminalImagePlacement(item, screen);
+        if (!placement || seen.has(placement.key)) continue;
+        seen.add(placement.key);
+        result.push(placement);
+      }
+      return result;
+    }
+
+    // Structural PNG validation performed on the raw bytes *before* they're
+    // ever wrapped in a Blob/object URL or handed to the browser's own image
+    // decoder: signature, a well-formed IHDR immediately following it, and
+    // sane/bounded dimensions. Returns `{width, height}` or `null`.
+    function validateTerminalImagePngBytes(bytes) {
+      if (!bytes || typeof bytes.length !== 'number' || bytes.length < 8 + 8 + 13) return null;
+      const signature = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+      for (let index = 0; index < 8; index += 1) {
+        if (bytes[index] !== signature[index]) return null;
+      }
+      const readUInt32BE = (offset) => (
+        (bytes[offset] * 0x1000000)
+        + (bytes[offset + 1] << 16)
+        + (bytes[offset + 2] << 8)
+        + bytes[offset + 3]
+      );
+      const chunkLength = readUInt32BE(8);
+      const chunkType = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+      if (chunkType !== 'IHDR' || chunkLength !== 13) return null;
+      const width = readUInt32BE(16);
+      const height = readUInt32BE(20);
+      if (!(width > 0) || !(height > 0)) return null;
+      if (width > TERMINAL_IMAGE_MAX_DIMENSION || height > TERMINAL_IMAGE_MAX_DIMENSION) return null;
+      const pixels = width * height;
+      if (!Number.isSafeInteger(pixels) || pixels > TERMINAL_IMAGE_MAX_PIXELS) return null;
+      return { width, height };
+    }
+
+    // Streams a fetch `Response` body into a single `Uint8Array`, rejecting
+    // as soon as either a declared `Content-Length` or the actual streamed
+    // total exceeds `maxBytes` — a chunked/unknown-length response can't
+    // bypass the cap simply by omitting the header.
+    async function readBoundedTerminalImageBody(response, maxBytes) {
+      const declaredLength = Number(response.headers?.get?.('content-length'));
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        throw new Error('terminal-image-too-large');
+      }
+      const reader = response.body?.getReader ? response.body.getReader() : null;
+      if (!reader) {
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength > maxBytes) throw new Error('terminal-image-too-large');
+        return new Uint8Array(buffer);
+      }
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error('terminal-image-too-large');
+        }
+        chunks.push(value);
+      }
+      const combined = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return combined;
+    }
+
+    // Fetches and fully validates one image's exact PNG bytes. Throws an
+    // `Error` tagged `error.code`: `'not-found'` only for an exact HTTP 404
+    // (permanently cacheable — the host never repurposes an `(imageId,
+    // version)` pair), `'transient'` for everything else recoverable (5xx,
+    // unexpected content type, oversized/streamed-cap, structurally invalid
+    // PNG) so callers apply a bounded cooldown instead of a permanent
+    // negative cache entry.
+    async function fetchTerminalImageBytes(baseURL, sessionId, imageId, version, signal) {
+      const query = new URLSearchParams({
+        s: sessionId, i: String(imageId), v: String(version)
+      });
+      const response = await fetch(`${baseURL}terminal-image?${query.toString()}`, {
+        signal,
+        credentials: 'same-origin'
+      });
+      if (response.status === 404) {
+        const error = new Error('terminal-image-not-found');
+        error.code = 'not-found';
+        throw error;
+      }
+      if (!response.ok) {
+        const error = new Error(`terminal-image-http-${response.status}`);
+        error.code = 'transient';
+        throw error;
+      }
+      const contentType = (response.headers?.get?.('content-type') || '').toLowerCase();
+      if (contentType && !contentType.startsWith('image/png')) {
+        const error = new Error('terminal-image-unexpected-content-type');
+        error.code = 'transient';
+        throw error;
+      }
+      let bytes;
+      try {
+        bytes = await readBoundedTerminalImageBody(response, TERMINAL_IMAGE_MAX_RESPONSE_BYTES);
+      } catch {
+        const error = new Error('terminal-image-too-large');
+        error.code = 'transient';
+        throw error;
+      }
+      const dimensions = validateTerminalImagePngBytes(bytes);
+      if (!dimensions) {
+        const error = new Error('terminal-image-invalid-png');
+        error.code = 'transient';
+        throw error;
+      }
+      return { bytes, width: dimensions.width, height: dimensions.height };
+    }
+    """#
+
     static let javascript =
-        markdownJavascript + draftJavascript + sessionCreationJavascript + #"""
+        markdownJavascript + draftJavascript + sessionCreationJavascript
+        + terminalImageJavascript + #"""
     const sessions = document.querySelector('#sessions');
     const terminal = document.querySelector('#terminal');
+    const terminalLines = document.querySelector('#terminal-lines');
+    const terminalImageOverlay = document.querySelector('#terminal-image-overlay');
+    const terminalCellProbe = document.querySelector('#terminal-cell-probe');
     const connection = document.querySelector('#connection');
     const lease = document.querySelector('#lease');
     const input = document.querySelector('#input');
@@ -1291,6 +1534,45 @@ enum RemoteWebAssets {
     let lastScreen = null;
     let historyStartLine = 0;
     let historyLines = [];
+    // Retained terminal-image placement state: authoritative snapshot from
+    // the most recent screen event that included a present `images` array
+    // (see buildTerminalImagePlacements), filtered down to whatever's still
+    // inside the actually-retained line range after every text update.
+    let imagePlacements = [];
+    // key -> {el, placement, cacheKey, pixels}. Persistent across renders:
+    // `renderLines` never destroys these, only `reconcileImageOverlay` adds/
+    // repositions/removes them, keyed by a stable placement identity so an
+    // unchanged, still-visible placement's node/img fetch survives.
+    const terminalImageNodes = new Map();
+    // sessionId:imageId:version -> {url, bytes, width, height, activeNodeCount, lastUsed}
+    const terminalImagePositiveCache = new Map();
+    // Exact-match permanently-negative keys (404 only). Insertion-ordered Set
+    // so the oldest entry can be evicted once the bound is exceeded.
+    const terminalImageNegativeCache = new Set();
+    // Exact immutable PNG bytes that passed structural validation but the
+    // browser decoder rejected. Bounded and permanent for this auth lifetime:
+    // re-fetching the same version cannot change the result.
+    const terminalImageDecodeFailures = new Set();
+    // Images skipped solely because every cache entry was actively visible.
+    // These retry only after a real capacity change (node release/eviction),
+    // never on a timer that would redownload bytes into the same full cache.
+    const terminalImageCapacityBlocked = new Set();
+    // key -> {failureCount, nextAttemptAt}: bounded cooldown for transient
+    // (non-404) failures, distinct from the permanent negative cache.
+    const terminalImageBackoff = new Map();
+    const terminalImageRetryTimers = new Map();
+    // key -> {controller, promise}
+    const terminalImageInFlight = new Map();
+    // key -> number of visible nodes waiting to mount a completed cache entry.
+    // Eviction treats these entries as active even before `img.src` is set.
+    const terminalImagePendingConsumers = new Map();
+    // Bumped only on session change/terminal refresh/full auth reset — an
+    // ordinary incremental screen update never bumps this, so an in-flight
+    // fetch survives an unrelated text-only re-render and reconciles against
+    // whatever the current state is once it resolves.
+    let terminalImageGeneration = 0;
+    let terminalActiveDecodedPixels = 0;
+    let terminalImageReconcileScheduled = false;
     let pendingScroll = 0;
     let scrollTimer = null;
     let touchY = null;
@@ -1352,7 +1634,8 @@ enum RemoteWebAssets {
       clearTimeout(scrollTimer);
       scrollTimer = null;
       terminal.classList.remove('terminal-scroll');
-      terminal.textContent = selected ? 'Loading…' : 'Select a session';
+      terminalLines.textContent = selected ? 'Loading…' : 'Select a session';
+      resetTerminalImagesForSessionChange();
       if (selected) openStream();
     }
     function setViewMode(mode, options) {
@@ -1390,6 +1673,7 @@ enum RemoteWebAssets {
           );
           if (now - lastReload > 60_000) {
             sessionStorage.setItem('copilot-projects-auth-reload', String(now));
+            resetTerminalImagesForSignOut();
             setTimeout(() => location.reload(), 1000);
           }
         }
@@ -1578,7 +1862,8 @@ enum RemoteWebAssets {
       scrollTimer = null;
       resetUserInputCards();
       lease.textContent = 'view only';
-      terminal.textContent = 'Loading…';
+      terminalLines.textContent = 'Loading…';
+      resetTerminalImagesForSessionChange();
       const loadingTranscript = document.createElement('div');
       loadingTranscript.className = 'transcript-empty';
       loadingTranscript.textContent = 'Loading completed turns…';
@@ -2187,14 +2472,398 @@ enum RemoteWebAssets {
       }
     }
 
+    // Line height prefers an actually-rendered `.terminal-line` (the real,
+    // current font metrics); falls back to the hidden probe (e.g. before any
+    // line has ever rendered), then a nonzero hardcoded default so a
+    // measurement glitch can never divide-by-zero downstream.
+    function measuredLineHeight() {
+      const rendered = terminalLines.querySelector('.terminal-line')
+        ?.getBoundingClientRect().height;
+      if (rendered && rendered > 0) return rendered;
+      const probe = terminalCellProbe?.getBoundingClientRect().height;
+      if (probe && probe > 0) return probe;
+      return 16;
+    }
+    // Cell width has no equivalent "real rendered line" source (a line's
+    // width varies with its content), so it's always measured from the
+    // dedicated fixed-length probe.
+    const TERMINAL_CELL_PROBE_LENGTH = 32;
+    function measuredCellWidth() {
+      const rect = terminalCellProbe?.getBoundingClientRect();
+      if (rect && rect.width > 0) return rect.width / TERMINAL_CELL_PROBE_LENGTH;
+      return 8;
+    }
+
+    function terminalImageBackoffActive(key) {
+      const entry = terminalImageBackoff.get(key);
+      if (!entry || entry.nextAttemptAt <= Date.now()) return false;
+      scheduleTerminalImageRetry(key, entry.nextAttemptAt, terminalImageGeneration);
+      return true;
+    }
+
+    function scheduleTerminalImageRetry(key, nextAttemptAt, generation) {
+      clearTimeout(terminalImageRetryTimers.get(key));
+      const delay = Math.max(0, nextAttemptAt - Date.now());
+      const timer = setTimeout(() => {
+        terminalImageRetryTimers.delete(key);
+        if (terminalImageGeneration !== generation || !selected) return;
+        const stillCurrent = imagePlacements.some((placement) => (
+          terminalImageCacheKey(
+            selected, placement.imageId, placement.contentVersion
+          ) === key
+        ));
+        if (stillCurrent) scheduleTerminalImageReconcile();
+      }, delay);
+      terminalImageRetryTimers.set(key, timer);
+    }
+
+    function setTerminalImageBackoff(key, failureCount, generation) {
+      const nextAttemptAt = Date.now() + terminalImageBackoffDelayMs(failureCount);
+      terminalImageBackoff.delete(key);
+      terminalImageBackoff.set(key, { failureCount, nextAttemptAt });
+      while (terminalImageBackoff.size > TERMINAL_IMAGE_MAX_BACKOFF_ENTRIES) {
+        const oldest = terminalImageBackoff.keys().next().value;
+        terminalImageBackoff.delete(oldest);
+        clearTimeout(terminalImageRetryTimers.get(oldest));
+        terminalImageRetryTimers.delete(oldest);
+      }
+      scheduleTerminalImageRetry(key, nextAttemptAt, generation);
+    }
+
+    function terminalImagePositiveCacheBytes() {
+      let total = 0;
+      terminalImagePositiveCache.forEach((entry) => { total += entry.bytes; });
+      return total;
+    }
+
+    // Only ever revokes/evicts entries with `activeNodeCount === 0` — an
+    // entry currently referenced by a visible `<img>` node is never a
+    // candidate, no matter how stale, so eviction can never pull a blob URL
+    // out from under something on screen.
+    function makeRoomInTerminalImagePositiveCache(extraBytes) {
+      const withinBudget = () => (
+        terminalImagePositiveCache.size < TERMINAL_IMAGE_MAX_POSITIVE_CACHE_ENTRIES
+        && terminalImagePositiveCacheBytes() + extraBytes <= TERMINAL_IMAGE_MAX_POSITIVE_CACHE_BYTES
+      );
+      if (withinBudget()) return true;
+      let evictedAny = false;
+      const evictable = [...terminalImagePositiveCache.entries()]
+        .filter(([key, entry]) => entry.activeNodeCount === 0
+          && (terminalImagePendingConsumers.get(key) || 0) === 0)
+        .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+      for (const [key, entry] of evictable) {
+        URL.revokeObjectURL(entry.url);
+        terminalImagePositiveCache.delete(key);
+        evictedAny = true;
+        if (withinBudget()) {
+          if (evictedAny) retryCapacityBlockedTerminalImages();
+          return true;
+        }
+      }
+      if (evictedAny) retryCapacityBlockedTerminalImages();
+      return withinBudget();
+    }
+
+    function addTerminalImageNegativeCacheEntry(key) {
+      terminalImageNegativeCache.delete(key);
+      terminalImageNegativeCache.add(key);
+      while (terminalImageNegativeCache.size > TERMINAL_IMAGE_MAX_NEGATIVE_CACHE_ENTRIES) {
+        const oldest = terminalImageNegativeCache.values().next().value;
+        terminalImageNegativeCache.delete(oldest);
+      }
+    }
+
+    function addBoundedTerminalImageKey(set, key) {
+      set.delete(key);
+      set.add(key);
+      while (set.size > TERMINAL_IMAGE_MAX_NEGATIVE_CACHE_ENTRIES) {
+        set.delete(set.values().next().value);
+      }
+    }
+
+    function blockTerminalImageOnCapacity(key) {
+      addBoundedTerminalImageKey(terminalImageCapacityBlocked, key);
+    }
+
+    function retryCapacityBlockedTerminalImages() {
+      if (!terminalImageCapacityBlocked.size) return;
+      terminalImageCapacityBlocked.clear();
+      scheduleTerminalImageReconcile();
+    }
+
+    // Bounded loader: at most `TERMINAL_IMAGE_MAX_IN_FLIGHT` concurrent
+    // requests, a 15s abort timeout, and every terminal outcome (positive,
+    // permanent 404, or transient cooldown) recorded so repeated
+    // reconciliation passes never refetch something already known-bad this
+    // soon. Resolves to the cache entry, or `null` if the image isn't
+    // currently available (never rejects).
+    function loadTerminalImage(sessionId, placement) {
+      const key = terminalImageCacheKey(sessionId, placement.imageId, placement.contentVersion);
+      const cached = terminalImagePositiveCache.get(key);
+      if (cached) {
+        cached.lastUsed = Date.now();
+        return Promise.resolve(cached);
+      }
+      if (terminalImageNegativeCache.has(key)) return Promise.resolve(null);
+      if (terminalImageDecodeFailures.has(key)) return Promise.resolve(null);
+      if (terminalImageCapacityBlocked.has(key)) return Promise.resolve(null);
+      if (terminalImageBackoffActive(key)) return Promise.resolve(null);
+      const existing = terminalImageInFlight.get(key);
+      if (existing) return existing.promise;
+      if (terminalImageInFlight.size >= TERMINAL_IMAGE_MAX_IN_FLIGHT) {
+        return Promise.resolve(null);
+      }
+      if (!makeRoomInTerminalImagePositiveCache(0)) {
+        // No cache room and nothing inactive to evict for it: skip the fetch
+        // entirely until a node release makes a real entry evictable.
+        blockTerminalImageOnCapacity(key);
+        return Promise.resolve(null);
+      }
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), TERMINAL_IMAGE_FETCH_TIMEOUT_MS);
+      const generation = terminalImageGeneration;
+      const promise = fetchTerminalImageBytes(
+        base, sessionId, placement.imageId, placement.contentVersion, controller.signal
+      ).then((result) => {
+        if (terminalImageGeneration !== generation) return null;
+        if (!makeRoomInTerminalImagePositiveCache(result.bytes.byteLength)) {
+          blockTerminalImageOnCapacity(key);
+          return null;
+        }
+        const url = URL.createObjectURL(new Blob([result.bytes], { type: 'image/png' }));
+        const entry = {
+          url,
+          bytes: result.bytes.byteLength,
+          width: result.width,
+          height: result.height,
+          activeNodeCount: 0,
+          lastUsed: Date.now()
+        };
+        terminalImagePositiveCache.set(key, entry);
+        terminalImageBackoff.delete(key);
+        clearTimeout(terminalImageRetryTimers.get(key));
+        terminalImageRetryTimers.delete(key);
+        return entry;
+      }).catch((error) => {
+        if (terminalImageGeneration !== generation) return null;
+        if (error?.code === 'not-found') {
+          addTerminalImageNegativeCacheEntry(key);
+        } else {
+          const failureCount = (terminalImageBackoff.get(key)?.failureCount || 0) + 1;
+          setTerminalImageBackoff(key, failureCount, generation);
+        }
+        return null;
+      }).finally(() => {
+        clearTimeout(timeoutId);
+        if (terminalImageInFlight.get(key)?.promise === promise) {
+          terminalImageInFlight.delete(key);
+        }
+        if (terminalImageGeneration === generation) {
+          scheduleTerminalImageReconcile();
+        }
+      });
+      terminalImageInFlight.set(key, { controller, promise });
+      return promise;
+    }
+
+    // Invalidates a shared cache entry after a real browser decode failure
+    // (structurally-valid-but-undecodable PNG bytes): revokes its one object
+    // URL exactly once and clears it from every node currently displaying it,
+    // so nothing visible is left pointing at a revoked URL.
+    function invalidateTerminalImageCacheEntry(key) {
+      const entry = terminalImagePositiveCache.get(key);
+      if (entry) {
+        URL.revokeObjectURL(entry.url);
+        terminalImagePositiveCache.delete(key);
+      }
+      addBoundedTerminalImageKey(terminalImageDecodeFailures, key);
+      terminalImageNodes.forEach((node) => {
+        if (node.cacheKey !== key) return;
+        terminalActiveDecodedPixels = Math.max(0, terminalActiveDecodedPixels - node.pixels);
+        node.cacheKey = null;
+        node.pixels = 0;
+        node.el.removeAttribute('src');
+      });
+      retryCapacityBlockedTerminalImages();
+    }
+
+    function mountTerminalImageSource(node, cacheEntry, key) {
+      node.cacheKey = key;
+      node.pixels = cacheEntry.width * cacheEntry.height;
+      cacheEntry.activeNodeCount += 1;
+      cacheEntry.lastUsed = Date.now();
+      terminalActiveDecodedPixels += node.pixels;
+      node.el.onerror = () => invalidateTerminalImageCacheEntry(key);
+      node.el.src = cacheEntry.url;
+    }
+
+    // Kicks off (or reuses) the bounded load for one placement. Safe to call
+    // repeatedly (every reconciliation pass) for a node that isn't mounted
+    // yet — `loadTerminalImage` itself is cheap once cached/negative/backed
+    // off. The async continuation re-checks *current* state before touching
+    // anything: a full session/generation change drops it outright, but an
+    // unrelated text-only render in between must not — it reconciles against
+    // whatever node/placement is current for this key at completion time.
+    function attachTerminalImageSource(node, placement) {
+      if (node.cacheKey || node.loadingKey || !selected) return;
+      const sessionId = selected;
+      const generation = terminalImageGeneration;
+      const key = terminalImageCacheKey(
+        sessionId, placement.imageId, placement.contentVersion
+      );
+      node.loadingKey = key;
+      terminalImagePendingConsumers.set(
+        key, (terminalImagePendingConsumers.get(key) || 0) + 1
+      );
+      loadTerminalImage(sessionId, placement).then((cacheEntry) => {
+        if (terminalImageGeneration !== generation) return;
+        const current = terminalImageNodes.get(placement.key);
+        if (!current || current.el !== node.el || current.cacheKey
+            || current.loadingKey !== key) return;
+        if (!cacheEntry) return;
+        if (terminalImagePositiveCache.get(key) !== cacheEntry) return;
+        const pixels = cacheEntry.width * cacheEntry.height;
+        if (terminalActiveDecodedPixels + pixels > TERMINAL_IMAGE_MAX_DECODED_PIXELS) return;
+        mountTerminalImageSource(current, cacheEntry, key);
+      }).finally(() => {
+        const remaining = Math.max(
+          0, (terminalImagePendingConsumers.get(key) || 1) - 1
+        );
+        if (remaining) terminalImagePendingConsumers.set(key, remaining);
+        else terminalImagePendingConsumers.delete(key);
+        if (node.loadingKey === key) node.loadingKey = null;
+      });
+    }
+
+    function createTerminalImageNode(placement) {
+      const el = document.createElement('img');
+      el.className = 'terminal-image';
+      el.alt = '';
+      el.draggable = false;
+      el.setAttribute('aria-hidden', 'true');
+      terminalImageOverlay.append(el);
+      const node = { el, cacheKey: null, loadingKey: null, pixels: 0 };
+      attachTerminalImageSource(node, placement);
+      return node;
+    }
+
+    function releaseTerminalImageNode(node) {
+      node.el.remove();
+      if (node.cacheKey) {
+        const cacheEntry = terminalImagePositiveCache.get(node.cacheKey);
+        if (cacheEntry) {
+          cacheEntry.activeNodeCount = Math.max(0, cacheEntry.activeNodeCount - 1);
+        }
+        terminalActiveDecodedPixels = Math.max(0, terminalActiveDecodedPixels - node.pixels);
+      }
+      retryCapacityBlockedTerminalImages();
+    }
+
+    function terminalImageViewportRange() {
+      const lineHeight = measuredLineHeight();
+      const start = historyStartLine + Math.floor(terminal.scrollTop / lineHeight);
+      const end = start + Math.ceil(terminal.clientHeight / lineHeight) + 1;
+      return { start, end };
+    }
+
+    function visibleTerminalImagePlacements() {
+      const { start, end } = terminalImageViewportRange();
+      const cellWidth = measuredCellWidth();
+      const firstColumn = Math.max(0, Math.floor(terminal.scrollLeft / cellWidth));
+      const lastColumn = firstColumn + Math.ceil(terminal.clientWidth / cellWidth) + 1;
+      return imagePlacements
+        .filter((placement) => placement.absoluteLine < end
+          && placement.absoluteLine + placement.rows > start
+          && placement.column < lastColumn
+          && placement.column + placement.columns > firstColumn)
+        .slice(0, TERMINAL_IMAGE_MAX_RENDERED_NODES);
+    }
+
+    // Renders/reconciles at most `TERMINAL_IMAGE_MAX_RENDERED_NODES` actual
+    // DOM nodes based on the current viewport: nodes for placements that
+    // fell out of view are removed, nodes for still-visible placements are
+    // repositioned in place (never recreated) by their stable key, and newly
+    // visible placements get a fresh node.
+    function reconcileTerminalImageOverlay() {
+      const visible = visibleTerminalImagePlacements();
+      const nextKeys = new Set(visible.map((placement) => placement.key));
+      [...terminalImageNodes.entries()].forEach(([key, node]) => {
+        if (!nextKeys.has(key)) {
+          releaseTerminalImageNode(node);
+          terminalImageNodes.delete(key);
+        }
+      });
+      const cellWidth = measuredCellWidth();
+      const lineHeight = measuredLineHeight();
+      visible.forEach((placement) => {
+        let node = terminalImageNodes.get(placement.key);
+        if (!node) {
+          node = createTerminalImageNode(placement);
+          terminalImageNodes.set(placement.key, node);
+        } else {
+          attachTerminalImageSource(node, placement);
+        }
+        node.el.style.top = `${(placement.absoluteLine - historyStartLine) * lineHeight}px`;
+        node.el.style.left = `${placement.column * cellWidth}px`;
+        node.el.style.width = `${placement.columns * cellWidth}px`;
+        node.el.style.height = `${placement.rows * lineHeight}px`;
+      });
+    }
+
+    function scheduleTerminalImageReconcile() {
+      if (terminalImageReconcileScheduled) return;
+      terminalImageReconcileScheduled = true;
+      requestAnimationFrame(() => {
+        terminalImageReconcileScheduled = false;
+        reconcileTerminalImageOverlay();
+      });
+    }
+
+    // Clears placement state and every currently-mounted overlay node, but
+    // leaves the positive/negative/backoff caches alone — a session switch
+    // may switch right back, and cached bytes/outcomes for a still-live
+    // session remain valid.
+    function clearTerminalImageDisplayState() {
+      [...terminalImageNodes.values()].forEach(releaseTerminalImageNode);
+      terminalImageNodes.clear();
+      imagePlacements = [];
+      terminalActiveDecodedPixels = 0;
+      terminalImageOverlay.replaceChildren();
+    }
+
+    // Session change / terminal refresh: bump the generation so any
+    // completion still in flight for the *previous* session can never
+    // repopulate cleared state, then abort every in-flight request — none of
+    // them can possibly belong to the session we're switching to, since it
+    // hasn't requested anything yet.
+    function resetTerminalImagesForSessionChange() {
+      terminalImageGeneration += 1;
+      terminalImageInFlight.forEach((request) => request.controller.abort());
+      terminalImageInFlight.clear();
+      terminalImagePendingConsumers.clear();
+      clearTerminalImageDisplayState();
+    }
+
+    // Full auth reset / sign-out: additionally revoke every retained object
+    // URL and wipe every cache, so nothing survives into whatever session
+    // reconnects next.
+    function resetTerminalImagesForSignOut() {
+      resetTerminalImagesForSessionChange();
+      terminalImagePositiveCache.forEach((entry) => URL.revokeObjectURL(entry.url));
+      terminalImagePositiveCache.clear();
+      terminalImageNegativeCache.clear();
+      terminalImageDecodeFailures.clear();
+      terminalImageCapacityBlocked.clear();
+      terminalImageBackoff.clear();
+      terminalImageRetryTimers.forEach(clearTimeout);
+      terminalImageRetryTimers.clear();
+    }
+
     function renderLines(screen) {
       const wasAtBottom =
         terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 12;
       const previousTop = historyStartLine + Math.floor(
-        terminal.scrollTop / Math.max(
-          terminal.querySelector('.terminal-line')?.getBoundingClientRect().height || 16,
-          1
-        )
+        terminal.scrollTop / measuredLineHeight()
       );
 
       if (screen.scrollMode === 'terminal' || screen.reset || !lastScreen
@@ -2220,6 +2889,24 @@ enum RemoteWebAssets {
         historyLines.pop();
       }
 
+      // Authoritative on any modern host (a present `images` array, `[]`
+      // included) fully replaces placement state every screen event, live or
+      // incremental history alike; only an old host that omits the field
+      // entirely (`images == null`) leaves prior placement state untouched.
+      if (Array.isArray(screen.images)) {
+        imagePlacements = buildTerminalImagePlacements(screen);
+      }
+      // Whichever branch above ran, bound placement state to the line range
+      // this client actually still retains — including the reset branch a
+      // few lines up, where `historyStartLine`/`historyLines` were just
+      // replaced wholesale.
+      const retainedStart = historyStartLine;
+      const retainedEnd = historyStartLine + historyLines.length;
+      imagePlacements = imagePlacements.filter((placement) => (
+        placement.absoluteLine < retainedEnd
+        && placement.absoluteLine + placement.rows > retainedStart
+      ));
+
       const fragment = document.createDocumentFragment();
       historyLines.forEach((line) => {
         const row = document.createElement('div');
@@ -2227,13 +2914,10 @@ enum RemoteWebAssets {
         appendLinkedText(row, line);
         fragment.append(row);
       });
-      terminal.replaceChildren(fragment);
+      terminalLines.replaceChildren(fragment);
       terminal.classList.toggle('terminal-scroll', screen.scrollMode === 'terminal');
 
-      const lineHeight = Math.max(
-        terminal.querySelector('.terminal-line')?.getBoundingClientRect().height || 16,
-        1
-      );
+      const lineHeight = measuredLineHeight();
       const saved = selected && sessionScroll.get(selected);
       if (screen.scrollMode === 'terminal' || wasAtBottom || saved?.atBottom) {
         terminal.scrollTop = terminal.scrollHeight;
@@ -2242,15 +2926,14 @@ enum RemoteWebAssets {
         terminal.scrollTop = Math.max(0, topLine - historyStartLine) * lineHeight;
       }
       lastScreen = screen;
+      scheduleTerminalImageReconcile();
     }
 
     const sessionScroll = new Map();
     terminal.addEventListener('scroll', () => {
+      scheduleTerminalImageReconcile();
       if (!selected || lastScreen?.scrollMode !== 'history') return;
-      const lineHeight = Math.max(
-        terminal.querySelector('.terminal-line')?.getBoundingClientRect().height || 16,
-        1
-      );
+      const lineHeight = measuredLineHeight();
       const atBottom =
         terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 12;
       sessionScroll.set(selected, {
@@ -2258,6 +2941,7 @@ enum RemoteWebAssets {
         topLine: historyStartLine + Math.floor(terminal.scrollTop / lineHeight)
       });
     });
+    window.addEventListener('resize', () => scheduleTerminalImageReconcile());
 
     function requestTerminalScroll(delta) {
       if (!selected || !writable || lastScreen?.scrollMode !== 'terminal') return;

@@ -432,7 +432,7 @@ struct RemoteRequestAuth: Sendable {
 
 private let remoteCSP =
     "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; "
-    + "worker-src 'self'; manifest-src 'self'; img-src 'self'; "
+    + "worker-src 'self'; manifest-src 'self'; img-src 'self' blob:; "
     + "frame-ancestors 'none'; base-uri 'none'"
 // Remote answers are nested JSON; an 8 KiB raw answer can expand substantially
 // when control characters are escaped in the inner payload and outer envelope.

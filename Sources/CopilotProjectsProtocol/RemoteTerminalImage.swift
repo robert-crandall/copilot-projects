@@ -22,6 +22,11 @@ public enum RemoteTerminalImageContract {
 public struct RemoteTerminalImagePlacement: Codable, Equatable, Sendable {
     public let imageId: UInt32
     public let contentVersion: UInt64
+    /// Decimal representation of `contentVersion` for clients whose native
+    /// number type cannot exactly represent every UInt64 (notably JavaScript).
+    /// Additive/backward-compatible: native clients continue using the numeric
+    /// field, while web clients use this exact string for cache keys and URLs.
+    public let contentVersionText: String?
     public let line: Int
     public let column: Int
     public let rows: Int
@@ -37,6 +42,7 @@ public struct RemoteTerminalImagePlacement: Codable, Equatable, Sendable {
     ) {
         self.imageId = imageId
         self.contentVersion = contentVersion
+        self.contentVersionText = String(contentVersion)
         self.line = line
         self.column = column
         self.rows = rows
