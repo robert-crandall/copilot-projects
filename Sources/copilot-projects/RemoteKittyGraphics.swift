@@ -1778,6 +1778,28 @@ final class RemoteKittyImageCapture {
                 rows: dims.rows, columns: dims.columns, x: dims.x, y: dims.y, z: dims.z
             ))
         }
+        if wildcardActiveImageIds.contains(imageId) {
+            for (key, dims) in placementDimensions
+                where key.imageId == imageId {
+                guard let placementId = key.placementId,
+                      !deletedPlacements.contains(PlacementKey(
+                          imageId: imageId,
+                          placementId: placementId
+                      )),
+                      dims.rows > 0,
+                      dims.columns > 0
+                else { continue }
+                selections.append(RemoteKittyPersistedPlacementSelection(
+                    version: version,
+                    placementId: placementId,
+                    rows: dims.rows,
+                    columns: dims.columns,
+                    x: dims.x,
+                    y: dims.y,
+                    z: dims.z
+                ))
+            }
+        }
         for key in exactActivePlacements where key.imageId == imageId {
             guard let dims = placementDimensions[PlacementGeometryKey(
                 imageId: imageId,
@@ -1842,6 +1864,7 @@ final class RemoteKittyImageCapture {
         order.append(key)
         dataByKey[key] = data
         totalBytes += data.count
+        latestVersion[imageId] = version
         pendingBudgetRegistrations.append(key)
         return true
     }

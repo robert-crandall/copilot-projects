@@ -239,14 +239,23 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
     func beginTerminationDrain() {
         isDrainingForTermination = true
         terminalView.flushImageRestoreBufferForTermination()
-        terminalView.terminate()
     }
 
     @MainActor
     func finishTerminationDrain() async {
+        await waitForTerminalOutputToQuiesce(maxTicks: 50)
+        terminalView.terminate()
+        await waitForTerminalOutputToQuiesce(maxTicks: 10)
+        terminalView.kittyImageCapture.disablePersistence()
+        terminalView.cancelImageRestore()
+        isDrainingForTermination = false
+    }
+
+    @MainActor
+    private func waitForTerminalOutputToQuiesce(maxTicks: Int) async {
         var lastGeneration = terminalView.remoteContentGeneration
         var quietTicks = 0
-        for _ in 0 ..< 50 {
+        for _ in 0 ..< maxTicks {
             try? await Task.sleep(for: .milliseconds(20))
             let generation = terminalView.remoteContentGeneration
             if generation == lastGeneration {
@@ -257,9 +266,6 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate {
                 quietTicks = 0
             }
         }
-        terminalView.kittyImageCapture.disablePersistence()
-        terminalView.cancelImageRestore()
-        isDrainingForTermination = false
     }
 
     /// Whether a recorded Copilot session id is a strict UUID (the only form the

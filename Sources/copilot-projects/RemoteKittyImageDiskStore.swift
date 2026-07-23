@@ -681,6 +681,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         guard persistManifest() else {
             manifest = originalManifest
             refreshSessionIndexLocked()
+            failClosedSessionAfterPersistenceFailure(sessionId)
             return false
         }
         for entry in removed {

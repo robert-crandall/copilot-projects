@@ -258,11 +258,10 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         for selection in currentSelections {
             terminal.feed(byteArray: RemoteKittyReplayEncoding.placementFrame(
                 imageId: selection.imageId,
-                // SwiftTerm treats p=0 as "unset" and allocates a fresh id on
-                // every replay. A stable positive id replaces the prior
-                // implicit record instead of leaking one per buffer switch;
-                // placeholder cells with id 0 intentionally match any record.
-                placementId: selection.placementId ?? 1,
+                placementId: replayPlacementId(
+                    for: selection,
+                    among: currentSelections
+                ),
                 rows: selection.rows,
                 columns: selection.columns,
                 x: selection.x,
@@ -272,6 +271,23 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
         }
         restoredPlacementBufferWasAlternate = activeBufferIsAlternate
         refreshSurface()
+    }
+
+    private func replayPlacementId(
+        for selection: RemoteKittyRestoredSelection,
+        among selections: [RemoteKittyRestoredSelection]
+    ) -> UInt32 {
+        if let placementId = selection.placementId, placementId > 0 {
+            return placementId
+        }
+        let explicitIds = Set(selections.compactMap {
+            $0.imageId == selection.imageId ? $0.placementId : nil
+        })
+        var candidate = UInt32.max
+        while explicitIds.contains(candidate), candidate > 1 {
+            candidate -= 1
+        }
+        return candidate
     }
 
     var restoredPlacementBufferWasAlternateForTesting: Bool? {

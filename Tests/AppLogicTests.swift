@@ -12102,6 +12102,54 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteKittyImageCaptureRestoredTransmitOnlyImageCanBePlacedLater() {
+        let capture = remoteKittyTestCapture()
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.beginRestoring()
+        XCTAssertTrue(capture.restoreEntry(imageId: 12, version: 99, data: png))
+        capture.finishRestoring()
+
+        capture.ingest(ArraySlice(remoteKittyFrameBytes(
+            control: "a=p,U=1,i=12,p=5,c=2,r=1"
+        )))
+
+        XCTAssertEqual(capture.currentVersion(for: 12, placementId: 5), 99)
+    }
+
+    @MainActor
+    func testRemoteKittyImageCapturePersistsExplicitPlacementCoveredByWildcard() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteKittyImageDiskStore(root: root)
+        let sessionId = "wildcard-explicit"
+        let capture = RemoteKittyImageCapture(
+            sessionId: sessionId,
+            epoch: 0,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store
+        )
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        capture.ingest(ArraySlice(remoteKittyFrameBytes(
+            control: "a=T,f=100,t=d,U=1,i=13,c=2,r=1",
+            base64Payload: png.base64EncodedString()
+        )))
+        capture.ingest(ArraySlice(remoteKittyFrameBytes(
+            control: "a=p,U=1,i=13,p=4,c=4,r=3"
+        )))
+        await store.flush()
+
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertEqual(Set(restored.currentSelections.compactMap(\.placementId)), [4])
+        XCTAssertTrue(restored.currentSelections.contains {
+            $0.placementId == nil && $0.rows == 1 && $0.columns == 2
+        })
+        XCTAssertTrue(restored.currentSelections.contains {
+            $0.placementId == 4 && $0.rows == 3 && $0.columns == 4
+        })
+    }
+
+    @MainActor
     func testRemoteKittyImageCapturePersistsEvictionOfNewTransmitOnlyVictimAfterRetain() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
