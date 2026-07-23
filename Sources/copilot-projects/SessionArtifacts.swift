@@ -112,7 +112,21 @@ enum SessionArtifacts {
         }
     }
 
-    static func destroy(sessionId: String, snapshot: ProcessTree.Snapshot? = nil) {
+    @discardableResult
+    static func destroy(
+        sessionId: String,
+        snapshot: ProcessTree.Snapshot? = nil,
+        kittyImageDiskStore: RemoteKittyImageDiskStore = .shared,
+        alreadyTombstoned: Bool = false
+    ) -> Bool {
+        // Synchronously tombstone this session's durable Kitty images
+        // *before* any teardown below — the marker itself must survive even
+        // an immediate app exit, so a late restore/persist callback racing
+        // this destroy can never resurrect data this call already committed
+        // to discard. The (potentially larger) actual cleanup is enqueued
+        // asynchronously by `tombstone(sessionId:)` itself.
+        let imageCleanupScheduled = alreadyTombstoned
+            || kittyImageDiskStore.tombstone(sessionId: sessionId)
         let socket = Paths.dtachSocketPath(sessionId: sessionId)
         if Paths.dtachExecutable != nil {
             let processes = snapshot ?? ProcessTree.snapshot()
@@ -125,6 +139,7 @@ enum SessionArtifacts {
             }
         }
         removeFiles(sessionId: sessionId)
+        return imageCleanupScheduled
     }
 
     static func removeFiles(sessionId: String) {

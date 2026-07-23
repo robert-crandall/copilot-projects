@@ -57,6 +57,7 @@ final class RemoteModelBridge: @unchecked Sendable {
     func screenRevision(sessionId: String) -> RemoteTerminalRevision? {
         guard let model,
               let view = model.controller(for: sessionId)?.terminalView,
+              !view.isRestoringImages,
               let terminal = view.terminal else { return nil }
         return RemoteTerminalRevision(
             contentGeneration: view.remoteContentGeneration,
@@ -152,6 +153,17 @@ final class RemoteModelBridge: @unchecked Sendable {
             imageId: imageId,
             version: version
         )
+    }
+
+    /// True while `sessionId`'s durable Kitty-image restore is still
+    /// pending — used to answer an exact-image request with a retryable
+    /// status instead of a definitive 404 (see `RemoteGateway
+    /// .handleTerminalImage`), since a request for a version a client
+    /// already knows about from before an app relaunch could otherwise
+    /// briefly (and wrongly) look permanently gone until the restore
+    /// finishes replaying it.
+    func isRestoringImages(sessionId: String) -> Bool {
+        model?.controller(for: sessionId)?.terminalView.isRestoringImages ?? false
     }
 }
 
@@ -746,13 +758,20 @@ private final class RemoteHTTPHandler:
                 imageId: imageId,
                 version: version
             ) else {
+                // A retryable status — never a definitive 404 — while this
+                // session's durable image restore is still pending: the
+                // exact `(imageId, version)` a client already knows about
+                // from before an app relaunch may simply not have finished
+                // replaying yet, and a client must never cache that as
+                // "permanently gone".
+                let pending = self.bridge.isRestoringImages(sessionId: sessionId)
                 channel.eventLoop.execute {
                     self.respond(
                         channel: channel,
                         method: method,
-                        status: .notFound,
+                        status: pending ? .serviceUnavailable : .notFound,
                         contentType: "text/plain",
-                        body: Data("Not found".utf8)
+                        body: Data((pending ? "Restoring" : "Not found").utf8)
                     )
                 }
                 return

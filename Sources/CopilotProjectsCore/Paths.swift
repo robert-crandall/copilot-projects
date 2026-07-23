@@ -250,6 +250,38 @@ public enum Paths {
         stateDir.appendingPathComponent("session-creation-ledger.json")
     }
 
+    /// Root for the durable Kitty inline-image store (`RemoteKittyImageDiskStore`):
+    /// exact retained PNG bytes + persisted current-selection/placement metadata,
+    /// so a session's images survive an app relaunch (or a reboot that kills the
+    /// dtach master) instead of only ever living in `RemoteKittyImageCapture`'s
+    /// in-memory grace cache.
+    public static var kittyImagesDir: URL {
+        stateDir.appendingPathComponent("kitty-images", isDirectory: true)
+    }
+
+    /// Directory holding one file per retained `(session, imageId, version)`
+    /// entry's exact PNG bytes.
+    public static var kittyImagesDataDir: URL {
+        kittyImagesDir.appendingPathComponent("data", isDirectory: true)
+    }
+
+    /// Directory holding one empty marker file per deliberately-destroyed
+    /// session, written synchronously *before* that session's terminal/dtach
+    /// teardown proceeds, so the marker survives even an immediate app exit —
+    /// startup cleanup consults it to guarantee a destroyed session's images
+    /// can never be resurrected, regardless of whether the async removal of
+    /// its manifest entries/data files had a chance to finish first.
+    public static var kittyImagesTombstonesDir: URL {
+        kittyImagesDir.appendingPathComponent("tombstones", isDirectory: true)
+    }
+
+    /// The single schema-versioned manifest recording every retained disk
+    /// entry and persisted current-selection/placement record, across every
+    /// session, process-wide.
+    public static var kittyImagesManifestPath: URL {
+        kittyImagesDir.appendingPathComponent("manifest.json")
+    }
+
     /// The bundled dtach helper (resumability backend), or an override, or nil.
     public static var dtachExecutable: String? {
         let env = ProcessInfo.processInfo.environment

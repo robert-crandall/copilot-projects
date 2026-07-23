@@ -45,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isPrimaryInstance = false
     private var eventMonitor: Any?
     private var hintWork: DispatchWorkItem?
+    private var terminationDrainStarted = false
 
     override init() {
         let native = NotificationManager()
@@ -96,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        model.activateKittyImagePersistence()
 
         nativeNotifications.onActivate = { [weak self] projectId, sessionId in
             self?.model.focus(projectId: projectId, sessionId: sessionId)
@@ -349,6 +351,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.detachAllClients()   // keep dtach masters alive for resume
         model.stopServer()
         model.save()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard isPrimaryInstance else { return .terminateNow }
+        guard !terminationDrainStarted else { return .terminateLater }
+        terminationDrainStarted = true
+        model.beginTermination()
+        model.stopServer()
+        Task { @MainActor [weak self] in
+            guard let self else {
+                sender.reply(toApplicationShouldTerminate: true)
+                return
+            }
+            await self.model.detachAllClientsAndDrain()
+            await self.model.flushKittyImagePersistence()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     @objc private func workspaceWillPowerOff(_ notification: Notification) {

@@ -123,6 +123,118 @@ enum RemoteKittyGraphics {
     }
 }
 
+/// Structural (never full-bitmap) PNG validation, shared by every path that
+/// must trust bytes it didn't just decode itself: the live capture path
+/// (`RemoteKittyImageCapture.finalizePending`, decoding a fresh base64
+/// payload) and the durable disk-persistence path (`RemoteKittyImageDiskStore`,
+/// which must revalidate every byte it reads back from disk on restore —
+/// on-disk corruption/truncation is untrusted input exactly like a live
+/// transmission's payload, never assumed safe just because this process wrote
+/// it in an earlier run). ImageIO only parses the PNG container's
+/// chunks/metadata here (`CGImageSourceGetStatusAtIndex`), never
+/// decoding/allocating the full pixel bitmap, so this stays cheap even for a
+/// large image.
+enum RemoteKittyPNGValidation {
+    static func isStructurallyValid(_ data: Data) -> Bool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) == 1,
+              let type = CGImageSourceGetType(source), type as String == UTType.png.identifier,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int
+        else { return false }
+        guard width > 0, height > 0,
+              width <= remoteKittyMaxImageDimension,
+              height <= remoteKittyMaxImageDimension
+        else { return false }
+        guard width * height <= remoteKittyMaxImagePixels else { return false }
+        return true
+    }
+}
+
+/// Builds the exact normalized Kitty APC byte sequences a restored image is
+/// replayed with (see `ProjectsTerminalView.replayRestoredImage`): a
+/// response-suppressed (`q=2`), transmit-only (`a=t`) chunked transmission of
+/// the exact retained PNG bytes — never activating a placement on its own —
+/// followed by a response-suppressed re-placement (`a=p,U=1,q=2`) naming the
+/// *exact* placement id the original live capture activated. Pure/static so
+/// the exact byte layout is unit-testable without a live `Terminal`, and
+/// shared so production replay and its tests can never drift from each other.
+enum RemoteKittyReplayEncoding {
+    /// Base64 characters per `a=t` continuation frame — comfortably under
+    /// `remoteKittyMaxRawFrameBytes`, mirroring how a real client chunks a
+    /// large image across `m=1` continuations rather than risking one
+    /// oversized APC frame.
+    static let chunkBytes = 32 * 1_024
+
+    /// One 7-bit APC Kitty graphics frame: `ESC _ G <control>[;<payload>] ESC \`.
+    static func apcFrame(control: String, payload: String = "") -> [UInt8] {
+        var bytes: [UInt8] = [0x1B, 0x5F, 0x47] // ESC _ G
+        bytes.append(contentsOf: Array(control.utf8))
+        if !payload.isEmpty {
+            bytes.append(0x3B) // ';'
+            bytes.append(contentsOf: Array(payload.utf8))
+        }
+        bytes.append(contentsOf: [0x1B, 0x5C]) // ESC \ (ST)
+        return bytes
+    }
+
+    /// Transmit-only (`a=t`), response-suppressed (`q=2`) frame(s) carrying
+    /// `data`'s exact base64 bytes, chunked via `m=1`/`m=0` continuations
+    /// exactly like a real large upload — never `a=T`, so this alone never
+    /// activates any placement (matching a restore's "images first, then
+    /// placement" replay ordering).
+    static func transmitOnlyFrames(imageId: UInt32, data: Data) -> [UInt8] {
+        let base64 = data.base64EncodedString()
+        var pieces: [Substring] = []
+        var remaining = Substring(base64)
+        while !remaining.isEmpty {
+            let end = remaining.index(
+                remaining.startIndex, offsetBy: chunkBytes, limitedBy: remaining.endIndex
+            ) ?? remaining.endIndex
+            pieces.append(remaining[..<end])
+            remaining = remaining[end...]
+        }
+        if pieces.isEmpty { pieces = [""] }
+        var bytes: [UInt8] = []
+        for (index, piece) in pieces.enumerated() {
+            let more = index != pieces.count - 1
+            if index == 0 {
+                bytes += apcFrame(
+                    control: "a=t,q=2,U=1,f=100,t=d,i=\(imageId),m=\(more ? 1 : 0)",
+                    payload: String(piece)
+                )
+            } else {
+                bytes += apcFrame(control: "m=\(more ? 1 : 0)", payload: String(piece))
+            }
+        }
+        return bytes
+    }
+
+    /// A response-suppressed (`q=2`) `a=p,U=1` re-placement naming the exact
+    /// positive `placementId` (never omitted — SwiftTerm treats `p=0` as
+    /// unset and mints a fresh auto-incremented id on every replay) with the
+    /// exact preserved `c=`/`r=` cell-span and optional `X=`/`Y=`/`z=`
+    /// pixel-offset/z-index metadata a real combined `a=T` transmission
+    /// carried.
+    static func placementFrame(
+        imageId: UInt32,
+        placementId: UInt32,
+        rows: Int,
+        columns: Int,
+        x: Int? = nil,
+        y: Int? = nil,
+        z: Int? = nil
+    ) -> [UInt8] {
+        var control = "a=p,U=1,q=2,i=\(imageId),p=\(placementId),r=\(rows),c=\(columns)"
+        if let x { control += ",X=\(x)" }
+        if let y { control += ",Y=\(y)" }
+        if let z { control += ",z=\(z)" }
+        return apcFrame(control: control)
+    }
+}
+
 // MARK: - Grid scanning -> placements (pure, SwiftTerm-independent)
 
 /// One decoded placeholder grid cell, in the coordinate space the caller used
@@ -491,6 +603,19 @@ final class RemoteKittyImageCapture {
     // (which never repeat `a=`/`p=`) came in between.
     private var pendingActivates = false
     private var pendingPlacementId: UInt32?
+    /// Combined first-frame metadata a real Copilot transmission carries
+    /// alongside `a=T` (e.g. `c=48,r=24`, and optionally `X=`/`Y=`/`z=`) —
+    /// captured only so a later durable-disk restore can replay a faithful
+    /// SwiftTerm placement (see `RemoteKittyImageDiskStore` and
+    /// `RemoteKittyReplayEncoding`); never otherwise interpreted here. `nil`
+    /// when the transmission never specified it (an id with no captured
+    /// dimensions is simply never persisted as a restorable current
+    /// selection — see `syncPersistedSelections`).
+    private var pendingRows: Int?
+    private var pendingColumns: Int?
+    private var pendingX: Int?
+    private var pendingY: Int?
+    private var pendingZ: Int?
 
     // Content versions are `(epoch << 32) | counter`: `epoch` is fixed for this
     // instance's whole lifetime and `counter` is monotonic within it, so two
@@ -502,6 +627,56 @@ final class RemoteKittyImageCapture {
     private var nextCounter: UInt64 = 1
     private let budget: RemoteKittyImageCaptureBudget
     private let maxAccumulatedBase64Bytes: Int
+
+    /// This instance's owning session — the durable disk store's persistence
+    /// key. Never used for any in-memory identity/lookup purpose; only to
+    /// scope every disk mutation/restore to exactly this session's own data.
+    let sessionId: String
+    /// The durable disk store this instance's retained bytes and
+    /// current-selection/placement metadata are asynchronously mirrored to,
+    /// or `nil` to disable persistence entirely (every existing test
+    /// constructs a capture this way, so none of them touch disk).
+    private var diskStore: RemoteKittyImageDiskStore?
+    /// True for the whole duration of a disk-restore replay (`beginRestoring`
+    /// through `finishRestoring`) — every disk-mutating hook below becomes a
+    /// no-op while this is set, so restoring previously-persisted state can
+    /// never recursively re-persist it (finding: restore/replay must never
+    /// double-account or re-derive fresh versions).
+    private var suppressPersistToDisk = false
+    /// True only between `beginRestoring()` and `finishRestoring()`, guarding
+    /// `restoreEntry`/`restoreCurrentSelection` against being called outside
+    /// that window (e.g. a stray call after a live session is already
+    /// running).
+    private var isRestoring = false
+    private var restoreAdvertisedChanged = false
+    // Deferred until `finishRestoring()`: registering with the (cross-session)
+    // budget as each entry is restored would let it evict a sibling entry in
+    // this very restore batch before `restoreCurrentSelection` has had a
+    // chance to mark it current, picking eviction victims off incomplete
+    // information. Registering only after every current-selection is applied
+    // means eviction preference (never drop a still-current version while a
+    // superseded one exists to sacrifice instead) sees this session's true
+    // final state.
+    private var pendingBudgetRegistrations: [StoredKey] = []
+
+    /// Preserved per-imageId combined `a=T`/`a=t` cell-span (`c=`/`r=`) and
+    /// optional pixel-offset/z-index (`X=`/`Y=`/`z=`) metadata, scoped to
+    /// exactly the same "still has retained data" lifetime as
+    /// `wildcardActiveImageIds`/`exactActivePlacements` (pruned in lockstep
+    /// everywhere those are) — never grows with every historical id a
+    /// long-lived session ever saw.
+    private struct PlacementDimensions: Equatable {
+        var rows: Int
+        var columns: Int
+        var x: Int?
+        var y: Int?
+        var z: Int?
+    }
+    private struct PlacementGeometryKey: Hashable {
+        let imageId: UInt32
+        let placementId: UInt32?
+    }
+    private var placementDimensions: [PlacementGeometryKey: PlacementDimensions] = [:]
 
     /// Bumped every time this instance's *currently advertised* availability
     /// for some image id can change — a fresh current version is retained, or
@@ -517,6 +692,10 @@ final class RemoteKittyImageCapture {
     private(set) var imageAvailabilityGeneration: UInt64 = 0
 
     /// - Parameters:
+    ///   - sessionId: The owning session, used only as the durable disk
+    ///     store's persistence key. Defaults to a fresh random value so every
+    ///     existing test call site (which never cares about persistence)
+    ///     keeps compiling unchanged.
     ///   - epoch: The high 32 bits every version handed out by this instance
     ///     carries. Defaults to a fresh random value per instance (production
     ///     behavior); tests inject a fixed value for deterministic version
@@ -534,11 +713,19 @@ final class RemoteKittyImageCapture {
     ///     chunks, each individually well under both the raw-frame and
     ///     decoded-image bounds — rather than relying on a single frame large
     ///     enough to *also* trip those other, unrelated bounds first.
+    ///   - diskStore: The durable disk store to asynchronously mirror
+    ///     retained bytes and current-selection metadata to. Defaults to
+    ///     `nil` (no persistence at all) rather than the real shared
+    ///     singleton, so every existing test — and any other caller that
+    ///     never passes one explicitly — can never touch disk.
     init(
+        sessionId: String = UUID().uuidString,
         epoch: UInt32 = UInt32.random(in: UInt32.min ... UInt32.max),
         budget: RemoteKittyImageCaptureBudget? = nil,
-        maxAccumulatedBase64Bytes: Int = remoteKittyMaxAccumulatedBase64Bytes
+        maxAccumulatedBase64Bytes: Int = remoteKittyMaxAccumulatedBase64Bytes,
+        diskStore: RemoteKittyImageDiskStore? = nil
     ) {
+        self.sessionId = sessionId
         self.epoch = epoch
         // `budget`'s default can't be spelled as `= .shared` in the parameter
         // list itself: default-argument expressions aren't evaluated in the
@@ -548,6 +735,7 @@ final class RemoteKittyImageCapture {
         // body, is equivalent for every real caller.
         self.budget = budget ?? .shared
         self.maxAccumulatedBase64Bytes = maxAccumulatedBase64Bytes
+        self.diskStore = diskStore
     }
 
     /// Feeds raw terminal output bytes. Safe to call with any chunking of the
@@ -669,6 +857,9 @@ final class RemoteKittyImageCapture {
             // Every specific exact-active entry for this id is now
             // redundant — the wildcard alone already covers them all.
             exactActivePlacements = exactActivePlacements.filter { $0.imageId != imageId }
+            placementDimensions = placementDimensions.filter {
+                $0.key.imageId != imageId || $0.key.placementId == nil
+            }
         }
     }
 
@@ -704,19 +895,38 @@ final class RemoteKittyImageCapture {
         wildcardActiveImageIds.remove(imageId)
         exactActivePlacements = exactActivePlacements.filter { $0.imageId != imageId }
         deletedPlacements = deletedPlacements.filter { $0.imageId != imageId }
+        placementDimensions = placementDimensions.filter { $0.key.imageId != imageId }
         var changedAdvertised = hadOwnAdvertised
+        syncPersistedSelections(imageId: imageId)
 
         if exactActivePlacements.count + deletedPlacements.count >= remoteKittyMaxPlacementActivityEntries {
+            let affectedIds = wildcardActiveImageIds.union(exactActivePlacements.map(\.imageId))
             let hadOtherAdvertised = wildcardActiveImageIds.contains { latestVersion[$0] != nil }
                 || exactActivePlacements.contains { latestVersion[$0.imageId] != nil }
             wildcardActiveImageIds.removeAll()
             exactActivePlacements.removeAll()
             deletedPlacements.removeAll()
+            placementDimensions.removeAll()
             changedAdvertised = changedAdvertised || hadOtherAdvertised
+            for affectedId in affectedIds { syncPersistedSelections(imageId: affectedId) }
         }
 
         if changedAdvertised {
             imageAvailabilityGeneration &+= 1
+        }
+    }
+
+    private func makeRoomForPlacementGeometry(_ key: PlacementGeometryKey) {
+        guard placementDimensions[key] == nil,
+              placementDimensions.count >= remoteKittyMaxPlacementActivityEntries
+        else { return }
+        let affectedIds = Set(placementDimensions.keys.map(\.imageId))
+        placementDimensions = placementDimensions.filter { $0.key.imageId != key.imageId }
+        if placementDimensions.count >= remoteKittyMaxPlacementActivityEntries {
+            placementDimensions.removeAll()
+        }
+        for imageId in affectedIds {
+            syncPersistedSelections(imageId: imageId)
         }
     }
 
@@ -735,7 +945,10 @@ final class RemoteKittyImageCapture {
     /// belongs to a single still-retained image id churned through many
     /// distinct placement ids. Not used by any production call site.
     var lifecycleActivityStateCountForTesting: Int {
-        wildcardActiveImageIds.count + exactActivePlacements.count + deletedPlacements.count
+        wildcardActiveImageIds.count
+            + exactActivePlacements.count
+            + deletedPlacements.count
+            + placementDimensions.count
     }
 
     /// The exact PNG bytes for `(imageId, version)`, or `nil` if that exact pair
@@ -976,7 +1189,18 @@ final class RemoteKittyImageCapture {
         // activity already existed for `imageId` regardless of which action
         // this is, so a plain `t` on an already-active id keeps showing it.
         pendingActivates = (keys["a"] == "T")
-        pendingPlacementId = keys["p"].flatMap { UInt32($0) }
+        pendingPlacementId = keys["p"].flatMap { UInt32($0) }.flatMap {
+            $0 > 0 ? $0 : nil
+        }
+        pendingRows = keys["r"].flatMap { Int($0) }.flatMap {
+            $0 > 0 && $0 <= remoteKittyMaxImageDimension ? $0 : nil
+        }
+        pendingColumns = keys["c"].flatMap { Int($0) }.flatMap {
+            $0 > 0 && $0 <= remoteKittyMaxImageDimension ? $0 : nil
+        }
+        pendingX = keys["X"].flatMap { Int($0) }
+        pendingY = keys["Y"].flatMap { Int($0) }
+        pendingZ = keys["z"].flatMap { Int($0) }
         appendPayload(payload)
         if keys["m"] != "1" { finalizePending() }
     }
@@ -1002,7 +1226,27 @@ final class RemoteKittyImageCapture {
         else { return }
 
         let wasAdvertised = isAnyPlacementAdvertised(imageId: imageId)
-        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }
+        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }.flatMap {
+            $0 > 0 ? $0 : nil
+        }
+        if let rows = keys["r"].flatMap({ Int($0) }),
+           let columns = keys["c"].flatMap({ Int($0) }),
+           rows > 0, columns > 0,
+           rows <= remoteKittyMaxImageDimension,
+           columns <= remoteKittyMaxImageDimension {
+            let geometryKey = PlacementGeometryKey(
+                imageId: imageId,
+                placementId: explicitPlacementId
+            )
+            makeRoomForPlacementGeometry(geometryKey)
+            placementDimensions[geometryKey] = PlacementDimensions(
+                rows: rows,
+                columns: columns,
+                x: keys["X"].flatMap { Int($0) },
+                y: keys["Y"].flatMap { Int($0) },
+                z: keys["z"].flatMap { Int($0) }
+            )
+        }
         activatePlacement(imageId: imageId, explicitPlacementId: explicitPlacementId)
         // Bump iff this re-placement could change what a fresh scan
         // currently discovers: it does exactly when the id wasn't already
@@ -1012,6 +1256,7 @@ final class RemoteKittyImageCapture {
         if !wasAdvertised {
             imageAvailabilityGeneration &+= 1
         }
+        syncPersistedSelections(imageId: imageId)
     }
 
     private func appendContinuation(payload: ArraySlice<UInt8>, more: Bool) {
@@ -1041,7 +1286,7 @@ final class RemoteKittyImageCapture {
         guard let imageId = pendingImageId,
               let decoded = Data(base64Encoded: Data(pendingBase64)),
               decoded.count <= remoteKittyMaxDecodedImageBytes,
-              Self.validatePNG(decoded)
+              RemoteKittyPNGValidation.isStructurallyValid(decoded)
         else { return }
         retain(imageId: imageId, data: decoded, activates: pendingActivates, explicitPlacementId: pendingPlacementId)
     }
@@ -1056,6 +1301,11 @@ final class RemoteKittyImageCapture {
         pendingImageId = nil
         pendingActivates = false
         pendingPlacementId = nil
+        pendingRows = nil
+        pendingColumns = nil
+        pendingX = nil
+        pendingY = nil
+        pendingZ = nil
         clearPendingBase64()
         budget.releasePending(owner: self)
     }
@@ -1073,6 +1323,11 @@ final class RemoteKittyImageCapture {
         pendingImageId = nil
         pendingActivates = false
         pendingPlacementId = nil
+        pendingRows = nil
+        pendingColumns = nil
+        pendingX = nil
+        pendingY = nil
+        pendingZ = nil
         clearPendingBase64()
     }
 
@@ -1089,28 +1344,6 @@ final class RemoteKittyImageCapture {
         }
     }
 
-    /// Requires a structurally *complete* PNG of PNG type — ImageIO only
-    /// parses the container's chunks/metadata here (`CGImageSourceGetStatusAtIndex`),
-    /// it never decodes/allocates the full pixel bitmap, so this stays cheap
-    /// even for large images while still rejecting truncated/malformed data
-    /// that a signature+IHDR-only check would have accepted.
-    private static func validatePNG(_ data: Data) -> Bool {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              CGImageSourceGetCount(source) == 1,
-              let type = CGImageSourceGetType(source), type as String == UTType.png.identifier,
-              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = properties[kCGImagePropertyPixelWidth] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight] as? Int
-        else { return false }
-        guard width > 0, height > 0,
-              width <= remoteKittyMaxImageDimension,
-              height <= remoteKittyMaxImageDimension
-        else { return false }
-        guard width * height <= remoteKittyMaxImagePixels else { return false }
-        return true
-    }
-
     /// Allocates this instance's next version: monotonic `counter` in the low
     /// 32 bits, this instance's fixed `epoch` in the high 32 bits.
     private func nextVersion() -> UInt64 {
@@ -1125,6 +1358,16 @@ final class RemoteKittyImageCapture {
         order.append(key)
         dataByKey[key] = data
         totalBytes += data.count
+        if activates, let rows = pendingRows, let columns = pendingColumns {
+            let geometryKey = PlacementGeometryKey(
+                imageId: imageId,
+                placementId: explicitPlacementId
+            )
+            makeRoomForPlacementGeometry(geometryKey)
+            placementDimensions[geometryKey] = PlacementDimensions(
+                rows: rows, columns: columns, x: pendingX, y: pendingY, z: pendingZ
+            )
+        }
         // Whether a *previous* version was already being advertised for
         // `imageId` — captured before either `latestVersion` or activation
         // state changes below — determines whether this retain's new
@@ -1153,6 +1396,12 @@ final class RemoteKittyImageCapture {
         if hadAdvertisedVersion || isAdvertisedNow {
             imageAvailabilityGeneration &+= 1
         }
+        persistRetainToDisk(
+            imageId: imageId,
+            version: version,
+            data: data,
+            selections: persistedSelections(imageId: imageId)
+        )
         budget.register(owner: self, imageId: imageId, version: version, bytes: data.count)
         enforceLocalBounds()
     }
@@ -1178,6 +1427,7 @@ final class RemoteKittyImageCapture {
             if isAnyPlacementActive(imageId: key.imageId) {
                 imageAvailabilityGeneration &+= 1
             }
+            syncPersistedSelections(imageId: key.imageId)
         }
         // Bound lifecycle state to ids that still have *some* retained data:
         // once no entry (current or older grace-retained) remains anywhere
@@ -1192,10 +1442,16 @@ final class RemoteKittyImageCapture {
             wildcardActiveImageIds.remove(key.imageId)
             exactActivePlacements = exactActivePlacements.filter { $0.imageId != key.imageId }
             deletedPlacements = deletedPlacements.filter { $0.imageId != key.imageId }
+            placementDimensions = placementDimensions.filter { $0.key.imageId != key.imageId }
         }
         if notifyBudget {
             budget.unregister(owner: self, imageId: key.imageId, version: key.version)
         }
+        // Mirrors this exact entry's removal onto disk regardless of
+        // `notifyBudget` — a local grace-cache eviction and a cross-session
+        // budget eviction (`evictForBudget`) must both stop this session's
+        // durable store from ever restoring bytes memory no longer has.
+        persistEvictionToDisk(imageId: key.imageId, version: key.version)
     }
 
     /// Called by `RemoteKittyImageCaptureBudget` when it needs to reclaim this
@@ -1242,7 +1498,9 @@ final class RemoteKittyImageCapture {
         resetPendingTransmission()
 
         let mode = keys["d"] ?? "a"
-        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }
+        let explicitPlacementId = keys["p"].flatMap { UInt32($0) }.flatMap {
+            $0 > 0 ? $0 : nil
+        }
         switch mode {
         case "A":
             clearAll()
@@ -1324,11 +1582,13 @@ final class RemoteKittyImageCapture {
         wildcardActiveImageIds.remove(imageId)
         exactActivePlacements = exactActivePlacements.filter { $0.imageId != imageId }
         deletedPlacements = deletedPlacements.filter { $0.imageId != imageId }
+        placementDimensions = placementDimensions.filter { $0.key.imageId != imageId }
         if wasAdvertised {
             // Was actually advertised (active *and* retained) before this
             // delete — now it isn't, so a scan's discoverable state changed.
             imageAvailabilityGeneration &+= 1
         }
+        syncPersistedSelections(imageId: imageId)
     }
 
     /// Removes only one specific `(imageId, placementId)` pair's activity —
@@ -1350,6 +1610,10 @@ final class RemoteKittyImageCapture {
         let key = PlacementKey(imageId: imageId, placementId: placementId)
         let wasAdvertised = isPlacementAdvertised(imageId: imageId, placementId: placementId)
         exactActivePlacements.remove(key)
+        placementDimensions.removeValue(forKey: PlacementGeometryKey(
+            imageId: imageId,
+            placementId: placementId
+        ))
         if wildcardActiveImageIds.contains(imageId) {
             if !deletedPlacements.contains(key) {
                 makeRoomForPlacementActivityEntry(imageId: imageId)
@@ -1374,6 +1638,7 @@ final class RemoteKittyImageCapture {
         if wasAdvertised {
             imageAvailabilityGeneration &+= 1
         }
+        syncPersistedSelections(imageId: imageId)
     }
 
     /// Removes every id's active-placement flag entirely (wildcard, exact
@@ -1386,12 +1651,15 @@ final class RemoteKittyImageCapture {
         // Only ids that were both active *and* still had retained data were
         // actually advertised before this clear — anything else clearing
         // here doesn't change what a scan would currently discover.
+        let affectedIds = wildcardActiveImageIds.union(exactActivePlacements.map(\.imageId))
         let hadAnyAdvertised = wildcardActiveImageIds.contains { latestVersion[$0] != nil }
             || exactActivePlacements.contains { latestVersion[$0.imageId] != nil }
         wildcardActiveImageIds.removeAll()
         exactActivePlacements.removeAll()
         deletedPlacements.removeAll()
+        placementDimensions.removeAll()
         if hadAnyAdvertised { imageAvailabilityGeneration &+= 1 }
+        for affectedId in affectedIds { syncPersistedSelections(imageId: affectedId) }
     }
 
     private func clearAll() {
@@ -1406,9 +1674,11 @@ final class RemoteKittyImageCapture {
         wildcardActiveImageIds.removeAll()
         exactActivePlacements.removeAll()
         deletedPlacements.removeAll()
+        placementDimensions.removeAll()
         totalBytes = 0
         if hadAnyAdvertised { imageAvailabilityGeneration &+= 1 }
         resetPendingTransmission()
+        persistClearSessionToDisk()
     }
 
     private func removeAllVersions(imageId: UInt32) {
@@ -1418,6 +1688,7 @@ final class RemoteKittyImageCapture {
             if key.imageId == imageId {
                 if let data = dataByKey.removeValue(forKey: key) { totalBytes -= data.count }
                 budget.unregister(owner: self, imageId: key.imageId, version: key.version)
+                persistEvictionToDisk(imageId: key.imageId, version: key.version)
             } else {
                 kept.append(key)
             }
@@ -1433,6 +1704,7 @@ final class RemoteKittyImageCapture {
         wildcardActiveImageIds.remove(imageId)
         exactActivePlacements = exactActivePlacements.filter { $0.imageId != imageId }
         deletedPlacements = deletedPlacements.filter { $0.imageId != imageId }
+        placementDimensions = placementDimensions.filter { $0.key.imageId != imageId }
         // Advertised availability only changes if `imageId` was both active
         // and had retained data before this — either alone means it wasn't
         // currently discoverable by a scan, so removing the other half here
@@ -1440,8 +1712,237 @@ final class RemoteKittyImageCapture {
         if wasActive && hadData {
             imageAvailabilityGeneration &+= 1
         }
+        if hadData { syncPersistedSelections(imageId: imageId) }
         if pendingImageId == imageId {
             resetPendingTransmission()
+        }
+    }
+
+    // MARK: - Durable disk persistence (hooks; no-ops without a `diskStore`)
+
+    /// Mirrors one freshly-retained `(imageId, version)` entry's exact bytes
+    /// onto disk, asynchronously — a no-op while `suppressPersistToDisk`
+    /// (mid-restore) or without a configured `diskStore`.
+    private func persistRetainToDisk(
+        imageId: UInt32,
+        version: UInt64,
+        data: Data,
+        selections: [RemoteKittyPersistedPlacementSelection]
+    ) {
+        guard !suppressPersistToDisk, let diskStore else { return }
+        diskStore.persistRetain(
+            sessionId: sessionId,
+            imageId: imageId,
+            version: version,
+            data: data,
+            currentSelections: selections
+        )
+    }
+
+    /// Mirrors one entry's removal (local grace-cache eviction, cross-session
+    /// budget eviction, or an explicit per-id delete) onto disk,
+    /// asynchronously.
+    private func persistEvictionToDisk(imageId: UInt32, version: UInt64) {
+        guard !suppressPersistToDisk, let diskStore else { return }
+        diskStore.persistEviction(sessionId: sessionId, imageId: imageId, version: version)
+    }
+
+    /// Mirrors a full `d=A`-style clear of every retained entry for this
+    /// session onto disk, asynchronously.
+    private func persistClearSessionToDisk() {
+        guard !suppressPersistToDisk, let diskStore else { return }
+        diskStore.persistClearSession(sessionId: sessionId)
+    }
+
+    /// Recomputes and persists (or clears) `imageId`'s durable
+    /// current-selection record(s) to reflect whatever this instance
+    /// currently advertises for it — called after every mutation that can
+    /// change `imageId`'s activation state or its `latestVersion`. Persists
+    /// nothing (and clears any existing persisted selection) when `imageId`
+    /// has no current version, no active placement, or no captured
+    /// `c=`/`r=` cell-span metadata to faithfully replay.
+    private func syncPersistedSelections(imageId: UInt32) {
+        guard !suppressPersistToDisk, let diskStore else { return }
+        diskStore.replaceCurrentSelections(
+            sessionId: sessionId,
+            imageId: imageId,
+            selections: persistedSelections(imageId: imageId)
+        )
+    }
+
+    private func persistedSelections(imageId: UInt32) -> [RemoteKittyPersistedPlacementSelection] {
+        guard let version = latestVersion[imageId] else { return [] }
+        var selections: [RemoteKittyPersistedPlacementSelection] = []
+        if wildcardActiveImageIds.contains(imageId),
+           let dims = placementDimensions[PlacementGeometryKey(
+               imageId: imageId,
+               placementId: nil
+           )],
+           dims.rows > 0, dims.columns > 0 {
+            selections.append(RemoteKittyPersistedPlacementSelection(
+                version: version, placementId: nil,
+                rows: dims.rows, columns: dims.columns, x: dims.x, y: dims.y, z: dims.z
+            ))
+        }
+        if wildcardActiveImageIds.contains(imageId) {
+            for (key, dims) in placementDimensions
+                where key.imageId == imageId {
+                guard let placementId = key.placementId,
+                      !deletedPlacements.contains(PlacementKey(
+                          imageId: imageId,
+                          placementId: placementId
+                      )),
+                      dims.rows > 0,
+                      dims.columns > 0
+                else { continue }
+                selections.append(RemoteKittyPersistedPlacementSelection(
+                    version: version,
+                    placementId: placementId,
+                    rows: dims.rows,
+                    columns: dims.columns,
+                    x: dims.x,
+                    y: dims.y,
+                    z: dims.z
+                ))
+            }
+        }
+        for key in exactActivePlacements where key.imageId == imageId {
+            guard let dims = placementDimensions[PlacementGeometryKey(
+                imageId: imageId,
+                placementId: key.placementId
+            )],
+                dims.rows > 0, dims.columns > 0
+            else { continue }
+            selections.append(RemoteKittyPersistedPlacementSelection(
+                version: version, placementId: key.placementId,
+                rows: dims.rows, columns: dims.columns, x: dims.x, y: dims.y, z: dims.z
+            ))
+        }
+        return selections
+    }
+
+    func currentPersistedSelection(
+        imageId: UInt32,
+        placementId: UInt32?
+    ) -> RemoteKittyPersistedPlacementSelection? {
+        let normalizedPlacementId = placementId.flatMap { $0 > 0 ? $0 : nil }
+        return persistedSelections(imageId: imageId).first {
+            ($0.placementId ?? 0) == (normalizedPlacementId ?? 0)
+        }
+    }
+
+    func disablePersistence() {
+        diskStore = nil
+    }
+
+    // MARK: - Durable disk restore (never touches disk; never a live command)
+
+    /// Begins a disk-restore replay window: must be followed by any number of
+    /// `restoreEntry`/`restoreCurrentSelection` calls, then exactly one
+    /// `finishRestoring()`. Every disk-persistence hook above becomes a no-op
+    /// for the whole window, so restoring previously-persisted state can
+    /// never recursively re-persist it back to the very store it came from.
+    func beginRestoring() {
+        isRestoring = true
+        suppressPersistToDisk = true
+        restoreAdvertisedChanged = false
+    }
+
+    /// Installs one previously-persisted disk entry directly into this
+    /// instance's in-memory retained state, without generating a new version
+    /// or touching activation/current-selection state — the restore-only
+    /// counterpart to `retain(...)`. Never called from any live Kitty
+    /// command. Requires the exact bytes to still pass the same structural
+    /// PNG validation a live transmission would (an on-disk PNG is untrusted
+    /// input exactly like one arriving over the wire), and is a no-op
+    /// (returning `false`) if `(imageId, version)` is already retained (e.g.
+    /// a duplicate restore call) — never overwrites or double-counts an
+    /// existing entry. Deliberately does *not* register with the
+    /// process-wide budget or enforce local bounds yet: see
+    /// `pendingBudgetRegistrations`.
+    @discardableResult
+    func restoreEntry(imageId: UInt32, version: UInt64, data: Data) -> Bool {
+        guard isRestoring else { return false }
+        guard imageId >= 1, imageId <= 0xFFFFFF,
+              RemoteKittyPNGValidation.isStructurallyValid(data)
+        else { return false }
+        let key = StoredKey(imageId: imageId, version: version)
+        guard dataByKey[key] == nil else { return false }
+        order.append(key)
+        dataByKey[key] = data
+        totalBytes += data.count
+        latestVersion[imageId] = version
+        pendingBudgetRegistrations.append(key)
+        return true
+    }
+
+    /// Installs one previously-persisted current-selection record — the
+    /// restore-only counterpart to a live `a=T`/`a=p` activation. Only
+    /// selects an `(imageId, version)` pair that was actually restored by a
+    /// prior `restoreEntry` call in this same window (never a dangling
+    /// reference to bytes that were never installed), and reuses
+    /// `activatePlacement` so wildcard-vs-exact activation semantics are
+    /// identical to the live path.
+    @discardableResult
+    func restoreCurrentSelection(
+        imageId: UInt32,
+        version: UInt64,
+        placementId: UInt32?,
+        rows: Int? = nil,
+        columns: Int? = nil,
+        x: Int? = nil,
+        y: Int? = nil,
+        z: Int? = nil
+    ) -> Bool {
+        guard isRestoring else { return false }
+        let key = StoredKey(imageId: imageId, version: version)
+        guard dataByKey[key] != nil else { return false }
+        let normalizedPlacementId = placementId.flatMap { $0 > 0 ? $0 : nil }
+        if let rows, let columns,
+           rows > 0, columns > 0,
+           rows <= remoteKittyMaxImageDimension,
+           columns <= remoteKittyMaxImageDimension {
+            let geometryKey = PlacementGeometryKey(
+                imageId: imageId,
+                placementId: normalizedPlacementId
+            )
+            makeRoomForPlacementGeometry(geometryKey)
+            placementDimensions[geometryKey] = PlacementDimensions(
+                rows: rows,
+                columns: columns,
+                x: x,
+                y: y,
+                z: z
+            )
+        }
+        let wasAdvertised = latestVersion[imageId] != nil && isAnyPlacementActive(imageId: imageId)
+        latestVersion[imageId] = version
+        activatePlacement(imageId: imageId, explicitPlacementId: normalizedPlacementId)
+        if !wasAdvertised { restoreAdvertisedChanged = true }
+        return true
+    }
+
+    /// Ends a disk-restore replay window begun by `beginRestoring()`:
+    /// registers every restored entry with the process-wide budget and
+    /// enforces local bounds (deferred until now so eviction preference sees
+    /// this session's *final* current-selection state, never a
+    /// still-incomplete one — see `pendingBudgetRegistrations`), then bumps
+    /// `imageAvailabilityGeneration` at most once for the whole batch if any
+    /// restored current availability actually changed. Safe to call even if
+    /// `beginRestoring()` was never followed by any restore calls at all.
+    func finishRestoring() {
+        guard isRestoring else { return }
+        isRestoring = false
+        suppressPersistToDisk = false
+        for key in pendingBudgetRegistrations {
+            guard let data = dataByKey[key] else { continue }
+            budget.register(owner: self, imageId: key.imageId, version: key.version, bytes: data.count)
+        }
+        pendingBudgetRegistrations.removeAll(keepingCapacity: false)
+        enforceLocalBounds()
+        if restoreAdvertisedChanged {
+            imageAvailabilityGeneration &+= 1
+            restoreAdvertisedChanged = false
         }
     }
 }
