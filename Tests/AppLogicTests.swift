@@ -11742,6 +11742,59 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteKittyImageDiskStoreNormalizesPersistedZeroPlacementId() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = "legacy-zero-placement"
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let pathStore = RemoteKittyImageDiskStore(root: root)
+        let dataURL = pathStore.dataFileURLForTesting(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1
+        )
+        try FileManager.default.createDirectory(
+            at: dataURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try png.write(to: dataURL)
+        let manifest = """
+        {
+          "schemaVersion": 1,
+          "entries": [{
+            "sessionId": "\(sessionId)",
+            "imageId": 1,
+            "version": 1,
+            "byteCount": \(png.count)
+          }],
+          "selections": [{
+            "sessionId": "\(sessionId)",
+            "imageId": 1,
+            "version": 1,
+            "placementId": 0,
+            "rows": 1,
+            "columns": 2
+          }]
+        }
+        """
+        try Data(manifest.utf8).write(to: root.appendingPathComponent("manifest.json"))
+
+        let store = RemoteKittyImageDiskStore(root: root)
+        let restored = await store.restore(sessionId: sessionId)
+        XCTAssertEqual(restored.currentSelections, [RemoteKittyRestoredSelection(
+            imageId: 1,
+            version: 1,
+            placementId: nil,
+            rows: 1,
+            columns: 2,
+            x: nil,
+            y: nil,
+            z: nil
+        )])
+    }
+
+    @MainActor
     func testRemoteKittyImageDiskStoreDoesNotCleanDiskBeforePrimaryActivation() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

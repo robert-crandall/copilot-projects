@@ -1154,7 +1154,6 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                       && $0.imageId >= 1
                       && $0.imageId <= 0xFFFFFF
                       && $0.version > 0
-                      && ($0.placementId.map { $0 > 0 } ?? true)
                       && $0.rows > 0
                       && $0.columns > 0
                       && $0.rows <= 4_096
@@ -1171,6 +1170,20 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
             guard !overflow, sum <= maxTotalBytes else { return Manifest() }
             totalBytes = sum
         }
-        return decoded
+        var normalized = decoded
+        normalized.selections = decoded.selections.map { selection in
+            ManifestSelectionRecord(
+                sessionId: selection.sessionId,
+                imageId: selection.imageId,
+                version: selection.version,
+                placementId: selection.placementId.flatMap { $0 > 0 ? $0 : nil },
+                rows: selection.rows,
+                columns: selection.columns,
+                x: selection.x,
+                y: selection.y,
+                z: selection.z
+            )
+        }
+        return normalized
     }
 }
