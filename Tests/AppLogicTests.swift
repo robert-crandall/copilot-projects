@@ -6647,6 +6647,38 @@ final class AppLogicTests: XCTestCase {
         ))
     }
 
+    func testRemoteWebCapsTranscriptRenderForLargeSessions() {
+        // A long transcript must not build its whole DOM in one synchronous pass.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const TRANSCRIPT_RENDER_LIMIT = 50;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const hiddenCount = Math.max(0, total - transcriptRenderLimit);"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const turns = hiddenCount > 0 ? allTurns.slice(hiddenCount) : allTurns;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "transcriptRenderLimit += TRANSCRIPT_RENDER_STEP;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".show-earlier"))
+        // Scroll stays anchored to a specific turn across window trim/reveal
+        // rather than jumping when a turn is dropped from the top.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "card.dataset.turnId = turn.id;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "transcript.scrollTop += card.getBoundingClientRect().top - anchorTop;"
+        ))
+        // The window must RESET on session switch, not merely be initialized once.
+        // Both the initializer and the selectSession reset assign it, so require at
+        // least two occurrences — removing the reset drops the count to one.
+        let assignments = RemoteWebAssets.javascript.components(
+            separatedBy: "transcriptRenderLimit = TRANSCRIPT_RENDER_LIMIT"
+        ).count - 1
+        XCTAssertGreaterThanOrEqual(assignments, 2)
+    }
+
     func testRemoteWebIgnoresStaleTranscriptAndPromptResponses() {
         XCTAssertTrue(RemoteWebAssets.javascript.contains(
             "const requestId = ++transcriptRequestId;"
