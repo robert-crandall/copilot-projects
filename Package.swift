@@ -17,12 +17,13 @@ let package = Package(
         // Pinned past the post-1.13 Metal fixes for stale rows/cursor, window
         // reparenting, synchronized output, and hidden-scroller layout. The
         // temporary fork also carries the Kitty truecolor placeholder ID fix
-        // proposed upstream in migueldeicaza/SwiftTerm#607, and a Metal-renderer
+        // proposed upstream in migueldeicaza/SwiftTerm#607, a Metal-renderer
         // empty-ink glyph cache (sirfergy/SwiftTerm#1) that keeps blank cells off
-        // the per-frame CoreText bounding-box path.
+        // the per-frame CoreText bounding-box path, and row/empty-ink cache
+        // invalidation to recover a blank Metal surface (sirfergy/SwiftTerm#2).
         .package(
             url: "https://github.com/sirfergy/SwiftTerm",
-            revision: "1e6a12191a0eb89aec9ed7595ff81667d411b163"
+            revision: "a4db01d926a05be43e2dfe51836badbbaca1a5d5"
         ),
         .package(
             url: "https://github.com/apple/swift-nio",

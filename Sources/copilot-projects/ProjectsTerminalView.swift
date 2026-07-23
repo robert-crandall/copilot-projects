@@ -534,9 +534,23 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
     /// SwiftTerm's Metal view is intentionally paused and redraws on demand.
     func refreshSurface() {
         configureRendererIfNeeded()
-        terminal?.updateFullScreen()
         if isUsingMetalRenderer,
            let metalView: MTKView = firstDescendant(of: MTKView.self) {
+            // `terminal.updateFullScreen()` marks the terminal's rows dirty but
+            // does NOT reach the Metal renderer's rebuild path: `metalDirtyRange`
+            // is only set inside the view's `updateDisplay()`, which this
+            // reveal/redraw path never calls, and the renderer only does a full
+            // rebuild when its cache signature changes or `rowCache` is empty. For
+            // an idle, unchanged buffer neither holds, so a plain `setNeedsDisplay`
+            // just repaints the *cached* rows. If a transient CoreText failure ever
+            // baked empty glyph buffers into those rows (or poisoned the
+            // never-cleared empty-ink cache), the surface stays blank — only the
+            // textureless cursor quad paints — and no reveal/redraw recovers it
+            // short of a restart. Dropping the row + empty-ink caches forces the
+            // next draw to rebuild every visible row from the current model,
+            // re-rasterizing any wrongly-memoized glyph (the valid glyph atlas is
+            // retained, so healthy glyphs are not re-rasterized).
+            invalidateMetalRenderCaches()
             surfaceRefreshGeneration += 1
             let generation = surfaceRefreshGeneration
             metalView.setNeedsDisplay(metalView.bounds)
@@ -554,10 +568,16 @@ final class ProjectsTerminalView: LocalProcessTerminalView {
                       currentMetalView.bounds.width > 0,
                       currentMetalView.bounds.height > 0
                 else { return }
-                self.terminal?.updateFullScreen()
+                // Re-invalidate: if the immediate draw already ran and rebuilt the
+                // rows empty (e.g. the transient failure was still in effect), the
+                // rows are cached again and this retry would otherwise be a no-op
+                // (idle buffer ⇒ no signature change, rows cacheValid). Cheap: the
+                // glyph atlas is retained.
+                self.invalidateMetalRenderCaches()
                 currentMetalView.setNeedsDisplay(currentMetalView.bounds)
             }
         } else {
+            terminal?.updateFullScreen()
             needsDisplay = true
             display()
         }
