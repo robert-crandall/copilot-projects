@@ -5627,7 +5627,7 @@ final class AppLogicTests: XCTestCase {
                 allowedAsset.value(forHTTPHeaderField: "Content-Security-Policy"),
                 "default-src 'self'; connect-src 'self'; style-src 'self'; "
                     + "script-src 'self'; worker-src 'self'; manifest-src 'self'; "
-                    + "img-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+                    + "img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'"
             )
             let manifestStatus = try await remoteHTTPStatus(
                 port: port,
@@ -7037,6 +7037,311 @@ final class AppLogicTests: XCTestCase {
             process.terminationStatus,
             0,
             String(data: output, encoding: .utf8) ?? "Markdown DOM rendering test failed"
+        )
+    }
+
+    // MARK: - Remote web terminal image rendering
+
+    /// Structural checks: the terminal keeps a persistent grid with separate
+    /// `.terminal-lines`/`.terminal-image-overlay` children (so a text-only
+    /// re-render never destroys/reinserts active image nodes), a hidden
+    /// fixed-length cell-width probe, and the required per-image
+    /// accessibility/interaction attributes and clipping.
+    func testRemoteWebAssetsTerminalImageOverlayStructure() {
+        XCTAssertTrue(RemoteWebAssets.html.contains(#"id="terminal-grid""#))
+        XCTAssertTrue(RemoteWebAssets.html.contains(
+            #"id="terminal-lines" class="terminal-lines""#
+        ))
+        XCTAssertTrue(RemoteWebAssets.html.contains(
+            #"id="terminal-image-overlay" class="terminal-image-overlay""#
+        ))
+        XCTAssertTrue(RemoteWebAssets.html.contains(#"id="terminal-cell-probe""#))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".terminal-image-overlay {"))
+        XCTAssertTrue(RemoteWebAssets.css.contains("overflow:hidden"))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".terminal-image {"))
+        XCTAssertTrue(RemoteWebAssets.css.contains("object-fit:contain"))
+        XCTAssertTrue(RemoteWebAssets.css.contains("object-position:top left"))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".terminal-cell-probe {"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("el.draggable = false;"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "el.setAttribute('aria-hidden', 'true');"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("el.className = 'terminal-image';"))
+    }
+
+    /// Source-level assertions for the semantics the skill's design requires
+    /// (exercised end-to-end via `testRemoteTerminalImageJavaScriptPureLogic`
+    /// below where practical, and here where they're only meaningfully
+    /// visible in how the DOM-touching code is wired together): authoritative
+    /// `Array.isArray(screen.images)` replacement including incremental
+    /// history, absolute-line conversion, post-trim retained-range
+    /// filtering, bounded caps, the 404-vs-transient cooldown split, active-
+    /// URL eviction protection, rAF-throttled scroll/resize reconciliation,
+    /// and the session-change/sign-out abort + cache-clear lifecycle.
+    func testRemoteWebAssetsTerminalImageJavaScriptLifecycleAssertions() {
+        let js = RemoteWebAssets.javascript
+        // Authoritative-array semantics, including the incremental history
+        // branch and the offset-out-of-range reset branch.
+        XCTAssertTrue(js.contains("if (Array.isArray(screen.images)) {"))
+        XCTAssertTrue(js.contains("imagePlacements = buildTerminalImagePlacements(screen);"))
+        XCTAssertTrue(js.contains("const retainedStart = historyStartLine;"))
+        XCTAssertTrue(js.contains("const retainedEnd = historyStartLine + historyLines.length;"))
+        XCTAssertTrue(js.contains("placement.absoluteLine < retainedEnd"))
+        // Absolute-line conversion happens against the *emitted* screen only.
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const absoluteLine = screen.firstLine + line;"
+        ))
+        // Bounded validation constants from the design.
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_RETAINED_LINE_SLACK = 1024;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_MAX_PLACEMENTS = 64;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_MAX_RENDERED_NODES = 8;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_FETCH_TIMEOUT_MS = 15_000;"
+        ))
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_MAX_IN_FLIGHT = 16;"
+        ))
+        // Streamed-body cap (declared Content-Length precheck plus streamed
+        // actual-byte cap) never trusts an absent/understated header alone.
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "if (total > maxBytes) {"
+        ))
+        // 404 is the only permanently-negative-cacheable outcome; everything
+        // else (5xx, bad content type, oversized, invalid PNG) is `transient`
+        // and gets a bounded cooldown instead.
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains("error.code = 'not-found';"))
+        XCTAssertTrue(js.contains("if (error?.code === 'not-found') {"))
+        XCTAssertTrue(js.contains("addTerminalImageNegativeCacheEntry(key);"))
+        XCTAssertTrue(js.contains("terminalImageBackoffDelayMs(failureCount)"))
+        XCTAssertTrue(RemoteWebAssets.terminalImageJavascript.contains(
+            "const TERMINAL_IMAGE_MAX_NEGATIVE_CACHE_ENTRIES = 128;"
+        ))
+        // Eviction only ever touches entries with no active DOM reference.
+        XCTAssertTrue(js.contains(".filter(([key, entry]) => entry.activeNodeCount === 0"))
+        XCTAssertTrue(js.contains("(terminalImagePendingConsumers.get(key) || 0) === 0"))
+        // Reconciliation is rAF-throttled and triggered by scroll and resize.
+        XCTAssertTrue(js.contains("requestAnimationFrame(() => {"))
+        XCTAssertTrue(js.contains("terminal.addEventListener('scroll', () => {\n  scheduleTerminalImageReconcile();"))
+        XCTAssertTrue(js.contains("window.addEventListener('resize', () => scheduleTerminalImageReconcile());"))
+        XCTAssertTrue(js.contains("const firstColumn = Math.max(0, Math.floor(terminal.scrollLeft / cellWidth));"))
+        XCTAssertTrue(js.contains("placement.column < lastColumn"))
+        // Session change / terminal refresh / sign-out lifecycle.
+        XCTAssertTrue(js.contains("function resetTerminalImagesForSessionChange() {"))
+        XCTAssertTrue(js.contains("terminalImageGeneration += 1;"))
+        XCTAssertTrue(js.contains("terminalImageInFlight.forEach((request) => request.controller.abort());"))
+        XCTAssertTrue(js.contains("function resetTerminalImagesForSignOut() {"))
+        XCTAssertTrue(js.contains("terminalImagePositiveCache.forEach((entry) => URL.revokeObjectURL(entry.url));"))
+        XCTAssertTrue(js.contains("resetTerminalImagesForSessionChange();"))
+        XCTAssertTrue(js.contains("resetTerminalImagesForSignOut();"))
+        // Async completions generation-check but reconcile against current
+        // state rather than a stale per-render token.
+        XCTAssertTrue(js.contains("if (terminalImageGeneration !== generation) return;"))
+        XCTAssertTrue(js.contains("const current = terminalImageNodes.get(placement.key);"))
+        XCTAssertTrue(js.contains("terminalImageInFlight.get(key)?.promise === promise"))
+        XCTAssertTrue(js.contains("scheduleTerminalImageRetry(key, nextAttemptAt, generation)"))
+        XCTAssertTrue(js.contains("node.loadingKey = key;"))
+        XCTAssertTrue(js.contains("terminalImagePositiveCache.get(key) !== cacheEntry"))
+        XCTAssertTrue(js.contains(
+            """
+            function addTerminalImageNegativeCacheEntry(key) {
+              terminalImageNegativeCache.delete(key);
+            """
+        ))
+        XCTAssertTrue(js.contains(
+            """
+            }
+
+            function addBoundedTerminalImageKey(set, key) {
+            """
+        ))
+        XCTAssertTrue(js.contains("terminalImageCapacityBlocked.has(key)"))
+        XCTAssertTrue(js.contains("blockTerminalImageOnCapacity(key);"))
+        XCTAssertTrue(js.contains("retryCapacityBlockedTerminalImages();"))
+        XCTAssertTrue(js.contains("terminalImageDecodeFailures.has(key)"))
+        XCTAssertTrue(js.contains("addBoundedTerminalImageKey(terminalImageDecodeFailures, key);"))
+        XCTAssertTrue(js.contains(
+            """
+            retryCapacityBlockedTerminalImages();
+              // A different visible node may have been waiting only on the aggregate
+            """
+        ))
+    }
+
+    /// Executes the actual validation/dedup/PNG/streamed-cap/404-vs-transient
+    /// logic under Node (no DOM needed), mirroring the existing
+    /// `markdownJavascript` pure-function test pattern.
+    func testRemoteTerminalImageJavaScriptPureLogic() throws {
+        try requireNodeForJavaScriptTests()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("terminal-image-test.js")
+        let harness = RemoteWebAssets.terminalImageJavascript + #"""
+
+        const assert = require('node:assert/strict');
+
+        // --- Validation + deterministic dedupe/cap ---
+        const screen = { firstLine: 100, lines: ['a', 'b', 'c'], cols: 10 };
+        const good = { imageId: 5, contentVersion: 2, line: 1, column: 0, rows: 2, columns: 4 };
+        const validated = validateTerminalImagePlacement(good, screen);
+        assert.equal(validated.absoluteLine, 101);
+        assert.equal(validated.key, '5:2:101:0:2:4');
+        const exactVersion = '169531417259147266';
+        const validatedExact = validateTerminalImagePlacement({
+          ...good, contentVersion: 169531417259147266, contentVersionText: exactVersion
+        }, screen);
+        assert.equal(validatedExact.contentVersion, exactVersion);
+        assert.equal(validatedExact.key, `5:${exactVersion}:101:0:2:4`);
+        assert.equal(validateTerminalImagePlacement({
+          ...good, contentVersion: 169531417259147266
+        }, screen), null);
+        assert.equal(validateTerminalImagePlacement({...good, column: 8, columns: 4}, screen), null);
+        assert.equal(validateTerminalImagePlacement({...good, imageId: 0}, screen), null);
+        assert.equal(validateTerminalImagePlacement({...good, imageId: 0x1000000}, screen), null);
+        assert.equal(validateTerminalImagePlacement({...good, line: 1.5}, screen), null);
+        assert.equal(validateTerminalImagePlacement({...good, contentVersion: 0}, screen), null);
+        assert.equal(validateTerminalImagePlacement({...good, rows: 1025}, screen), null);
+        // Bounded negative/out-of-lines slack (retainedLineSlack-style), like iOS.
+        assert.ok(validateTerminalImagePlacement({...good, line: -1024}, screen));
+        assert.equal(validateTerminalImagePlacement({...good, line: -1025}, screen), null);
+        assert.ok(validateTerminalImagePlacement(
+          {...good, line: screen.lines.length + 1023}, screen
+        ));
+        assert.equal(validateTerminalImagePlacement(
+          {...good, line: screen.lines.length + 1024}, screen
+        ), null);
+
+        const many = Array.from({length: 100}, (_, i) => ({
+          imageId: (i % 5) + 1, contentVersion: 1, line: 0, column: 0, rows: 1, columns: 1
+        }));
+        const placements = buildTerminalImagePlacements({ ...screen, images: [...many, many[0]] });
+        assert.ok(placements.length <= TERMINAL_IMAGE_MAX_PLACEMENTS);
+        assert.equal(new Set(placements.map((p) => p.key)).size, placements.length);
+        assert.deepEqual(buildTerminalImagePlacements({ ...screen, images: null }), []);
+        assert.deepEqual(buildTerminalImagePlacements({ ...screen, images: [] }), []);
+
+        // --- PNG structural validation ---
+        function makePng(width, height) {
+          const bytes = new Uint8Array(8 + 8 + 13);
+          bytes.set([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A], 0);
+          const view = new DataView(bytes.buffer);
+          view.setUint32(8, 13, false);
+          bytes.set([0x49,0x48,0x44,0x52], 12);
+          view.setUint32(16, width, false);
+          view.setUint32(20, height, false);
+          return bytes;
+        }
+        assert.deepEqual(validateTerminalImagePngBytes(makePng(10, 20)), { width: 10, height: 20 });
+        assert.equal(validateTerminalImagePngBytes(makePng(0, 20)), null);
+        assert.equal(validateTerminalImagePngBytes(makePng(5000, 20)), null);
+        assert.ok(validateTerminalImagePngBytes(makePng(4000, 4000)));
+        assert.equal(validateTerminalImagePngBytes(makePng(4001, 4000)), null);
+        const badSig = makePng(10, 10); badSig[0] = 0;
+        assert.equal(validateTerminalImagePngBytes(badSig), null);
+        const badChunk = makePng(10, 10); badChunk.set([0,0,0,0], 12);
+        assert.equal(validateTerminalImagePngBytes(badChunk), null);
+
+        assert.equal(terminalImageCacheKey('s1', 5, 2), 's1:5:2');
+        assert.equal(terminalImageBackoffDelayMs(1), 1000);
+        assert.equal(terminalImageBackoffDelayMs(10), 30000);
+
+        (async () => {
+          const bigResponse = {
+            headers: { get: (k) => k === 'content-length' ? String(10 * 1024 * 1024) : null }
+          };
+          await assert.rejects(readBoundedTerminalImageBody(bigResponse, 5 * 1024 * 1024));
+
+          function makeStreamResponse(chunkSizes) {
+            let index = 0;
+            return {
+              headers: { get: () => null },
+              body: { getReader: () => ({
+                read: async () => {
+                  if (index >= chunkSizes.length) return { done: true, value: undefined };
+                  const value = new Uint8Array(chunkSizes[index]);
+                  index += 1;
+                  return { done: false, value };
+                },
+                cancel: async () => {}
+              }) }
+            };
+          }
+          await assert.rejects(
+            readBoundedTerminalImageBody(makeStreamResponse([3*1024*1024, 3*1024*1024]), 5*1024*1024)
+          );
+          const okBytes = await readBoundedTerminalImageBody(
+            makeStreamResponse([1024, 1024]), 5*1024*1024
+          );
+          assert.equal(okBytes.length, 2048);
+
+          globalThis.fetch = async (url) => {
+            if (url.includes('i=404')) return { status: 404, ok: false, headers: { get: () => null } };
+            if (url.includes('i=503')) return { status: 503, ok: false, headers: { get: () => null } };
+            if (url.includes('i=200')) {
+              const png = makePng(2, 2);
+              let done = false;
+              return {
+                status: 200, ok: true,
+                headers: { get: (k) => k === 'content-type' ? 'image/png' : null },
+                body: { getReader: () => ({
+                  read: async () => {
+                    if (done) return { done: true };
+                    done = true;
+                    return { done: false, value: png };
+                  },
+                  cancel: async () => {}
+                }) }
+              };
+            }
+            if (url.includes('i=999')) {
+              return {
+                status: 200, ok: true,
+                headers: { get: (k) => k === 'content-type' ? 'text/html' : null },
+                body: null, arrayBuffer: async () => new ArrayBuffer(4)
+              };
+            }
+            throw new Error('unexpected url ' + url);
+          };
+          try {
+            await fetchTerminalImageBytes('/base/', 's', 404, 1, undefined);
+            assert.fail('expected throw');
+          } catch (e) { assert.equal(e.code, 'not-found'); }
+          try {
+            await fetchTerminalImageBytes('/base/', 's', 503, 1, undefined);
+            assert.fail('expected throw');
+          } catch (e) { assert.equal(e.code, 'transient'); }
+          try {
+            await fetchTerminalImageBytes('/base/', 's', 999, 1, undefined);
+            assert.fail('expected throw');
+          } catch (e) { assert.equal(e.code, 'transient'); }
+          const result = await fetchTerminalImageBytes('/base/', 's', 200, 1, undefined);
+          assert.equal(result.width, 2);
+          assert.equal(result.height, 2);
+        })().catch((error) => { console.error(error); process.exit(1); });
+        """#
+        try harness.write(to: script, atomically: true, encoding: .utf8)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", script.path]
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: output, encoding: .utf8) ?? "Terminal image JavaScript test failed"
         )
     }
 
@@ -8714,6 +9019,26 @@ final class AppLogicTests: XCTestCase {
         let data = try JSONEncoder().encode(screen)
         let decoded = try JSONDecoder().decode(RemoteTerminalScreen.self, from: data)
         XCTAssertEqual(decoded, screen)
+        XCTAssertEqual(decoded.images?.first?.contentVersionText, "3")
+    }
+
+    func testRemoteTerminalImagePlacementDecodesOlderNumericOnlyJSON() throws {
+        let json = """
+        {
+          "imageId": 7,
+          "contentVersion": 3,
+          "line": 0,
+          "column": 1,
+          "rows": 2,
+          "columns": 2
+        }
+        """
+        let decoded = try JSONDecoder().decode(
+            RemoteTerminalImagePlacement.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(decoded.contentVersion, 3)
+        XCTAssertNil(decoded.contentVersionText)
     }
 
     // MARK: - Remote Kitty placeholder decode + sanitize (pure)
