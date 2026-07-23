@@ -290,6 +290,10 @@ enum RemoteWebAssets {
     #transcript { flex:1; min-height:0; overflow:auto; -webkit-overflow-scrolling:touch;
       overscroll-behavior:contain; padding:10px; }
     .transcript-empty { color:#888; padding:18px 8px; text-align:center; }
+    .show-earlier { justify-self:center; margin:6px auto 10px; padding:6px 14px;
+      background:#232323; color:#ddd; border:1px solid #3a3a3a; border-radius:14px;
+      font-size:.85rem; cursor:pointer; }
+    .show-earlier:hover { background:#2c2c2c; }
     .turn { margin:0 0 12px; padding:10px; border:1px solid #333; border-radius:10px;
       background:#1d1d1d; }
     .turn-header { display:flex; justify-content:space-between; gap:8px;
@@ -1297,6 +1301,13 @@ enum RemoteWebAssets {
     let transcriptRequestId = 0;
     let selectionGeneration = 0;
     let viewMode = 'conversation';
+    // Only the most recent turns are rendered up front so a long transcript
+    // can't freeze the tab building hundreds of markdown-parsed cards in one
+    // synchronous pass; "Show earlier" reveals older turns a bounded batch at a
+    // time. Reset per session in selectSession().
+    const TRANSCRIPT_RENDER_LIMIT = 50;
+    const TRANSCRIPT_RENDER_STEP = 50;
+    let transcriptRenderLimit = TRANSCRIPT_RENDER_LIMIT;
     // Per-session queue of Copilot prompts. Conversation mode lets you stack
     // multiple messages while the agent is busy; they flush in order as it frees.
     const QUEUE_CAP = 25;
@@ -1558,6 +1569,7 @@ enum RemoteWebAssets {
       historyLines = [];
       promptSending = false;
       awaitingPromptStart = false;
+      transcriptRenderLimit = TRANSCRIPT_RENDER_LIMIT;
       transcriptRequestId += 1;
       selectionGeneration += 1;
       clearTimeout(promptFallbackTimer);
@@ -2056,17 +2068,52 @@ enum RemoteWebAssets {
     function renderTranscript(snapshot) {
       const wasAtBottom =
         transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 18;
+      // Capture a stable scroll anchor — the first turn intersecting the viewport
+      // top — so trimming older turns (a new SSE turn slides the capped window) or
+      // revealing them ("Show earlier") keeps the viewport on the same content
+      // instead of jumping. Only needed when the user has scrolled up.
+      let anchorId = null;
+      let anchorTop = 0;
+      if (!wasAtBottom) {
+        const containerTop = transcript.getBoundingClientRect().top;
+        for (const card of transcript.querySelectorAll('.turn')) {
+          const rect = card.getBoundingClientRect();
+          if (rect.bottom > containerTop) {
+            anchorId = card.dataset.turnId;
+            anchorTop = rect.top;
+            break;
+          }
+        }
+      }
       const fragment = document.createDocumentFragment();
-      const turns = snapshot?.turns || [];
-      if (!turns.length) {
+      const allTurns = snapshot?.turns || [];
+      const total = allTurns.length;
+      if (!total) {
         const empty = document.createElement('div');
         empty.className = 'transcript-empty';
         empty.textContent = 'Completed turns will appear here.';
         fragment.append(empty);
       }
+      // Cap the rendered turns to the most recent window; older turns are
+      // revealed on demand so a long transcript never builds its whole DOM (and
+      // re-parses every message's markdown) in one blocking pass.
+      const hiddenCount = Math.max(0, total - transcriptRenderLimit);
+      if (hiddenCount > 0) {
+        const showEarlier = document.createElement('button');
+        showEarlier.type = 'button';
+        showEarlier.className = 'show-earlier';
+        showEarlier.textContent = `Show earlier (${hiddenCount} more)`;
+        showEarlier.addEventListener('click', () => {
+          transcriptRenderLimit += TRANSCRIPT_RENDER_STEP;
+          renderTranscript(snapshot);
+        });
+        fragment.append(showEarlier);
+      }
+      const turns = hiddenCount > 0 ? allTurns.slice(hiddenCount) : allTurns;
       turns.forEach((turn) => {
         const card = document.createElement('article');
         card.className = 'turn';
+        card.dataset.turnId = turn.id;
         const header = document.createElement('div');
         header.className = 'turn-header';
         const kind = document.createElement('span');
@@ -2097,7 +2144,23 @@ enum RemoteWebAssets {
         fragment.append(card);
       });
       transcript.replaceChildren(fragment);
-      if (wasAtBottom) transcript.scrollTop = transcript.scrollHeight;
+      if (wasAtBottom) {
+        transcript.scrollTop = transcript.scrollHeight;
+      } else if (anchorId !== null) {
+        // Restore the anchored turn to its prior viewport position.
+        let restored = false;
+        for (const card of transcript.querySelectorAll('.turn')) {
+          if (card.dataset.turnId === anchorId) {
+            transcript.scrollTop += card.getBoundingClientRect().top - anchorTop;
+            restored = true;
+            break;
+          }
+        }
+        // The anchored turn was trimmed off the top (user parked at the very top
+        // of an actively-streaming, capped session) — keep them at the top rather
+        // than letting the viewport drift by one turn.
+        if (!restored) transcript.scrollTop = 0;
+      }
     }
 
     async function fetchTranscript(revision) {
