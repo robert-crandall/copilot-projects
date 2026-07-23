@@ -33,14 +33,53 @@ public enum CopilotExtension {
     // Ask the installed native helper to resolve this process through the actual
     // dtach socket ancestry. If the helper is installed but cannot prove ownership,
     // fail closed; only old installs without the helper retain the env fallback.
-    function resolveAppSessionId() {
+    const sessionResolverPath = (() => {
         const home = typeof process.env.HOME === "string" ? process.env.HOME : "";
         const candidates = home ? [
             join(home, ".local/bin/copilot-projects"),
             join(home, ".local/bin/copilot-mux"),
         ] : [];
-        const resolver = candidates.find((candidate) => fileExistsSync(candidate));
-        if (!resolver) {
+        return candidates.find((candidate) => fileExistsSync(candidate)) || null;
+    })();
+
+    // Resolve the app (tab) session id a pid belongs to via the native helper's
+    // dtach-socket ancestry walk. Returns a valid session id, "" when the pid
+    // resolves to no managed tab (e.g. an orphan reparented to launchd), or null
+    // when resolution is unavailable/failed. Callers MUST treat null as "unknown"
+    // and never as a match. Results are cached per pid only briefly: a pid's
+    // ancestry CAN change (a live owner reparented to launchd stops resolving to
+    // its tab — the exact failure this repairs), so the cache is time-bounded to
+    // avoid re-running the resolver on every throttled publish while still letting
+    // a reparented owner become displaceable within one TTL.
+    const resolvedTabCache = new Map(); // pid -> { value, at }
+    const RESOLVED_TAB_TTL_MS = 5_000;
+    function resolveSessionForPid(pid) {
+        if (!sessionResolverPath || !Number.isInteger(pid) || pid <= 0) return null;
+        const cached = resolvedTabCache.get(pid);
+        if (cached && Date.now() - cached.at < RESOLVED_TAB_TTL_MS) return cached.value;
+        let result;
+        try {
+            const resolved = execFileSync(
+                sessionResolverPath,
+                ["resolve-session", "--pid", String(pid)],
+                { encoding: "utf8", timeout: 1_000, stdio: ["ignore", "pipe", "ignore"] }
+            ).trim();
+            result = sessionIdPattern.test(resolved) ? resolved : "";
+        } catch (error) {
+            // `resolve-session` exits non-zero (status 1, no output) when the pid
+            // belongs to no managed tab — a definitive "no tab", not a failure, so
+            // treat it as "" (displaceable). Only a spawn failure or timeout (no
+            // numeric exit status) is genuinely unknown -> null, so we stay
+            // conservative and never displace a live owner on a flaky lookup. The
+            // unknown case is not cached, so a transient failure isn't remembered.
+            result = (error && typeof error.status === "number") ? "" : null;
+        }
+        if (result !== null) resolvedTabCache.set(pid, { value: result, at: Date.now() });
+        return result;
+    }
+
+    function resolveAppSessionId() {
+        if (!sessionResolverPath) {
             return {
                 sessionId: sessionIdPattern.test(environmentAppSessionId || "")
                     ? environmentAppSessionId
@@ -48,23 +87,8 @@ public enum CopilotExtension {
                 native: false,
             };
         }
-        try {
-            const resolved = execFileSync(
-                resolver,
-                ["resolve-session", "--pid", String(process.pid)],
-                {
-                    encoding: "utf8",
-                    timeout: 1_000,
-                    stdio: ["ignore", "pipe", "ignore"],
-                }
-            ).trim();
-            return {
-                sessionId: sessionIdPattern.test(resolved) ? resolved : "",
-                native: true,
-            };
-        } catch {
-            return { sessionId: "", native: true };
-        }
+        const resolved = resolveSessionForPid(process.pid);
+        return { sessionId: resolved === null ? "" : resolved, native: true };
     }
 
     const appSessionResolution = resolveAppSessionId();
@@ -249,6 +273,35 @@ public enum CopilotExtension {
             return current === null || current === owner.bootTime;
         }
 
+        // A live pid alone does not entitle a marker to keep this tab's shared
+        // files: an orphaned or cross-tab copilot (e.g. one that grabbed the
+        // marker via a stale COPILOT_PROJECTS_SESSION before native dtach
+        // resolution existed, then was reparented to launchd) would otherwise
+        // block this tab's real interactive session from ever claiming ownership
+        // and republishing its transcript. Only an owner that actually belongs to
+        // THIS app session may hold the claim. We make this judgment ONLY when our
+        // own identity is natively resolved; otherwise we stay conservative and
+        // never displace a live owner. A same-tab peer (e.g. a `copilot -p`
+        // classifier under the same dtach master) still resolves to this tab and
+        // is honored, preserving the original anti-clobber protection.
+        function ownerBelongsToThisTab(owner) {
+            if (!appSessionResolution.native || !validSessionId) return true;
+            if (typeof owner.appSessionId === "string"
+                    && sessionIdPattern.test(owner.appSessionId)) {
+                return owner.appSessionId === appSessionId;
+            }
+            const resolved = resolveSessionForPid(owner.pid);
+            if (resolved === null) return true; // unknown -> do not displace
+            return resolved === appSessionId;
+        }
+
+        // The marker keeps its claim only while its process is alive AND still
+        // belongs to this tab. Everything else (dead, or alive-but-foreign) is
+        // displaceable by this tab's own session.
+        function ownerHoldsClaim(owner) {
+            return ownerProcessAlive(owner) && ownerBelongsToThisTab(owner);
+        }
+
         function recordedOwner() {
             try {
                 return JSON.parse(readFileSync(transcriptOwnerPath, "utf8"));
@@ -339,23 +392,24 @@ public enum CopilotExtension {
             }
         }
 
-        function reclaimDeadOwner(expectedOwner) {
+        function reclaimDisplaceableOwner(expectedOwner) {
             return withTranscriptOwnerLock(() => {
                 const owner = recordedOwner();
                 if (!owner) return writeOwnerMarker();
                 if (ownerMatchesCurrentProcess(owner)) return true;
-                if (ownerProcessAlive(owner)) return false;
+                if (ownerHoldsClaim(owner)) return false;
                 if (!ownerMatches(owner, expectedOwner)) return false;
                 return replaceOwnerMarker();
             });
         }
 
         // Claiming: returns true if this process may write shared files. Claims
-        // ownership atomically (exclusive create) when the marker is absent or
-        // held by a dead process. Stale-owner reclamation is serialized so a
-        // process that read the stale marker cannot delete a fresh winner's
-        // marker. Returns false if another live process owns it or the claim is
-        // lost.
+        // ownership atomically (exclusive create) when the marker is absent,
+        // held by a dead process, or held by a live process that does not belong
+        // to this tab (an orphaned/cross-tab copilot). Reclamation is serialized
+        // so a process that read the stale marker cannot delete a fresh winner's
+        // marker. Returns false only if a live owner that belongs to THIS tab
+        // holds it or the claim is lost.
         function ownsSharedFiles() {
             for (let attempt = 0; attempt < 3; attempt += 1) {
                 const owner = recordedOwner();
@@ -364,8 +418,8 @@ public enum CopilotExtension {
                         activateSharedFilesOwnership();
                         return true;
                     }
-                    if (ownerProcessAlive(owner)) return false;
-                    if (reclaimDeadOwner(owner)) {
+                    if (ownerHoldsClaim(owner)) return false;
+                    if (reclaimDisplaceableOwner(owner)) {
                         activateSharedFilesOwnership(true);
                         return true;
                     }
