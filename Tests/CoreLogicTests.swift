@@ -905,6 +905,136 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertEqual(summary["ownerPidIsCurrent"] as? Bool, true)
     }
 
+    // A live owner that belongs to a DIFFERENT tab (an orphaned/cross-tab copilot
+    // whose pid does not resolve to this app session) must be displaceable, so
+    // this tab's real interactive session can reclaim ownership and republish its
+    // transcript. Uses a stub native resolver that maps only this process to the
+    // tab; the recorded owner's pid resolves to nothing.
+    func testCopilotExtensionReclaimsOwnershipFromLiveForeignOwner() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-foreign-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        let bin = root.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+        let copilotSessionId = "44444444-4444-4444-8444-444444444444"
+
+        // Stub `copilot-projects resolve-session --pid N`: the hook's own pid
+        // (this stub's parent) resolves to the tab; every other pid resolves to
+        // nothing, so the recorded owner (pid 1) is treated as foreign.
+        let resolver = bin.appendingPathComponent("copilot-projects")
+        try #"""
+        #!/bin/sh
+        PID=""
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "--pid" ]; then shift; PID="$1"; fi
+          shift
+        done
+        if [ "$PID" = "$PPID" ]; then
+          printf '%s' "$COPILOT_PROJECTS_SESSION"
+        else
+          exit 1
+        fi
+        """#.write(to: resolver, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: resolver.path
+        )
+
+        let prelude = #"""
+        const namedListeners = new Map();
+        const fakeSession = {
+          sessionId: "__COPILOT_SESSION_ID__",
+          rpc: {
+            schedule: { list: async () => ({entries:[]}) },
+            permissions: { getAllowAll: async () => ({ enabled: true }) }
+          },
+          on(name, handler) {
+            if (typeof name !== "function") namedListeners.set(name, handler);
+          },
+          async getEvents() { return []; }
+        };
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: "const joinSession = async () => fakeSession;"
+        )
+        let epilogue = #"""
+
+        const sessionsDir = `${process.env.COPILOT_PROJECTS_ROOT}/sessions`;
+        const ownerPath = `${sessionsDir}/${process.env.COPILOT_PROJECTS_SESSION}.transcript-owner.json`;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        // A live foreign owner: pid 1 is always "alive", no appSessionId, and the
+        // stub resolver maps pid 1 to no tab. The fix must displace it.
+        writeFileSync(ownerPath, JSON.stringify({
+          copilotSessionId: "old-session",
+          pid: 1
+        }));
+
+        namedListeners.get("assistant.turn_start")({
+          id: "turn",
+          type: "assistant.turn_start",
+          timestamp: "2026-07-12T04:00:00.000Z",
+          data: {}
+        });
+
+        let waited = 0;
+        let owner = null;
+        while (waited < 4000) {
+          try { owner = JSON.parse(readFileSync(ownerPath, "utf8")); } catch {}
+          if (owner && owner.copilotSessionId === "__COPILOT_SESSION_ID__") break;
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          waited += 80;
+        }
+
+        console.log(JSON.stringify({
+          ownerCopilotSessionId: owner?.copilotSessionId,
+          ownerAppSessionId: owner?.appSessionId,
+          ownerPidIsCurrent: owner?.pid === process.pid
+        }));
+        process.exit(0);
+        """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
+        let scriptURL = root.appendingPathComponent("foreign.mjs")
+        try (prelude + extensionScript + epilogue).write(
+            to: scriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        XCTAssertEqual(summary["ownerCopilotSessionId"] as? String, copilotSessionId)
+        XCTAssertEqual(summary["ownerAppSessionId"] as? String, appSessionId)
+        XCTAssertEqual(summary["ownerPidIsCurrent"] as? Bool, true)
+    }
+
     func testCopilotExtensionDiscardsStaleAllowAllRefreshResult() throws {
         try requireNodeForJavaScriptTests()
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)

@@ -265,24 +265,96 @@ final class TranscriptController: ObservableObject {
         copilotSessionId: String,
         directory: URL = Paths.sessionsDir
     ) -> Bool {
-        let path = directory
-            .appendingPathComponent("\(sessionId).transcript-owner.json").path
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let owner = try? JSONDecoder().decode(TranscriptOwner.self, from: data),
+        guard let owner = readOwnerMarker(sessionId: sessionId, directory: directory),
               let ownerCopilotSessionId = owner.copilotSessionId else {
             // No owner recorded (or the owner predates copilotSessionId being
             // tracked) — nothing further to cross-check against.
             return true
         }
-        let allows = ownerCopilotSessionId == copilotSessionId
-        if !allows {
+        if ownerCopilotSessionId == copilotSessionId { return true }
+
+        // The owner's recorded Copilot session differs from the transcript we
+        // read. Whether that is a genuine reclamation race (quarantine) or a
+        // stale marker left by an orphaned/foreign copilot (must NOT permanently
+        // quarantine this tab's own transcript) depends on whether the owner can
+        // be corroborated as belonging to this tab.
+        switch ownerCorroboration(
+            owner: owner,
+            sessionId: sessionId
+        ) {
+        case .aliveElsewhere:
+            // A live process that does not belong to this tab holds the marker
+            // (e.g. it claimed ownership via a stale COPILOT_PROJECTS_SESSION and
+            // was later reparented to launchd). Reject this read so nothing is
+            // surfaced under an untrusted owner, but do NOT persist a quarantine
+            // that would outlive the stale owner and permanently hide this tab's
+            // own transcript.
+            return false
+        case .confirmedThisTab, .dead:
             recordForeignTranscriptQuarantine(
                 sessionId: sessionId,
                 copilotSessionId: copilotSessionId,
                 directory: directory
             )
+            return false
         }
-        return allows
+    }
+
+    private enum OwnerCorroboration {
+        /// The owner's recorded process is gone.
+        case dead
+        /// The owner belongs to this tab (declared a matching native
+        /// `appSessionId`, or its live pid resolves to this tab).
+        case confirmedThisTab
+        /// The owner is alive but does not belong to this tab — it resolves to a
+        /// different tab, or cannot be resolved at all (an orphan).
+        case aliveElsewhere
+    }
+
+    nonisolated private static func readOwnerMarker(
+        sessionId: String,
+        directory: URL = Paths.sessionsDir
+    ) -> TranscriptOwner? {
+        let path = directory
+            .appendingPathComponent("\(sessionId).transcript-owner.json").path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let owner = try? JSONDecoder().decode(TranscriptOwner.self, from: data)
+        else {
+            return nil
+        }
+        return owner
+    }
+
+    /// Classifies a recorded owner marker relative to this tab. Only a marker that
+    /// declares a matching native `appSessionId` is treated as this tab's confirmed
+    /// owner — that field is written solely by a process that resolved its own tab
+    /// through dtach ancestry, so it is spoof- and pid-reuse-resistant. A legacy
+    /// marker without `appSessionId` cannot be positively bound to a tab (a live
+    /// pid is not an identity, and a reused pid could resolve anywhere), so it is
+    /// only ever `dead` (its recorded process is gone) or `aliveElsewhere`
+    /// (present but unproven) — never `confirmedThisTab`. Quarantine PERSISTENCE
+    /// and self-heal both hinge on `confirmedThisTab`, keeping them tied to the
+    /// one trustworthy signal.
+    nonisolated private static func ownerCorroboration(
+        owner: TranscriptOwner,
+        sessionId: String
+    ) -> OwnerCorroboration {
+        if let appSessionId = owner.appSessionId {
+            return appSessionId.caseInsensitiveCompare(sessionId) == .orderedSame
+                ? .confirmedThisTab
+                : .aliveElsewhere
+        }
+        guard owner.pid > 0, processIsAlive(owner.pid) else { return .dead }
+        return .aliveElsewhere
+    }
+
+    /// Best-effort liveness for a pid (no identity guarantee). Mirrors the
+    /// extension hook's `process.kill(pid, 0)` probe: alive if the signal is
+    /// deliverable, or if it exists but is owned by another user (EPERM).
+    nonisolated private static func processIsAlive(_ pid: pid_t) -> Bool {
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     nonisolated static func transcriptOwnerMatchesSession(
@@ -368,6 +440,34 @@ final class TranscriptController: ObservableObject {
             snapshot.copilotSessionId
         ) else {
             try? FileManager.default.removeItem(atPath: path)
+            return true
+        }
+        // Self-heal: a quarantined id that is ALSO the Copilot session of the
+        // confirmed current owner of this tab cannot be foreign to its own tab —
+        // it was recorded from a since-displaced stale owner. Drop only that entry,
+        // and only on positive same-tab provenance (never merely because a live
+        // owner is absent, which could un-hide genuinely foreign content). We
+        // already hold quarantineLock, so mutate the file directly rather than
+        // routing through the (also-locking) record/remove helpers.
+        if let owner = readOwnerMarker(sessionId: sessionId),
+           owner.copilotSessionId == snapshot.copilotSessionId,
+           case .confirmedThisTab = ownerCorroboration(
+               owner: owner,
+               sessionId: sessionId
+           ) {
+            let remaining = quarantine.foreignCopilotSessionIds
+                .subtracting([snapshot.copilotSessionId])
+            if remaining.isEmpty {
+                try? FileManager.default.removeItem(atPath: path)
+            } else if let data = try? JSONEncoder().encode(TranscriptQuarantine(
+                schemaVersion: TranscriptQuarantine.currentSchemaVersion,
+                foreignCopilotSessionIds: remaining
+            )) {
+                try? data.write(
+                    to: URL(fileURLWithPath: path),
+                    options: .atomic
+                )
+            }
             return true
         }
         return false
