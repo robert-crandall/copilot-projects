@@ -396,6 +396,35 @@ enum RemoteWebAssets {
       border:1px solid #555; border-radius:7px; padding:9px;
       font:16px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; }
     .user-input-status { color:#c9a227; font-size:11px; min-height:1em; }
+    .elicitation-fields { display:grid; gap:11px; }
+    .elicitation-field { display:grid; gap:5px; }
+    .elicitation-field-title { color:#9fb4d6; font-size:11px; font-weight:600; }
+    .elicitation-field-req { color:#c9a227; }
+    .elicitation-field-desc { color:#8fa0bd; font-size:11px; }
+    .elicitation-control { width:100%; box-sizing:border-box; background:#222; color:#fff;
+      border:1px solid #555; border-radius:7px; padding:9px;
+      font:16px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; }
+    textarea.elicitation-control { resize:none; }
+    .elicitation-hint { color:#8fa0bd; font-size:10px; }
+    .elicitation-check { display:flex; align-items:center; gap:8px; color:#eaf1ff;
+      font-size:14px; }
+    .elicitation-multi { display:grid; gap:6px; }
+    .elicitation-multi-option { display:flex; align-items:center; gap:8px; width:100%;
+      text-align:left; padding:9px; border-radius:7px; background:#243350;
+      border:1px solid #3a4a63; color:#eaf1ff; }
+    .elicitation-multi-option[aria-pressed="true"] { border-color:#539bf5; background:#2b3f63; }
+    .elicitation-multi-option:disabled { opacity:.5; }
+    .elicitation-actions { display:flex; align-items:center; gap:8px; }
+    .elicitation-actions .spacer { flex:1 1 auto; }
+    .elicitation-decline, .elicitation-submit { padding:9px 12px; border-radius:7px;
+      border:1px solid #3a4a63; background:#243350; color:#eaf1ff; }
+    .elicitation-submit { background:#238636; border-color:#2ea043; color:#fff; }
+    .elicitation-submit:disabled, .elicitation-decline:disabled { opacity:.5; }
+    .elicitation-open { display:inline-block; padding:9px 12px; border-radius:7px;
+      background:#238636; border:1px solid #2ea043; color:#fff; text-decoration:none;
+      width:max-content; }
+    .elicitation-url { color:#9fb4d6; font-size:12px; overflow-wrap:anywhere; }
+    .elicitation-fallback { color:#9fb4d6; font-size:12px; }
     @media (max-width: 700px) {
       header { flex:0 0 auto; min-height:48px; flex-wrap:wrap; gap:6px; padding:6px 8px; }
       header strong { display:none; }
@@ -1613,6 +1642,14 @@ enum RemoteWebAssets {
     const latestUserInputAttempts = new Map();
     let userInputAttemptSequence = 0;
     let userInputCardSequence = 0;
+    // Parallel bookkeeping for schema-form / url elicitations. Each entry carries
+    // the parsed form and the in-progress answer values so a workspace refresh
+    // that doesn't change the request set never wipes a half-filled form.
+    const elicitationCards = new Map();
+    const submittingElicitations = new Map();
+    const latestElicitationAttempts = new Map();
+    let elicitationAttemptSequence = 0;
+    let elicitationCardSequence = 0;
     const requested = new URLSearchParams(location.search);
     let pendingFocusSession = requested.get('session');
 
@@ -1830,6 +1867,7 @@ enum RemoteWebAssets {
         writable = true;
         lease.textContent = 'control enabled';
         syncUserInputCards();
+        syncElicitationCards();
         updatePromptState();
       }
     }
@@ -1873,6 +1911,7 @@ enum RemoteWebAssets {
       clearTimeout(scrollTimer);
       scrollTimer = null;
       resetUserInputCards();
+      resetElicitationCards();
       lease.textContent = 'view only';
       terminalLines.textContent = 'Loading…';
       resetTerminalImagesForSessionChange();
@@ -1888,6 +1927,7 @@ enum RemoteWebAssets {
       acquire(id);
       if (viewMode === 'terminal') terminal.focus();
       syncUserInputCards();
+      syncElicitationCards();
       renderQueue();
       updatePromptState();
     }
@@ -1997,6 +2037,7 @@ enum RemoteWebAssets {
       if (!q || !q.length) return;
       const state = sessionState.get(id);
       if ((state?.pendingUserInputs || []).length > 0) return;
+      if ((state?.pendingElicitations || []).length > 0) return;
       if (!(writable && state?.promptable === true
           && !promptSending && !awaitingPromptStart)) return;
       flushingQueue = true;
@@ -2043,7 +2084,8 @@ enum RemoteWebAssets {
     function updatePromptState(message) {
       const state = selected && sessionState.get(selected);
       const pendingInputs = (state && state.pendingUserInputs) || [];
-      const hasQuestions = pendingInputs.length > 0;
+      const pendingElicits = (state && state.pendingElicitations) || [];
+      const hasQuestions = pendingInputs.length > 0 || pendingElicits.length > 0;
       promptForm.classList.toggle('hidden', hasQuestions);
       if (hasQuestions) {
         promptSubmit.disabled = true;
@@ -2129,6 +2171,7 @@ enum RemoteWebAssets {
         }
       }
       syncUserInputCards();
+      syncElicitationCards();
       updatePromptState();
     }
     function currentUserInputs() {
@@ -2319,6 +2362,777 @@ enum RemoteWebAssets {
         setCardStatus(requestId, 'Answer was not accepted');
       } else {
         setCardStatus(requestId, 'Answer was not sent');
+      }
+    }
+    // ---- Schema-form / url elicitations (elicitation.requested) --------------
+    // Mirrors the iOS ElicitationForm/ElicitationCard: only a bounded, flat subset
+    // of JSON Schema is rendered natively; anything outside it falls back to the
+    // terminal so we never render arbitrary or nested schema.
+    const ELICITATION_MAX_FIELDS = 32;
+    const ELICITATION_MAX_CHOICES = 50;
+    function isPlainObject(value) {
+      return value !== null && typeof value === 'object' && !Array.isArray(value);
+    }
+    function nonNegativeInt(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)
+        || value < 0 || !Number.isInteger(value)) {
+        return null;
+      }
+      return value;
+    }
+    function labeledElicitationChoices(entries) {
+      if (!Array.isArray(entries) || entries.length > ELICITATION_MAX_CHOICES) return null;
+      const choices = [];
+      const seen = new Set();
+      for (const entry of entries) {
+        if (!isPlainObject(entry)) return null;
+        if (!Object.keys(entry).every((key) => key === 'const' || key === 'title')) return null;
+        if (typeof entry.const !== 'string' || seen.has(entry.const)) return null;
+        seen.add(entry.const);
+        let title = entry.const;
+        if ('title' in entry) {
+          if (typeof entry.title !== 'string') return null;
+          title = entry.title;
+        }
+        choices.push({ value: entry.const, title });
+      }
+      return choices.length ? choices : null;
+    }
+    function bareElicitationChoices(values) {
+      if (!Array.isArray(values) || values.length > ELICITATION_MAX_CHOICES) return null;
+      const choices = [];
+      const seen = new Set();
+      for (const entry of values) {
+        if (typeof entry !== 'string' || seen.has(entry)) return null;
+        seen.add(entry);
+        choices.push({ value: entry, title: entry });
+      }
+      return choices.length ? choices : null;
+    }
+    function elicitationChoiceSet(items) {
+      const supportedItemKeys = new Set([
+        'anyOf', 'oneOf', 'enum', 'type', 'title', 'description'
+      ]);
+      if (!Object.keys(items).every((key) => supportedItemKeys.has(key))) return null;
+      if ('type' in items && items.type !== 'string') return null;
+      const alternatives = Array.isArray(items.anyOf) ? items.anyOf
+        : Array.isArray(items.oneOf) ? items.oneOf : null;
+      if (alternatives) {
+        if ('enum' in items) return null;
+        return labeledElicitationChoices(alternatives);
+      }
+      if (Array.isArray(items.enum)) return bareElicitationChoices(items.enum);
+      return null;
+    }
+    function elicitationStringKind(prop) {
+      let minLength = null;
+      if ('minLength' in prop) {
+        minLength = nonNegativeInt(prop.minLength);
+        if (minLength === null) return null;
+      }
+      let maxLength = null;
+      if ('maxLength' in prop) {
+        maxLength = nonNegativeInt(prop.maxLength);
+        if (maxLength === null) return null;
+      }
+      if (minLength !== null && maxLength !== null && minLength > maxLength) return null;
+      return { type: 'string', minLength, maxLength };
+    }
+    function elicitationArrayKind(prop) {
+      if (!isPlainObject(prop.items)) return null;
+      const choices = elicitationChoiceSet(prop.items);
+      if (!choices) return null;
+      let minItems = null;
+      if ('minItems' in prop) {
+        minItems = nonNegativeInt(prop.minItems);
+        if (minItems === null) return null;
+      }
+      let maxItems = null;
+      if ('maxItems' in prop) {
+        maxItems = nonNegativeInt(prop.maxItems);
+        if (maxItems === null) return null;
+      }
+      if (minItems !== null && maxItems !== null && minItems > maxItems) return null;
+      return { type: 'stringMultiSelect', choices, minItems, maxItems };
+    }
+    function elicitationFieldKind(prop) {
+      if ('$ref' in prop) return null;
+      const banned = [
+        'anyOf', 'allOf', 'not', 'if', 'then', 'else', 'const', 'format', 'pattern',
+        'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf'
+      ];
+      for (const key of banned) {
+        if (key in prop) return null;
+      }
+      if (Array.isArray(prop.oneOf)) {
+        if ('enum' in prop) return null;
+        if ('minLength' in prop || 'maxLength' in prop) return null;
+        if (prop.type !== 'string') return null;
+        const choices = labeledElicitationChoices(prop.oneOf);
+        return choices ? { type: 'stringOneOf', choices } : null;
+      }
+      if (Array.isArray(prop.enum)) {
+        if ('minLength' in prop || 'maxLength' in prop) return null;
+        if (prop.type !== 'string') return null;
+        if (prop.enum.length > ELICITATION_MAX_CHOICES) return null;
+        const options = [];
+        const seen = new Set();
+        for (const entry of prop.enum) {
+          if (typeof entry !== 'string') return null;
+          options.push(entry);
+          seen.add(entry);
+        }
+        if (seen.size !== options.length) return null;
+        return options.length ? { type: 'stringEnum', options } : null;
+      }
+      if (typeof prop.type !== 'string') return null;
+      const type = prop.type;
+      if (type !== 'string' && ('minLength' in prop || 'maxLength' in prop)) return null;
+      switch (type) {
+        case 'boolean': return { type: 'bool' };
+        case 'integer': return { type: 'number', isInteger: true };
+        case 'number': return { type: 'number', isInteger: false };
+        case 'string': return elicitationStringKind(prop);
+        case 'array': return elicitationArrayKind(prop);
+        default: return null;
+      }
+    }
+    function parseElicitationForm(schema) {
+      if (!isPlainObject(schema)) return null;
+      const supportedRootKeys = new Set([
+        '$schema', 'type', 'title', 'description', 'properties', 'required',
+        'additionalProperties'
+      ]);
+      if (!Object.keys(schema).every((key) => supportedRootKeys.has(key))) return null;
+      if ('type' in schema && schema.type !== 'object') return null;
+      const properties = schema.properties;
+      if (!isPlainObject(properties)) return null;
+      const propertyKeys = Object.keys(properties);
+      if (!propertyKeys.length || propertyKeys.length > ELICITATION_MAX_FIELDS) return null;
+      const required = new Set();
+      if ('required' in schema) {
+        if (!Array.isArray(schema.required)) return null;
+        for (const name of schema.required) {
+          if (typeof name !== 'string') return null;
+          required.add(name);
+        }
+      }
+      for (const name of required) {
+        if (!(name in properties)) return null;
+      }
+      const fields = [];
+      // JSON object key order isn't guaranteed across the wire, so sort keys for a
+      // stable, deterministic field order (matches the iOS client).
+      for (const key of propertyKeys.slice().sort()) {
+        const prop = properties[key];
+        if (!isPlainObject(prop)) return null;
+        const kind = elicitationFieldKind(prop);
+        if (!kind) return null;
+        const title = typeof prop.title === 'string' ? prop.title : key;
+        const description = typeof prop.description === 'string' ? prop.description : null;
+        fields.push({
+          key, title, description, kind,
+          required: required.has(key),
+          hasDefault: 'default' in prop,
+          defaultValue: 'default' in prop ? prop.default : undefined
+        });
+      }
+      return fields.length ? { fields } : null;
+    }
+    function elicitationAccepts(kind, value) {
+      switch (kind.type) {
+        case 'stringEnum':
+          return typeof value === 'string' && kind.options.includes(value);
+        case 'stringOneOf':
+          return typeof value === 'string'
+            && kind.choices.some((choice) => choice.value === value);
+        case 'bool':
+          return typeof value === 'boolean';
+        case 'number':
+          if (typeof value !== 'number' || !Number.isFinite(value)) return false;
+          return kind.isInteger ? value === Math.round(value) : true;
+        case 'string': {
+          if (typeof value !== 'string') return false;
+          const length = [...value].length;
+          if (kind.minLength !== null && length < kind.minLength) return false;
+          if (kind.maxLength !== null && length > kind.maxLength) return false;
+          return true;
+        }
+        case 'stringMultiSelect': {
+          if (!Array.isArray(value)) return false;
+          const seen = new Set();
+          for (const item of value) {
+            if (typeof item !== 'string') return false;
+            if (!kind.choices.some((choice) => choice.value === item)) return false;
+            if (seen.has(item)) return false;
+            seen.add(item);
+          }
+          if (kind.minItems !== null && value.length < kind.minItems) return false;
+          if (kind.maxItems !== null && value.length > kind.maxItems) return false;
+          return true;
+        }
+        default:
+          return false;
+      }
+    }
+    // Build the accepted-answer payload, or null while any present value is invalid
+    // or a required field is missing.
+    function validatedElicitationContent(form, values, touched) {
+      const payload = {};
+      for (const field of form.fields) {
+        if (!(field.key in values)) {
+          if (field.required) return null;
+          continue;
+        }
+        const value = values[field.key];
+        if (!elicitationAccepts(field.kind, value)) return null;
+        if (field.required || touched.has(field.key) || field.hasDefault) {
+          payload[field.key] = value;
+        }
+      }
+      return payload;
+    }
+    function seedElicitationDefaults(entry) {
+      if (!entry.form) return;
+      for (const field of entry.form.fields) {
+        if (field.hasDefault && elicitationAccepts(field.kind, field.defaultValue)) {
+          entry.values[field.key] = field.defaultValue;
+        } else if (field.required) {
+          switch (field.kind.type) {
+            case 'stringEnum':
+              if (field.kind.options.length) entry.values[field.key] = field.kind.options[0];
+              break;
+            case 'stringOneOf':
+              if (field.kind.choices.length) {
+                entry.values[field.key] = field.kind.choices[0].value;
+              }
+              break;
+            case 'bool':
+              entry.values[field.key] = false;
+              break;
+            case 'string':
+              entry.values[field.key] = '';
+              break;
+            case 'stringMultiSelect':
+              entry.values[field.key] = [];
+              break;
+            case 'number':
+              break;  // required numbers must be filled by the user
+          }
+        }
+      }
+    }
+    function elicitationValuesEqual(a, b) {
+      if (a === undefined && b === undefined) return true;
+      return a === b;
+    }
+    function parseElicitationNumber(text) {
+      const trimmed = text.trim();
+      if (!trimmed) return null;
+      if (!/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(trimmed)) return null;
+      const value = Number(trimmed);
+      return Number.isFinite(value) ? value : null;
+    }
+    function formatElicitationNumber(value) {
+      if (value === Math.round(value) && Math.abs(value) < 1e15) {
+        return String(Math.round(value));
+      }
+      return String(value);
+    }
+    function elicitationStringLengthRequirement(kind) {
+      if (kind.type !== 'string') return null;
+      const { minLength, maxLength } = kind;
+      if (minLength !== null && maxLength !== null) {
+        return `Use ${minLength}\u2013${maxLength} code points.`;
+      }
+      if (minLength !== null) {
+        return `Use at least ${minLength} ${minLength === 1 ? 'code point' : 'code points'}.`;
+      }
+      if (maxLength !== null) {
+        return `Use at most ${maxLength} ${maxLength === 1 ? 'code point' : 'code points'}.`;
+      }
+      return null;
+    }
+    function safeWebURL(rawURL) {
+      if (typeof rawURL !== 'string' || !rawURL) return null;
+      let url;
+      try {
+        url = new URL(rawURL);
+      } catch (error) {
+        return null;
+      }
+      const scheme = url.protocol.toLowerCase();
+      if (scheme !== 'https:' && scheme !== 'http:') return null;
+      if (!url.host) return null;
+      return url.href;
+    }
+    function currentElicitations() {
+      return (selected && sessionState.get(selected)?.pendingElicitations) || [];
+    }
+    function sessionHasElicitation(sessionId, requestId) {
+      return (sessionState.get(sessionId)?.pendingElicitations || [])
+        .some((request) => request.requestId === requestId);
+    }
+    function resetElicitationCards() {
+      submittingElicitations.forEach((entry) => clearTimeout(entry.timer));
+      submittingElicitations.clear();
+      latestElicitationAttempts.clear();
+      elicitationCards.clear();
+    }
+    function setElicitationStatus(requestId, text) {
+      const status = elicitationCards.get(requestId)?.card
+        .querySelector('.user-input-status');
+      if (status) status.textContent = text || '';
+    }
+    function refreshElicitationControls(entry) {
+      const submitting = submittingElicitations.has(entry.request.requestId);
+      const disabled = submitting || !writable;
+      entry.card.querySelectorAll(
+        'select, input, textarea, .elicitation-multi-option, .elicitation-decline'
+      ).forEach((element) => { element.disabled = disabled; });
+      entry.card.querySelectorAll('.elicitation-multi-option').forEach((button) => {
+        button.style.opacity = disabled ? '0.5' : '1';
+      });
+      if (entry.submitButton) {
+        if (entry.isURLMode) {
+          entry.submitButton.disabled = disabled;
+        } else if (entry.form) {
+          entry.submitButton.disabled = disabled
+            || validatedElicitationContent(entry.form, entry.values, entry.touched) === null;
+        }
+      }
+    }
+    function refreshElicitationCardStates() {
+      for (const entry of elicitationCards.values()) {
+        refreshElicitationControls(entry);
+      }
+    }
+    function selectedMultiStrings(entry, key) {
+      const value = entry.values[key];
+      if (!Array.isArray(value)) return [];
+      return value.filter((item) => typeof item === 'string');
+    }
+    function toggleElicitationChoice(entry, field, value) {
+      const kind = field.kind;
+      const selected = new Set(selectedMultiStrings(entry, field.key));
+      if (selected.has(value)) {
+        selected.delete(value);
+      } else {
+        if (kind.maxItems !== null && selected.size >= kind.maxItems) return;
+        selected.add(value);
+      }
+      entry.values[field.key] = kind.choices
+        .map((choice) => choice.value)
+        .filter((choiceValue) => selected.has(choiceValue));
+      entry.touched.add(field.key);
+    }
+    function buildElicitationChoiceSelect(entry, field, controlId, options) {
+      const select = document.createElement('select');
+      select.id = controlId;
+      select.className = 'elicitation-control';
+      options.forEach((option) => {
+        const element = document.createElement('option');
+        element.textContent = option.title;
+        select.append(element);
+      });
+      select.onchange = () => {
+        const chosen = options[select.selectedIndex];
+        if (chosen.value === undefined) delete entry.values[field.key];
+        else entry.values[field.key] = chosen.value;
+        entry.touched.add(field.key);
+        entry.refresh();
+      };
+      entry.controlSyncers.push(() => {
+        const current = entry.values[field.key];
+        let index = options.findIndex((option) =>
+          elicitationValuesEqual(option.value, current));
+        if (index < 0) index = 0;
+        select.selectedIndex = index;
+      });
+      return select;
+    }
+    function buildElicitationControl(entry, field, controlId) {
+      const kind = field.kind;
+      switch (kind.type) {
+        case 'stringEnum': {
+          const options = kind.options.map((option) =>
+            ({ value: option, title: option === '' ? 'Empty string' : option }));
+          if (!field.required) options.unshift({ value: undefined, title: 'Not set' });
+          return buildElicitationChoiceSelect(entry, field, controlId, options);
+        }
+        case 'stringOneOf': {
+          const options = kind.choices.map((choice) =>
+            ({ value: choice.value, title: choice.title }));
+          if (!field.required) options.unshift({ value: undefined, title: 'Not set' });
+          return buildElicitationChoiceSelect(entry, field, controlId, options);
+        }
+        case 'bool': {
+          if (field.required) {
+            const label = document.createElement('label');
+            label.className = 'elicitation-check';
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.id = controlId;
+            input.onchange = () => {
+              entry.values[field.key] = input.checked;
+              entry.touched.add(field.key);
+              entry.refresh();
+            };
+            entry.controlSyncers.push(() => {
+              input.checked = entry.values[field.key] === true;
+            });
+            const caption = document.createElement('span');
+            caption.textContent = 'Enabled';
+            label.append(input, caption);
+            return label;
+          }
+          return buildElicitationChoiceSelect(entry, field, controlId, [
+            { value: undefined, title: 'Not set' },
+            { value: true, title: 'True' },
+            { value: false, title: 'False' }
+          ]);
+        }
+        case 'number': {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.inputMode = kind.isInteger ? 'numeric' : 'decimal';
+          input.id = controlId;
+          input.className = 'elicitation-control';
+          input.oninput = () => {
+            entry.touched.add(field.key);
+            const number = parseElicitationNumber(input.value);
+            if (number !== null) entry.values[field.key] = number;
+            else if (input.value.trim() === '') delete entry.values[field.key];
+            // Keep the raw text so the user can keep editing; validation rejects it.
+            else entry.values[field.key] = input.value;
+            entry.refresh();
+          };
+          entry.controlSyncers.push(() => {
+            const value = entry.values[field.key];
+            if (typeof value === 'number' && Number.isFinite(value)) {
+              input.value = formatElicitationNumber(value);
+            } else if (typeof value === 'string') {
+              input.value = value;
+            } else {
+              input.value = '';
+            }
+          });
+          return input;
+        }
+        case 'string': {
+          const wrap = document.createElement('div');
+          const textarea = document.createElement('textarea');
+          textarea.id = controlId;
+          textarea.className = 'elicitation-control';
+          textarea.rows = 2;
+          textarea.oninput = () => {
+            entry.touched.add(field.key);
+            const text = textarea.value;
+            if (!field.required && text === '' && !elicitationAccepts(kind, '')) {
+              delete entry.values[field.key];
+            } else {
+              entry.values[field.key] = text;
+            }
+            entry.refresh();
+          };
+          entry.controlSyncers.push(() => {
+            const value = entry.values[field.key];
+            textarea.value = typeof value === 'string' ? value : '';
+          });
+          wrap.append(textarea);
+          const requirement = elicitationStringLengthRequirement(kind);
+          if (requirement) {
+            const hint = document.createElement('div');
+            hint.className = 'elicitation-hint';
+            hint.textContent = requirement;
+            wrap.append(hint);
+          }
+          return wrap;
+        }
+        case 'stringMultiSelect': {
+          const group = document.createElement('div');
+          group.className = 'elicitation-multi';
+          group.setAttribute('role', 'group');
+          const syncGroup = () => {
+            const selected = new Set(selectedMultiStrings(entry, field.key));
+            group.querySelectorAll('.elicitation-multi-option').forEach((button) => {
+              const on = selected.has(button.dataset.value);
+              button.setAttribute('aria-pressed', on ? 'true' : 'false');
+              const box = button.querySelector('.elicitation-multi-box');
+              if (box) box.textContent = on ? '\u2611' : '\u2610';
+            });
+          };
+          kind.choices.forEach((choice) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'elicitation-multi-option';
+            button.dataset.value = choice.value;
+            button.setAttribute('aria-pressed', 'false');
+            const box = document.createElement('span');
+            box.className = 'elicitation-multi-box';
+            box.setAttribute('aria-hidden', 'true');
+            box.textContent = '\u2610';
+            const caption = document.createElement('span');
+            caption.textContent = choice.title;
+            button.append(box, caption);
+            button.onclick = () => {
+              toggleElicitationChoice(entry, field, choice.value);
+              syncGroup();
+              entry.refresh();
+            };
+            group.append(button);
+          });
+          entry.controlSyncers.push(syncGroup);
+          return group;
+        }
+        default:
+          return document.createElement('div');
+      }
+    }
+    function buildElicitationField(entry, field) {
+      const wrap = document.createElement('div');
+      wrap.className = 'elicitation-field';
+      const controlId = `elicitation-field-${++elicitationCardSequence}`;
+      const title = document.createElement('label');
+      title.className = 'elicitation-field-title';
+      title.setAttribute('for', controlId);
+      title.textContent = field.title;
+      if (field.required) {
+        const marker = document.createElement('span');
+        marker.className = 'elicitation-field-req';
+        marker.textContent = ' *';
+        title.append(marker);
+      }
+      wrap.append(title);
+      if (field.description) {
+        const description = document.createElement('div');
+        description.className = 'elicitation-field-desc';
+        description.textContent = field.description;
+        wrap.append(description);
+      }
+      wrap.append(buildElicitationControl(entry, field, controlId));
+      return wrap;
+    }
+    function buildElicitationActions(entry, acceptLabel, includeAccept) {
+      const actions = document.createElement('div');
+      actions.className = 'elicitation-actions';
+      const decline = document.createElement('button');
+      decline.type = 'button';
+      decline.className = 'elicitation-decline';
+      decline.textContent = 'Decline';
+      decline.onclick = () => submitElicitation(entry.request.requestId, 'decline');
+      actions.append(decline);
+      if (includeAccept) {
+        const spacer = document.createElement('span');
+        spacer.className = 'spacer';
+        const accept = document.createElement('button');
+        accept.type = 'button';
+        accept.className = 'elicitation-submit';
+        accept.textContent = acceptLabel;
+        accept.onclick = () => submitElicitation(entry.request.requestId, 'accept');
+        actions.append(spacer, accept);
+        entry.submitButton = accept;
+      }
+      return actions;
+    }
+    function buildElicitationURLControls(entry, card) {
+      const request = entry.request;
+      const link = safeWebURL(request.url);
+      if (link) {
+        const urlText = document.createElement('div');
+        urlText.className = 'elicitation-url';
+        urlText.textContent = link;
+        card.append(urlText);
+        const open = document.createElement('a');
+        open.className = 'elicitation-open';
+        open.href = link;
+        open.target = '_blank';
+        open.rel = 'noopener noreferrer';
+        open.textContent = 'Open in browser';
+        card.append(open);
+        card.append(buildElicitationActions(entry, 'Done', true));
+      } else {
+        const fallback = document.createElement('div');
+        fallback.className = 'elicitation-fallback';
+        fallback.textContent = 'Open this link in the Copilot terminal.';
+        card.append(fallback);
+        if (typeof request.url === 'string' && request.url) {
+          const raw = document.createElement('div');
+          raw.className = 'elicitation-url';
+          raw.textContent = request.url;
+          card.append(raw);
+        }
+        card.append(buildElicitationActions(entry, 'Done', false));
+      }
+    }
+    // Untrusted message/field text is only ever inserted with textContent.
+    function buildElicitationCard(request) {
+      const entry = {
+        request,
+        form: parseElicitationForm(request.schema),
+        isURLMode: request.mode === 'url'
+          || (typeof request.url === 'string' && request.url.length > 0),
+        values: {},
+        touched: new Set(),
+        controlSyncers: [],
+        card: null,
+        submitButton: null,
+        refresh: () => {}
+      };
+      const card = document.createElement('article');
+      card.className = 'user-input-card elicitation-card';
+      card.dataset.requestId = request.requestId;
+      const messageId = `elicitation-message-${++elicitationCardSequence}`;
+      card.setAttribute('aria-labelledby', messageId);
+      const head = document.createElement('div');
+      head.className = 'user-input-head';
+      const heading = document.createElement('span');
+      heading.textContent = 'Copilot needs your input';
+      head.append(heading);
+      if (request.agentId) {
+        const agent = document.createElement('span');
+        agent.className = 'user-input-agent';
+        agent.textContent = 'Subagent';
+        head.append(agent);
+      }
+      card.append(head);
+      const message = document.createElement('div');
+      message.className = 'user-input-question';
+      message.id = messageId;
+      message.textContent = request.message || '';
+      card.append(message);
+      if (entry.isURLMode) {
+        buildElicitationURLControls(entry, card);
+      } else if (entry.form) {
+        const fields = document.createElement('div');
+        fields.className = 'elicitation-fields';
+        entry.form.fields.forEach((field) => {
+          fields.append(buildElicitationField(entry, field));
+        });
+        card.append(fields);
+        card.append(buildElicitationActions(entry, 'Send answer', true));
+      } else {
+        // Outside the supported flat-schema subset: keep it answerable in the
+        // terminal rather than rendering arbitrary/nested schema.
+        const fallback = document.createElement('div');
+        fallback.className = 'elicitation-fallback';
+        fallback.textContent = 'Answer this one in the Copilot terminal.';
+        card.append(fallback);
+      }
+      const status = document.createElement('div');
+      status.className = 'user-input-status';
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      card.append(status);
+      entry.card = card;
+      entry.refresh = () => refreshElicitationControls(entry);
+      if (!entry.isURLMode && entry.form) seedElicitationDefaults(entry);
+      entry.controlSyncers.forEach((sync) => sync());
+      entry.refresh();
+      return entry;
+    }
+    // Only build a card once per request ID so an in-progress form isn't wiped by
+    // an unrelated workspace update; a card is removed only when the snapshot drops
+    // its request.
+    function syncElicitationCards() {
+      const pending = currentElicitations();
+      const ids = new Set(pending.map((request) => request.requestId));
+      for (const [requestId, entry] of [...elicitationCards]) {
+        if (!ids.has(requestId)) {
+          entry.card.remove();
+          elicitationCards.delete(requestId);
+          const submitting = submittingElicitations.get(requestId);
+          if (submitting) {
+            clearTimeout(submitting.timer);
+            submittingElicitations.delete(requestId);
+          }
+          latestElicitationAttempts.delete(requestId);
+        }
+      }
+      pending.forEach((request) => {
+        let entry = elicitationCards.get(request.requestId);
+        if (!entry) {
+          entry = buildElicitationCard(request);
+          elicitationCards.set(request.requestId, entry);
+          userInput.append(entry.card);
+        }
+        entry.refresh();
+      });
+    }
+    async function submitElicitation(requestId, action) {
+      if (!selected || !writable || submittingElicitations.has(requestId)) return;
+      const entry = elicitationCards.get(requestId);
+      if (!entry) return;
+      let content = null;
+      if (action === 'accept' && entry.form) {
+        content = validatedElicitationContent(entry.form, entry.values, entry.touched);
+        if (content === null) return;
+        let encoded;
+        try {
+          encoded = JSON.stringify(content);
+        } catch (error) {
+          setElicitationStatus(requestId, 'Answer was not sent');
+          return;
+        }
+        if (new TextEncoder().encode(encoded).length > 32768) {
+          setElicitationStatus(
+            requestId, 'Answer is too large to send \u2014 shorten it and try again.'
+          );
+          return;
+        }
+      }
+      const payload = { requestId, action };
+      if (action === 'accept' && content !== null) payload.content = content;
+      const submittedSession = selected;
+      const submittedGeneration = selectionGeneration;
+      const token = ++elicitationAttemptSequence;
+      latestElicitationAttempts.set(requestId, token);
+      // Retryable fallback: if the workspace still shows the request 15s later,
+      // re-enable the controls so the answer can be tried again.
+      const timer = setTimeout(() => {
+        const submitting = submittingElicitations.get(requestId);
+        if (!submitting || submitting.token !== token) return;
+        submittingElicitations.delete(requestId);
+        if (selected === submittedSession
+            && sessionHasElicitation(submittedSession, requestId)) {
+          entry.refresh();
+          setElicitationStatus(requestId, 'Still waiting \u2014 you can try again.');
+        }
+      }, 15000);
+      submittingElicitations.set(requestId, { timer, token });
+      entry.refresh();
+      setElicitationStatus(requestId, 'Sending\u2026');
+      const response = await control({
+        type: 'answer-elicitation',
+        sessionId: submittedSession,
+        data: JSON.stringify(payload)
+      });
+      if (selected !== submittedSession
+          || selectionGeneration !== submittedGeneration) return;
+      if (latestElicitationAttempts.get(requestId) !== token) return;
+      if (response?.ok) {
+        // Keep the card disabled until the workspace snapshot drops the request
+        // (card removed) or the 15s fallback re-enables it.
+        setElicitationStatus(requestId, 'Waiting for Copilot\u2026');
+        return;
+      }
+      const submitting = submittingElicitations.get(requestId);
+      if (submitting?.token === token) {
+        clearTimeout(submitting.timer);
+        submittingElicitations.delete(requestId);
+      }
+      entry.refresh();
+      if (response?.status === 403) {
+        writable = false;
+        lease.textContent = 'view only';
+        refreshElicitationCardStates();
+        setElicitationStatus(requestId, 'Control moved to another device');
+      } else if (response?.status === 409) {
+        setElicitationStatus(requestId, 'Another answer is still processing \u2014 try again.');
+      } else if (response?.status === 422) {
+        setElicitationStatus(requestId, 'Answer was not accepted');
+      } else {
+        setElicitationStatus(requestId, 'Answer was not sent');
       }
     }
     const LINK_PATTERN = /\[[^\]\r\n]+\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<>()\[\]]+/gi;

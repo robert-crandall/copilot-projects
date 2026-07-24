@@ -194,6 +194,16 @@ whose choices or payload are too large is never exposed remotely so the terminal
 exact. Answers are re-validated host-side against the fresh heartbeat before an atomic, private
 response file hands them to the extension.
 
+The remote client also answers schema-form `elicitation.requested` questions the same way the
+native iOS client does. A bounded, flat subset of the request's `requestedSchema`
+(enum/`oneOf` choices, multi-select arrays, booleans, numbers, and length-bounded strings) is
+rendered as a native form with Decline/Send-answer actions; url-mode requests offer a safe
+new-tab **Open in browser** link with Decline/Done. Send stays disabled until every required
+field holds a type-valid value, the submitted content is re-validated against the same subset,
+and anything outside it (nested/`$ref`/unsupported schema, or a non-http(s) url) falls back to
+"answer this one in the Copilot terminal" so arbitrary schema is never rendered. Accept, decline,
+and cancel are delivered to the live session over the same lease-gated control message.
+
 Normal-buffer sessions expose a bounded, independently scrollable history without moving the
 desktop terminal viewport. Active Copilot/full-screen sessions forward web wheel gestures to the
 existing TUI only while the remote client holds the writer lease. Terminal `http://`/`https://`
