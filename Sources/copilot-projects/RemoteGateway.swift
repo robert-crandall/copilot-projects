@@ -119,8 +119,29 @@ final class RemoteModelBridge: @unchecked Sendable {
         ) ?? .missing
     }
 
-    nonisolated func transcriptRevision(sessionId: String) -> RemoteTranscriptRevision {
-        TranscriptController.remoteRevision(sessionId: sessionId)
+    /// The transcript revision, folded together with the session's current
+    /// image-availability generation so that capturing, displaying, evicting, or
+    /// restoring an inline image (none of which touch the transcript file) still
+    /// changes the revision and prompts clients to re-fetch `/transcript` — where
+    /// the per-turn image associations are computed. Without this, conversation
+    /// images would only refresh when the CLI happened to rewrite the transcript.
+    func transcriptRevision(sessionId: String) -> RemoteTranscriptRevision {
+        let base = TranscriptController.remoteRevision(sessionId: sessionId)
+        guard let view = model?.controller(for: sessionId)?.terminalView else {
+            return base
+        }
+        return RemoteTranscriptRevision(
+            sessionId: base.sessionId,
+            generation: "\(base.generation)#img\(view.kittyImageCapture.imageAvailabilityGeneration)"
+        )
+    }
+
+    /// The currently-advertised inline images for `sessionId` paired with their
+    /// display time, or `nil` if the session/view is gone. Read on the main
+    /// actor (capture state is main-actor isolated); the caller joins this
+    /// bounded metadata against the transcript turns off-actor.
+    func retainedImageMetadata(sessionId: String) -> [RemoteKittyImageCapture.RetainedImageInfo]? {
+        model?.controller(for: sessionId)?.terminalView.kittyImageCapture.retainedImageMetadata()
     }
 
     func sendPrompt(sessionId: String, value: String) -> RemotePromptResult {
@@ -685,11 +706,16 @@ private final class RemoteHTTPHandler:
                 }
                 return
             }
+            let imageMetadata = self.bridge.retainedImageMetadata(sessionId: sessionId) ?? []
             let encodedData = await Task.detached {
                 let snapshot = TranscriptController.loadRemoteSnapshot(sessionId: sessionId)
+                let augmented = TranscriptImageAssociation.attach(
+                    images: imageMetadata,
+                    to: snapshot
+                )
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
-                return try? encoder.encode(snapshot)
+                return try? encoder.encode(augmented)
             }.value
             guard let data = encodedData else {
                 channel.eventLoop.execute {
@@ -1324,13 +1350,13 @@ private final class RemoteHTTPHandler:
             let bridge = self.bridge
             let dismissalSnapshot = self.notificationSync?.dismissalSnapshot()
             Task.detached {
-                let transcriptSessionId = await MainActor.run {
-                    streamSessionId.flatMap {
+                let (transcriptSessionId, transcriptRevision):
+                    (String?, RemoteTranscriptRevision?) = await MainActor.run {
+                    let sessionId = streamSessionId.flatMap {
                         bridge.hasSession($0) ? $0 : nil
                     }
-                }
-                let transcriptRevision = transcriptSessionId.map {
-                    bridge.transcriptRevision(sessionId: $0)
+                    let revision = sessionId.map { bridge.transcriptRevision(sessionId: $0) }
+                    return (sessionId, revision)
                 }
                 await MainActor.run {
                     let workspace = refreshWorkspace ? bridge.workspace() : nil
