@@ -6745,6 +6745,58 @@ final class AppLogicTests: XCTestCase {
         XCTAssertTrue(RemoteWebAssets.javascript.contains("response?.status === 422"))
     }
 
+    func testRemoteWebSurfacesElicitationCardsSafely() {
+        // Schema-form / url elicitations render into the same question surface as
+        // ask_user, mirroring the native iOS ElicitationForm/ElicitationCard.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("function parseElicitationForm(schema) {"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("function syncElicitationCards() {"))
+        // Untrusted message/field text is only ever set via textContent.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "message.textContent = request.message || '';"
+        ))
+        // Only a bounded, flat schema subset renders; anything else falls back to
+        // the terminal instead of rendering arbitrary/nested schema.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "fallback.textContent = 'Answer this one in the Copilot terminal.';"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("if ('$ref' in prop) return null;"))
+        // url-mode only opens safe http(s) links in a new tab.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("open.textContent = 'Open in browser';"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if (scheme !== 'https:' && scheme !== 'http:') return null;"
+        ))
+        // accept / decline are delivered over the lease-gated control message.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("type: 'answer-elicitation'"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("data: JSON.stringify(payload)"))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "submitElicitation(entry.request.requestId, 'accept')"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "submitElicitation(entry.request.requestId, 'decline')"
+        ))
+        // Send stays disabled until the submitted content re-validates.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "validatedElicitationContent(entry.form, entry.values, entry.touched) === null"
+        ))
+        // Composer is suppressed while an elicitation is pending, and the queue pauses.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "const pendingElicits = (state && state.pendingElicitations) || [];"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "if ((state?.pendingElicitations || []).length > 0) return;"
+        ))
+        // Retry/removal semantics: 15s fallback, snapshot-driven removal, error codes.
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "sessionHasElicitation(submittedSession, requestId)"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains(
+            "latestElicitationAttempts.get(requestId) !== token"
+        ))
+        XCTAssertTrue(RemoteWebAssets.javascript.contains("refreshElicitationCardStates();"))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".elicitation-multi-option"))
+        XCTAssertTrue(RemoteWebAssets.css.contains(".elicitation-submit"))
+    }
+
     func testMarkdownParserSplitsCommonBlockStructure() {
         let markdown = """
         # Heading
