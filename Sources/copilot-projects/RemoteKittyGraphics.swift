@@ -545,6 +545,13 @@ final class RemoteKittyImageCapture {
     private var dataByKey: [StoredKey: Data] = [:]
     private var totalBytes = 0
     private var latestVersion: [UInt32: UInt64] = [:]
+    /// Wall-clock time each retained `(imageId, version)` was captured/displayed,
+    /// used only to associate an image with the transcript turn active at that
+    /// moment (see `retainedImageMetadata`). In-memory only and intentionally
+    /// NOT persisted to the disk store: after a relaunch a restored image has no
+    /// display time, so it simply isn't associated to any turn (it still renders
+    /// in Terminal mode). Kept in lockstep with `dataByKey`.
+    private var displayedAt: [StoredKey: Date] = [:]
 
     // Ids with a currently *active* Unicode-placeholder placement — tracked
     // separately from `latestVersion`/`dataByKey` (retained PNG bytes) so the
@@ -758,6 +765,37 @@ final class RemoteKittyImageCapture {
     func currentVersion(for imageId: UInt32, placementId: UInt32 = 0) -> UInt64? {
         guard isPlacementActive(imageId: imageId, placementId: placementId) else { return nil }
         return latestVersion[imageId]
+    }
+
+    /// One currently-retained image and the wall-clock time it was displayed,
+    /// for associating images with transcript turns.
+    struct RetainedImageInfo: Sendable {
+        let imageId: UInt32
+        let version: UInt64
+        let displayedAt: Date
+    }
+
+    /// Snapshot of every image this session currently advertises (retained data
+    /// + an active placement, exactly what `/terminal-image` can still serve)
+    /// paired with the time it was displayed. Restored-from-disk images have no
+    /// display time and are omitted, so a caller can only ever associate an
+    /// image whose bytes are guaranteed fetchable. Bounded by the per-session
+    /// retention caps (`remoteKittyMaxRetainedEntries`), so this is always small.
+    func retainedImageMetadata() -> [RetainedImageInfo] {
+        var result: [RetainedImageInfo] = []
+        for key in order {
+            // `latestVersion[id] == key.version` selects the single current
+            // retained version per id; `isAnyPlacementActive` accepts an image
+            // shown via any placement (not just the default `p=0`), matching
+            // what a fetch can still serve.
+            guard latestVersion[key.imageId] == key.version else { continue }
+            guard isAnyPlacementActive(imageId: key.imageId) else { continue }
+            guard let when = displayedAt[key] else { continue }
+            result.append(
+                RetainedImageInfo(imageId: key.imageId, version: key.version, displayedAt: when)
+            )
+        }
+        return result
     }
 
     /// Whether `(imageId, placementId)` is currently active, independent of
@@ -1357,6 +1395,7 @@ final class RemoteKittyImageCapture {
         let key = StoredKey(imageId: imageId, version: version)
         order.append(key)
         dataByKey[key] = data
+        displayedAt[key] = Date()
         totalBytes += data.count
         if activates, let rows = pendingRows, let columns = pendingColumns {
             let geometryKey = PlacementGeometryKey(
@@ -1413,6 +1452,7 @@ final class RemoteKittyImageCapture {
     private func removeStoredKey(_ key: StoredKey, notifyBudget: Bool) {
         guard let data = dataByKey.removeValue(forKey: key) else { return }
         totalBytes -= data.count
+        displayedAt.removeValue(forKey: key)
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         if latestVersion[key.imageId] == key.version {
             latestVersion.removeValue(forKey: key.imageId)
@@ -1670,6 +1710,7 @@ final class RemoteKittyImageCapture {
         }
         order.removeAll()
         dataByKey.removeAll()
+        displayedAt.removeAll()
         latestVersion.removeAll()
         wildcardActiveImageIds.removeAll()
         exactActivePlacements.removeAll()
@@ -1687,6 +1728,7 @@ final class RemoteKittyImageCapture {
         for key in order {
             if key.imageId == imageId {
                 if let data = dataByKey.removeValue(forKey: key) { totalBytes -= data.count }
+                displayedAt.removeValue(forKey: key)
                 budget.unregister(owner: self, imageId: key.imageId, version: key.version)
                 persistEvictionToDisk(imageId: key.imageId, version: key.version)
             } else {

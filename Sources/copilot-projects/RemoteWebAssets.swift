@@ -357,6 +357,11 @@ enum RemoteWebAssets {
       border:1px solid #444; white-space:pre-wrap; overflow-wrap:anywhere; }
     .markdown th { background:rgba(255,255,255,.05); }
     .tools { color:#aaa; font-size:11px; margin-top:7px; }
+    .conversation-images { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .conversation-image { margin:0; max-width:100%; }
+    .conversation-image-img { display:block; max-width:100%; height:auto;
+      max-height:320px; border:1px solid #333; border-radius:8px;
+      background:#111; object-fit:contain; }
     #prompt-queue { flex:0 0 auto; max-height:32%; overflow:auto;
       -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
       display:flex; flex-direction:column; gap:5px; padding:8px 10px 0; }
@@ -1316,6 +1321,9 @@ enum RemoteWebAssets {
     const TERMINAL_IMAGE_MAX_DECODED_PIXELS = 16_000_000;
     const TERMINAL_IMAGE_MAX_DIMENSION = 4096;
     const TERMINAL_IMAGE_MAX_PIXELS = 16_000_000;
+    // Conversation inline-image transient-failure retry (capacity/backoff).
+    const CONVERSATION_IMAGE_RETRY_MS = 1_500;
+    const CONVERSATION_IMAGE_MAX_RETRIES = 3;
     const TERMINAL_IMAGE_BACKOFF_BASE_MS = 1000;
     const TERMINAL_IMAGE_BACKOFF_MAX_MS = 30_000;
 
@@ -1573,6 +1581,13 @@ enum RemoteWebAssets {
     // repositions/removes them, keyed by a stable placement identity so an
     // unchanged, still-visible placement's node/img fetch survives.
     const terminalImageNodes = new Map();
+    // Conversation-mode inline image nodes currently holding a positive-cache
+    // reference. The conversation DOM is fully rebuilt (`replaceChildren`) on
+    // every transcript render, so — unlike the terminal overlay's reconciled
+    // node map — these are tracked in a flat list: each render mounts a fresh
+    // set, then releases the previous render's set, so an unchanged image's
+    // shared cache entry never drops to a zero reference count across the swap.
+    let conversationImageNodes = [];
     // sessionId:imageId:version -> {url, bytes, width, height, activeNodeCount, lastUsed}
     const terminalImagePositiveCache = new Map();
     // Exact-match permanently-negative keys (404 only). Insertion-ordered Set
@@ -1612,6 +1627,10 @@ enum RemoteWebAssets {
     let transcriptRequestId = 0;
     let selectionGeneration = 0;
     let viewMode = 'conversation';
+    // Last transcript snapshot rendered, so switching back to the Conversation
+    // tab can re-render (and mount inline images, which are skipped while the
+    // tab is hidden — see renderTranscript).
+    let lastRenderedTranscript = null;
     // Only the most recent turns are rendered up front so a long transcript
     // can't freeze the tab building hundreds of markdown-parsed cards in one
     // synchronous pass; "Show earlier" reveals older turns a bounded batch at a
@@ -1684,8 +1703,16 @@ enum RemoteWebAssets {
         tab.setAttribute('aria-selected', String(tab.dataset.mode === mode));
       });
       if (mode === 'terminal') {
-        if (changed) refreshTerminal();
+        if (changed) {
+          // Free the shared image budget the (now-hidden) conversation images
+          // were holding so they can't starve the terminal overlay.
+          releaseAllConversationImageNodes();
+          refreshTerminal();
+        }
         if (!options?.silent) terminal.focus();
+      } else if (mode === 'conversation' && changed && lastRenderedTranscript) {
+        // Re-render so inline images (skipped while the tab was hidden) mount.
+        renderTranscript(lastRenderedTranscript);
       }
     }
 
@@ -3177,6 +3204,7 @@ enum RemoteWebAssets {
     }
 
     function renderTranscript(snapshot) {
+      lastRenderedTranscript = snapshot;
       const wasAtBottom =
         transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 18;
       // Capture a stable scroll anchor — the first turn intersecting the viewport
@@ -3221,6 +3249,11 @@ enum RemoteWebAssets {
         fragment.append(showEarlier);
       }
       const turns = hiddenCount > 0 ? allTurns.slice(hiddenCount) : allTurns;
+      // Mount this render's conversation images into a fresh list, then release
+      // the previous render's list after the DOM swap below, so an unchanged
+      // image's shared cache entry never hits a zero reference count in between.
+      const releasingConversationNodes = conversationImageNodes;
+      conversationImageNodes = [];
       turns.forEach((turn) => {
         const card = document.createElement('article');
         card.className = 'turn';
@@ -3252,9 +3285,23 @@ enum RemoteWebAssets {
             + (successful ? ` · ${successful} completed` : '');
           card.append(tools);
         }
+        if (viewMode === 'conversation'
+            && Array.isArray(turn.images) && turn.images.length && selected) {
+          const gallery = document.createElement('div');
+          gallery.className = 'conversation-images';
+          turn.images.forEach((raw) => {
+            const ref = normalizeConversationImageRef(raw);
+            if (!ref) return;
+            const node = createConversationImageNode(selected, ref);
+            conversationImageNodes.push(node);
+            gallery.append(node.figure);
+          });
+          if (gallery.childElementCount) card.append(gallery);
+        }
         fragment.append(card);
       });
       transcript.replaceChildren(fragment);
+      releasingConversationNodes.forEach(releaseConversationImageNode);
       if (wasAtBottom) {
         transcript.scrollTop = transcript.scrollHeight;
       } else if (anchorId !== null) {
@@ -3590,6 +3637,113 @@ enum RemoteWebAssets {
       retryCapacityBlockedTerminalImages();
     }
 
+    // --- Conversation-mode inline images -------------------------------------
+    // Reuses the exact same bounded positive/negative/in-flight cache and byte
+    // fetch as terminal images (deduping by sessionId:imageId:version), but with
+    // its own node lifecycle because the transcript DOM is rebuilt each render.
+
+    // Picks the JS-safe exact version string (UInt64 can exceed 2^53, so the
+    // wire carries a decimal `contentVersionText`), mirroring terminal
+    // placements. Returns null for anything unsafe so one bad ref can't break
+    // the turn.
+    function normalizeConversationImageRef(raw) {
+      if (!raw || typeof raw !== 'object') return null;
+      const { imageId, contentVersion, contentVersionText } = raw;
+      if (!Number.isSafeInteger(imageId) || imageId < 1 || imageId > 0xFFFFFF) return null;
+      const exactVersion = typeof contentVersionText === 'string'
+        && /^[1-9][0-9]{0,19}$/.test(contentVersionText)
+        ? contentVersionText
+        : (Number.isSafeInteger(contentVersion) && contentVersion > 0
+          ? String(contentVersion) : null);
+      if (!exactVersion) return null;
+      return { imageId, contentVersion: exactVersion };
+    }
+
+    // Mounts a decoded image into a conversation node, enforcing the same
+    // shared decoded-pixel budget terminal mounts respect so conversation
+    // images can never starve the terminal overlay. Returns whether it mounted;
+    // a `false` (over budget) leaves the node blank to be retried on a later
+    // render once budget frees.
+    function mountConversationImage(node, cacheEntry, key) {
+      const pixels = cacheEntry.width * cacheEntry.height;
+      if (terminalActiveDecodedPixels + pixels > TERMINAL_IMAGE_MAX_DECODED_PIXELS) {
+        return false;
+      }
+      node.cacheKey = key;
+      node.pixels = pixels;
+      cacheEntry.activeNodeCount += 1;
+      cacheEntry.lastUsed = Date.now();
+      terminalActiveDecodedPixels += pixels;
+      node.el.onerror = () => invalidateTerminalImageCacheEntry(key);
+      node.el.src = cacheEntry.url;
+      return true;
+    }
+
+    function releaseConversationImageNode(node) {
+      node.released = true;
+      if (node.cacheKey) {
+        const cacheEntry = terminalImagePositiveCache.get(node.cacheKey);
+        if (cacheEntry) {
+          cacheEntry.activeNodeCount = Math.max(0, cacheEntry.activeNodeCount - 1);
+        }
+        terminalActiveDecodedPixels = Math.max(0, terminalActiveDecodedPixels - node.pixels);
+        node.cacheKey = null;
+        node.pixels = 0;
+      }
+      retryCapacityBlockedTerminalImages();
+    }
+
+    function releaseAllConversationImageNodes() {
+      const releasing = conversationImageNodes;
+      conversationImageNodes = [];
+      releasing.forEach(releaseConversationImageNode);
+    }
+
+    // Builds one inline conversation image node. A cache hit mounts
+    // synchronously (so an unchanged image keeps a non-zero reference across the
+    // render swap); otherwise a bounded loader mounts it on completion. A
+    // transient/capacity miss (null result or a full decoded-pixel budget) is
+    // retried a few times with backoff so a temporary failure doesn't leave the
+    // image permanently blank until the next unrelated transcript revision —
+    // every attempt re-checks the node isn't released and the session/generation
+    // hasn't moved on.
+    function createConversationImageNode(sessionId, ref) {
+      const figure = document.createElement('figure');
+      figure.className = 'conversation-image';
+      const el = document.createElement('img');
+      el.className = 'conversation-image-img';
+      el.alt = 'Terminal image';
+      el.loading = 'lazy';
+      el.draggable = false;
+      figure.append(el);
+      const node = { el, figure, cacheKey: null, pixels: 0, released: false };
+      const key = terminalImageCacheKey(sessionId, ref.imageId, ref.contentVersion);
+      const cached = terminalImagePositiveCache.get(key);
+      if (cached) {
+        cached.lastUsed = Date.now();
+        if (mountConversationImage(node, cached, key)) return node;
+      }
+      const generation = terminalImageGeneration;
+      const attempt = (remaining) => {
+        if (node.released || node.cacheKey) return;
+        if (terminalImageGeneration !== generation) return;
+        loadTerminalImage(sessionId, ref).then((cacheEntry) => {
+          if (node.released || node.cacheKey) return;
+          if (terminalImageGeneration !== generation) return;
+          if (cacheEntry
+              && terminalImagePositiveCache.get(key) === cacheEntry
+              && mountConversationImage(node, cacheEntry, key)) {
+            return;
+          }
+          if (remaining > 0) {
+            setTimeout(() => attempt(remaining - 1), CONVERSATION_IMAGE_RETRY_MS);
+          }
+        });
+      };
+      attempt(CONVERSATION_IMAGE_MAX_RETRIES);
+      return node;
+    }
+
     function terminalImageViewportRange() {
       const lineHeight = measuredLineHeight();
       const start = historyStartLine + Math.floor(terminal.scrollTop / lineHeight);
@@ -3657,6 +3811,7 @@ enum RemoteWebAssets {
     function clearTerminalImageDisplayState() {
       [...terminalImageNodes.values()].forEach(releaseTerminalImageNode);
       terminalImageNodes.clear();
+      releaseAllConversationImageNodes();
       imagePlacements = [];
       terminalActiveDecodedPixels = 0;
       terminalImageOverlay.replaceChildren();

@@ -9359,6 +9359,159 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(placements, run())
     }
 
+    // MARK: - Transcript image association (pure)
+
+    private func makeTurn(
+        id: String,
+        startedAt: TimeInterval,
+        endedAt: TimeInterval? = nil
+    ) -> TranscriptTurn {
+        TranscriptTurn(
+            id: id,
+            startedAt: Date(timeIntervalSince1970: startedAt),
+            endedAt: endedAt.map { Date(timeIntervalSince1970: $0) },
+            kind: "agent",
+            userContent: "",
+            assistantMessages: [],
+            tools: [],
+            isAborted: false
+        )
+    }
+
+    private func makeSnapshot(_ turns: [TranscriptTurn]) -> TranscriptSnapshot {
+        TranscriptSnapshot(
+            schemaVersion: 3,
+            updatedAt: Date(timeIntervalSince1970: 10_000),
+            copilotSessionId: "cs",
+            turns: turns
+        )
+    }
+
+    private func img(
+        _ imageId: UInt32,
+        _ version: UInt64,
+        at displayedAt: TimeInterval
+    ) -> RemoteKittyImageCapture.RetainedImageInfo {
+        RemoteKittyImageCapture.RetainedImageInfo(
+            imageId: imageId,
+            version: version,
+            displayedAt: Date(timeIntervalSince1970: displayedAt)
+        )
+    }
+
+    func testTranscriptImageAssociationAttachesToActiveTurn() {
+        let snapshot = makeSnapshot([
+            makeTurn(id: "t1", startedAt: 100, endedAt: 200),
+            makeTurn(id: "t2", startedAt: 200, endedAt: 300),
+        ])
+        // Displayed at 250 -> active turn is t2 (greatest startedAt <= 250).
+        let result = TranscriptImageAssociation.attach(images: [img(5, 42, at: 250)], to: snapshot)
+        XCTAssertNil(result.turns[0].images)
+        XCTAssertEqual(result.turns[1].images?.count, 1)
+        XCTAssertEqual(result.turns[1].images?.first?.imageId, 5)
+        XCTAssertEqual(result.turns[1].images?.first?.contentVersion, 42)
+        XCTAssertEqual(result.turns[1].images?.first?.contentVersionText, "42")
+    }
+
+    func testTranscriptImageAssociationUsesStartedAtNotEndedAt() {
+        // Streaming turn with endedAt == nil; image displayed "after" its start
+        // must still attach to it, and never leak into an earlier ended turn.
+        let snapshot = makeSnapshot([
+            makeTurn(id: "t1", startedAt: 100, endedAt: 150),
+            makeTurn(id: "t2", startedAt: 200, endedAt: nil),
+        ])
+        let result = TranscriptImageAssociation.attach(images: [img(9, 1, at: 999)], to: snapshot)
+        XCTAssertNil(result.turns[0].images)
+        XCTAssertEqual(result.turns[1].images?.map(\.imageId), [9])
+    }
+
+    func testTranscriptImageAssociationDropsImageBeforeFirstTurn() {
+        let snapshot = makeSnapshot([makeTurn(id: "t1", startedAt: 100)])
+        let result = TranscriptImageAssociation.attach(images: [img(1, 1, at: 50)], to: snapshot)
+        XCTAssertNil(result.turns[0].images)
+    }
+
+    func testTranscriptImageAssociationDedupesToNewestVersionPerImageId() {
+        let snapshot = makeSnapshot([makeTurn(id: "t1", startedAt: 100)])
+        let result = TranscriptImageAssociation.attach(
+            images: [img(7, 10, at: 110), img(7, 20, at: 120)],
+            to: snapshot
+        )
+        XCTAssertEqual(result.turns[0].images?.count, 1)
+        XCTAssertEqual(result.turns[0].images?.first?.contentVersion, 20)
+    }
+
+    func testTranscriptImageAssociationKeepsMultipleDistinctImagesInOneTurn() {
+        let snapshot = makeSnapshot([makeTurn(id: "t1", startedAt: 100)])
+        let result = TranscriptImageAssociation.attach(
+            images: [img(3, 1, at: 110), img(4, 1, at: 120)],
+            to: snapshot
+        )
+        XCTAssertEqual(result.turns[0].images?.map(\.imageId), [3, 4])
+    }
+
+    func testTranscriptImageAssociationNoImagesLeavesSnapshotUnchanged() {
+        let snapshot = makeSnapshot([makeTurn(id: "t1", startedAt: 100)])
+        let result = TranscriptImageAssociation.attach(images: [], to: snapshot)
+        XCTAssertEqual(result, snapshot)
+        XCTAssertNil(result.turns[0].images)
+    }
+
+    func testTranscriptImageAssociationStripsPreexistingTurnImages() {
+        // A snapshot that already carries `images` (a buggy/hostile CLI writer)
+        // must have them replaced by host-computed refs — here none, so nil.
+        let injected = TranscriptTurn(
+            id: "t1", startedAt: Date(timeIntervalSince1970: 100), endedAt: nil,
+            kind: "agent", userContent: "", assistantMessages: [], tools: [],
+            isAborted: false,
+            images: [TranscriptImageRef(imageId: 999, contentVersion: 1)]
+        )
+        let result = TranscriptImageAssociation.attach(images: [], to: makeSnapshot([injected]))
+        XCTAssertNil(result.turns[0].images)
+    }
+
+    func testTranscriptImageAssociationReplacesInjectedImagesWithHostRefs() {
+        let injected = TranscriptTurn(
+            id: "t1", startedAt: Date(timeIntervalSince1970: 100), endedAt: nil,
+            kind: "agent", userContent: "", assistantMessages: [], tools: [],
+            isAborted: false,
+            images: [TranscriptImageRef(imageId: 999, contentVersion: 1)]
+        )
+        let result = TranscriptImageAssociation.attach(
+            images: [img(5, 42, at: 150)],
+            to: makeSnapshot([injected])
+        )
+        XCTAssertEqual(result.turns[0].images?.map(\.imageId), [5])
+    }
+
+    func testTranscriptImageRefRoundTripsOptionalFieldThroughCodable() throws {
+        // A CLI-written turn (no `images` key) decodes with images == nil, and a
+        // host-augmented turn round-trips its refs (incl. the JS-safe text).
+        let cliJSON = Data("""
+        {"id":"t1","startedAt":"1970-01-01T00:01:40Z","endedAt":null,"kind":"agent",\
+        "userContent":"hi","assistantMessages":[],"tools":[],"isAborted":false}
+        """.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(TranscriptTurn.self, from: cliJSON)
+        XCTAssertNil(decoded.images)
+
+        let augmented = TranscriptTurn(
+            id: decoded.id, startedAt: decoded.startedAt, endedAt: decoded.endedAt,
+            kind: decoded.kind, userContent: decoded.userContent,
+            assistantMessages: decoded.assistantMessages, tools: decoded.tools,
+            isAborted: decoded.isAborted,
+            images: [TranscriptImageRef(imageId: 12_345, contentVersion: 18_000_000_000_000_000_001)]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let reencoded = try decoder.decode(TranscriptTurn.self, from: encoder.encode(augmented))
+        XCTAssertEqual(reencoded.images?.count, 1)
+        XCTAssertEqual(reencoded.images?.first?.imageId, 12_345)
+        XCTAssertEqual(reencoded.images?.first?.contentVersion, 18_000_000_000_000_000_001)
+        XCTAssertEqual(reencoded.images?.first?.contentVersionText, "18000000000000000001")
+    }
+
     // MARK: - Remote Kitty APC capture (byte-level parser, bounded + fail-closed)
 
     @MainActor

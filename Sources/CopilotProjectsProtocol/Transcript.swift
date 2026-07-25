@@ -28,6 +28,11 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
     public let assistantMessages: [TranscriptAssistantMessage]
     public let tools: [TranscriptTool]
     public let isAborted: Bool
+    /// Inline Kitty images the host associated with this turn (the currently
+    /// retained captures whose display time fell within this turn). Absent in
+    /// the CLI-written snapshot and populated only by the host before serving
+    /// remote clients; optional so older clients (and the CLI writer) ignore it.
+    public let images: [TranscriptImageRef]?
 
     public init(
         id: String,
@@ -37,7 +42,8 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
         userContent: String,
         assistantMessages: [TranscriptAssistantMessage],
         tools: [TranscriptTool],
-        isAborted: Bool
+        isAborted: Bool,
+        images: [TranscriptImageRef]? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -47,6 +53,26 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
         self.assistantMessages = assistantMessages
         self.tools = tools
         self.isAborted = isAborted
+        self.images = images
+    }
+}
+
+/// A reference to one currently-retained inline Kitty image, as associated with
+/// a transcript turn. Carries the exact `(imageId, contentVersion)` needed to
+/// fetch the bytes via `RemoteTerminalImageContract.path`
+/// (`/terminal-image?s=&i=&v=`). `contentVersionText` is the decimal string form
+/// of `contentVersion` for JavaScript clients, which cannot represent the full
+/// `UInt64` range exactly (it carries a random 32-bit epoch in its high bits);
+/// mirrors `RemoteTerminalImagePlacement`'s own JS-safe version handling.
+public struct TranscriptImageRef: Codable, Equatable, Sendable {
+    public let imageId: UInt32
+    public let contentVersion: UInt64
+    public let contentVersionText: String
+
+    public init(imageId: UInt32, contentVersion: UInt64) {
+        self.imageId = imageId
+        self.contentVersion = contentVersion
+        self.contentVersionText = String(contentVersion)
     }
 }
 
