@@ -90,6 +90,13 @@ enum RemoteWebAssets {
           </section>
         </div>
       </main>
+      <div id="image-lightbox" role="dialog" aria-modal="true"
+        aria-label="Image viewer" aria-hidden="true">
+        <button class="image-lightbox-close" type="button"
+          aria-label="Close image viewer">&times;</button>
+        <img class="image-lightbox-img" alt="Expanded terminal image" draggable="false">
+        <div class="image-lightbox-hint">Scroll or pinch to zoom · drag to pan · Esc to close</div>
+      </div>
       <script src="app.js"></script>
     </body>
     </html>
@@ -361,7 +368,23 @@ enum RemoteWebAssets {
     .conversation-image { margin:0; max-width:100%; }
     .conversation-image-img { display:block; max-width:100%; height:auto;
       max-height:320px; border:1px solid #333; border-radius:8px;
-      background:#111; object-fit:contain; }
+      background:#111; object-fit:contain; cursor:zoom-in; }
+    #image-lightbox { position:fixed; inset:0; z-index:1000; display:none;
+      align-items:center; justify-content:center; background:rgba(0,0,0,.9);
+      touch-action:none; overscroll-behavior:contain; }
+    #image-lightbox.open { display:flex; }
+    .image-lightbox-img { max-width:100%; max-height:100%; object-fit:contain;
+      user-select:none; -webkit-user-drag:none; will-change:transform;
+      transform-origin:0 0; cursor:zoom-in; }
+    #image-lightbox.zoomed .image-lightbox-img { cursor:grab; }
+    #image-lightbox.panning .image-lightbox-img { cursor:grabbing; }
+    .image-lightbox-close { position:absolute; top:12px; right:16px; width:40px;
+      height:40px; border:none; border-radius:50%; background:rgba(0,0,0,.5);
+      color:#fff; font-size:24px; line-height:40px; cursor:pointer; z-index:1; }
+    .image-lightbox-close:hover { background:rgba(255,255,255,.18); }
+    .image-lightbox-hint { position:absolute; bottom:14px; left:50%;
+      transform:translateX(-50%); color:#aaa; font-size:12px; pointer-events:none;
+      background:rgba(0,0,0,.4); padding:4px 10px; border-radius:12px; }
     #prompt-queue { flex:0 0 auto; max-height:32%; overflow:auto;
       -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
       display:flex; flex-direction:column; gap:5px; padding:8px 10px 0; }
@@ -3676,11 +3699,14 @@ enum RemoteWebAssets {
       terminalActiveDecodedPixels += pixels;
       node.el.onerror = () => invalidateTerminalImageCacheEntry(key);
       node.el.src = cacheEntry.url;
+      // Lets the fullscreen viewer find (and pin) this decoded entry on click.
+      node.el.dataset.cacheKey = key;
       return true;
     }
 
     function releaseConversationImageNode(node) {
       node.released = true;
+      delete node.el.dataset.cacheKey;
       if (node.cacheKey) {
         const cacheEntry = terminalImagePositiveCache.get(node.cacheKey);
         if (cacheEntry) {
@@ -3742,6 +3768,212 @@ enum RemoteWebAssets {
       };
       attempt(CONVERSATION_IMAGE_MAX_RETRIES);
       return node;
+    }
+
+    // --- Fullscreen image viewer (lightbox) --------------------------------
+    // Clicking an inline conversation image opens it fullscreen with scroll/
+    // pinch zoom and drag pan. While open, the decoded cache entry is pinned
+    // (activeNodeCount bumped) so eviction can't revoke its blob URL underneath.
+    const imageLightbox = document.querySelector('#image-lightbox');
+    const imageLightboxImg = imageLightbox
+      ? imageLightbox.querySelector('.image-lightbox-img') : null;
+    const imageLightboxClose = imageLightbox
+      ? imageLightbox.querySelector('.image-lightbox-close') : null;
+    const LIGHTBOX_MIN_SCALE = 1;
+    const LIGHTBOX_MAX_SCALE = 8;
+    const lightboxState = {
+      pinnedKey: null, scale: 1, tx: 0, ty: 0, moved: false,
+      pointers: new Map(), pinch: null, pan: null, lastFocus: null,
+    };
+
+    function pinLightboxEntry(key) {
+      if (!key) return;
+      const entry = terminalImagePositiveCache.get(key);
+      if (!entry) return;
+      entry.activeNodeCount += 1;
+      entry.lastUsed = Date.now();
+      lightboxState.pinnedKey = key;
+    }
+
+    function unpinLightboxEntry() {
+      const key = lightboxState.pinnedKey;
+      lightboxState.pinnedKey = null;
+      if (!key) return;
+      const entry = terminalImagePositiveCache.get(key);
+      if (entry) entry.activeNodeCount = Math.max(0, entry.activeNodeCount - 1);
+      retryCapacityBlockedTerminalImages();
+    }
+
+    function applyLightboxTransform() {
+      if (!imageLightboxImg) return;
+      const zoomed = lightboxState.scale > 1.001;
+      imageLightbox.classList.toggle('zoomed', zoomed);
+      if (!zoomed) { lightboxState.tx = 0; lightboxState.ty = 0; }
+      imageLightboxImg.style.transform =
+        `translate(${lightboxState.tx}px, ${lightboxState.ty}px) scale(${lightboxState.scale})`;
+    }
+
+    function clampLightboxScale(s) {
+      return Math.min(LIGHTBOX_MAX_SCALE, Math.max(LIGHTBOX_MIN_SCALE, s));
+    }
+
+    // Cursor/point relative to the image's untransformed top-left.
+    function lightboxLocalPoint(clientX, clientY) {
+      const r = imageLightboxImg.getBoundingClientRect();
+      return { x: clientX - r.left + lightboxState.tx,
+               y: clientY - r.top + lightboxState.ty };
+    }
+
+    // Zoom to nextScale while keeping content point under (qx,qy) fixed.
+    function zoomLightboxAt(nextScale, qx, qy) {
+      const s0 = lightboxState.scale;
+      const s1 = clampLightboxScale(nextScale);
+      if (s1 === s0) return;
+      lightboxState.tx = qx - (s1 / s0) * (qx - lightboxState.tx);
+      lightboxState.ty = qy - (s1 / s0) * (qy - lightboxState.ty);
+      lightboxState.scale = s1;
+      applyLightboxTransform();
+    }
+
+    function openImageLightbox(imgEl) {
+      if (!imageLightbox || !imgEl) return;
+      const src = imgEl.currentSrc || imgEl.src;
+      if (!src) return;
+      lightboxState.scale = 1; lightboxState.tx = 0; lightboxState.ty = 0;
+      lightboxState.moved = false; lightboxState.pinch = null; lightboxState.pan = null;
+      lightboxState.pointers.clear();
+      pinLightboxEntry(imgEl.dataset ? imgEl.dataset.cacheKey : null);
+      imageLightboxImg.src = src;
+      imageLightbox.classList.add('open');
+      imageLightbox.classList.remove('zoomed', 'panning');
+      imageLightbox.setAttribute('aria-hidden', 'false');
+      lightboxState.lastFocus = document.activeElement;
+      applyLightboxTransform();
+      if (imageLightboxClose) imageLightboxClose.focus();
+    }
+
+    function closeImageLightbox() {
+      if (!imageLightbox || !imageLightbox.classList.contains('open')) return;
+      imageLightbox.classList.remove('open', 'zoomed', 'panning');
+      imageLightbox.setAttribute('aria-hidden', 'true');
+      if (imageLightboxImg) imageLightboxImg.removeAttribute('src');
+      lightboxState.pointers.clear();
+      lightboxState.pinch = null; lightboxState.pan = null;
+      unpinLightboxEntry();
+      const prev = lightboxState.lastFocus;
+      lightboxState.lastFocus = null;
+      if (prev && typeof prev.focus === 'function') prev.focus();
+    }
+
+    function toggleLightboxZoom(evt) {
+      if (lightboxState.moved) return;
+      if (lightboxState.scale > 1.001) {
+        lightboxState.scale = 1; lightboxState.tx = 0; lightboxState.ty = 0;
+        applyLightboxTransform();
+      } else {
+        const q = lightboxLocalPoint(evt.clientX, evt.clientY);
+        zoomLightboxAt(2.5, q.x, q.y);
+      }
+    }
+
+    function lightboxPointerMid() {
+      let sx = 0, sy = 0;
+      lightboxState.pointers.forEach((p) => { sx += p.x; sy += p.y; });
+      const n = lightboxState.pointers.size || 1;
+      return { x: sx / n, y: sy / n };
+    }
+
+    function lightboxPointerDist() {
+      const pts = [...lightboxState.pointers.values()];
+      if (pts.length < 2) return 0;
+      return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    }
+
+    if (imageLightbox && imageLightboxImg) {
+      // Open from any inline conversation image click.
+      transcript.addEventListener('click', (event) => {
+        const target = event.target;
+        if (target && target.classList
+            && target.classList.contains('conversation-image-img')) {
+          event.preventDefault();
+          openImageLightbox(target);
+        }
+      });
+
+      if (imageLightboxClose) {
+        imageLightboxClose.addEventListener('click', closeImageLightbox);
+      }
+      // Click on the dark backdrop (but not the image/close) dismisses.
+      imageLightbox.addEventListener('click', (event) => {
+        if (event.target === imageLightbox) closeImageLightbox();
+      });
+      // Tap/click the image toggles fit <-> zoomed (unless it was a drag).
+      imageLightboxImg.addEventListener('click', toggleLightboxZoom);
+
+      imageLightbox.addEventListener('wheel', (event) => {
+        event.preventDefault();
+        const q = lightboxLocalPoint(event.clientX, event.clientY);
+        const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+        zoomLightboxAt(lightboxState.scale * factor, q.x, q.y);
+      }, { passive: false });
+
+      imageLightboxImg.addEventListener('pointerdown', (event) => {
+        imageLightboxImg.setPointerCapture(event.pointerId);
+        lightboxState.pointers.set(event.pointerId,
+          { x: event.clientX, y: event.clientY });
+        lightboxState.moved = false;
+        if (lightboxState.pointers.size === 2) {
+          lightboxState.pan = null;
+          lightboxState.pinch = { dist: lightboxPointerDist(), scale: lightboxState.scale };
+        } else if (lightboxState.pointers.size === 1) {
+          lightboxState.pan = { tx: lightboxState.tx, ty: lightboxState.ty,
+            x: event.clientX, y: event.clientY };
+        }
+      });
+
+      imageLightboxImg.addEventListener('pointermove', (event) => {
+        const p = lightboxState.pointers.get(event.pointerId);
+        if (!p) return;
+        p.x = event.clientX; p.y = event.clientY;
+        if (lightboxState.pointers.size >= 2 && lightboxState.pinch) {
+          const dist = lightboxPointerDist();
+          if (lightboxState.pinch.dist > 0 && dist > 0) {
+            const mid = lightboxPointerMid();
+            const q = lightboxLocalPoint(mid.x, mid.y);
+            zoomLightboxAt(lightboxState.pinch.scale * (dist / lightboxState.pinch.dist),
+              q.x, q.y);
+          }
+          lightboxState.moved = true;
+        } else if (lightboxState.pan && lightboxState.scale > 1.001) {
+          const dx = event.clientX - lightboxState.pan.x;
+          const dy = event.clientY - lightboxState.pan.y;
+          if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+            lightboxState.moved = true;
+            imageLightbox.classList.add('panning');
+          }
+          lightboxState.tx = lightboxState.pan.tx + dx;
+          lightboxState.ty = lightboxState.pan.ty + dy;
+          applyLightboxTransform();
+        }
+      });
+
+      const endPointer = (event) => {
+        lightboxState.pointers.delete(event.pointerId);
+        if (lightboxState.pointers.size < 2) lightboxState.pinch = null;
+        if (lightboxState.pointers.size === 0) {
+          lightboxState.pan = null;
+          imageLightbox.classList.remove('panning');
+        }
+      };
+      imageLightboxImg.addEventListener('pointerup', endPointer);
+      imageLightboxImg.addEventListener('pointercancel', endPointer);
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && imageLightbox.classList.contains('open')) {
+          event.preventDefault();
+          closeImageLightbox();
+        }
+      });
     }
 
     function terminalImageViewportRange() {
@@ -3823,6 +4055,7 @@ enum RemoteWebAssets {
     // them can possibly belong to the session we're switching to, since it
     // hasn't requested anything yet.
     function resetTerminalImagesForSessionChange() {
+      closeImageLightbox();
       terminalImageGeneration += 1;
       terminalImageInFlight.forEach((request) => request.controller.abort());
       terminalImageInFlight.clear();
