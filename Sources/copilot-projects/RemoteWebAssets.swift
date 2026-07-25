@@ -22,6 +22,10 @@ enum RemoteWebAssets {
         <button id="new-session" aria-label="New session" title="New session" disabled>
           New Session
         </button>
+        <button id="close-session" aria-label="Close session"
+          title="Close session" disabled>
+          Close Session
+        </button>
         <span id="create-status" class="create-status" role="status" aria-live="polite"
           aria-atomic="true"></span>
         <span id="connection" class="connection connecting" role="status"
@@ -246,6 +250,10 @@ enum RemoteWebAssets {
       border-radius:6px; background:#1f6feb; color:#fff; cursor:pointer; }
     #new-session-project:disabled,
     #new-session:disabled { background:#30363d; color:#7d8590; cursor:default; }
+    #close-session { padding:5px 10px; font-size:12px; border:1px solid #f8514955;
+      border-radius:6px; background:#21262d; color:#f85149; cursor:pointer; }
+    #close-session:disabled { background:#30363d; color:#7d8590;
+      border-color:#444; cursor:default; }
     .create-status { font-size:11px; color:#8b949e; max-width:220px;
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .connection { display:inline-flex; align-items:center; justify-content:center;
@@ -1557,6 +1565,7 @@ enum RemoteWebAssets {
     const pivotTabs = Array.from(document.querySelectorAll('.pivot-tab'));
     const newSessionButton = document.querySelector('#new-session');
     const newSessionProject = document.querySelector('#new-session-project');
+    const closeSessionButton = document.querySelector('#close-session');
     const createStatus = document.querySelector('#create-status');
     const base = location.pathname.endsWith('/')
       ? location.pathname : `${location.pathname}/`;
@@ -1777,6 +1786,33 @@ enum RemoteWebAssets {
       } catch (error) {
         setConnection('error', 'Connection error');
         return null;
+      }
+    }
+    let closingSession = false;
+    // The close button targets the selected session, which the client already
+    // holds the lease for (selectSession acquires it). The gateway rejects a
+    // close without a held lease, so gating on `writable` matches the server.
+    function updateCloseSessionState() {
+      const canClose = !!selected && writable && sessionState.has(selected);
+      closeSessionButton.disabled = !canClose || closingSession;
+    }
+    async function closeCurrentSession() {
+      if (!selected || !writable || closingSession) return;
+      const sessionId = selected;
+      closingSession = true;
+      updateCloseSessionState();
+      try {
+        const response = await control({ type: 'close-session', sessionId });
+        if (response && response.ok && selected === sessionId) {
+          // The session is ending; drop local control now. The next workspace
+          // snapshot removes the tab and reconciles selection.
+          writable = false;
+          lease.textContent = 'view only';
+        }
+      } finally {
+        closingSession = false;
+        updateCloseSessionState();
+        updatePromptState();
       }
     }
     function setCreateStatus(text) {
@@ -2132,6 +2168,7 @@ enum RemoteWebAssets {
       }
     }
     function updatePromptState(message) {
+      updateCloseSessionState();
       const state = selected && sessionState.get(selected);
       const pendingInputs = (state && state.pendingUserInputs) || [];
       const pendingElicits = (state && state.pendingElicitations) || [];
@@ -4277,6 +4314,7 @@ enum RemoteWebAssets {
       if (next) { setViewMode(next.dataset.mode, {silent:true}); next.focus(); }
     });
     newSessionButton.onclick = () => { createSession(); };
+    closeSessionButton.onclick = () => { closeCurrentSession(); };
     newSessionProject.onchange = () => {
       const nextProjectId = newSessionProject.value || null;
       if (createTargetProjectId === nextProjectId) return;
