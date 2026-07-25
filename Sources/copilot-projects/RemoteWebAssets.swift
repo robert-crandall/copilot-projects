@@ -1321,6 +1321,9 @@ enum RemoteWebAssets {
     const TERMINAL_IMAGE_MAX_DECODED_PIXELS = 16_000_000;
     const TERMINAL_IMAGE_MAX_DIMENSION = 4096;
     const TERMINAL_IMAGE_MAX_PIXELS = 16_000_000;
+    // Conversation inline-image transient-failure retry (capacity/backoff).
+    const CONVERSATION_IMAGE_RETRY_MS = 1_500;
+    const CONVERSATION_IMAGE_MAX_RETRIES = 3;
     const TERMINAL_IMAGE_BACKOFF_BASE_MS = 1000;
     const TERMINAL_IMAGE_BACKOFF_MAX_MS = 30_000;
 
@@ -1624,6 +1627,10 @@ enum RemoteWebAssets {
     let transcriptRequestId = 0;
     let selectionGeneration = 0;
     let viewMode = 'conversation';
+    // Last transcript snapshot rendered, so switching back to the Conversation
+    // tab can re-render (and mount inline images, which are skipped while the
+    // tab is hidden — see renderTranscript).
+    let lastRenderedTranscript = null;
     // Only the most recent turns are rendered up front so a long transcript
     // can't freeze the tab building hundreds of markdown-parsed cards in one
     // synchronous pass; "Show earlier" reveals older turns a bounded batch at a
@@ -1696,8 +1703,16 @@ enum RemoteWebAssets {
         tab.setAttribute('aria-selected', String(tab.dataset.mode === mode));
       });
       if (mode === 'terminal') {
-        if (changed) refreshTerminal();
+        if (changed) {
+          // Free the shared image budget the (now-hidden) conversation images
+          // were holding so they can't starve the terminal overlay.
+          releaseAllConversationImageNodes();
+          refreshTerminal();
+        }
         if (!options?.silent) terminal.focus();
+      } else if (mode === 'conversation' && changed && lastRenderedTranscript) {
+        // Re-render so inline images (skipped while the tab was hidden) mount.
+        renderTranscript(lastRenderedTranscript);
       }
     }
 
@@ -3189,6 +3204,7 @@ enum RemoteWebAssets {
     }
 
     function renderTranscript(snapshot) {
+      lastRenderedTranscript = snapshot;
       const wasAtBottom =
         transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 18;
       // Capture a stable scroll anchor — the first turn intersecting the viewport
@@ -3269,7 +3285,8 @@ enum RemoteWebAssets {
             + (successful ? ` · ${successful} completed` : '');
           card.append(tools);
         }
-        if (Array.isArray(turn.images) && turn.images.length && selected) {
+        if (viewMode === 'conversation'
+            && Array.isArray(turn.images) && turn.images.length && selected) {
           const gallery = document.createElement('div');
           gallery.className = 'conversation-images';
           turn.images.forEach((raw) => {
@@ -3642,14 +3659,24 @@ enum RemoteWebAssets {
       return { imageId, contentVersion: exactVersion };
     }
 
+    // Mounts a decoded image into a conversation node, enforcing the same
+    // shared decoded-pixel budget terminal mounts respect so conversation
+    // images can never starve the terminal overlay. Returns whether it mounted;
+    // a `false` (over budget) leaves the node blank to be retried on a later
+    // render once budget frees.
     function mountConversationImage(node, cacheEntry, key) {
+      const pixels = cacheEntry.width * cacheEntry.height;
+      if (terminalActiveDecodedPixels + pixels > TERMINAL_IMAGE_MAX_DECODED_PIXELS) {
+        return false;
+      }
       node.cacheKey = key;
-      node.pixels = cacheEntry.width * cacheEntry.height;
+      node.pixels = pixels;
       cacheEntry.activeNodeCount += 1;
       cacheEntry.lastUsed = Date.now();
-      terminalActiveDecodedPixels += node.pixels;
+      terminalActiveDecodedPixels += pixels;
       node.el.onerror = () => invalidateTerminalImageCacheEntry(key);
       node.el.src = cacheEntry.url;
+      return true;
     }
 
     function releaseConversationImageNode(node) {
@@ -3674,9 +3701,12 @@ enum RemoteWebAssets {
 
     // Builds one inline conversation image node. A cache hit mounts
     // synchronously (so an unchanged image keeps a non-zero reference across the
-    // render swap); otherwise the bounded loader mounts it on completion, guarded
-    // against a stale session/generation or a node already released by a later
-    // render.
+    // render swap); otherwise a bounded loader mounts it on completion. A
+    // transient/capacity miss (null result or a full decoded-pixel budget) is
+    // retried a few times with backoff so a temporary failure doesn't leave the
+    // image permanently blank until the next unrelated transcript revision —
+    // every attempt re-checks the node isn't released and the session/generation
+    // hasn't moved on.
     function createConversationImageNode(sessionId, ref) {
       const figure = document.createElement('figure');
       figure.className = 'conversation-image';
@@ -3691,16 +3721,26 @@ enum RemoteWebAssets {
       const cached = terminalImagePositiveCache.get(key);
       if (cached) {
         cached.lastUsed = Date.now();
-        mountConversationImage(node, cached, key);
-        return node;
+        if (mountConversationImage(node, cached, key)) return node;
       }
       const generation = terminalImageGeneration;
-      loadTerminalImage(sessionId, ref).then((cacheEntry) => {
-        if (node.released) return;
+      const attempt = (remaining) => {
+        if (node.released || node.cacheKey) return;
         if (terminalImageGeneration !== generation) return;
-        if (!cacheEntry || terminalImagePositiveCache.get(key) !== cacheEntry) return;
-        mountConversationImage(node, cacheEntry, key);
-      });
+        loadTerminalImage(sessionId, ref).then((cacheEntry) => {
+          if (node.released || node.cacheKey) return;
+          if (terminalImageGeneration !== generation) return;
+          if (cacheEntry
+              && terminalImagePositiveCache.get(key) === cacheEntry
+              && mountConversationImage(node, cacheEntry, key)) {
+            return;
+          }
+          if (remaining > 0) {
+            setTimeout(() => attempt(remaining - 1), CONVERSATION_IMAGE_RETRY_MS);
+          }
+        });
+      };
+      attempt(CONVERSATION_IMAGE_MAX_RETRIES);
       return node;
     }
 

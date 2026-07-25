@@ -781,19 +781,19 @@ final class RemoteKittyImageCapture {
     /// display time and are omitted, so a caller can only ever associate an
     /// image whose bytes are guaranteed fetchable. Bounded by the per-session
     /// retention caps (`remoteKittyMaxRetainedEntries`), so this is always small.
-    /// Newest-first per the underlying `order` reversal is not guaranteed; the
-    /// caller de-dupes/sorts as needed.
     func retainedImageMetadata() -> [RetainedImageInfo] {
-        var seen: Set<UInt32> = []
         var result: [RetainedImageInfo] = []
-        // `order` is oldest-first; iterate reversed so that if (defensively) an
-        // id somehow had two retained entries, we keep the newest advertised one.
-        for key in order.reversed() {
-            guard !seen.contains(key.imageId) else { continue }
-            guard let version = currentVersion(for: key.imageId), version == key.version else { continue }
+        for key in order {
+            // `latestVersion[id] == key.version` selects the single current
+            // retained version per id; `isAnyPlacementActive` accepts an image
+            // shown via any placement (not just the default `p=0`), matching
+            // what a fetch can still serve.
+            guard latestVersion[key.imageId] == key.version else { continue }
+            guard isAnyPlacementActive(imageId: key.imageId) else { continue }
             guard let when = displayedAt[key] else { continue }
-            seen.insert(key.imageId)
-            result.append(RetainedImageInfo(imageId: key.imageId, version: version, displayedAt: when))
+            result.append(
+                RetainedImageInfo(imageId: key.imageId, version: key.version, displayedAt: when)
+            )
         }
         return result
     }

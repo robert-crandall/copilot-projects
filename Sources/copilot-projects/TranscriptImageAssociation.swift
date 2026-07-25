@@ -18,35 +18,35 @@ enum TranscriptImageAssociation {
         images: [RemoteKittyImageCapture.RetainedImageInfo],
         to snapshot: TranscriptSnapshot
     ) -> TranscriptSnapshot {
-        guard !images.isEmpty, !snapshot.turns.isEmpty else { return snapshot }
-        let turns = snapshot.turns
-
         // turnIndex -> imageId -> chosen (newest) info for that turn.
         var byTurn: [Int: [UInt32: RemoteKittyImageCapture.RetainedImageInfo]] = [:]
-        for image in images {
-            guard let turnIndex = Self.activeTurnIndex(turns, at: image.displayedAt) else {
-                continue
-            }
-            var perImage = byTurn[turnIndex] ?? [:]
-            if let existing = perImage[image.imageId] {
-                if image.version > existing.version { perImage[image.imageId] = image }
-            } else {
-                perImage[image.imageId] = image
-            }
-            byTurn[turnIndex] = perImage
-        }
-        guard !byTurn.isEmpty else { return snapshot }
-
-        var newTurns = turns
-        for (turnIndex, perImage) in byTurn {
-            let refs = perImage.values
-                .sorted {
-                    if $0.displayedAt != $1.displayedAt { return $0.displayedAt < $1.displayedAt }
-                    return $0.imageId < $1.imageId
+        if !snapshot.turns.isEmpty {
+            for image in images {
+                guard let turnIndex = Self.activeTurnIndex(snapshot.turns, at: image.displayedAt)
+                else { continue }
+                var perImage = byTurn[turnIndex] ?? [:]
+                if let existing = perImage[image.imageId] {
+                    if image.version > existing.version { perImage[image.imageId] = image }
+                } else {
+                    perImage[image.imageId] = image
                 }
-                .map { TranscriptImageRef(imageId: $0.imageId, contentVersion: $0.version) }
-            let turn = turns[turnIndex]
-            newTurns[turnIndex] = TranscriptTurn(
+                byTurn[turnIndex] = perImage
+            }
+        }
+        // Rebuild EVERY turn from host-computed refs (or nil), never preserving
+        // any `images` that were on the decoded snapshot: the CLI writer owns
+        // the transcript file but must not be trusted to supply image refs, so
+        // the host is the sole authority for this field.
+        let newTurns = snapshot.turns.enumerated().map { index, turn -> TranscriptTurn in
+            let refs: [TranscriptImageRef]? = byTurn[index].map { perImage in
+                perImage.values
+                    .sorted {
+                        if $0.displayedAt != $1.displayedAt { return $0.displayedAt < $1.displayedAt }
+                        return $0.imageId < $1.imageId
+                    }
+                    .map { TranscriptImageRef(imageId: $0.imageId, contentVersion: $0.version) }
+            }
+            return TranscriptTurn(
                 id: turn.id,
                 startedAt: turn.startedAt,
                 endedAt: turn.endedAt,
@@ -66,18 +66,12 @@ enum TranscriptImageAssociation {
         )
     }
 
-    /// Index of the turn with the greatest `startedAt <= time`, or `nil` if no
-    /// turn had started by `time`. Linear scan; both inputs are bounded small
-    /// (turns <= ~200, images <= per-session retention cap).
+    /// Index of the turn active at `time` — the last (chronologically latest)
+    /// turn whose `startedAt <= time`, or `nil` if no turn had started yet.
+    /// Transcript turns are appended in start order, so `lastIndex` yields the
+    /// greatest `startedAt <= time` and resolves identical `startedAt` ties to
+    /// the later turn.
     static func activeTurnIndex(_ turns: [TranscriptTurn], at time: Date) -> Int? {
-        var best: Int?
-        for (index, turn) in turns.enumerated() where turn.startedAt <= time {
-            if let current = best {
-                if turn.startedAt > turns[current].startedAt { best = index }
-            } else {
-                best = index
-            }
-        }
-        return best
+        turns.lastIndex { $0.startedAt <= time }
     }
 }

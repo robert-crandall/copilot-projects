@@ -9457,6 +9457,33 @@ final class AppLogicTests: XCTestCase {
         XCTAssertNil(result.turns[0].images)
     }
 
+    func testTranscriptImageAssociationStripsPreexistingTurnImages() {
+        // A snapshot that already carries `images` (a buggy/hostile CLI writer)
+        // must have them replaced by host-computed refs — here none, so nil.
+        let injected = TranscriptTurn(
+            id: "t1", startedAt: Date(timeIntervalSince1970: 100), endedAt: nil,
+            kind: "agent", userContent: "", assistantMessages: [], tools: [],
+            isAborted: false,
+            images: [TranscriptImageRef(imageId: 999, contentVersion: 1)]
+        )
+        let result = TranscriptImageAssociation.attach(images: [], to: makeSnapshot([injected]))
+        XCTAssertNil(result.turns[0].images)
+    }
+
+    func testTranscriptImageAssociationReplacesInjectedImagesWithHostRefs() {
+        let injected = TranscriptTurn(
+            id: "t1", startedAt: Date(timeIntervalSince1970: 100), endedAt: nil,
+            kind: "agent", userContent: "", assistantMessages: [], tools: [],
+            isAborted: false,
+            images: [TranscriptImageRef(imageId: 999, contentVersion: 1)]
+        )
+        let result = TranscriptImageAssociation.attach(
+            images: [img(5, 42, at: 150)],
+            to: makeSnapshot([injected])
+        )
+        XCTAssertEqual(result.turns[0].images?.map(\.imageId), [5])
+    }
+
     func testTranscriptImageRefRoundTripsOptionalFieldThroughCodable() throws {
         // A CLI-written turn (no `images` key) decodes with images == nil, and a
         // host-augmented turn round-trips its refs (incl. the JS-safe text).
