@@ -4,12 +4,6 @@ import Foundation
 /// session status dot automatically. The hook no-ops unless it runs inside a
 /// Copilot Projects terminal (where the per-session env is set), so it is safe to
 /// have configured globally and coexists with other integrations (e.g. cmux).
-///
-/// Compatibility: a `copilot` process caches its hook command at startup, so an
-/// agent that was already running before the rebrand keeps invoking the old
-/// `copilot-mux-hook.sh`. The script is therefore written under both the new and
-/// the legacy name (identical content), and the legacy JSON config is removed so
-/// new agents register only the new hook (no double-fire).
 public enum CopilotHooks {
     public static var hooksDir: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -18,17 +12,13 @@ public enum CopilotHooks {
 
     public static var scriptURL: URL { hooksDir.appendingPathComponent("copilot-projects-hook.sh") }
     public static var configURL: URL { hooksDir.appendingPathComponent("copilot-projects.json") }
-    static var legacyScriptURL: URL { hooksDir.appendingPathComponent("copilot-mux-hook.sh") }
-    static var legacyConfigURL: URL { hooksDir.appendingPathComponent("copilot-mux.json") }
 
     /// True when the Copilot CLI hooks directory exists (CLI installed + used).
     public static var copilotPresent: Bool {
         FileManager.default.fileExists(atPath: hooksDir.path)
     }
 
-    /// Maps agent lifecycle events to `copilot-projects set-status`. Reads both the
-    /// current and legacy env var names so it works in sessions started before the
-    /// rebrand (whose shells still carry `COPILOT_MUX_*`).
+    /// Maps agent lifecycle events to `copilot-projects set-status`.
     public static let script = #"""
     #!/usr/bin/env bash
     # Copilot Projects <-> Copilot CLI status bridge (managed by Copilot Projects; safe to delete).
@@ -37,19 +27,16 @@ public enum CopilotHooks {
 
     emit() { printf '{}\n'; }   # neutral hook result
 
-    environment_session_id="${COPILOT_PROJECTS_SESSION:-${COPILOT_MUX_SESSION:-}}"
-    socket="${COPILOT_PROJECTS_SOCKET:-${COPILOT_MUX_SOCKET:-}}"
+    environment_session_id="${COPILOT_PROJECTS_SESSION:-}"
+    socket="${COPILOT_PROJECTS_SOCKET:-}"
     if [ -z "$environment_session_id" ] && [ -z "$socket" ]; then
       emit
       exit 0
     fi
 
-    # Derive the state dir from whichever socket env is present; otherwise fall back
-    # to the storage root that matches the session's vintage.
+    # Derive the state dir from the socket env when present.
     if [ -n "$socket" ]; then
       state_dir="$(dirname "$socket")"
-    elif [ -n "${COPILOT_MUX_SESSION:-}" ]; then
-      state_dir="$HOME/.local/state/copilot-mux"
     else
       state_dir="$HOME/.local/state/copilot-projects"
     fi
@@ -59,7 +46,6 @@ public enum CopilotHooks {
     # ancestry. If the installed resolver cannot prove ownership, fail closed; only
     # old installs without the resolver retain the environment fallback.
     resolver="$HOME/.local/bin/copilot-projects"
-    [ ! -x "$resolver" ] && resolver="$HOME/.local/bin/copilot-mux"
     if [ -x "$resolver" ]; then
       session_id="$("$resolver" resolve-session --pid "$PPID" 2>/dev/null)" \
         || { emit; exit 0; }
@@ -73,8 +59,6 @@ public enum CopilotHooks {
 
     cli="$(command -v copilot-projects 2>/dev/null || true)"
     [ -z "$cli" ] && [ -x "$HOME/.local/bin/copilot-projects" ] && cli="$HOME/.local/bin/copilot-projects"
-    [ -z "$cli" ] && cli="$(command -v copilot-mux 2>/dev/null || true)"
-    [ -z "$cli" ] && [ -x "$HOME/.local/bin/copilot-mux" ] && cli="$HOME/.local/bin/copilot-mux"
 
     status_record_prompt_timestamp() {
       local record value
@@ -363,23 +347,16 @@ public enum CopilotHooks {
     public static func install() throws -> String {
         let fm = FileManager.default
         try fm.createDirectory(at: hooksDir, withIntermediateDirectories: true)
-        // Write the (identical) script under both names so agents that cached the
-        // legacy hook path before the rebrand don't hit a missing file.
-        for url in [scriptURL, legacyScriptURL] {
-            try Data(script.utf8).write(to: url, options: .atomic)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-        }
+        try Data(script.utf8).write(to: scriptURL, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
         try Data(config.utf8).write(to: configURL, options: .atomic)
-        // Remove the legacy JSON so new agents don't register the hook twice. The
-        // legacy script file stays in place for already-running agents.
-        try? fm.removeItem(at: legacyConfigURL)
         return "Installed Copilot CLI hooks in \(hooksDir.path) "
             + "(copilot-projects-hook.sh, copilot-projects.json). Start a new Copilot CLI session to pick them up."
     }
 
     public static func uninstall() {
         let fm = FileManager.default
-        for url in [scriptURL, legacyScriptURL, configURL, legacyConfigURL] {
+        for url in [scriptURL, configURL] {
             try? fm.removeItem(at: url)
         }
     }
@@ -392,11 +369,8 @@ public enum CopilotHooks {
     }
 
     private static func upToDate() -> Bool {
-        let fm = FileManager.default
         guard let s = try? String(contentsOf: scriptURL, encoding: .utf8), s == script,
-              let c = try? String(contentsOf: configURL, encoding: .utf8), c == config,
-              let ls = try? String(contentsOf: legacyScriptURL, encoding: .utf8), ls == script,
-              !fm.fileExists(atPath: legacyConfigURL.path)
+              let c = try? String(contentsOf: configURL, encoding: .utf8), c == config
         else { return false }
         return true
     }

@@ -34,44 +34,24 @@ public enum Paths {
         return path.isEmpty ? raw : path
     }
 
-    /// The storage root. Honors `COPILOT_PROJECTS_STATE_DIR` (or the legacy
-    /// `COPILOT_MUX_STATE_DIR`); otherwise see `defaultStateDir`.
+    /// The storage root. Honors `COPILOT_PROJECTS_STATE_DIR`; otherwise uses the
+    /// default application state directory.
     public static var stateDir: URL {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["COPILOT_PROJECTS_STATE_DIR"] ?? env["COPILOT_MUX_STATE_DIR"],
+        if let override = env["COPILOT_PROJECTS_STATE_DIR"],
            !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true)
         }
         return defaultStateDir
     }
 
-    /// Resolved once per process. An install that already has sessions under the
-    /// pre-rebrand `copilot-mux` directory keeps using it — the directory is
-    /// internal and is deliberately never moved, because the live dtach masters
-    /// were launched with their old socket paths baked into argv, so relocating
-    /// the sockets would strand them. Fresh installs use the current name.
-    private static let defaultStateDir: URL = {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let current = home.appendingPathComponent(".local/state/copilot-projects", isDirectory: true)
-        let legacy = home.appendingPathComponent(".local/state/copilot-mux", isDirectory: true)
-        if hasMeaningfulState(legacy) && !hasMeaningfulState(current) { return legacy }
-        return current
-    }()
-
-    /// True if a directory holds real session state, so an empty/accidental dir
-    /// never wins the legacy-vs-current decision above.
-    private static func hasMeaningfulState(_ dir: URL) -> Bool {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: dir.appendingPathComponent("state.json").path) { return true }
-        let sessions = dir.appendingPathComponent("sessions").path
-        if let items = try? fm.contentsOfDirectory(atPath: sessions), !items.isEmpty { return true }
-        return false
-    }
+    private static let defaultStateDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/state/copilot-projects", isDirectory: true)
 
     /// Unix domain socket the app listens on (override with `COPILOT_PROJECTS_SOCKET`).
     public static var socketPath: String {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["COPILOT_PROJECTS_SOCKET"] ?? env["COPILOT_MUX_SOCKET"],
+        if let override = env["COPILOT_PROJECTS_SOCKET"],
            !override.isEmpty {
             return override
         }
@@ -184,8 +164,8 @@ public enum Paths {
     }
 
     /// Absolute path to the `copilot` CLI, resolved without relying on an
-    /// interactive login shell's rc files. Honors an explicit override
-    /// (`COPILOT_PROJECTS_COPILOT`, or the legacy `COPILOT_MUX_COPILOT`), then
+    /// interactive login shell's rc files. Honors an explicit
+    /// `COPILOT_PROJECTS_COPILOT` override, then
     /// `$HOME/.local/bin/copilot` (the documented install location), then the
     /// first executable named `copilot` on the app process `PATH`. Returns `nil`
     /// when none exists so remote session creation fails closed instead of
@@ -199,8 +179,7 @@ public enum Paths {
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileManager: FileManager = .default
     ) -> String? {
-        if let override = environment["COPILOT_PROJECTS_COPILOT"]
-            ?? environment["COPILOT_MUX_COPILOT"],
+        if let override = environment["COPILOT_PROJECTS_COPILOT"],
            !override.isEmpty,
            fileManager.isExecutableFile(atPath: override) {
             return override
@@ -285,7 +264,7 @@ public enum Paths {
     /// The bundled dtach helper (resumability backend), or an override, or nil.
     public static var dtachExecutable: String? {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["COPILOT_PROJECTS_DTACH"] ?? env["COPILOT_MUX_DTACH"],
+        if let override = env["COPILOT_PROJECTS_DTACH"],
            !override.isEmpty,
            FileManager.default.isExecutableFile(atPath: override) {
             return override

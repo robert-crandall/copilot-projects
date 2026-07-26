@@ -175,8 +175,7 @@ public enum ProcessTree {
             }
             if let name = snap.nameOf[current],
                name == "copilot-project"
-                    || name == "copilot-projects"
-                    || name == "copilot-mux" {
+                    || name == "copilot-projects" {
                 return fallback
             }
             guard let parent = snap.parentOf[current], parent > 0 else {

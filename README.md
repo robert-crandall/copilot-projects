@@ -322,12 +322,10 @@ the only emulator.
 - **Tradeoff:** scrollback *history* doesn't survive a detach (a full-screen TUI like copilot
   repaints on reattach; a plain shell starts fresh). Live scrollback while attached is normal.
 
-Sockets live under `~/.local/state/copilot-projects/sessions/` on fresh installs. An install
-migrated from the old `copilot-mux` name intentionally keeps using
-`~/.local/state/copilot-mux/`, because live dtach masters have those socket paths baked into
-their argv. `copilot-projects doctor` prints the active path and distinguishes the normal
-master/client process pair from real orphaned masters. If the bundled dtach is missing,
-sessions fall back to plain shells. Override it with `COPILOT_PROJECTS_DTACH`.
+Sockets live under `~/.local/state/copilot-projects/sessions/`. `copilot-projects doctor`
+prints the active path and distinguishes the normal master/client process pair from real
+orphaned masters. If the bundled dtach is missing, sessions fall back to plain shells.
+Override it with `COPILOT_PROJECTS_DTACH`.
 
 ## Renderer
 
@@ -347,9 +345,8 @@ layout, and synchronized output.
   Live SwiftTerm views stay outside the observable graph.
 - `ControlServer` listens on `~/.local/state/copilot-projects/control.sock` (mode 0600 in a 0700
   dir); each connection is one JSON request → one JSON response.
-- State is persisted to `~/.local/state/copilot-projects/state.json`.
-  Existing pre-rebrand installs may use the legacy path described above. Writes are atomic,
-  preserve a known-good backup, and never overwrite unreadable state with an empty workspace.
+- State is persisted to `~/.local/state/copilot-projects/state.json`. Writes are atomic, preserve
+  a known-good backup, and never overwrite unreadable state with an empty workspace.
 
 Override locations with `COPILOT_PROJECTS_SOCKET` and `COPILOT_PROJECTS_STATE_DIR` to run an isolated
 instance. An app launched with either override does not replace the global CLI symlink or Copilot

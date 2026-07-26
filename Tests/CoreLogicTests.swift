@@ -216,7 +216,6 @@ final class CoreLogicTests: XCTestCase {
             "HOME": root.path,
             "COPILOT_PROJECTS_SESSION": "6780CCA3-92AF-4506-95F2-F018A195A1A1",
             "COPILOT_PROJECTS_SOCKET": "",
-            "COPILOT_MUX_SOCKET": "",
         ]) { _, new in new }
         process.standardOutput = stdout
         process.standardError = stderr
@@ -1960,13 +1959,7 @@ final class CoreLogicTests: XCTestCase {
             "COPILOT_PROJECTS_STATE_DIR": "/isolated/state",
         ]))
         XCTAssertFalse(Env.shouldInstallGlobalIntegration([
-            "COPILOT_MUX_STATE_DIR": "/isolated/legacy-state",
-        ]))
-        XCTAssertFalse(Env.shouldInstallGlobalIntegration([
             "COPILOT_PROJECTS_SOCKET": "/isolated/control.sock",
-        ]))
-        XCTAssertFalse(Env.shouldInstallGlobalIntegration([
-            "COPILOT_MUX_SOCKET": "/isolated/legacy-control.sock",
         ]))
     }
 

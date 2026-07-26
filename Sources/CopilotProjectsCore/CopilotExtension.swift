@@ -23,10 +23,8 @@ public enum CopilotExtension {
     } from "node:fs";
     import { joinSession } from "@github/copilot-sdk/extension";
 
-    const environmentAppSessionId = process.env.COPILOT_PROJECTS_SESSION
-        || process.env.COPILOT_MUX_SESSION;
-    const socketPath = process.env.COPILOT_PROJECTS_SOCKET
-        || process.env.COPILOT_MUX_SOCKET;
+    const environmentAppSessionId = process.env.COPILOT_PROJECTS_SESSION;
+    const socketPath = process.env.COPILOT_PROJECTS_SOCKET;
     const sessionIdPattern = /^[0-9A-Fa-f-]{36}$/;
 
     // The environment can be stale or cross-contaminated in a long-lived shell.
@@ -35,10 +33,7 @@ public enum CopilotExtension {
     // fail closed; only old installs without the helper retain the env fallback.
     const sessionResolverPath = (() => {
         const home = typeof process.env.HOME === "string" ? process.env.HOME : "";
-        const candidates = home ? [
-            join(home, ".local/bin/copilot-projects"),
-            join(home, ".local/bin/copilot-mux"),
-        ] : [];
+        const candidates = home ? [join(home, ".local/bin/copilot-projects")] : [];
         return candidates.find((candidate) => fileExistsSync(candidate)) || null;
     })();
 
