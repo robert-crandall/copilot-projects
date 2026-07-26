@@ -25,7 +25,4 @@ if !cliArgs.isEmpty, !CLIMain.isCocoaLaunchArguments(cliArgs) {
     exit(2)
 }
 
-// One-time copy of pre-rebrand UserDefaults (bundle-id change) before any window
-// or split view restores its saved frame.
-LegacyDefaults.migrateIfNeeded()
 CopilotProjectsApp.main()

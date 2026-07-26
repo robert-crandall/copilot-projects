@@ -330,7 +330,7 @@ final class AppModel: ObservableObject {
     /// whole check with COPILOT_PROJECTS_LIVENESS=0.
     private var agentProcessNames: Set<String> {
         let env = ProcessInfo.processInfo.environment
-        if let raw = env["COPILOT_PROJECTS_AGENT_PROCESSES"] ?? env["COPILOT_MUX_AGENT_PROCESSES"],
+        if let raw = env["COPILOT_PROJECTS_AGENT_PROCESSES"],
            !raw.isEmpty {
             let names = raw.split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -342,7 +342,7 @@ final class AppModel: ObservableObject {
 
     private var livenessEnabled: Bool {
         let env = ProcessInfo.processInfo.environment
-        return (env["COPILOT_PROJECTS_LIVENESS"] ?? env["COPILOT_MUX_LIVENESS"]) != "0"
+        return env["COPILOT_PROJECTS_LIVENESS"] != "0"
     }
 
     init(
@@ -482,15 +482,6 @@ final class AppModel: ObservableObject {
             try? fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
         }
 
-        // Retire the pre-rebrand `copilot-mux` alias: the hook resolves
-        // copilot-projects first, so it's dead weight. Only remove it when it's a
-        // symlink we created (points at a Copilot Projects executable), never a real
-        // file the user may have placed there.
-        let legacy = dir.appendingPathComponent("copilot-mux")
-        if let dest = try? fm.destinationOfSymbolicLink(atPath: legacy.path),
-           dest.hasSuffix("/copilot-projects") || dest.hasSuffix("/copilot-mux") {
-            try? fm.removeItem(at: legacy)
-        }
     }
 
     // MARK: - derived

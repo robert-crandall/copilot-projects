@@ -2028,9 +2028,7 @@ final class AppLogicTests: XCTestCase {
         environment["HOME"] = root.path
         environment["RESOLVER_CALLED"] = called.path
         environment["COPILOT_PROJECTS_SESSION"] = nil
-        environment["COPILOT_MUX_SESSION"] = nil
         environment["COPILOT_PROJECTS_SOCKET"] = nil
-        environment["COPILOT_MUX_SOCKET"] = nil
         process.environment = environment
         process.standardInput = input
         process.standardOutput = Pipe()

@@ -19,7 +19,7 @@ struct RootView: View {
             HSplitView {
                 SidebarView(model: model)
                     .frame(minWidth: 200, idealWidth: 240, maxWidth: 360)
-                    .background(SplitViewAutosaver(name: "copilotmux.sidebar"))
+                    .background(SplitViewAutosaver(name: "copilot-projects.sidebar"))
                 VStack(spacing: 0) {
                     tabRow
                     Divider()

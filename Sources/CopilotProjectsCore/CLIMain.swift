@@ -421,10 +421,6 @@ public enum CLIMain {
             let link = dir.appendingPathComponent("copilot-projects")
             try? fm.removeItem(at: link)
             try fm.createSymbolicLink(atPath: link.path, withDestinationPath: exe)
-            // Keep the old name working for shells/scripts created before the rename.
-            let legacyLink = dir.appendingPathComponent("copilot-mux")
-            try? fm.removeItem(at: legacyLink)
-            try? fm.createSymbolicLink(atPath: legacyLink.path, withDestinationPath: exe)
             print("Linked \(link.path) -> \(exe)")
             let pathEnv = ProcessInfo.processInfo.environment["PATH"] ?? ""
             if !pathEnv.split(separator: ":").contains(Substring(dir.path)) {
