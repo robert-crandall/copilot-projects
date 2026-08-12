@@ -568,9 +568,6 @@ struct SessionTab: View {
             } else if !session.schedules.isEmpty {
                 ScheduleBadge(schedules: session.schedules)
             }
-            if session.hasUnread {
-                Circle().fill(Color.blue).frame(width: 6, height: 6)
-            }
             Button(action: onClose) {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
             }
