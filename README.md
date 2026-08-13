@@ -1,12 +1,10 @@
 # Copilot Projects
 
 A deliberately small macOS terminal app that organizes CLI sessions by **project**.
-Projects are listed vertically in a sidebar; each project's terminal sessions are laid
-out horizontally. It keeps the parts of [cmux](https://github.com/manaflow-ai/cmux) that
+Sessions are listed by what needs attention, with a compact project switcher above them.
+It keeps the parts of [cmux](https://github.com/manaflow-ai/cmux) that
 matter most for working with coding agents — **status indicators** and **notifications** —
 and drops everything else.
-
-![Copilot Projects — vertical project sidebar, terminal sessions as horizontal tabs](docs/screenshot.png)
 
 It replaces cmux's Ghostty integration with
 [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)'s native Metal renderer,
@@ -14,15 +12,17 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 
 ## Features
 
-- **Projects (vertical sidebar):** a project is just a named group of sessions. Create one
-  with `⌘N` (name it; no folder required). Jump to one with **`⌘1`–`⌘9`**.
-- **Sessions (browser-style tabs):** each project shows a horizontal tab strip; one terminal
-  is visible at a time. Add a tab with `⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
-  (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, close with `⌘W` or the tab's ✕. Background tabs keep
-  running. Hold **⌘** (projects) or **⌃** (tabs) to see the number on each.
-- **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
-  counts appear in the sidebar; a blue dot on the session tab marks work that finished
-  while you were away. With the Copilot CLI hooks installed (below), this is driven automatically.
+- **Projects (compact switcher):** a project is just a named group of sessions. Create one
+  with `⌘N` (name it; no folder required). Jump to one with **`⌘1`–`⌘9`**, filter the list,
+  or drag project chips to set their stable order.
+- **Sessions (attention-grouped list):** sessions appear in Needs you, Ready for review,
+  Working without you, and Inactive groups. Add one with `⌘T`, switch with a click /
+  **`⌃Tab`** (next) / `⌃⇧Tab` (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, and close with
+  `⌘W` or the row's ✕. Shortcuts follow the visible flat list. Hold **⌘** (projects) or
+  **⌃** (sessions) to see each number.
+- **Status:** each session reports `idle` / `running` / `waiting`, and the list derives its
+  four attention groups from that status, finished work, questions, and background work.
+  With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Completed-turn drawer:** Copilot CLI remains the native interactive terminal, while a
   collapsible drawer overlays its right edge with independently scrollable completed turns
   rendered as Markdown. Live work, permissions, shortcuts, and input stay entirely in the CLI.
@@ -65,9 +65,11 @@ Requires Xcode 26+, macOS 26+.
 ./scripts/build-app.sh --release        # optimized build
 ```
 
-`build-app.sh` runs `swift build`, assembles `dist/Copilot Projects.app`, precompiles
-SwiftTerm's Metal shaders, and signs the nested executables inner-first. Local builds
-default to ad-hoc signing; set `CODESIGN_IDENTITY` for Developer ID signing.
+`build-app.sh` runs `swift build`, assembles `dist/Copilot Projects.app`, and signs the
+nested executables inner-first. It precompiles SwiftTerm's shaders when the Metal
+Toolchain is installed; debug builds otherwise bundle the source for runtime compilation,
+while release builds require the toolchain. Local builds default to ad-hoc signing; set
+`CODESIGN_IDENTITY` for Developer ID signing.
 
 On first launch the app symlinks its binary to `~/.local/bin/copilot-projects`. Put that on your
 `PATH` to use the CLI from anywhere:

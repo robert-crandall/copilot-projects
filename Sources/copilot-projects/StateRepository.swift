@@ -87,6 +87,10 @@ struct StateRepository {
         if !copy.projects.contains(where: { $0.id == copy.selectedProjectId }) {
             copy.selectedProjectId = copy.projects.first?.id
         }
+        copy.sessionOrder = SessionManualOrder.reconciled(
+            order: copy.sessionOrder,
+            projects: copy.projects
+        )
         copy.schemaVersion = PersistedState.currentSchemaVersion
         return copy
     }

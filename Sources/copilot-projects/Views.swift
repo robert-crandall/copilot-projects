@@ -6,26 +6,20 @@ import CopilotProjectsCore
 struct RootView: View {
     @ObservedObject var model: AppModel
 
-    // Top strip in the window's title-bar region: the fleet status sits at the
-    // right; the traffic lights float over the left. The session tabs live in a
-    // separate thin row just below it — out of the window's drag region — so a
-    // drag reorders them instead of moving the window. (Content in the title-bar
-    // drag region always moves the window on macOS, so the tabs can't live there.)
     private let titleStripHeight: CGFloat = 38
 
     var body: some View {
         VStack(spacing: 0) {
             topStrip
+            ProjectSwitcherBar(model: model)
+                .frame(height: 32)
+            Divider()
             HSplitView {
-                SidebarView(model: model)
+                SessionListView(model: model)
                     .frame(minWidth: 200, idealWidth: 240, maxWidth: 360)
                     .background(SplitViewAutosaver(name: "copilot-projects.sidebar"))
-                VStack(spacing: 0) {
-                    tabRow
-                    Divider()
-                    DetailView(model: model)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+                DetailView(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .ignoresSafeArea(.container, edges: .top)
@@ -43,18 +37,6 @@ struct RootView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private var tabRow: some View {
-        HStack(spacing: 0) {
-            if let project = model.selectedProject, !project.sessions.isEmpty {
-                SessionTabBar(model: model, project: project)
-            } else {
-                Spacer(minLength: 0)
-            }
-        }
-        .frame(height: 32)
-        .frame(maxWidth: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
 }
 
 /// Removes the title-bar/content separator (a thin line that can pick up the
@@ -133,135 +115,292 @@ struct SplitViewAutosaver: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-struct SidebarView: View {
+struct ProjectSwitcherBar: View {
     @ObservedObject var model: AppModel
     @State private var dropTargetProjectId: String?
 
     var body: some View {
-        List(selection: Binding(
-            get: { model.selectedProjectId },
-            set: { model.selectProject($0) }
-        )) {
-            ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
-                ProjectRow(
-                    project: project,
-                    number: index < 9 ? index + 1 : nil,
-                    showNumber: model.numberHint == .projects,
-                    isDropTarget: dropTargetProjectId == project.id
-                )
-                    .tag(project.id)
-                    .onDrop(of: [.text], delegate: ProjectDropDelegate(
-                        projectId: project.id,
-                        dropTargetProjectId: $dropTargetProjectId,
-                        model: model))
-                    .contextMenu {
-                        Button("New Session") { model.addSession(toProjectId: project.id) }
-                        Button("Rename…") { model.renameProjectInteractive(project.id) }
-                        Divider()
-                        Button("Close Project", role: .destructive) {
-                            model.closeProject(project.id)
+        HStack(spacing: 6) {
+            Menu {
+                Button("All projects") { model.setProjectScope(nil) }
+                ForEach(model.projects) { project in
+                    Button(project.name) { model.setProjectScope(project.id) }
+                }
+                Divider()
+                Button("New Project…") { model.addProjectInteractive() }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(filterLabel).lineLimit(1)
+                    Image(systemName: "chevron.down").font(.system(size: 8))
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .padding(.leading, 8)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
+                        ProjectChip(
+                            project: project,
+                            isSelected: project.id == model.selectedProjectId,
+                            number: index < 9 ? index + 1 : nil,
+                            showNumber: model.numberHint == .projects,
+                            isDropTarget: dropTargetProjectId == project.id
+                        )
+                        .onTapGesture { model.selectProject(project.id) }
+                        .onDrag {
+                            DragPayload.itemProvider(.project, id: project.id)
+                        }
+                        .onDrop(of: DragPayload.projectDropTypes, delegate: ProjectDropDelegate(
+                            projectId: project.id,
+                            dropTargetProjectId: $dropTargetProjectId,
+                            model: model
+                        ))
+                        .contextMenu {
+                            Button("New Session") { model.addSession(toProjectId: project.id) }
+                            Button("Rename…") { model.renameProjectInteractive(project.id) }
+                            Divider()
+                            Button("Close Project", role: .destructive) {
+                                model.closeProject(project.id)
+                            }
                         }
                     }
-            }
-            .onMove { model.moveProjects(fromOffsets: $0, toOffset: $1) }
-        }
-        .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 8) {
-                Button {
-                    model.addProjectInteractive()
-                } label: {
-                    Label("New Project", systemImage: "plus")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 4)
+                    Color.clear
+                        .frame(width: 18, height: 24)
+                        .overlay(alignment: .leading) {
+                            InsertionBar().opacity(dropTargetProjectId == "" ? 1 : 0)
+                        }
+                        .onDrop(of: [DragPayload.projectType], delegate: ProjectDropDelegate(
+                            projectId: nil,
+                            dropTargetProjectId: $dropTargetProjectId,
+                            model: model
+                        ))
                 }
-                .controlSize(.large)
-                .buttonStyle(.borderless)
-                .hoverHighlight()
-
-                Text("v\(CLIMain.versionNumber)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
             }
-            .padding(8)
+
+            Button { model.redrawActiveTerminal() } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.caption)
+                    .frame(width: 24, height: 22)
+            }
+            .buttonStyle(.borderless)
+            .hoverHighlight()
+            .help("Redraw Terminal")
+            .accessibilityLabel("Redraw Terminal")
+
+            Button {
+                if let projectId = model.selectedProjectId {
+                    model.addSession(toProjectId: projectId)
+                }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.caption)
+                    .frame(width: 24, height: 22)
+            }
+            .buttonStyle(.borderless)
+            .hoverHighlight()
+            .help("New Session (⌘T)")
+            .padding(.trailing, 8)
         }
+        .frame(maxWidth: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var filterLabel: String {
+        guard let id = model.projectScopeId,
+              let project = model.projects.first(where: { $0.id == id }) else {
+            return "All projects"
+        }
+        return project.name
     }
 }
 
-struct ProjectRow: View {
+private struct ProjectChip: View {
     let project: Project
-    var number: Int? = nil
-    var showNumber: Bool = false
-    var isDropTarget: Bool = false
+    let isSelected: Bool
+    let number: Int?
+    let showNumber: Bool
+    let isDropTarget: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(project.name).lineLimit(1)
-                Text("\(project.sessions.count) session\(project.sessions.count == 1 ? "" : "s")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                statusLine
-                    .font(.caption)
-                    .lineLimit(1)
+        HStack(spacing: 5) {
+            if project.waitingCount > 0 {
+                Circle().fill(.orange).frame(width: 7, height: 7)
+            } else if project.runningCount > 0 {
+                Circle().fill(.green).frame(width: 7, height: 7)
             }
-            Spacer(minLength: 4)
+            Text(project.name).font(.caption).lineLimit(1)
             if showNumber, let number {
                 NumberBadge(number: number)
             } else if project.hasUnread {
                 Image(systemName: "bell.badge.fill")
                     .foregroundStyle(.blue)
-                    .font(.caption)
+                    .font(.caption2)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 8)
+        .frame(height: 24)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(Color.accentColor, lineWidth: isDropTarget ? 2 : 0)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.accentColor.opacity(isDropTarget ? 0.15 : 0))
-                )
-                .padding(.horizontal, -5)
-                .padding(.vertical, -2)
+                .fill(isSelected
+                    ? Color.accentColor.opacity(0.18)
+                    : Color(nsColor: .controlBackgroundColor))
         )
-    }
-
-    // Its own line, always present (even when "idle"), so the row height never
-    // changes as agents start/stop. Waiting is the actionable one, so it's orange;
-    // running is muted; idle is fainter still.
-    @ViewBuilder private var statusLine: some View {
-        let running = project.runningCount
-        let background = project.backgroundWorkCount
-        let scheduled = project.scheduledCount
-        let waiting = project.waitingCount
-        if running > 0 || background > 0 || scheduled > 0 || waiting > 0 {
-            HStack(spacing: 4) {
-                if running > 0 { Text("\(running) running").foregroundStyle(.green) }
-                if running > 0, background > 0 || scheduled > 0 || waiting > 0 {
-                    Text("·").foregroundStyle(.tertiary)
-                }
-                if background > 0 { Text("\(background) background").foregroundStyle(.purple) }
-                if background > 0, scheduled > 0 || waiting > 0 {
-                    Text("·").foregroundStyle(.tertiary)
-                }
-                if scheduled > 0 { Text("\(scheduled) scheduled").foregroundStyle(.indigo) }
-                if scheduled > 0, waiting > 0 { Text("·").foregroundStyle(.tertiary) }
-                if waiting > 0 { Text("\(waiting) waiting").foregroundStyle(.orange) }
-            }
-        } else {
-            Text("idle").foregroundStyle(.tertiary)
-        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(
+                    isDropTarget ? Color.accentColor : Color.gray.opacity(0.18),
+                    lineWidth: isDropTarget ? 2 : 1
+                )
+        )
+        .contentShape(Rectangle())
     }
 }
 
-/// The indicator at the left of a session tab. A spinner means the agent is busy
+struct SessionListView: View {
+    @ObservedObject var model: AppModel
+    @State private var dropTargetId: String?
+
+    var body: some View {
+        List(selection: Binding(
+            get: { model.globalSelectedSessionId },
+            set: { if let id = $0 { model.selectSession(id) } }
+        )) {
+            ForEach(model.attentionSections) { section in
+                Section {
+                    if section.entries.isEmpty {
+                        Text("No sessions")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    } else {
+                        ForEach(section.entries) { entry in
+                            SessionRow(
+                                entry: entry,
+                                number: number(for: entry.id),
+                                showNumber: model.numberHint == .tabs,
+                                onClose: {
+                                    model.requestCloseSession(
+                                        projectId: entry.projectId,
+                                        sessionId: entry.id
+                                    )
+                                }
+                            )
+                            .tag(entry.id)
+                            .onTapGesture { model.selectSession(entry.id) }
+                            .overlay(alignment: .top) {
+                                InsertionBar(horizontal: true)
+                                    .opacity(dropTargetId == entry.id ? 1 : 0)
+                            }
+                            .onDrag {
+                                dropTargetId = nil
+                                return DragPayload.itemProvider(
+                                    .session,
+                                    id: entry.id,
+                                    group: section.group
+                                )
+                            }
+                            .onDrop(
+                                of: [DragPayload.sessionType(for: section.group)],
+                                delegate: SessionListDropDelegate(
+                                    targetId: entry.id,
+                                    placeAfter: false,
+                                    targetGroup: section.group,
+                                    dropTargetId: $dropTargetId,
+                                    model: model
+                                )
+                            )
+                        }
+                        if let last = section.entries.last {
+                            Color.clear
+                                .frame(height: 12)
+                                .overlay(alignment: .top) {
+                                    InsertionBar(horizontal: true)
+                                        .opacity(dropTargetId == "\(last.id):after" ? 1 : 0)
+                                }
+                                .onDrop(
+                                    of: [DragPayload.sessionType(for: section.group)],
+                                    delegate: SessionListDropDelegate(
+                                        targetId: last.id,
+                                        placeAfter: true,
+                                        targetGroup: section.group,
+                                        dropTargetId: $dropTargetId,
+                                        model: model
+                                    )
+                                )
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text(section.group.title)
+                        Spacer()
+                        Text("\(section.count)")
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            Text("v\(CLIMain.versionNumber)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .padding(8)
+        }
+    }
+
+    private func number(for sessionId: String) -> Int? {
+        guard let index = model.visibleSessionOrder.firstIndex(where: { $0.id == sessionId }),
+              index < 9 else { return nil }
+        return index + 1
+    }
+}
+
+private struct SessionRow: View {
+    let entry: SessionListEntry
+    let number: Int?
+    let showNumber: Bool
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 7) {
+            ZStack {
+                SessionStatusIndicator(session: entry.session)
+                    .opacity(showNumber ? 0 : 1)
+                if showNumber, let number { NumberBadge(number: number) }
+            }
+            .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.session.title)
+                    .lineLimit(1)
+                    .help(entry.session.statusText ?? entry.session.title)
+                Text(entry.projectName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 2)
+            if entry.session.hasBackgroundWork {
+                BackgroundWorkBadge()
+            } else if !entry.session.schedules.isEmpty {
+                ScheduleBadge(schedules: entry.session.schedules)
+            }
+            Button(action: onClose) {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .opacity(0.6)
+            .help("Close Session")
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+/// The indicator at the left of a session row. A spinner means the agent is busy
 /// (running); orange means it's waiting on your input; blue means it has finished
 /// and you haven't viewed it yet ("ready for interaction"); idle shows nothing.
 /// The 9pt frame keeps the slot a constant size whether or not a dot is shown.
-struct SessionTabIndicator: View {
+struct SessionStatusIndicator: View {
     let session: Session
 
     var body: some View {
@@ -306,7 +445,7 @@ struct SessionTabIndicator: View {
     }
 }
 
-/// Shown on a tab and its project's sidebar row while background work is active.
+/// Shown on a session row while background work is active.
 /// Sized to the reserved 9pt slot so the project name stays aligned.
 struct BackgroundWorkBadge: View {
     var body: some View {
@@ -332,7 +471,7 @@ struct ScheduleBadge: View {
     }
 }
 
-/// Keycap-style number shown on projects (⌘) / tabs (⌃) while the modifier is held.
+/// Keycap-style number shown on projects (⌘) / sessions (⌃) while the modifier is held.
 struct NumberBadge: View {
     let number: Int
 
@@ -388,84 +527,6 @@ struct DetailView: View {
     }
 }
 
-struct SessionTabBar: View {
-    @ObservedObject var model: AppModel
-    let project: Project
-    @State private var draggedSession: Session?
-    @State private var dropTargetId: String?     // a session id, or "" for end-of-row
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(Array(project.sessions.enumerated()), id: \.element.id) { index, session in
-                        SessionTab(
-                            session: session,
-                            isActive: session.id == project.selectedSessionId,
-                            number: index < 9 ? index + 1 : nil,
-                            showNumber: model.numberHint == .tabs,
-                            onSelect: { model.selectSession(projectId: project.id, sessionId: session.id) },
-                            onClose: { model.requestCloseSession(projectId: project.id, sessionId: session.id) }
-                        )
-                        .overlay(alignment: .leading) {
-                            insertionBar.opacity(dropTargetId == session.id ? 1 : 0).offset(x: -4)
-                        }
-                        .onDrag {
-                            draggedSession = session
-                            dropTargetId = nil
-                            return NSItemProvider(object: session.id as NSString)
-                        }
-                        .onDrop(of: [.text], delegate: TabDropDelegate(
-                            targetId: session.id, dragged: $draggedSession,
-                            dropTargetId: $dropTargetId, model: model, projectId: project.id))
-                    }
-                    // Trailing drop zone → move to the end of the row.
-                    Color.clear
-                        .frame(width: 24)
-                        .frame(maxHeight: .infinity)
-                        .overlay(alignment: .leading) {
-                            insertionBar.opacity(dropTargetId == "" ? 1 : 0)
-                        }
-                        .onDrop(of: [.text], delegate: TabDropDelegate(
-                            targetId: "", dragged: $draggedSession,
-                            dropTargetId: $dropTargetId, model: model, projectId: project.id))
-                }
-                .padding(.leading, 8)
-                .padding(.vertical, 5)
-            }
-            .frame(maxWidth: .infinity)
-
-            Button { model.redrawActiveTerminal() } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.caption)
-                    .frame(width: 24, height: 22)
-            }
-            .buttonStyle(.borderless)
-            .hoverHighlight()
-            .help("Redraw Terminal")
-            .accessibilityLabel("Redraw Terminal")
-            .padding(.trailing, 4)
-
-            Button { model.addSession(toProjectId: project.id) } label: {
-                Image(systemName: "plus")
-                    .font(.caption)
-                    .frame(width: 24, height: 22)
-            }
-            .buttonStyle(.borderless)
-            .hoverHighlight()
-            .help("New Session (⌘T)")
-            .padding(.trailing, 8)
-        }
-    }
-
-    private var insertionBar: some View {
-        RoundedRectangle(cornerRadius: 1.5)
-            .fill(Color.accentColor)
-            .frame(width: 3)
-            .padding(.vertical, 3)
-    }
-}
-
 private struct HoverHighlightModifier: ViewModifier {
     @State private var isHovering = false
 
@@ -487,109 +548,173 @@ private extension View {
     }
 }
 
-/// Drag-to-reorder for session tabs with an insertion indicator. `targetId` is a
-/// session id (insert before it) or "" (move to the end).
-private struct TabDropDelegate: DropDelegate {
+enum DragPayload {
+    enum Kind: Equatable {
+        case session
+        case project
+    }
+
+    static func encode(_ kind: Kind, _ id: String) -> String {
+        switch kind {
+        case .session: return "session:\(id)"
+        case .project: return "project:\(id)"
+        }
+    }
+
+    static func decode(_ raw: String) -> (kind: Kind, id: String)? {
+        if raw.hasPrefix("session:") {
+            return (.session, String(raw.dropFirst("session:".count)))
+        }
+        if raw.hasPrefix("project:") {
+            return (.project, String(raw.dropFirst("project:".count)))
+        }
+        return nil
+    }
+
+    static let projectType = UTType(
+        exportedAs: "com.github.robert-crandall.copilot-projects.drag.project"
+    )
+
+    static let projectDropTypes = [projectType] + SessionAttentionGroup.allCases.map(sessionType)
+
+    static func sessionType(for group: SessionAttentionGroup) -> UTType {
+        UTType(
+            exportedAs: "com.github.robert-crandall.copilot-projects.drag.session.\(group.rawValue)"
+        )
+    }
+
+    static func itemProvider(
+        _ kind: Kind,
+        id: String,
+        group: SessionAttentionGroup? = nil
+    ) -> NSItemProvider {
+        let provider = NSItemProvider(object: encode(kind, id) as NSString)
+        let type: UTType
+        switch kind {
+        case .project:
+            type = projectType
+        case .session:
+            guard let group else { return provider }
+            type = sessionType(for: group)
+        }
+        provider.registerDataRepresentation(
+            forTypeIdentifier: type.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(Data(), nil)
+            return nil
+        }
+        return provider
+    }
+}
+
+private struct InsertionBar: View {
+    var horizontal = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5)
+            .fill(Color.accentColor)
+            .frame(
+                maxWidth: horizontal ? .infinity : 3,
+                maxHeight: horizontal ? 3 : .infinity
+            )
+    }
+}
+
+private struct SessionListDropDelegate: DropDelegate {
     let targetId: String
-    @Binding var dragged: Session?
+    let placeAfter: Bool
+    let targetGroup: SessionAttentionGroup
     @Binding var dropTargetId: String?
     let model: AppModel
-    let projectId: String
+
+    private var dropKey: String { placeAfter ? "\(targetId):after" : targetId }
+    private var acceptedType: UTType { DragPayload.sessionType(for: targetGroup) }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [acceptedType])
+    }
 
     func dropEntered(info: DropInfo) {
-        guard let dragged, dragged.id != targetId else { dropTargetId = nil; return }
-        dropTargetId = targetId
-    }
-    func dropExited(info: DropInfo) {
-        if dropTargetId == targetId { dropTargetId = nil }
-    }
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
-    func performDrop(info: DropInfo) -> Bool {
-        if let dragged {
-            model.moveSession(projectId: projectId, draggedId: dragged.id,
-                              beforeId: targetId.isEmpty ? nil : targetId)
+        guard info.hasItemsConforming(to: [acceptedType]) else {
+            dropTargetId = nil
+            return
         }
-        dragged = nil
+        dropTargetId = dropKey
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetId == dropKey { dropTargetId = nil }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        info.hasItemsConforming(to: [acceptedType]) ? DropProposal(operation: .move) : nil
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
         dropTargetId = nil
+        guard let provider = info.itemProviders(for: [acceptedType]).first else { return false }
+        provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let raw = object as? String,
+                  let payload = DragPayload.decode(raw),
+                  payload.kind == .session else { return }
+            DispatchQueue.main.async {
+                model.moveSessionInList(
+                    draggedId: payload.id,
+                    targetId: targetId,
+                    placeAfter: placeAfter
+                )
+            }
+        }
         return true
     }
 }
 
-/// Drop target for a session tab dragged onto a project row in the sidebar —
-/// moves that session into the project. `dropTargetProjectId` drives the row's
-/// drag-over highlight. A project-reorder drag (List `.onMove`) doesn't vend a
-/// `.text` item, so `validateDrop` ignores it and the two gestures don't collide.
 private struct ProjectDropDelegate: DropDelegate {
-    let projectId: String
+    let projectId: String?
     @Binding var dropTargetProjectId: String?
     let model: AppModel
 
-    func validateDrop(info: DropInfo) -> Bool { info.hasItemsConforming(to: [.text]) }
-    func dropEntered(info: DropInfo) { dropTargetProjectId = projectId }
-    func dropExited(info: DropInfo) {
-        if dropTargetProjectId == projectId { dropTargetProjectId = nil }
+    private var dropKey: String { projectId ?? "" }
+    private var acceptedTypes: [UTType] {
+        projectId == nil ? [DragPayload.projectType] : DragPayload.projectDropTypes
     }
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: acceptedTypes)
+    }
+    func dropEntered(info: DropInfo) {
+        guard info.hasItemsConforming(to: acceptedTypes) else {
+            dropTargetProjectId = nil
+            return
+        }
+        dropTargetProjectId = dropKey
+    }
+    func dropExited(info: DropInfo) {
+        if dropTargetProjectId == dropKey { dropTargetProjectId = nil }
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        info.hasItemsConforming(to: acceptedTypes)
+            ? DropProposal(operation: .move)
+            : nil
+    }
+
     func performDrop(info: DropInfo) -> Bool {
         dropTargetProjectId = nil
-        guard let provider = info.itemProviders(for: [.text]).first else { return false }
+        guard let provider = info.itemProviders(for: acceptedTypes).first else { return false }
         provider.loadObject(ofClass: NSString.self) { object, _ in
-            guard let sid = object as? String else { return }
-            DispatchQueue.main.async { model.moveSession(toProjectId: projectId, draggedId: sid) }
-        }
-        return true
-    }
-}
-
-struct SessionTab: View {
-    let session: Session
-    let isActive: Bool
-    var number: Int? = nil
-    var showNumber: Bool = false
-    let onSelect: () -> Void
-    let onClose: () -> Void
-
-    var body: some View {
-        HStack(spacing: 6) {
-            ZStack {
-                SessionTabIndicator(session: session)
-                    .opacity(showNumber ? 0 : 1)
-                if showNumber, let number {
-                    NumberBadge(number: number)
+            guard let raw = object as? String,
+                  let payload = DragPayload.decode(raw) else { return }
+            DispatchQueue.main.async {
+                switch payload.kind {
+                case .project:
+                    model.moveProject(draggedId: payload.id, beforeId: projectId)
+                case .session:
+                    guard let projectId else { return }
+                    model.moveSession(toProjectId: projectId, draggedId: payload.id)
                 }
             }
-            .frame(width: 18, height: 18)
-            Text(session.title)
-                .font(.callout)
-                .lineLimit(1)
-                .help(session.statusText ?? session.title)
-            if session.hasBackgroundWork {
-                BackgroundWorkBadge()
-            } else if !session.schedules.isEmpty {
-                ScheduleBadge(schedules: session.schedules)
-            }
-            Button(action: onClose) {
-                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-            }
-            .buttonStyle(.borderless)
-            .opacity(0.6)
-            .help("Close Session")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .frame(maxWidth: 210)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(isActive
-                      ? Color(nsColor: .selectedContentBackgroundColor).opacity(0.25)
-                      : Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 7)
-                .stroke(isActive ? Color.accentColor.opacity(0.55) : Color.gray.opacity(0.15),
-                        lineWidth: 1)
-        )
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onSelect)
+        return true
     }
 }

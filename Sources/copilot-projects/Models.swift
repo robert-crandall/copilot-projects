@@ -17,8 +17,8 @@ struct Session: Identifiable, Codable, Equatable {
     var finishedUnseen: Bool = false
     var turnCompleted: Bool = false
     /// copilot is waiting on its own background agents (it reports this via a
-    /// "Copilot: Waiting for background agents" terminal title). Surfaced as a tab/
-    /// sidebar indicator instead of letting that title clobber the tab's real name.
+    /// "Copilot: Waiting for background agents" terminal title). Surfaced as a
+    /// session indicator instead of letting that title clobber the session's real name.
     var backgroundAgentsActive: Bool = false
     var scheduledTurnActive: Bool = false
     var agentActivity: AgentActivitySnapshot?
@@ -42,6 +42,67 @@ struct Session: Identifiable, Codable, Equatable {
         self.id = id
         self.title = title
         self.cwd = cwd
+    }
+}
+
+/// Which action a session is waiting on. Declaration order is display order.
+enum SessionAttentionGroup: String, CaseIterable, Identifiable {
+    case needsYou
+    case readyForReview
+    case workingWithoutYou
+    case inactive
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .needsYou: return "Needs you"
+        case .readyForReview: return "Ready for review"
+        case .workingWithoutYou: return "Working without you"
+        case .inactive: return "Inactive"
+        }
+    }
+
+    static func group(for session: Session) -> SessionAttentionGroup {
+        if session.status == .waiting || session.hasPendingQuestions {
+            return .needsYou
+        }
+        if session.status == .idle && session.finishedUnseen {
+            return .readyForReview
+        }
+        if session.status == .running || session.hasBackgroundWork {
+            return .workingWithoutYou
+        }
+        return .inactive
+    }
+}
+
+struct SessionListEntry: Identifiable, Equatable {
+    var session: Session
+    var projectId: String
+    var projectName: String
+    var id: String { session.id }
+}
+
+struct AttentionSection: Identifiable, Equatable {
+    var group: SessionAttentionGroup
+    var entries: [SessionListEntry]
+    var id: String { group.rawValue }
+    var count: Int { entries.count }
+}
+
+enum SessionManualOrder {
+    static func reconciled(order: [String], projects: [Project]) -> [String] {
+        let liveIds = projects.flatMap(\.sessions).map(\.id)
+        let liveSet = Set(liveIds)
+        var seen = Set<String>()
+        var result = order.filter { liveSet.contains($0) && seen.insert($0).inserted }
+        result.append(contentsOf: liveIds.filter { seen.insert($0).inserted })
+        return result
+    }
+
+    static func ranks(_ order: [String]) -> [String: Int] {
+        Dictionary(uniqueKeysWithValues: order.enumerated().map { ($0.element, $0.offset) })
     }
 }
 
@@ -89,15 +150,17 @@ struct PersistedState: Codable {
     var schemaVersion: Int
     var projects: [Project]
     var selectedProjectId: String?
+    var sessionOrder: [String]
 
-    init(projects: [Project], selectedProjectId: String?) {
+    init(projects: [Project], selectedProjectId: String?, sessionOrder: [String] = []) {
         self.schemaVersion = Self.currentSchemaVersion
         self.projects = projects
         self.selectedProjectId = selectedProjectId
+        self.sessionOrder = sessionOrder
     }
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, projects, selectedProjectId
+        case schemaVersion, projects, selectedProjectId, sessionOrder
     }
 
     init(from decoder: Decoder) throws {
@@ -105,6 +168,7 @@ struct PersistedState: Codable {
         schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
         projects = try values.decode([Project].self, forKey: .projects)
         selectedProjectId = try values.decodeIfPresent(String.self, forKey: .selectedProjectId)
+        sessionOrder = try values.decodeIfPresent([String].self, forKey: .sessionOrder) ?? []
     }
 }
 
@@ -112,5 +176,5 @@ struct PersistedState: Codable {
 enum NumberHint {
     case none      // nothing held
     case projects  // ⌘ held → number badges on projects
-    case tabs      // ⌃ held → number badges on session tabs
+    case tabs      // ⌃ held → number badges on session rows
 }

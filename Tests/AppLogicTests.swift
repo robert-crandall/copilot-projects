@@ -10,9 +10,13 @@ import CryptoKit
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import SwiftUI
 #if canImport(Darwin)
 import Darwin
 #endif
+
+@MainActor
+private var retainedSmokeTestWindows: [NSWindow] = []
 
 private final class SSECaptureDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
@@ -409,6 +413,658 @@ final class AppLogicTests: XCTestCase {
             ]
         )
         XCTAssertTrue(session.hasPendingQuestions)
+    }
+
+    func testSessionAttentionGroupClassificationAndPriority() {
+        func session(
+            status: SessionStatus = .idle,
+            finished: Bool = false,
+            backgroundAgents: Bool = false,
+            scheduled: Bool = false,
+            activity: AgentActivitySnapshot? = nil
+        ) -> Session {
+            var value = Session(title: "session", cwd: "/")
+            value.status = status
+            value.finishedUnseen = finished
+            value.backgroundAgentsActive = backgroundAgents
+            value.scheduledTurnActive = scheduled
+            value.agentActivity = activity
+            return value
+        }
+
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let pendingInput = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: timestamp,
+            foregroundTurnActive: false,
+            scheduledTurnActive: false,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil,
+            trackedUserInputs: [
+                TrackedUserInput(
+                    requestId: "input",
+                    question: "Choose",
+                    choices: ["A"],
+                    allowFreeform: false,
+                    requestedAt: timestamp,
+                    agentId: nil
+                ),
+            ]
+        )
+        let pendingElicitation = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: timestamp,
+            foregroundTurnActive: false,
+            scheduledTurnActive: false,
+            activeSubagents: [],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil,
+            trackedElicitations: [
+                TrackedElicitation(
+                    requestId: "elicitation",
+                    message: "Confirm",
+                    mode: "url",
+                    url: "https://example.com",
+                    schema: nil,
+                    requestedAt: timestamp
+                ),
+            ]
+        )
+        let activeSubagent = AgentActivitySnapshot(
+            schemaVersion: 1,
+            updatedAt: timestamp,
+            foregroundTurnActive: false,
+            scheduledTurnActive: false,
+            activeSubagents: [
+                TrackedSubagent(
+                    id: "agent",
+                    name: "agent",
+                    description: "Working",
+                    model: "gpt"
+                ),
+            ],
+            schedules: [],
+            idleGeneration: 0,
+            lastIdleAborted: false,
+            lastIdleTurnKind: nil,
+            error: nil
+        )
+
+        let cases: [(Session, SessionAttentionGroup)] = [
+            (session(status: .waiting), .needsYou),
+            (session(activity: pendingInput), .needsYou),
+            (session(activity: pendingElicitation), .needsYou),
+            (session(status: .waiting, finished: true), .needsYou),
+            (session(status: .waiting, backgroundAgents: true), .needsYou),
+            (session(finished: true), .readyForReview),
+            (session(finished: true, backgroundAgents: true), .readyForReview),
+            (session(status: .running, finished: true), .workingWithoutYou),
+            (session(status: .running), .workingWithoutYou),
+            (session(backgroundAgents: true), .workingWithoutYou),
+            (session(scheduled: true), .workingWithoutYou),
+            (session(activity: activeSubagent), .workingWithoutYou),
+            (session(), .inactive),
+        ]
+        for (value, expected) in cases {
+            XCTAssertEqual(SessionAttentionGroup.group(for: value), expected)
+            XCTAssertTrue(SessionAttentionGroup.allCases.contains(expected))
+        }
+    }
+
+    func testSessionManualOrderReconciliation() {
+        let a = Session(id: "a", title: "A", cwd: "/")
+        let b = Session(id: "b", title: "B", cwd: "/")
+        let c = Session(id: "c", title: "C", cwd: "/")
+        let projects = [
+            Project(id: "p1", name: "One", cwd: "/", sessions: [a, b]),
+            Project(id: "p2", name: "Two", cwd: "/", sessions: [c]),
+        ]
+
+        XCTAssertEqual(
+            SessionManualOrder.reconciled(
+                order: ["c", "stale", "a", "c"],
+                projects: projects
+            ),
+            ["c", "a", "b"]
+        )
+        XCTAssertEqual(
+            SessionManualOrder.reconciled(order: [], projects: projects),
+            ["a", "b", "c"]
+        )
+        XCTAssertEqual(SessionManualOrder.reconciled(order: ["stale"], projects: []), [])
+        XCTAssertEqual(SessionManualOrder.ranks(["c", "a", "b"]), ["c": 0, "a": 1, "b": 2])
+    }
+
+    func testAttentionSectionsPreserveStableProjectAndSessionOrder() {
+        func session(_ id: String, waiting: Bool = false) -> Session {
+            var value = Session(id: id, title: id, cwd: "/")
+            value.status = waiting ? .waiting : .idle
+            return value
+        }
+        let p1 = Project(
+            id: "p1",
+            name: "One",
+            cwd: "/",
+            sessions: [session("a", waiting: true), session("b")]
+        )
+        let p2 = Project(
+            id: "p2",
+            name: "Two",
+            cwd: "/",
+            sessions: [session("c", waiting: true), session("d")]
+        )
+
+        let empty = AppModel.attentionSections(
+            projects: [],
+            scopeProjectId: nil,
+            sessionOrder: []
+        )
+        XCTAssertEqual(empty.map(\.group), SessionAttentionGroup.allCases)
+        XCTAssertTrue(empty.allSatisfy(\.entries.isEmpty))
+
+        let sections = AppModel.attentionSections(
+            projects: [p1, p2],
+            scopeProjectId: nil,
+            sessionOrder: ["c", "a", "d", "b"]
+        )
+        XCTAssertEqual(sections.map(\.group), SessionAttentionGroup.allCases)
+        XCTAssertEqual(sections[0].entries.map(\.id), ["c", "a"])
+        XCTAssertEqual(sections[3].entries.map(\.id), ["d", "b"])
+        XCTAssertEqual(sections[0].entries.map(\.projectId), ["p2", "p1"])
+        XCTAssertEqual(sections[0].entries.map(\.projectName), ["Two", "One"])
+
+        let partiallyRanked = AppModel.attentionSections(
+            projects: [p1, p2],
+            scopeProjectId: nil,
+            sessionOrder: ["c", "d"]
+        )
+        XCTAssertEqual(partiallyRanked[0].entries.map(\.id), ["c", "a"])
+        XCTAssertEqual(partiallyRanked[3].entries.map(\.id), ["d", "b"])
+
+        let reordered = AppModel.attentionSections(
+            projects: [p2, p1],
+            scopeProjectId: nil,
+            sessionOrder: ["c", "a", "d", "b"]
+        )
+        XCTAssertEqual(reordered.flatMap(\.entries).map(\.id), ["c", "a", "d", "b"])
+
+        let filtered = AppModel.attentionSections(
+            projects: [p1, p2],
+            scopeProjectId: "p2",
+            sessionOrder: ["c", "a", "d", "b"]
+        )
+        XCTAssertEqual(filtered.count, 4)
+        XCTAssertEqual(filtered.flatMap(\.entries).map(\.id), ["c", "d"])
+        XCTAssertTrue(AppModel.attentionSections(
+            projects: [p1, p2],
+            scopeProjectId: "missing",
+            sessionOrder: ["c", "a", "d", "b"]
+        ).allSatisfy(\.entries.isEmpty))
+    }
+
+    @MainActor
+    func testAttentionListSelectionShortcutsAndFilter() throws {
+        _ = NSApplication.shared
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/attention-selection-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let a = Session(id: "a", title: "A", cwd: root.path)
+        let b = Session(id: "b", title: "B", cwd: root.path)
+        let c = Session(id: "c", title: "C", cwd: root.path)
+        let p1 = Project(
+            id: "p1", name: "One", cwd: root.path, sessions: [a],
+            selectedSessionId: a.id
+        )
+        let p2 = Project(
+            id: "p2", name: "Two", cwd: root.path, sessions: [b, c],
+            selectedSessionId: c.id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
+        let model = AppModel(
+            stateRepository: repository,
+            completionNotificationDelayNanoseconds: 10_000_000,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+
+        for (index, id) in ["b", "c"].enumerated() {
+            model.setStatus(sessionId: id, status: .running, text: nil, timestamp: Int64(index * 10 + 1))
+            model.setStatus(
+                sessionId: id,
+                status: .idle,
+                text: nil,
+                timestamp: Int64(index * 10 + 2),
+                source: "session-idle",
+                notification: .completed
+            )
+        }
+        XCTAssertTrue(model.projects[1].sessions.allSatisfy(\.hasUnread))
+
+        model.selectSessionByIndex(0)
+        XCTAssertEqual(model.selectedProjectId, "p2")
+        XCTAssertEqual(model.globalSelectedSessionId, "b")
+        XCTAssertFalse(model.projects[1].sessions[0].hasUnread)
+        XCTAssertFalse(model.projects[1].sessions[0].finishedUnseen)
+        XCTAssertTrue(model.projects[1].sessions[1].hasUnread)
+        XCTAssertTrue(model.projects[1].sessions[1].finishedUnseen)
+
+        let selection = model.globalSelectedSessionId
+        model.selectSession("missing")
+        XCTAssertEqual(model.globalSelectedSessionId, selection)
+        model.selectSessionByIndex(-1)
+        XCTAssertEqual(model.globalSelectedSessionId, selection)
+        model.selectSessionByIndex(model.visibleSessionOrder.count)
+        XCTAssertEqual(model.globalSelectedSessionId, selection)
+
+        model.setProjectScope("p1")
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), ["a"])
+        model.selectSessionByIndex(0)
+        XCTAssertEqual(model.globalSelectedSessionId, "a")
+        model.setProjectScope(nil)
+        XCTAssertEqual(Set(model.visibleSessionOrder.map(\.id)), Set(["a", "b", "c"]))
+
+        model.selectSession("c")
+        model.selectAdjacentSession(1)
+        XCTAssertEqual(model.globalSelectedSessionId, model.visibleSessionOrder.first?.id)
+        model.selectAdjacentSession(-1)
+        XCTAssertEqual(model.globalSelectedSessionId, "c")
+
+        model.selectSession("c")
+        model.setProjectScope("p1")
+        model.selectAdjacentSession(1)
+        XCTAssertEqual(model.globalSelectedSessionId, "a")
+        model.selectSession("c")
+        model.setProjectScope("p1")
+        model.selectAdjacentSession(-1)
+        XCTAssertEqual(model.globalSelectedSessionId, "a")
+
+        model.setProjectScope("p2")
+        model.selectProjectByIndex(0)
+        XCTAssertEqual(model.selectedProjectId, "p1")
+        XCTAssertEqual(model.projectScopeId, "p1")
+        XCTAssertTrue(model.visibleSessionOrder.contains { $0.id == model.globalSelectedSessionId })
+        model.setProjectScope(nil)
+        model.selectProjectByIndex(1)
+        XCTAssertNil(model.projectScopeId)
+
+        model.setProjectScope("p1")
+        model.focus(projectId: nil, sessionId: "c")
+        XCTAssertEqual(model.selectedProjectId, "p2")
+        XCTAssertEqual(model.projectScopeId, "p2")
+        XCTAssertTrue(model.visibleSessionOrder.contains { $0.id == "c" })
+        model.setProjectScope("p2")
+        model.focus(projectId: "p1", sessionId: nil)
+        XCTAssertEqual(model.selectedProjectId, "p1")
+        XCTAssertEqual(model.projectScopeId, "p1")
+
+        model.setProjectScope("missing")
+        XCTAssertEqual(model.projectScopeId, "p1")
+        XCTAssertEqual(model.selectedProjectId, "p1")
+        let hiddenSelection = model.globalSelectedSessionId
+        model.selectAdjacentSession(1)
+        model.selectAdjacentSession(-1)
+        model.selectSessionByIndex(0)
+        XCTAssertEqual(model.globalSelectedSessionId, hiddenSelection)
+        model.setProjectScope("p1")
+        model.closeProject("p1")
+        XCTAssertNil(model.projectScopeId)
+    }
+
+    @MainActor
+    func testProjectScopeTargetsVisibleProjectAndHandlesEmptyScope() throws {
+        _ = NSApplication.shared
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/project-scope-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let session = Session(id: "s1", title: "One", cwd: root.path)
+        let p1 = Project(
+            id: "p1", name: "One", cwd: root.path, sessions: [session],
+            selectedSessionId: session.id
+        )
+        let p2 = Project(id: "p2", name: "Two", cwd: root.path)
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        func assertInvariant(file: StaticString = #filePath, line: UInt = #line) {
+            XCTAssertTrue(
+                model.projectScopeId == nil || model.projectScopeId == model.selectedProjectId,
+                file: file,
+                line: line
+            )
+        }
+
+        model.setProjectScope("p2")
+        XCTAssertEqual(model.selectedProjectId, "p2")
+        XCTAssertTrue(model.visibleSessionOrder.isEmpty)
+        XCTAssertNil(model.globalSelectedSessionId)
+        model.closeSelectedSession()
+        XCTAssertTrue(model.project("p2")?.sessions.isEmpty == true)
+        assertInvariant()
+
+        model.addSessionToSelected()
+        let addedId = try XCTUnwrap(model.globalSelectedSessionId)
+        XCTAssertEqual(model.project("p2")?.sessions.map(\.id), [addedId])
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), [addedId])
+        assertInvariant()
+
+        model.closeSelectedSession()
+        XCTAssertTrue(model.project("p2")?.sessions.isEmpty == true)
+        XCTAssertTrue(model.visibleSessionOrder.isEmpty)
+        assertInvariant()
+
+        let selectedBeforeInvalidScope = model.selectedProjectId
+        model.setProjectScope("missing")
+        XCTAssertEqual(model.selectedProjectId, selectedBeforeInvalidScope)
+        XCTAssertEqual(model.projectScopeId, "p2")
+        model.setProjectScope(nil)
+        XCTAssertNil(model.projectScopeId)
+        XCTAssertEqual(model.selectedProjectId, "p2")
+
+        model.setProjectScope("p2")
+        model.closeProject("p2")
+        XCTAssertNil(model.projectScopeId)
+        XCTAssertEqual(model.selectedProjectId, "p1")
+        assertInvariant()
+    }
+
+    @MainActor
+    func testProjectCreationInitialSessionOrderIsStableBeforeAndAfterPersistence() throws {
+        _ = NSApplication.shared
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/project-initial-order-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        var request = ControlRequest(command: "new-project")
+        request.name = "One"
+        request.cwd = root.path
+        let firstProjectId = try XCTUnwrap(model.handle(request).text)
+        let initialSessionId = try XCTUnwrap(model.project(firstProjectId)?.sessions.first?.id)
+        let addedSessionId = try XCTUnwrap(model.addSession(toProjectId: firstProjectId))
+        XCTAssertEqual(Array(model.sessionOrder.suffix(2)), [initialSessionId, addedSessionId])
+
+        request.name = "Two"
+        let secondProjectId = try XCTUnwrap(model.handle(request).text)
+        let secondProjectSessionId = try XCTUnwrap(model.project(secondProjectId)?.sessions.first?.id)
+        XCTAssertEqual(model.sessionOrder.last, secondProjectSessionId)
+        model.moveProject(draggedId: secondProjectId, beforeId: firstProjectId)
+        XCTAssertEqual(
+            model.visibleSessionOrder.filter { $0.projectId == firstProjectId }.map(\.id),
+            [initialSessionId, addedSessionId]
+        )
+
+        model.setStatus(sessionId: initialSessionId, status: .waiting, text: nil)
+        XCTAssertEqual(model.sessionOrder.first, initialSessionId)
+        model.closeSession(projectId: firstProjectId, sessionId: addedSessionId)
+        XCTAssertFalse(model.sessionOrder.contains(addedSessionId))
+        model.closeProject(secondProjectId)
+        XCTAssertFalse(model.sessionOrder.contains(secondProjectSessionId))
+
+        let reloaded = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        XCTAssertEqual(
+            reloaded.visibleSessionOrder.filter { $0.projectId == firstProjectId }.map(\.id),
+            [initialSessionId]
+        )
+    }
+
+    func testSessionOrderPersistenceCompatibilityAndNormalization() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/session-order-state-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("state.json")
+        let repository = StateRepository(path: path)
+
+        let legacy = """
+        {"schemaVersion":1,"projects":[
+          {"id":"p1","name":"One","cwd":"/","sessions":[
+            {"id":"a","title":"A","cwd":"/"},{"id":"b","title":"B","cwd":"/"}
+          ],"selectedSessionId":"a"}
+        ],"selectedProjectId":"p1"}
+        """
+        try Data(legacy.utf8).write(to: path)
+        guard case .loaded(let legacyState) = repository.load() else {
+            return XCTFail("legacy state did not load")
+        }
+        XCTAssertEqual(legacyState.sessionOrder, ["a", "b"])
+
+        let stale = """
+        {"schemaVersion":1,"projects":[
+          {"id":"p1","name":"One","cwd":"/","sessions":[
+            {"id":"a","title":"A","cwd":"/"},{"id":"b","title":"B","cwd":"/"}
+          ],"selectedSessionId":"a"}
+        ],"selectedProjectId":"p1","sessionOrder":["stale","b"]}
+        """
+        try Data(stale.utf8).write(to: path)
+        guard case .loaded(let normalized) = repository.load() else {
+            return XCTFail("new state did not load")
+        }
+        XCTAssertEqual(normalized.sessionOrder, ["b", "a"])
+
+        let encoded = try JSONEncoder().encode(normalized)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        object.removeValue(forKey: "sessionOrder")
+        let stripped = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(PersistedState.self, from: stripped)
+        XCTAssertEqual(decoded.schemaVersion, 1)
+        XCTAssertTrue(decoded.sessionOrder.isEmpty)
+    }
+
+    @MainActor
+    func testAttentionListAndProjectOrdering() throws {
+        _ = NSApplication.shared
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/attention-order-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let prefix = "attention-\(UUID().uuidString)"
+        let aId = "\(prefix)-a"
+        let bId = "\(prefix)-b"
+        let cId = "\(prefix)-c"
+        let dId = "\(prefix)-d"
+        let a = Session(id: aId, title: "A", cwd: root.path)
+        let b = Session(id: bId, title: "B", cwd: root.path)
+        let c = Session(id: cId, title: "C", cwd: root.path)
+        let d = Session(id: dId, title: "D", cwd: root.path)
+        let p1 = Project(
+            id: "p1", name: "One", cwd: root.path, sessions: [a, b, c],
+            selectedSessionId: b.id
+        )
+        let p2 = Project(
+            id: "p2", name: "Two", cwd: root.path, sessions: [d],
+            selectedSessionId: d.id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+
+        let originalProjects = model.projects
+        let originalSelection = model.selectedProjectId
+        XCTAssertTrue(model.moveSessionInList(draggedId: dId, targetId: aId))
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), [dId, aId, bId, cId])
+        XCTAssertEqual(model.projects, originalProjects)
+        XCTAssertEqual(model.selectedProjectId, originalSelection)
+        XCTAssertTrue(model.moveSessionInList(draggedId: cId, targetId: bId))
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), [dId, aId, cId, bId])
+        XCTAssertFalse(model.moveSessionInList(
+            draggedId: bId,
+            targetId: cId,
+            placeAfter: true
+        ))
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), [dId, aId, cId, bId])
+
+        XCTAssertTrue(model.moveSessionInList(
+            draggedId: aId,
+            targetId: bId,
+            placeAfter: true
+        ))
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), [dId, cId, bId, aId])
+        XCTAssertFalse(model.moveSessionInList(draggedId: aId, targetId: aId))
+        XCTAssertFalse(model.moveSessionInList(draggedId: "missing", targetId: aId))
+        XCTAssertFalse(model.moveSessionInList(draggedId: aId, targetId: "missing"))
+
+        model.setStatus(sessionId: dId, status: .waiting, text: nil)
+        let snapshot = model.sessionOrder
+        XCTAssertFalse(model.moveSessionInList(draggedId: aId, targetId: dId))
+        XCTAssertEqual(model.sessionOrder, snapshot)
+
+        let orderBeforeProjectMove = model.visibleSessionOrder.map(\.id)
+        model.moveProject(draggedId: "p2", beforeId: "p1")
+        XCTAssertEqual(model.projects.map(\.id), ["p2", "p1"])
+        XCTAssertEqual(model.visibleSessionOrder.map(\.id), orderBeforeProjectMove)
+        model.moveProject(draggedId: "p2", beforeId: nil)
+        XCTAssertEqual(model.projects.map(\.id), ["p1", "p2"])
+        let projectSnapshot = model.projects
+        model.moveProject(draggedId: "missing", beforeId: nil)
+        model.moveProject(draggedId: "p1", beforeId: "missing")
+        XCTAssertEqual(model.projects, projectSnapshot)
+
+        let positionBeforeOwnershipMove = model.visibleSessionOrder.firstIndex { $0.id == cId }
+        XCTAssertTrue(model.moveSession(toProjectId: "p2", draggedId: cId))
+        XCTAssertEqual(
+            model.visibleSessionOrder.firstIndex { $0.id == cId },
+            positionBeforeOwnershipMove
+        )
+        XCTAssertEqual(model.projects[1].sessions.last?.id, cId)
+        let positionBeforeRemoteMove = model.sessionOrder.firstIndex(of: cId)
+        XCTAssertEqual(
+            model.moveRemoteSession(sessionId: cId, toProjectId: "p1"),
+            .moved
+        )
+        XCTAssertEqual(model.sessionOrder.firstIndex(of: cId), positionBeforeRemoteMove)
+
+        XCTAssertTrue(model.moveSession(toProjectId: "p1", draggedId: dId))
+        XCTAssertEqual(model.projects[0].sessions.last?.id, dId)
+        XCTAssertEqual(model.projects[0].selectedSessionId, dId)
+
+        model.setProjectScope("p2")
+        model.selectSession(dId)
+        XCTAssertEqual(model.selectedProjectId, "p1")
+        XCTAssertEqual(model.projectScopeId, "p1")
+        XCTAssertTrue(model.visibleSessionOrder.contains { $0.id == dId })
+
+        let persistedOrder = model.visibleSessionOrder.map(\.id)
+        let reloaded = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        XCTAssertEqual(reloaded.visibleSessionOrder.map(\.id), persistedOrder)
+        let json = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: root.appendingPathComponent("state.json"))
+        ) as? [String: Any]
+        XCTAssertEqual(json?["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(json?["sessionOrder"] as? [String], model.sessionOrder)
+    }
+
+    func testDragPayloadRoundTripAndProviderBoundaries() {
+        for (kind, id) in [
+            (DragPayload.Kind.session, "session:id"),
+            (DragPayload.Kind.project, "project:id"),
+        ] {
+            let decoded = DragPayload.decode(DragPayload.encode(kind, id))
+            XCTAssertEqual(decoded?.kind, kind)
+            XCTAssertEqual(decoded?.id, id)
+        }
+        XCTAssertNil(DragPayload.decode("abc"))
+
+        let projectProvider = DragPayload.itemProvider(.project, id: "p1")
+        XCTAssertTrue(projectProvider.hasItemConformingToTypeIdentifier(
+            DragPayload.projectType.identifier
+        ))
+        for group in SessionAttentionGroup.allCases {
+            XCTAssertFalse(projectProvider.hasItemConformingToTypeIdentifier(
+                DragPayload.sessionType(for: group).identifier
+            ))
+        }
+
+        for group in SessionAttentionGroup.allCases {
+            let sessionProvider = DragPayload.itemProvider(.session, id: "s1", group: group)
+            XCTAssertTrue(sessionProvider.hasItemConformingToTypeIdentifier(
+                DragPayload.sessionType(for: group).identifier
+            ))
+            XCTAssertFalse(sessionProvider.hasItemConformingToTypeIdentifier(
+                DragPayload.projectType.identifier
+            ))
+            for otherGroup in SessionAttentionGroup.allCases where otherGroup != group {
+                XCTAssertFalse(sessionProvider.hasItemConformingToTypeIdentifier(
+                    DragPayload.sessionType(for: otherGroup).identifier
+                ))
+            }
+        }
+    }
+
+    @MainActor
+    func testRootViewConstructsAndLaysOut() throws {
+        _ = NSApplication.shared
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/root-view-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        let session = Session(id: "session", title: "Session", cwd: root.path)
+        let project = Project(
+            id: "project",
+            name: "Project",
+            cwd: root.path,
+            sessions: [session],
+            selectedSessionId: session.id
+        )
+        try repository.save(PersistedState(
+            projects: [project],
+            selectedProjectId: project.id
+        ))
+        let model = AppModel(
+            stateRepository: repository,
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let hostingView = NSHostingView(rootView: RootView(model: model))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        hostingView.frame = window.contentView?.bounds ?? .zero
+        hostingView.layoutSubtreeIfNeeded()
+        XCTAssertFalse(hostingView.frame.isEmpty)
+        retainedSmokeTestWindows.append(window)
     }
 
     @MainActor
@@ -6201,6 +6857,7 @@ final class AppLogicTests: XCTestCase {
             RemoteCreateSessionRequest(requestId: requestId, projectId: "p1"))
         // An empty project adopts the new session as its selection.
         XCTAssertEqual(model.project("p1")?.selectedSessionId, requestId.uuidString)
+        XCTAssertEqual(model.sessionOrder.last, requestId.uuidString)
     }
 
     @MainActor
