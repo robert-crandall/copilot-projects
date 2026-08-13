@@ -187,6 +187,8 @@ enum RemoteSessionMoveResult: Equatable {
 final class AppModel: ObservableObject {
     @Published private(set) var projects: [Project] = []
     @Published private(set) var selectedProjectId: String?
+    @Published private(set) var projectScopeId: String?
+    @Published private(set) var sessionOrder: [String] = []
     @Published var numberHint: NumberHint = .none
     @Published private(set) var transcriptOpenSessions: Set<String> = []
 
@@ -434,10 +436,10 @@ final class AppModel: ObservableObject {
         if projects.isEmpty {
             let project = makeProject(name: "home", cwd: Paths.defaultStartupDir, withSession: true)
             projects.append(project)
-            selectedProjectId = project.id
+            setSelectedProject(project.id)
             save()
         } else if selectedProjectId == nil {
-            selectedProjectId = projects.first?.id
+            setSelectedProject(projects.first?.id)
         }
         // Start the whole selected project's sessions on launch (matches the prior
         // per-project eager start), not just the visible tab.
@@ -499,6 +501,56 @@ final class AppModel: ObservableObject {
     var selectedProject: Project? {
         guard let id = selectedProjectId else { return nil }
         return projects.first { $0.id == id }
+    }
+
+    nonisolated static func attentionSections(
+        projects: [Project],
+        scopeProjectId: String?,
+        sessionOrder: [String]
+    ) -> [AttentionSection] {
+        let ranks = SessionManualOrder.ranks(sessionOrder)
+        var entriesByGroup = Dictionary(
+            uniqueKeysWithValues: SessionAttentionGroup.allCases.map {
+                ($0, [(entry: SessionListEntry, fallbackIndex: Int)]())
+            }
+        )
+        var fallbackIndex = 0
+        for project in projects {
+            for session in project.sessions {
+                defer { fallbackIndex += 1 }
+                guard scopeProjectId == nil || scopeProjectId == project.id else { continue }
+                entriesByGroup[SessionAttentionGroup.group(for: session), default: []].append(
+                    (
+                        SessionListEntry(
+                            session: session,
+                            projectId: project.id,
+                            projectName: project.name
+                        ),
+                        fallbackIndex
+                    )
+                )
+            }
+        }
+        return SessionAttentionGroup.allCases.map {
+            let entries = entriesByGroup[$0, default: []].sorted { lhs, rhs in
+                let lhsRank = ranks[lhs.entry.id] ?? sessionOrder.count + lhs.fallbackIndex
+                let rhsRank = ranks[rhs.entry.id] ?? sessionOrder.count + rhs.fallbackIndex
+                return (lhsRank, lhs.fallbackIndex) < (rhsRank, rhs.fallbackIndex)
+            }.map(\.entry)
+            return AttentionSection(group: $0, entries: entries)
+        }
+    }
+
+    var attentionSections: [AttentionSection] {
+        Self.attentionSections(
+            projects: projects,
+            scopeProjectId: projectScopeId,
+            sessionOrder: sessionOrder
+        )
+    }
+
+    var visibleSessionOrder: [SessionListEntry] {
+        attentionSections.flatMap(\.entries)
     }
 
     func project(_ id: String) -> Project? {
@@ -684,6 +736,7 @@ final class AppModel: ObservableObject {
             let session = Session(title: "shell", cwd: cwd)
             project.sessions = [session]
             project.selectedSessionId = session.id
+            appendSessionOrder(session.id)
         }
         return project
     }
@@ -726,6 +779,7 @@ final class AppModel: ObservableObject {
         let session = Session(title: "shell", cwd: dir)
         projects[pi].sessions.append(session)
         projects[pi].selectedSessionId = session.id
+        appendSessionOrder(session.id)
         controller(for: session.id)
         refreshSelectedTranscriptController()
         save()
@@ -784,6 +838,7 @@ final class AppModel: ObservableObject {
 
         let session = Session(id: sessionId, title: "Copilot", cwd: cwd)
         projects[pi].sessions.append(session)
+        appendSessionOrder(session.id)
         // Do NOT steal the Mac's selected tab: only adopt the new session when the
         // project currently has no selection.
         if (projects[pi].selectedSessionId ?? "").isEmpty {
@@ -861,6 +916,7 @@ final class AppModel: ObservableObject {
         let closedIndex = projects[pi].sessions.firstIndex { $0.id == sid }
         let wasSelected = projects[pi].selectedSessionId == sid
         projects[pi].sessions.removeAll { $0.id == sid }
+        removeSessionOrder([sid])
         if wasSelected {
             if projects[pi].sessions.isEmpty {
                 projects[pi].selectedSessionId = nil
@@ -1654,6 +1710,7 @@ final class AppModel: ObservableObject {
 
     func closeProject(_ pid: String) {
         guard let pi = projectIndex(pid) else { return }
+        let removedSessionIds = projects[pi].sessions.map(\.id)
         for session in projects[pi].sessions {
             _ = kittyImageDiskStore.tombstone(sessionId: session.id)
         }
@@ -1678,8 +1735,10 @@ final class AppModel: ObservableObject {
             foregroundIdleGenerationBaselines.removeValue(forKey: session.id)
         }
         projects.remove(at: pi)
+        removeSessionOrder(removedSessionIds)
+        if projectScopeId == pid { projectScopeId = nil }
         if selectedProjectId == pid {
-            selectedProjectId = projects.first?.id
+            setSelectedProject(projects.first?.id)
             if let sid = currentSelectedSessionId { controller(for: sid) }
         }
         refreshSelectedTranscriptController()
@@ -1707,7 +1766,7 @@ final class AppModel: ObservableObject {
     }
 
     func selectProject(_ id: String?) {
-        selectedProjectId = id
+        setSelectedProject(id)
         if let id, let pi = projectIndex(id) {
             for i in projects[pi].sessions.indices {
                 projects[pi].sessions[i].hasUnread = false
@@ -1718,9 +1777,7 @@ final class AppModel: ObservableObject {
                let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
                 projects[pi].sessions[si].finishedUnseen = false
             }
-            for session in projects[pi].sessions {
-                controller(for: session.id)
-            }
+            startControllers(forProjectIndex: pi)
         }
         refreshSelectedTranscriptController()
         updateDockBadge()
@@ -1740,10 +1797,32 @@ final class AppModel: ObservableObject {
         save()
     }
 
+    func setProjectScope(_ id: String?) {
+        guard let id else {
+            projectScopeId = nil
+            return
+        }
+        guard projectIndex(id) != nil else { return }
+        projectScopeId = id
+        if selectedProjectId != id {
+            selectProject(id)
+        }
+    }
+
+    func selectSession(_ sessionId: String) {
+        guard let loc = locateIndex(sessionId) else { return }
+        let projectId = projects[loc.p].id
+        if selectedProjectId != projectId {
+            setSelectedProject(projectId)
+            startControllers(forProjectIndex: loc.p)
+        }
+        selectSession(projectId: projectId, sessionId: sessionId)
+    }
+
     func selectSessionByIndex(_ index: Int) {
-        guard let pid = selectedProjectId, let pi = projectIndex(pid),
-              index >= 0, index < projects[pi].sessions.count else { return }
-        selectSession(projectId: pid, sessionId: projects[pi].sessions[index].id)
+        let sessions = visibleSessionOrder
+        guard index >= 0, index < sessions.count else { return }
+        selectSession(sessions[index].id)
     }
 
     func selectProjectByIndex(_ index: Int) {
@@ -1751,31 +1830,46 @@ final class AppModel: ObservableObject {
         selectProject(projects[index].id)
     }
 
-    /// Reorder projects (drag-and-drop in the sidebar).
-    func moveProjects(fromOffsets source: IndexSet, toOffset destination: Int) {
-        projects.move(fromOffsets: source, toOffset: destination)
-        save()
-    }
-
-    /// Reorder session tabs within a project (drag-and-drop in the tab bar).
-    /// Inserts the dragged session immediately before `beforeId`, or at the end
-    /// when `beforeId` is nil.
-    func moveSession(projectId: String, draggedId: String, beforeId: String?) {
-        guard let pi = projectIndex(projectId) else { return }
-        var sessions = projects[pi].sessions
-        guard let from = sessions.firstIndex(where: { $0.id == draggedId }) else { return }
-        let item = sessions.remove(at: from)
-        if let beforeId, let to = sessions.firstIndex(where: { $0.id == beforeId }) {
-            sessions.insert(item, at: to)
+    func moveProject(draggedId: String, beforeId: String?) {
+        guard draggedId != beforeId,
+              let from = projects.firstIndex(where: { $0.id == draggedId }) else { return }
+        if let beforeId, !projects.contains(where: { $0.id == beforeId }) { return }
+        let project = projects.remove(at: from)
+        if let beforeId, let to = projects.firstIndex(where: { $0.id == beforeId }) {
+            projects.insert(project, at: to)
         } else {
-            sessions.append(item)
+            projects.append(project)
         }
-        projects[pi].sessions = sessions
         save()
     }
 
-    /// Move a session into another project by dragging its tab onto a project row
-    /// in the sidebar. The live terminal is preserved — controllers are keyed by
+    @discardableResult
+    func moveSessionInList(
+        draggedId: String,
+        targetId: String,
+        placeAfter: Bool = false
+    ) -> Bool {
+        guard draggedId != targetId,
+              let source = locateIndex(draggedId),
+              let target = locateIndex(targetId),
+              SessionAttentionGroup.group(for: projects[source.p].sessions[source.s])
+                == SessionAttentionGroup.group(for: projects[target.p].sessions[target.s])
+        else { return false }
+
+        let previousOrder = resolvedSessionOrder()
+        var nextOrder = previousOrder
+        guard let draggedIndex = nextOrder.firstIndex(of: draggedId) else { return false }
+        nextOrder.remove(at: draggedIndex)
+        guard let targetIndex = nextOrder.firstIndex(of: targetId) else { return false }
+        nextOrder.insert(draggedId, at: targetIndex + (placeAfter ? 1 : 0))
+        guard nextOrder != previousOrder else { return false }
+        sessionOrder = nextOrder
+        save()
+        return true
+    }
+
+    /// Move a session into another project from the project switcher.
+    /// The live terminal is preserved — controllers are keyed by
     /// session id, so the agent keeps running and only the owning project changes
     /// (status/notification/focus routing all resolve by session id). No-op when
     /// dropped on the project the session already belongs to.
@@ -1834,12 +1928,43 @@ final class AppModel: ObservableObject {
     }
 
     func selectAdjacentSession(_ delta: Int) {
-        guard let pid = selectedProjectId, let pi = projectIndex(pid) else { return }
-        let sessions = projects[pi].sessions
+        let sessions = visibleSessionOrder
         guard !sessions.isEmpty else { return }
-        let current = sessions.firstIndex { $0.id == projects[pi].selectedSessionId } ?? 0
-        let next = (current + delta + sessions.count) % sessions.count
-        selectSession(projectId: pid, sessionId: sessions[next].id)
+        let next: Int
+        if let current = sessions.firstIndex(where: { $0.id == globalSelectedSessionId }) {
+            next = ((current + delta) % sessions.count + sessions.count) % sessions.count
+        } else {
+            next = delta < 0 ? sessions.count - 1 : 0
+        }
+        selectSession(sessions[next].id)
+    }
+
+    private func setSelectedProject(_ id: String?) {
+        selectedProjectId = id
+        if projectScopeId != nil, projectScopeId != id {
+            projectScopeId = id
+        }
+    }
+
+    private func appendSessionOrder(_ sessionId: String) {
+        if !sessionOrder.contains(sessionId) {
+            sessionOrder.append(sessionId)
+        }
+    }
+
+    private func removeSessionOrder(_ sessionIds: [String]) {
+        let removed = Set(sessionIds)
+        sessionOrder.removeAll { removed.contains($0) }
+    }
+
+    private func resolvedSessionOrder() -> [String] {
+        SessionManualOrder.reconciled(order: sessionOrder, projects: projects)
+    }
+
+    private func startControllers(forProjectIndex index: Int) {
+        for session in projects[index].sessions {
+            controller(for: session.id)
+        }
     }
 
     // MARK: - status / notifications (driven by the CLI)
@@ -2621,12 +2746,12 @@ final class AppModel: ObservableObject {
 
     func focus(projectId: String?, sessionId: String?) {
         if let sessionId, let loc = locateIndex(sessionId) {
-            selectedProjectId = projects[loc.p].id
+            setSelectedProject(projects[loc.p].id)
             projects[loc.p].selectedSessionId = sessionId
             projects[loc.p].sessions[loc.s].hasUnread = false
             projects[loc.p].sessions[loc.s].finishedUnseen = false
         } else if let projectId, let pi = projectIndex(projectId) {
-            selectedProjectId = projectId
+            setSelectedProject(projectId)
             for i in projects[pi].sessions.indices {
                 projects[pi].sessions[i].hasUnread = false
             }
@@ -2880,7 +3005,8 @@ final class AppModel: ObservableObject {
             return
         }
         projects = state.projects
-        selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
+        sessionOrder = state.sessionOrder
+        setSelectedProject(state.selectedProjectId ?? state.projects.first?.id)
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let sid = projects[pi].sessions[si].id
@@ -2968,7 +3094,15 @@ final class AppModel: ObservableObject {
 
     func save() {
         guard stateLoadFailure == nil else { return }
-        let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
+        let resolvedOrder = resolvedSessionOrder()
+        if sessionOrder != resolvedOrder {
+            sessionOrder = resolvedOrder
+        }
+        let state = PersistedState(
+            projects: projects,
+            selectedProjectId: selectedProjectId,
+            sessionOrder: sessionOrder
+        )
         do {
             try stateRepository.save(state)
         } catch {

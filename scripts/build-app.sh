@@ -152,13 +152,24 @@ if [ -d "$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle" ]; then
   cp -R "$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle" "$RES/"
   SHADER_SOURCE="$RESOURCE_BUILD_DIR/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
   if [ -f "$SHADER_SOURCE" ]; then
-    echo "==> compiling SwiftTerm Metal shaders"
-    SHADER_TMP="$(mktemp -d -t copilot-projects-shaders)"
-    AIR_FILE="$SHADER_TMP/Shaders.air"
-    xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 \
-      -c "$SHADER_SOURCE" -o "$AIR_FILE"
-    xcrun -sdk macosx metallib "$AIR_FILE" -o "$RES/default.metallib"
-    rm -rf "$SHADER_TMP"
+    if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+      echo "==> compiling SwiftTerm Metal shaders"
+      SHADER_BUILD_DIR="$BUILD_DIR/copilot-projects-shaders"
+      rm -rf "$SHADER_BUILD_DIR"
+      mkdir -p "$SHADER_BUILD_DIR"
+      AIR_FILE="$SHADER_BUILD_DIR/Shaders.air"
+      xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 \
+        -c "$SHADER_SOURCE" -o "$AIR_FILE"
+      xcrun -sdk macosx metallib "$AIR_FILE" -o "$RES/default.metallib"
+      rm -rf "$SHADER_BUILD_DIR"
+    elif [ "$CONFIG" = "release" ]; then
+      echo "error: Metal Toolchain is required for release builds." >&2
+      echo "Install it with: xcodebuild -downloadComponent MetalToolchain" >&2
+      exit 1
+    else
+      echo "warning: Metal Toolchain unavailable; SwiftTerm will use its debug fallback." >&2
+      echo "warning: Install it with: xcodebuild -downloadComponent MetalToolchain" >&2
+    fi
   fi
 fi
 
