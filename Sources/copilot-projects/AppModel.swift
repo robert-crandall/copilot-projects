@@ -3094,7 +3094,10 @@ final class AppModel: ObservableObject {
 
     func save() {
         guard stateLoadFailure == nil else { return }
-        sessionOrder = resolvedSessionOrder()
+        let resolvedOrder = resolvedSessionOrder()
+        if sessionOrder != resolvedOrder {
+            sessionOrder = resolvedOrder
+        }
         let state = PersistedState(
             projects: projects,
             selectedProjectId: selectedProjectId,

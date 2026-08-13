@@ -575,7 +575,9 @@ enum DragPayload {
         exportedAs: "com.github.robert-crandall.copilot-projects.drag.project"
     )
 
-    static let projectDropTypes = [projectType] + SessionAttentionGroup.allCases.map(sessionType)
+    static let projectDropTypes = [projectType] + SessionAttentionGroup.allCases.map {
+        sessionType(for: $0)
+    }
 
     static func sessionType(for group: SessionAttentionGroup) -> UTType {
         UTType(
