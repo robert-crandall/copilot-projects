@@ -221,7 +221,10 @@ capsules, window buttons, menus, and drag indicators keep their own geometry.
 ## Components
 
 **Session browser:** vertically stacked, two-line names with explicit Running,
-Waiting for input, Finished, or Idle states. Selected rows use steel fill and
+Waiting for input, Request failed, Finished, or Idle states. A failed latest
+request shows a native red exclamation in the state slot (its help names the
+CLI's message), and the transcript drawer marks that turn with a red **Failed**
+capsule and a closing **Request failed** note. Selected rows use steel fill and
 edge; raised hover applies only when inactive. Titles retain native primary ink.
 Single-click selects; double-click on the selector ends that session through
 the existing active-work confirmation. The dedicated End control and separate

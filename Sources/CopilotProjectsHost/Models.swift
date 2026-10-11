@@ -1,5 +1,6 @@
 import Foundation
 import CopilotProjectsCore
+import CopilotProjectsProtocol
 
 /// A terminal session inside a project. Value type; the live terminal NSView lives
 /// elsewhere (AppModel.controllers) and is keyed by `id`.
@@ -44,6 +45,11 @@ struct Session: Identifiable, Codable, Equatable {
     /// Keep that lifecycle state separate from the attention shown to the user.
     var displayStatus: SessionStatus { hasPendingInput ? .waiting : status }
 
+    /// The latest request failed and the session has been idle since.
+    var failedRequest: TranscriptTurnError? {
+        displayStatus == .idle ? agentActivity?.remoteLastError() : nil
+    }
+
     var requiresEndConfirmation: Bool {
         status != .idle || hasBackgroundWork || !schedules.isEmpty || hasPendingInput
     }
@@ -53,7 +59,9 @@ struct Session: Identifiable, Codable, Equatable {
         switch displayStatus {
         case .running: return "Running"
         case .waiting: return "Waiting for input"
-        case .idle: return finishedUnseen ? "Finished" : "Idle"
+        case .idle:
+            if failedRequest != nil { return "Request failed" }
+            return finishedUnseen ? "Finished" : "Idle"
         }
     }
 

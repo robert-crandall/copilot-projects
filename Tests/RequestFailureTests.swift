@@ -1,0 +1,134 @@
+import AppKit
+import XCTest
+@testable import CopilotProjectsHost
+import CopilotProjectsProtocol
+
+final class RequestFailureTests: XCTestCase {
+    private let message = "Execution failed: 400 internal server error (Request ID: 00000-f881)"
+    private let failedAt = "2026-10-10T23:38:00.191Z"
+
+    private var trackerError: String {
+        #"{"message":"\#(message)","errorType":"query","timestamp":"\#(failedAt)","statusCode":400}"#
+    }
+
+    private func failedAtDate() throws -> Date {
+        try Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(failedAt)
+    }
+
+    private func transcriptDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        decoder.dateDecodingStrategy = .custom {
+            try fractional.parse(try $0.singleValueContainer().decode(String.self))
+        }
+        return decoder
+    }
+
+    func testTranscriptTurnCarriesTheTrackerErrorThroughImageAssociation() throws {
+        let json = #"""
+        {"id":"turn","startedAt":"2026-10-10T22:00:00.000Z","endedAt":"\#(failedAt)",
+         "kind":"foreground","userContent":"record","assistantMessages":[],"tools":[],
+         "isAborted":false,"images":[],"error":\#(trackerError)}
+        """#
+        let turn = try transcriptDecoder().decode(TranscriptTurn.self, from: Data(json.utf8))
+        let expected = TranscriptTurnError(
+            message: message, errorType: "query", statusCode: 400, timestamp: try failedAtDate()
+        )
+        XCTAssertEqual(turn.error, expected)
+
+        let associated = TranscriptImageAssociation.attach(
+            images: [],
+            to: TranscriptSnapshot(
+                schemaVersion: 3, updatedAt: Date(), copilotSessionId: "copilot", turns: [turn]
+            )
+        )
+        XCTAssertNil(associated.turns[0].images)
+        XCTAssertEqual(associated.turns[0].error, expected)
+    }
+
+    func testTurnsWithoutAnErrorStillEncodeWithoutTheKey() throws {
+        let turn = TranscriptTurn(
+            id: "turn", startedAt: Date(), endedAt: nil, kind: "foreground",
+            userContent: "hi", assistantMessages: [], tools: [], isAborted: false
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(turn)) as? [String: Any]
+        )
+        XCTAssertNil(object["error"])
+        let legacy = #"""
+        {"id":"turn","startedAt":"2026-10-10T22:00:00.000Z","endedAt":null,"kind":"foreground",
+         "userContent":"hi","assistantMessages":[],"tools":[],"isAborted":false}
+        """#
+        XCTAssertNil(try transcriptDecoder().decode(TranscriptTurn.self, from: Data(legacy.utf8)).error)
+    }
+
+    func testHeartbeatFailureDecodesWithoutRejectingTheSnapshot() throws {
+        let base = #""schemaVersion":1,"updatedAt":"2026-10-10T23:38:01Z","foregroundTurnActive":false,"#
+            + #""scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,"#
+            + #""lastIdleAborted":false"#
+        let failed = try JSONDecoder().decode(
+            AgentActivitySnapshot.self,
+            from: Data("{\(base),\"lastTurnError\":\(trackerError)}".utf8)
+        )
+        XCTAssertEqual(failed.remoteLastError(), TranscriptTurnError(
+            message: message, errorType: "query", statusCode: 400, timestamp: try failedAtDate()
+        ))
+
+        let partial = try JSONDecoder().decode(
+            AgentActivitySnapshot.self,
+            from: Data("{\(base),\"lastTurnError\":{\"message\":\"Rate limited\"}}".utf8)
+        )
+        XCTAssertEqual(partial.remoteLastError()?.message, "Rate limited")
+        XCTAssertNil(partial.remoteLastError()?.statusCode)
+
+        for blank in [#"{"message":"  "}"#, "{}"] {
+            let snapshot = try JSONDecoder().decode(
+                AgentActivitySnapshot.self, from: Data("{\(base),\"lastTurnError\":\(blank)}".utf8)
+            )
+            XCTAssertNil(snapshot.remoteLastError())
+        }
+        XCTAssertNil(try JSONDecoder().decode(
+            AgentActivitySnapshot.self, from: Data("{\(base)}".utf8)
+        ).remoteLastError())
+    }
+
+    @MainActor
+    func testIdleSessionReportsItsFailureLocallyAndRemotely() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = Session(title: "voice", cwd: root.path)
+        let project = Project(name: "Skills", cwd: root.path, sessions: [session])
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+        let now = Date()
+        let updatedAt = ISO8601DateFormatter().string(from: now)
+        let heartbeat = #"""
+        {"schemaVersion":1,"updatedAt":"\#(updatedAt)","foregroundTurnActive":false,
+         "scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,
+         "lastIdleAborted":false,"lastIdleTurnKind":"foreground","lastTurnError":\#(trackerError)}
+        """#
+        try Data(heartbeat.utf8).write(
+            to: root.appendingPathComponent("\(session.id).agent-activity.json")
+        )
+        let model = AppModel(stateRepository: repository, agentActivityDirectory: root)
+        model.refreshAgentActivitySnapshots(now: now)
+
+        let expected = TranscriptTurnError(
+            message: message, errorType: "query", statusCode: 400, timestamp: try failedAtDate()
+        )
+        let local = model.projects[0].sessions[0]
+        XCTAssertEqual(local.failedRequest, expected)
+        XCTAssertEqual(local.attentionLabel, "Request failed")
+        XCTAssertEqual(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError, expected)
+
+        var running = local
+        running.status = .running
+        XCTAssertNil(running.failedRequest)
+        XCTAssertEqual(running.attentionLabel, "Running")
+        model.setStatus(sessionId: session.id, status: .running, text: nil)
+        XCTAssertEqual(model.projects[0].sessions[0].status, .running)
+        XCTAssertNil(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError)
+    }
+}

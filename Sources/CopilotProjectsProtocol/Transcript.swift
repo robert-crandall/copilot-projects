@@ -64,6 +64,10 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
     /// the CLI-written snapshot and populated only by the host before serving
     /// remote clients; optional so older clients (and the CLI writer) ignore it.
     public let images: [TranscriptImageRef]?
+    /// Why the request failed, when it ended in a request-level
+    /// `session.error` the agent did not recover from. Absent for successful,
+    /// stopped, and in-progress turns, and from older trackers.
+    public let error: TranscriptTurnError?
 
     public init(
         id: String,
@@ -74,7 +78,8 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
         assistantMessages: [TranscriptAssistantMessage],
         tools: [TranscriptTool],
         isAborted: Bool,
-        images: [TranscriptImageRef]? = nil
+        images: [TranscriptImageRef]? = nil,
+        error: TranscriptTurnError? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -85,6 +90,25 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
         self.tools = tools
         self.isAborted = isAborted
         self.images = images
+        self.error = error
+    }
+}
+
+/// A request failure as the CLI reported it. `message` is the CLI's own
+/// wording (it can carry a request ID); `errorType` is its category, such as
+/// `query`, `rate_limit`, or `authentication`; `statusCode` is the upstream
+/// HTTP status when there was one.
+public struct TranscriptTurnError: Codable, Equatable, Sendable {
+    public let message: String
+    public let errorType: String?
+    public let statusCode: Int?
+    public let timestamp: Date
+
+    public init(message: String, errorType: String? = nil, statusCode: Int? = nil, timestamp: Date) {
+        self.message = message
+        self.errorType = errorType
+        self.statusCode = statusCode
+        self.timestamp = timestamp
     }
 }
 

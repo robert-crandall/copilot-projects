@@ -59,7 +59,8 @@ enum TranscriptImageAssociation {
                 assistantMessages: turn.assistantMessages,
                 tools: turn.tools,
                 isAborted: turn.isAborted,
-                images: refs
+                images: refs,
+                error: turn.error
             )
         }
         return TranscriptSnapshot(

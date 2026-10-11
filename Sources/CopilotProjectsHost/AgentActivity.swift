@@ -74,6 +74,22 @@ struct AgentActivitySnapshot: Codable, Equatable {
     var sessionIdleAtMilliseconds: Int64? = nil
     var workflow: RemoteSessionWorkflow? = nil
     var currentIntent: String? = nil
+    /// The latest request's failure, published only while no request is
+    /// running. Strings and optionals throughout: one malformed field must not
+    /// fail the whole heartbeat decode.
+    var lastTurnError: TrackedTurnError? = nil
+
+    func remoteLastError() -> TranscriptTurnError? {
+        guard let lastTurnError,
+              let message = lastTurnError.message?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !message.isEmpty else { return nil }
+        return TranscriptTurnError(
+            message: message,
+            errorType: lastTurnError.errorType,
+            statusCode: lastTurnError.statusCode,
+            timestamp: lastTurnError.timestamp.flatMap(AgentTimestamp.parse) ?? Date()
+        )
+    }
 
     func remoteActivityText(expectedSessionId: String?, at now: Date) -> String? {
         guard let expectedSessionId, !expectedSessionId.isEmpty,
@@ -328,6 +344,14 @@ struct TrackedSubagent: Codable, Equatable, Identifiable {
     var name: String
     var description: String
     var model: String?
+}
+
+/// The heartbeat's `lastTurnError`, mirrored from the tracker.
+struct TrackedTurnError: Codable, Equatable {
+    var message: String?
+    var errorType: String?
+    var statusCode: Int?
+    var timestamp: String?
 }
 
 /// The session's effective model, mirrored from the extension heartbeat.

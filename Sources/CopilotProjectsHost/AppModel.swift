@@ -2057,7 +2057,10 @@ final class AppModel: ObservableObject {
                             conversationEpoch: operation.conversationEpoch,
                             operationSupport: operation.support,
                             operationReceipts: operation.receipts,
-                            workflow: session.agentActivity?.workflow
+                            workflow: session.agentActivity?.workflow,
+                            lastError: status == .idle
+                                ? session.agentActivity?.remoteLastError()
+                                : nil
                         )
                     }
                 )

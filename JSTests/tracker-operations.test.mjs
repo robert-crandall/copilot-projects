@@ -1045,6 +1045,171 @@ test("durable history streams the pending turn and live text follows newer input
   assert.equal(previousTurn.assistantMessages.some((message) => message.content.startsWith("new ")), false);
 });
 
+function readTranscript(runtime) {
+  const path = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
+  return realExistsSync(path) ? JSON.parse(realReadFileSync(path, "utf8")) : { turns: [] };
+}
+
+const queryFailure = {
+  errorType: "query",
+  message: "Execution failed: 400 internal server error (Request ID: 00000-f881)",
+  statusCode: 400,
+  providerCallId: "00000-f881",
+};
+
+test("a failed request marks its turn and the session until the next request", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const request = await runtime.session.emit("user.message", { content: "record my voice" });
+  await runtime.session.emit("assistant.turn_start", { turnId: "60" });
+  await runtime.session.emit("assistant.message", { messageId: "progress", content: "Capturing playback." });
+  await runtime.session.emit("tool.execution_start", { toolCallId: "capture", toolName: "bash" });
+  await runtime.session.emit("tool.execution_complete", { toolCallId: "capture", success: true });
+  await runtime.session.emit("assistant.turn_end", { turnId: "60" });
+  await runtime.session.emit("assistant.turn_start", { turnId: "61" });
+  await runtime.session.emit("assistant.turn_end", { turnId: "61" });
+  const failure = await runtime.session.emit("session.error", queryFailure);
+  await runtime.session.emit("session.idle");
+
+  const failed = await waitFor(() => {
+    const turn = readTranscript(runtime).turns.find((entry) => entry.id === request.id);
+    return turn?.endedAt && turn.error && turn;
+  }, "the failed request was not marked");
+  const expected = {
+    message: queryFailure.message,
+    errorType: "query",
+    timestamp: failure.timestamp,
+    statusCode: 400,
+  };
+  assert.deepEqual(failed.error, expected);
+  assert.deepEqual(failed.assistantMessages.map((message) => message.content), ["Capturing playback."]);
+  assert.equal(failed.tools.length, 1);
+  await waitFor(() => readSnapshot(runtime).lastTurnError, "the session did not report the failure");
+  assert.deepEqual(readSnapshot(runtime).lastTurnError, expected);
+
+  const next = await runtime.session.emit("user.message", { content: "Keep going!" });
+  assert.equal(readSnapshot(runtime).lastTurnError, undefined);
+  await waitFor(() => readTranscript(runtime).turns.some((turn) => turn.id === next.id),
+    "the next request did not reach the transcript");
+  const turns = readTranscript(runtime).turns;
+  assert.deepEqual(turns.find((turn) => turn.id === request.id).error, expected);
+  assert.equal("error" in turns.find((turn) => turn.id === next.id), false);
+});
+
+test("failures the agent recovers from within a request are cleared", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const request = await runtime.session.emit("user.message", { content: "retry" });
+  await runtime.session.emit("assistant.turn_start", { turnId: "1" });
+  await runtime.session.emit("assistant.turn_end", { turnId: "1" });
+  await runtime.session.emit("session.error", queryFailure);
+  await runtime.session.emit("assistant.turn_start", { turnId: "2" });
+  await runtime.session.emit("assistant.message", { messageId: "done", content: "Done after all." });
+  await runtime.session.emit("session.idle");
+  const turn = await waitFor(() => {
+    const entry = readTranscript(runtime).turns.find((candidate) => candidate.id === request.id);
+    return entry?.endedAt && entry;
+  }, "the recovered request did not finish");
+  assert.equal("error" in turn, false);
+  assert.equal(readSnapshot(runtime).lastTurnError, undefined);
+});
+
+test("failures outside a request get their own entry, and diagnostics are ignored", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const request = await runtime.session.emit("user.message", { content: "finish" });
+  await runtime.session.emit("assistant.message", { messageId: "answer", content: "Finished." });
+  await runtime.session.emit("session.idle");
+  await waitFor(() => readTranscript(runtime).turns.find((turn) => turn.id === request.id)?.endedAt,
+    "the request did not finish");
+
+  await runtime.session.emit("session.error", {
+    errorType: "model-provider-labels", message: "Failed to read model provider attribution",
+  });
+  await runtime.session.emit("session.error", {
+    errorType: "persistence", message: "Failed to persist session events",
+  }, { ephemeral: true });
+  await runtime.session.emit("session.error", {
+    errorType: "model_call", message: "Retrying",
+  });
+  await runtime.session.emit("session.error", queryFailure, { agentId: "background-1" });
+  const gate = await runtime.session.emit("session.error", {
+    errorType: "authentication",
+    message: "You must be logged in to send messages. Please run /login",
+  });
+
+  const standalone = await waitFor(
+    () => readTranscript(runtime).turns.find((turn) => turn.id === gate.id),
+    "the out-of-request failure did not get its own entry"
+  );
+  assert.equal(standalone.kind, "automated");
+  assert.equal(standalone.userContent, "");
+  assert.equal(standalone.endedAt, gate.timestamp);
+  assert.deepEqual(standalone.error, {
+    message: "You must be logged in to send messages. Please run /login",
+    errorType: "authentication",
+    timestamp: gate.timestamp,
+  });
+  const turns = readTranscript(runtime).turns;
+  assert.equal(turns.filter((turn) => turn.error).length, 1);
+  assert.equal("error" in turns.find((turn) => turn.id === request.id), false);
+  await waitFor(() => readSnapshot(runtime).lastTurnError?.errorType === "authentication",
+    "the session did not report the out-of-request failure");
+});
+
+test("durable replay marks a failed request and keeps later failures separate", {
+  concurrency: false,
+}, async (t) => {
+  const event = (id, type, data, offset) => ({
+    id, type, timestamp: new Date(Date.UTC(2026, 9, 10, 23, 37, offset)).toISOString(), data,
+  });
+  const runtime = await createRuntime(t, (session, fixture) => {
+    const directory = join(fixture.root, "copilot-home", "session-state", fixture.copilotSessionId);
+    realMkdirSync(directory, { recursive: true });
+    realWriteFileSync(join(directory, "events.jsonl"), [
+      event("done", "user.message", { content: "earlier" }, 0),
+      event("done-answer", "assistant.message", { messageId: "a", content: "Earlier answer." }, 1),
+      event("failed", "user.message", { content: "record my voice" }, 2),
+      event("failed-start", "assistant.turn_start", { turnId: "61" }, 3),
+      event("failed-end", "assistant.turn_end", { turnId: "61" }, 4),
+      event("failed-error", "session.error", queryFailure, 5),
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  });
+  const home = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+  t.after(() => {
+    if (home === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = home;
+  });
+  await workflowReady(runtime);
+  const failedTurn = await waitFor(
+    () => readTranscript(runtime).turns.find((turn) => turn.id === "failed")?.error,
+    "durable replay did not mark the failed request", 4_000
+  );
+  assert.equal(failedTurn.statusCode, 400);
+  assert.equal("error" in readTranscript(runtime).turns.find((turn) => turn.id === "done"), false);
+  await waitFor(() => readSnapshot(runtime).lastTurnError?.statusCode === 400,
+    "the session did not report the durable failure", 4_000);
+
+  // Durable replay never sees the idle that ended the request. Live delivery
+  // knows the request was over, so a later failure is its own entry.
+  await runtime.session.emit("session.idle");
+  const journal = join(runtime.root, "copilot-home", "session-state", runtime.copilotSessionId, "events.jsonl");
+  const hook = await runtime.session.emit("session.error", {
+    errorType: "query", message: "userPromptTransformed hook failed",
+  });
+  fs.appendFileSync(journal, JSON.stringify(hook) + "\n");
+  const standalone = await waitFor(
+    () => readTranscript(runtime).turns.find((turn) => turn.id === hook.id),
+    "the post-request failure did not get its own entry", 4_000
+  );
+  assert.equal(standalone.error.message, "userPromptTransformed hook failed");
+  assert.deepEqual(readTranscript(runtime).turns.find((turn) => turn.id === "failed").error, failedTurn);
+});
+
 function requestClose(runtime) {
   const name = `${runtime.appSessionId}.close-session-request`;
   realWriteFileSync(join(runtime.sessions, name), "");
