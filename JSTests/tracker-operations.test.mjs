@@ -1291,9 +1291,8 @@ test("durable history streams the pending turn and live text follows newer input
   assert.equal(previousTurn.assistantMessages.some((message) => message.content.startsWith("new ")), false);
 });
 
-function readTranscript(runtime) {
-  const path = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
-  return realExistsSync(path) ? JSON.parse(realReadFileSync(path, "utf8")) : { turns: [] };
+function transcriptTurnsOf(runtime) {
+  return readTranscript(runtime)?.turns ?? [];
 }
 
 const queryFailure = {
@@ -1319,7 +1318,7 @@ test("a failed request marks its turn and the session until the next request", {
   await runtime.session.emit("session.idle");
 
   const failed = await waitFor(() => {
-    const turn = readTranscript(runtime).turns.find((entry) => entry.id === request.id);
+    const turn = transcriptTurnsOf(runtime).find((entry) => entry.id === request.id);
     return turn?.endedAt && turn.error && turn;
   }, "the failed request was not marked");
   const expected = {
@@ -1336,9 +1335,9 @@ test("a failed request marks its turn and the session until the next request", {
 
   const next = await runtime.session.emit("user.message", { content: "Keep going!" });
   assert.equal(readSnapshot(runtime).lastTurnError, undefined);
-  await waitFor(() => readTranscript(runtime).turns.some((turn) => turn.id === next.id),
+  await waitFor(() => transcriptTurnsOf(runtime).some((turn) => turn.id === next.id),
     "the next request did not reach the transcript");
-  const turns = readTranscript(runtime).turns;
+  const turns = transcriptTurnsOf(runtime);
   assert.deepEqual(turns.find((turn) => turn.id === request.id).error, expected);
   assert.equal("error" in turns.find((turn) => turn.id === next.id), false);
 });
@@ -1355,7 +1354,7 @@ test("failures the agent recovers from within a request are cleared", {
   await runtime.session.emit("assistant.message", { messageId: "done", content: "Done after all." });
   await runtime.session.emit("session.idle");
   const turn = await waitFor(() => {
-    const entry = readTranscript(runtime).turns.find((candidate) => candidate.id === request.id);
+    const entry = transcriptTurnsOf(runtime).find((candidate) => candidate.id === request.id);
     return entry?.endedAt && entry;
   }, "the recovered request did not finish");
   assert.equal("error" in turn, false);
@@ -1369,7 +1368,7 @@ test("failures outside a request get their own entry, and diagnostics are ignore
   const request = await runtime.session.emit("user.message", { content: "finish" });
   await runtime.session.emit("assistant.message", { messageId: "answer", content: "Finished." });
   await runtime.session.emit("session.idle");
-  await waitFor(() => readTranscript(runtime).turns.find((turn) => turn.id === request.id)?.endedAt,
+  await waitFor(() => transcriptTurnsOf(runtime).find((turn) => turn.id === request.id)?.endedAt,
     "the request did not finish");
 
   await runtime.session.emit("session.error", {
@@ -1388,7 +1387,7 @@ test("failures outside a request get their own entry, and diagnostics are ignore
   });
 
   const standalone = await waitFor(
-    () => readTranscript(runtime).turns.find((turn) => turn.id === gate.id),
+    () => transcriptTurnsOf(runtime).find((turn) => turn.id === gate.id),
     "the out-of-request failure did not get its own entry"
   );
   assert.equal(standalone.kind, "automated");
@@ -1399,7 +1398,7 @@ test("failures outside a request get their own entry, and diagnostics are ignore
     errorType: "authentication",
     timestamp: gate.timestamp,
   });
-  const turns = readTranscript(runtime).turns;
+  const turns = transcriptTurnsOf(runtime);
   assert.equal(turns.filter((turn) => turn.error).length, 1);
   assert.equal("error" in turns.find((turn) => turn.id === request.id), false);
   await waitFor(() => readSnapshot(runtime).lastTurnError?.errorType === "authentication",
@@ -1432,11 +1431,11 @@ test("durable replay marks a failed request and keeps later failures separate", 
   });
   await workflowReady(runtime);
   const failedTurn = await waitFor(
-    () => readTranscript(runtime).turns.find((turn) => turn.id === "failed")?.error,
+    () => transcriptTurnsOf(runtime).find((turn) => turn.id === "failed")?.error,
     "durable replay did not mark the failed request", 4_000
   );
   assert.equal(failedTurn.statusCode, 400);
-  assert.equal("error" in readTranscript(runtime).turns.find((turn) => turn.id === "done"), false);
+  assert.equal("error" in transcriptTurnsOf(runtime).find((turn) => turn.id === "done"), false);
   await waitFor(() => readSnapshot(runtime).lastTurnError?.statusCode === 400,
     "the session did not report the durable failure", 4_000);
 
@@ -1449,11 +1448,11 @@ test("durable replay marks a failed request and keeps later failures separate", 
   });
   fs.appendFileSync(journal, JSON.stringify(hook) + "\n");
   const standalone = await waitFor(
-    () => readTranscript(runtime).turns.find((turn) => turn.id === hook.id),
+    () => transcriptTurnsOf(runtime).find((turn) => turn.id === hook.id),
     "the post-request failure did not get its own entry", 4_000
   );
   assert.equal(standalone.error.message, "userPromptTransformed hook failed");
-  assert.deepEqual(readTranscript(runtime).turns.find((turn) => turn.id === "failed").error, failedTurn);
+  assert.deepEqual(transcriptTurnsOf(runtime).find((turn) => turn.id === "failed").error, failedTurn);
 });
 
 function requestClose(runtime) {
