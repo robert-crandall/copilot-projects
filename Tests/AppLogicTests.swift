@@ -9794,7 +9794,7 @@ final class AppLogicTests: XCTestCase {
             control: "a=T,f=100,t=d,U=1,i=20", base64Payload: png.base64EncodedString()
         )[...])
         let before = first.imageAvailabilityToken
-        XCTAssertEqual(first.imageAvailabilityToken, before)
+        XCTAssertNotEqual(before, initialToken)
         first.ingest(remoteKittyFrameBytes(control: "a=d,d=i,i=20")[...])
         XCTAssertNotEqual(first.imageAvailabilityToken, before)
         XCTAssertEqual(first.imageAvailabilityToken, "\(identity)-\(first.imageAvailabilityGeneration)")
