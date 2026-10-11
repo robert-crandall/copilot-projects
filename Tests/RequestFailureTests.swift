@@ -80,6 +80,9 @@ final class RequestFailureTests: XCTestCase {
         )
         XCTAssertEqual(partial.remoteLastError()?.message, "Rate limited")
         XCTAssertNil(partial.remoteLastError()?.statusCode)
+        XCTAssertEqual(partial.remoteLastError(), partial.remoteLastError(),
+                       "repeated projections must compare equal")
+        XCTAssertEqual(partial.remoteLastError()?.timestamp, Date(timeIntervalSince1970: 0))
 
         for blank in [#"{"message":"  "}"#, "{}"] {
             let snapshot = try JSONDecoder().decode(

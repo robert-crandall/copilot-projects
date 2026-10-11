@@ -87,7 +87,9 @@ struct AgentActivitySnapshot: Codable, Equatable {
             message: message,
             errorType: lastTurnError.errorType,
             statusCode: lastTurnError.statusCode,
-            timestamp: lastTurnError.timestamp.flatMap(AgentTimestamp.parse) ?? Date()
+            // A fixed fallback keeps repeated projections equal.
+            timestamp: lastTurnError.timestamp.flatMap(AgentTimestamp.parse)
+                ?? Date(timeIntervalSince1970: 0)
         )
     }
 

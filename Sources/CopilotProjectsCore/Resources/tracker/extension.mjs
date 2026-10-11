@@ -229,6 +229,10 @@ if (validSessionId && socketPath) {
     // it was for each root `session.error`, keyed by event id.
     let liveRequestOpen = false;
     const liveTranscriptErrorScopes = new Map();
+    // Root turn starts seen live after an idle: a new request with no
+    // classified `user.message` (a remote command, a notification wake).
+    // Replay ends the previous request there, as the unpersisted idle did.
+    const liveRequestOpeners = new Set();
     let latestResumeTranscriptTurnId = null;
     let synthesizedTaskCompletionContent = null;
     let transcriptInitialized = false;
@@ -304,13 +308,6 @@ if (validSessionId && socketPath) {
     const REQUEST_FAILURE_ERROR_TYPES = new Set([
         "query", "authentication", "authorization", "rate_limit",
         "context_limit", "quota", "session_limits", "execution",
-    ]);
-    // Raised by the runtime's run-error planner, so always inside a request.
-    // The CLI also logs `execution` and `authentication` for terminal shell
-    // commands, user switching, and pre-send gates.
-    const MODEL_RUN_ERROR_TYPES = new Set([
-        "query", "authorization", "rate_limit", "context_limit", "quota",
-        "session_limits",
     ]);
     const MAX_DURABLE_EVENT_BYTES = 4 * 1_024 * 1_024;
     const HISTORY_REPLAY_TIMEOUT_MS = 5_000;
@@ -2821,15 +2818,12 @@ if (validSessionId && socketPath) {
     }
 
     function trimTranscriptTurns(maximumTurns = MAX_TRANSCRIPT_TURNS) {
-        // Keep the transcript bounded. Drop the oldest non-foreground turn
-        // first, except for the latest resume marker; if only foreground
-        // conversation plus that marker remain, sacrifice the oldest
-        // foreground turn so the restart boundary is visible.
+        // Keep the transcript bounded. Drop the oldest disposable turn
+        // first; if only foreground conversation, failures, and the resume
+        // marker remain, sacrifice the oldest of those so the restart
+        // boundary is visible.
         while (transcriptTurns.length > maximumTurns) {
-            let index = transcriptTurns.findIndex(
-                (turn) => turn.kind !== "foreground"
-                    && turn.id !== latestResumeTranscriptTurnId
-            );
+            let index = transcriptTurns.findIndex(isDisposableTranscriptTurn);
             if (index === -1) {
                 index = transcriptTurns.findIndex(
                     (turn) => turn.id !== latestResumeTranscriptTurnId
@@ -2872,6 +2866,15 @@ if (validSessionId && socketPath) {
     function clearRecentlyDroppedTurns() {
         recentlyDroppedTurns.length = 0;
         recentlyDroppedTurnBytes = 0;
+    }
+
+    // Scheduled and automated turns go first when the transcript must
+    // shrink, except the latest resume marker and failed requests, which are
+    // kept like human conversation so a failure stays visible.
+    function isDisposableTranscriptTurn(turn) {
+        return turn.kind !== "foreground"
+            && !turn.error
+            && turn.id !== latestResumeTranscriptTurnId;
     }
 
     function serializedPendingTurn() {
@@ -3054,20 +3057,14 @@ if (validSessionId && socketPath) {
 
         // Phase 1: drop whole non-foreground stored turns (oldest first).
         while (overBudget()) {
-            const index = droppableStoredIndex(
-                (turn) => turn.kind !== "foreground"
-                    && turn.id !== latestResumeTranscriptTurnId
-            );
+            const index = droppableStoredIndex(isDisposableTranscriptTurn);
             if (index === -1) break;
             dropStoredTurn(index);
         }
         // Phase 2: shed payload from any remaining non-foreground turn (i.e. an
         // in-progress scheduled/automated turn) before touching foreground.
         while (overBudget()) {
-            if (!shedOldestPayload(
-                (turn) => turn.kind !== "foreground"
-                    && turn.id !== latestResumeTranscriptTurnId
-            )) break;
+            if (!shedOldestPayload(isDisposableTranscriptTurn)) break;
         }
         // Phase 3: drop whole foreground stored turns (oldest), never pending,
         // leaving at least one turn for payload shedding below.
@@ -3328,12 +3325,6 @@ if (validSessionId && socketPath) {
         return error;
     }
 
-    function isModelRunFailure(error) {
-        return MODEL_RUN_ERROR_TYPES.has(error.errorType)
-            || (error.errorType === "authentication"
-                && error.statusCode !== undefined);
-    }
-
     function observeLiveRequestScope(event) {
         if (event.agentId) return;
         if (event.type === "session.error") {
@@ -3346,6 +3337,13 @@ if (validSessionId && socketPath) {
             }
         } else if (event.type === "assistant.turn_start"
                 || (event.type === "user.message" && classifyUserMessage(event))) {
+            if (!liveRequestOpen && event.type === "assistant.turn_start"
+                    && typeof event.id === "string" && event.id.length > 0) {
+                liveRequestOpeners.add(event.id);
+                while (liveRequestOpeners.size > MAX_LIVE_ERROR_SCOPES) {
+                    liveRequestOpeners.delete(liveRequestOpeners.values().next().value);
+                }
+            }
             liveRequestOpen = true;
         } else if (event.type === "session.idle") {
             liveRequestOpen = false;
@@ -3359,8 +3357,16 @@ if (validSessionId && socketPath) {
     }
 
     function recordTranscriptError(event, error) {
+        // Replay without the live boundary (a restarted tracker) cannot tell
+        // a failed request from a later pre-send failure such as a prompt
+        // hook. It is unambiguous only while the agent loop is running or
+        // the open turn has no answer yet; anything else is its own entry,
+        // so a successful answer is never marked failed.
+        const unanswered = pendingTranscriptTurn !== null
+            && pendingTranscriptTurn.assistantMessages.length === 0
+            && pendingTranscriptTurn.tools.length === 0;
         const inRequest = liveTranscriptErrorScopes.get(event.id)
-            ?? (isModelRunFailure(error) || transcriptAssistantTurnActive);
+            ?? (transcriptAssistantTurnActive || unanswered);
         if (inRequest) {
             // A failure before `user.message` (a prompt hook, say) has no
             // turn yet; it still gets one so the failure is visible.
@@ -3380,8 +3386,17 @@ if (validSessionId && socketPath) {
     function latestTranscriptError() {
         // The named turn handlers set these before they publish, so a new
         // request hides the old failure even while durable replay catches up.
-        if (foregroundTurnActive || scheduledTurnActive) return null;
-        return (pendingTranscriptTurn ?? transcriptTurns.at(-1))?.error ?? null;
+        // Background agents keep the request open after the main loop idles,
+        // and they can still restart it.
+        if (foregroundTurnActive || scheduledTurnActive || activeSubagents.size > 0) {
+            return null;
+        }
+        if (pendingTranscriptTurn) return pendingTranscriptTurn.error ?? null;
+        // A resume notice is not a request; the one before it is the latest.
+        const latest = transcriptTurns.findLast(
+            (turn) => !turn.id?.startsWith?.(RESUME_TRANSCRIPT_TURN_PREFIX)
+        );
+        return latest?.error ?? null;
     }
 
     function resetTranscriptReplayState(turns, model, droppedTurns = []) {
@@ -3414,6 +3429,9 @@ if (validSessionId && socketPath) {
             break;
         }
         case "assistant.turn_start":
+            if (liveRequestOpeners.has(event.id)) {
+                finishTranscriptTurn(false, event.timestamp);
+            }
             transcriptAssistantTurnActive = true;
             clearRecoveredTranscriptError();
             break;
@@ -4071,6 +4089,7 @@ if (validSessionId && socketPath) {
         currentTurnKind = null;
         liveRequestOpen = false;
         liveTranscriptErrorScopes.clear();
+        liveRequestOpeners.clear();
         closeActivityIdleBaseline = idleGeneration;
         closeActivityState = "pending";
         closeActivityPendingSince = Date.now();
