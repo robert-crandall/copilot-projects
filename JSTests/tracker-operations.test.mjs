@@ -1417,6 +1417,10 @@ test("durable replay attributes failures by the live request boundary", {
     realWriteFileSync(join(directory, "events.jsonl"), [
       event("done", "user.message", { content: "earlier" }, 0),
       event("done-answer", "assistant.message", { messageId: "a", content: "Earlier answer." }, 1),
+      // A pre-send gate after an answer is its own entry.
+      event("gate-error", "session.error", {
+        errorType: "authentication", message: "You must be logged in to send messages.",
+      }, 1.5),
       // The reported shape: progress, a failed retry, then the error.
       event("failed", "user.message", { content: "record my voice" }, 2),
       event("failed-start", "assistant.turn_start", { turnId: "60" }, 3),
@@ -1442,6 +1446,12 @@ test("durable replay attributes failures by the live request boundary", {
       event("unanswered-start", "assistant.turn_start", { turnId: "0" }, 19),
       event("unanswered-end", "assistant.turn_end", { turnId: "0" }, 20),
       event("unanswered-error", "session.error", { ...queryFailure, statusCode: 503 }, 21),
+      // A sessionStart hook runs after the prompt's message; its failure is
+      // that request's.
+      event("starting", "user.message", { content: "new session" }, 21.2),
+      event("starting-hook", "hook.start", { hookType: "sessionStart" }, 21.4),
+      event("starting-hook-end", "hook.end", { hookType: "sessionStart", success: false }, 21.6),
+      event("starting-error", "session.error", { errorType: "query", message: "sessionStart hook failed" }, 21.8),
       // A Mission Control prompt starts a new request without a user turn.
       event("remote", "user.message", { content: "remote", source: "command-1" }, 22),
       event("remote-start", "assistant.turn_start", { turnId: "0" }, 23),
@@ -1464,15 +1474,18 @@ test("durable replay attributes failures by the live request boundary", {
   }, "cold replay did not finish", 4_000);
   const byId = (id) => turns.find((turn) => turn.id === id);
   assert.equal("error" in byId("done"), false);
+  assert.equal(byId("gate-error")?.kind, "automated");
+  assert.equal(byId("gate-error").error.errorType, "authentication");
   assert.equal(byId("failed").error?.statusCode, 400);
   assert.equal("error" in byId("recovered"), false, "a recovered failure must clear");
   assert.equal(byId("hook-error")?.kind, "automated");
   assert.equal(byId("hook-error").error.message, "Prompt hook failed");
   assert.equal(byId("unanswered").error?.statusCode, 503);
+  assert.equal(byId("starting").error?.message, "sessionStart hook failed");
   const remote = turns.find((turn) => turn.assistantMessages.some((m) => m.content === "Remote reply."));
   assert.notEqual(remote.id, "unanswered");
   assert.equal("error" in remote, false);
-  for (const id of ["failed-error", "recovered-error", "unanswered-error"]) {
+  for (const id of ["failed-error", "recovered-error", "unanswered-error", "starting-error"]) {
     assert.equal(byId(id), undefined, id);
   }
   await waitFor(() => readSnapshot(runtime).workflow, "the heartbeat did not settle", 4_000);
@@ -1641,6 +1654,53 @@ test("an attached shell keeps a failure quiet until the request ends", {
   assert.equal(readSnapshot(runtime).lastTurnError?.statusCode, 400,
     "the idle publish must already see the request as ended");
 });
+
+for (const durable of [false, true]) {
+  test(`a queued prompt's hook failure never marks the request before it (${durable ? "durable" : "live"})`, {
+    concurrency: false,
+  }, async (t) => {
+    const runtime = await createRuntime(t, (session, fixture) => {
+      if (!durable) return;
+      const directory = join(fixture.root, "copilot-home", "session-state", fixture.copilotSessionId);
+      realMkdirSync(directory, { recursive: true });
+      realWriteFileSync(join(directory, "events.jsonl"), JSON.stringify({
+        id: "earlier", type: "user.message", timestamp: new Date().toISOString(),
+        data: { content: "earlier" },
+      }) + "\n");
+    });
+    let journal = null;
+    if (durable) {
+      const home = process.env.COPILOT_HOME;
+      process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+      t.after(() => {
+        if (home === undefined) delete process.env.COPILOT_HOME;
+        else process.env.COPILOT_HOME = home;
+      });
+      await workflowReady(runtime);
+      journal = join(runtime.root, "copilot-home", "session-state", runtime.copilotSessionId, "events.jsonl");
+    }
+    const emit = async (type, data, extra) => {
+      const event = await runtime.session.emit(type, data, extra);
+      if (journal && type !== "session.idle") fs.appendFileSync(journal, JSON.stringify(event) + "\n");
+      return event;
+    };
+    const first = await emit("user.message", { content: "first" });
+    await emit("assistant.turn_start", { turnId: "0" });
+    await emit("assistant.message", { messageId: "a", content: "First answer." });
+    await emit("assistant.turn_end", { turnId: "0" });
+    // The queued prompt's hook runs before the request above goes idle.
+    await emit("hook.start", { hookType: "userPromptTransformed" });
+    await emit("hook.end", { hookType: "userPromptTransformed", success: false });
+    const hook = await emit("session.error", { errorType: "query", message: "Prompt hook failed" });
+    await emit("session.idle");
+    const entry = await waitFor(
+      () => transcriptTurnsOf(runtime).find((turn) => turn.id === hook.id),
+      "the queued prompt's failure did not get its own entry", 4_000
+    );
+    assert.equal(entry.error.message, "Prompt hook failed");
+    assert.equal("error" in transcriptTurnsOf(runtime).find((turn) => turn.id === first.id), false);
+  });
+}
 
 test("a failure outlives the turn cap and a later resume notice", {
   concurrency: false,

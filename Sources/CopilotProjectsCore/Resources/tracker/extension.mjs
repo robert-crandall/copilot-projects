@@ -320,12 +320,13 @@ if (validSessionId && socketPath) {
         "query", "authorization", "rate_limit", "context_limit", "quota",
         "session_limits",
     ]);
-    const PROMPT_HOOK_TYPES = new Set([
-        "sessionStart", "userPromptSubmitted", "userPromptTransformed",
-    ]);
+    // The one hook that runs before a prompt's `user.message` and reports
+    // its own failure as a `session.error`.
+    const PROMPT_HOOK_TYPES = new Set(["userPromptTransformed"]);
     const REQUEST_ACTIVITY_EVENT_TYPES = new Set([
-        "user.message", "assistant.turn_start", "assistant.turn_end",
-        "assistant.message", "tool.execution_start", "tool.execution_complete",
+        "user.message", "system.notification", "assistant.turn_start",
+        "assistant.turn_end", "assistant.message", "tool.execution_start",
+        "tool.execution_complete",
     ]);
     const MAX_DURABLE_EVENT_BYTES = 4 * 1_024 * 1_024;
     const HISTORY_REPLAY_TIMEOUT_MS = 5_000;
@@ -3378,7 +3379,7 @@ if (validSessionId && socketPath) {
                 }
             }
             liveRequestOpen = true;
-        } else if (event.type === "session.idle") {
+        } else if (event.type === "session.idle" || event.type === "session.shutdown") {
             liveRequestOpen = false;
         }
     }
@@ -3390,18 +3391,20 @@ if (validSessionId && socketPath) {
     }
 
     function recordTranscriptError(event, error) {
-        // Replay without the live boundary (a restarted tracker) relies on
-        // the log. A failure right after a prompt hook happened before the
-        // next request was sent; otherwise a running loop, an unanswered
-        // request, or a model-run failure belongs to the open request.
-        // Pre-send and terminal failures are their own entries, so a
-        // successful answer is never marked failed.
+        // A failure right after a prompt hook happened before that prompt was
+        // sent, even when it was queued behind a request still running.
+        // Otherwise the live boundary decides; replay without it (a restarted
+        // tracker) treats a running loop, an unanswered request, or a
+        // model-run failure as part of the open request. Pre-send and
+        // terminal failures are their own entries, so a successful answer is
+        // never marked failed.
         const unanswered = pendingTranscriptTurn !== null
             && pendingTranscriptTurn.assistantMessages.length === 0
             && pendingTranscriptTurn.tools.length === 0;
-        const inRequest = liveTranscriptErrorScopes.get(event.id)
-            ?? (!transcriptPromptPhase && (transcriptAssistantTurnActive
-                || unanswered || isModelRunFailure(error)));
+        const inRequest = !transcriptPromptPhase
+            && (liveTranscriptErrorScopes.get(event.id)
+                ?? (transcriptAssistantTurnActive || unanswered
+                    || isModelRunFailure(error)));
         if (inRequest) {
             // A failure before `user.message` (a prompt hook, say) has no
             // turn yet; it still gets one so the failure is visible.
