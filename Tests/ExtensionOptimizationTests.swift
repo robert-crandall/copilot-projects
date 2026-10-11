@@ -717,6 +717,32 @@ extension ExtensionOptimizationTests {
     equal(Buffer.byteLength(noneFit), fullBytes, "exactly the live transcript's size");
     equal(ids(transcriptTurns), "scheduled,fg1,fg2", "nothing was trimmed");
 
+    // That shortcut still checks its encode against the budget. Here the live
+    // transcript is one byte over, but the oldest buffered turn's stored size
+    // is overstated, so by the stored sizes the live transcript seems to fit
+    // with less room than the newest buffered turn needs. The live-only encode
+    // misses the budget, and the publish takes the measuring path, trimming
+    // exactly as it would with no buffer at all.
+    MAX_TRANSCRIPT_BYTES = fullBytes - 1;
+    load(budgetTurns);
+    const unbuffered = encodedTranscriptWithinBudget(null);
+    load(budgetTurns);
+    const overstated = encodedTranscriptWithinBudget(null, [
+        { turn: clone(gone[0]), bytes: itemBytes(gone[0]) + 64 },
+        { turn: clone(gone[1]), bytes: itemBytes(gone[1]) },
+        { turn: clone(gone[2]), bytes: itemBytes(gone[2]) },
+    ]);
+    check(
+        Buffer.byteLength(overstated) <= MAX_TRANSCRIPT_BYTES,
+        "the shortcut never publishes past the budget: " + Buffer.byteLength(overstated)
+    );
+    equal("droppedTurns" in JSON.parse(overstated), false, "no buffer beside a trimmed transcript");
+    equal(ids(transcriptTurns), "fg1,fg2", "the measuring path trimmed the scheduled turn");
+    equal(
+        withoutUpdatedAt(overstated), withoutUpdatedAt(unbuffered),
+        "the same document the measuring path publishes without a buffer"
+    );
+
     // A re-encode that misses the budget (sizes that no longer match their
     // turns: the oldest overstated, so the room looks bigger, and the newest
     // understated, so they look like they fit it) falls back to no buffer
