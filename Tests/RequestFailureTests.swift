@@ -93,6 +93,43 @@ final class RequestFailureTests: XCTestCase {
         XCTAssertNil(try JSONDecoder().decode(
             AgentActivitySnapshot.self, from: Data("{\(base)}".utf8)
         ).remoteLastError())
+
+        let mistyped = try JSONDecoder().decode(
+            AgentActivitySnapshot.self,
+            from: Data(("{\(base),\"lastTurnError\":{\"message\":\"Rate limited\","
+                + "\"errorType\":7,\"statusCode\":\"429\",\"timestamp\":42}}").utf8)
+        )
+        XCTAssertEqual(mistyped.remoteLastError(), TranscriptTurnError(
+            message: "Rate limited", errorType: nil, statusCode: nil,
+            timestamp: Date(timeIntervalSince1970: 0)
+        ))
+        for malformed in [#""oops""#, "[]", "3", #"{"message":5}"#] {
+            let snapshot = try JSONDecoder().decode(
+                AgentActivitySnapshot.self,
+                from: Data("{\(base),\"lastTurnError\":\(malformed)}".utf8)
+            )
+            XCTAssertEqual(snapshot.idleGeneration, 3)
+            XCTAssertNil(snapshot.remoteLastError())
+        }
+    }
+
+    func testDisconnectedHeartbeatDoesNotReportItsFrozenFailure() throws {
+        let base = #""schemaVersion":1,"updatedAt":"2026-10-10T23:38:01Z","foregroundTurnActive":false,"#
+            + #""scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,"#
+            + #""lastIdleAborted":false,"lastTurnError":\#(trackerError)"#
+        for disconnect in ["Connection is closed.", "Connection is disposed."] {
+            let snapshot = try JSONDecoder().decode(
+                AgentActivitySnapshot.self,
+                from: Data("{\(base),\"error\":\"\(disconnect)\"}".utf8)
+            )
+            XCTAssertTrue(snapshot.reportsTerminalDisconnect)
+            XCTAssertNil(snapshot.remoteLastError())
+        }
+        let transient = try JSONDecoder().decode(
+            AgentActivitySnapshot.self,
+            from: Data("{\(base),\"error\":\"rename failed\"}".utf8)
+        )
+        XCTAssertEqual(transient.remoteLastError()?.message, message)
     }
 
     @MainActor

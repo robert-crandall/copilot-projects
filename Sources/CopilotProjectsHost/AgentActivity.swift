@@ -75,12 +75,15 @@ struct AgentActivitySnapshot: Codable, Equatable {
     var workflow: RemoteSessionWorkflow? = nil
     var currentIntent: String? = nil
     /// The latest request's failure, published only while no request is
-    /// running. Strings and optionals throughout: one malformed field must not
-    /// fail the whole heartbeat decode.
+    /// running. Decoded leniently: one malformed field must not fail the whole
+    /// heartbeat decode.
     var lastTurnError: TrackedTurnError? = nil
 
     func remoteLastError() -> TranscriptTurnError? {
-        guard let lastTurnError,
+        // A disconnected tracker can't see newer requests the status hooks
+        // still report, so its last failure may be stale.
+        guard !reportsTerminalDisconnect,
+              let lastTurnError,
               let message = lastTurnError.message?.trimmingCharacters(in: .whitespacesAndNewlines),
               !message.isEmpty else { return nil }
         return TranscriptTurnError(
@@ -348,12 +351,28 @@ struct TrackedSubagent: Codable, Equatable, Identifiable {
     var model: String?
 }
 
-/// The heartbeat's `lastTurnError`, mirrored from the tracker.
+/// The heartbeat's `lastTurnError`, mirrored from the tracker. A mistyped
+/// field (or a non-object value) decodes as nil instead of rejecting the
+/// whole heartbeat.
 struct TrackedTurnError: Codable, Equatable {
     var message: String?
     var errorType: String?
     var statusCode: Int?
     var timestamp: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case message, errorType, statusCode, timestamp
+    }
+}
+
+extension TrackedTurnError {
+    init(from decoder: Decoder) throws {
+        let container = try? decoder.container(keyedBy: CodingKeys.self)
+        message = try? container?.decodeIfPresent(String.self, forKey: .message)
+        errorType = try? container?.decodeIfPresent(String.self, forKey: .errorType)
+        statusCode = try? container?.decodeIfPresent(Int.self, forKey: .statusCode)
+        timestamp = try? container?.decodeIfPresent(String.self, forKey: .timestamp)
+    }
 }
 
 /// The session's effective model, mirrored from the extension heartbeat.
