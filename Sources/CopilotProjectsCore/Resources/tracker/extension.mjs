@@ -3580,7 +3580,11 @@ if (validSessionId && socketPath) {
         if (disableCurrentIdentity) {
             durableDisabledIdentity = durableHistoryIdentity;
         }
-        if (!durableBaselineComplete) {
+        // Roll back only a replay this tracker started (resetDurableCursor
+        // cleared the transcript and set the identity) that never completed
+        // its baseline. Without one, the live transcript is already the
+        // best state we have, and restoring the fallback would discard it.
+        if (durableHistoryIdentity !== null && !durableBaselineComplete) {
             resetTranscriptReplayState(
                 durableFallbackTurns,
                 durableFallbackModel,

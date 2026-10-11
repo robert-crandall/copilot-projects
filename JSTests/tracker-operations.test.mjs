@@ -1227,6 +1227,158 @@ test("losing durable authority before its baseline keeps the restored dropped-tu
   assert.deepEqual(published.droppedTurns, dropped);
 });
 
+function snapshotTurn(id, offset) {
+  return {
+    id,
+    startedAt: new Date(1_700_000_000_000 + offset).toISOString(),
+    endedAt: new Date(1_700_000_000_500 + offset).toISOString(),
+    kind: "foreground",
+    userContent: id,
+    assistantMessages: [],
+    tools: [],
+    isAborted: false,
+  };
+}
+
+function writeRestoredTranscript(runtime, turns, droppedTurns) {
+  realWriteFileSync(transcriptFile(runtime), JSON.stringify({
+    schemaVersion: 3,
+    updatedAt: new Date(1_700_000_010_000).toISOString(),
+    copilotSessionId: runtime.copilotSessionId,
+    turns,
+    droppedTurns,
+  }));
+}
+
+function durableJournal(runtime) {
+  return join(runtime.root, "copilot-home", "session-state", runtime.copilotSessionId, "events.jsonl");
+}
+
+// `createRuntime` restores COPILOT_HOME once startup returns; the 5s poll
+// must keep resolving this runtime's journal, never the developer's.
+function pinCopilotHome(t, runtime) {
+  const savedEnvironment = saveEnvironment(["COPILOT_HOME"]);
+  process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+  t.after(() => restoreEnvironment(savedEnvironment));
+}
+
+// Runs 5s polls that find no durable journal around live turns: one that
+// completes between polls and one still streaming while a poll runs. Losing
+// durable authority does not publish, so a final live turn forces the
+// transcript out before anything is asserted.
+async function liveTurnsAcrossMissingJournalPolls(runtime, earlierTurnIds) {
+  const poll = async () => {
+    runtime.intervalCallback();
+    // The poll reconciles on a zero-delay timer.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+  await poll();
+  await runtime.session.emit("user.message", { content: "live 1" }, { id: "live-1" });
+  await runtime.session.emit("assistant.turn_start");
+  await runtime.session.emit("assistant.message", { messageId: "reply-1", content: "done 1" });
+  await runtime.session.emit("session.idle", { aborted: false });
+  await poll();
+  await runtime.session.emit("user.message", { content: "live 2" }, { id: "live-2" });
+  await runtime.session.emit("assistant.turn_start");
+  await runtime.session.emit("assistant.message_delta", { messageId: "reply-2", deltaContent: "partial" });
+  await poll();
+  await runtime.session.emit("assistant.message", { messageId: "reply-2", content: "done 2" });
+  await runtime.session.emit("session.idle", { aborted: false });
+  await poll();
+  await runtime.session.emit("user.message", { content: "live 3" }, { id: "live-3" });
+  await runtime.session.emit("session.idle", { aborted: false });
+  const published = await waitFor(() => {
+    const value = readTranscript(runtime);
+    return value?.turns.at(-1)?.id === "live-3" && value.turns.at(-1).endedAt && value;
+  }, "final live turn missing");
+  assert.deepEqual(
+    published.turns.map((turn) => turn.id),
+    [...earlierTurnIds, "live-1", "live-2", "live-3"]
+  );
+  const replies = (id) => published.turns.find((turn) => turn.id === id).assistantMessages
+    .map((message) => message.content);
+  assert.deepEqual(replies("live-1"), ["done 1"]);
+  assert.deepEqual(replies("live-2"), ["done 2"]);
+  return published;
+}
+
+test("polls without a durable journal keep SDK history, its model, and live turns", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.history = [
+      { id: "model", type: "session.model_change", timestamp: new Date(1_699_999_999_000).toISOString(),
+        data: { newModel: "fixture-model", reasoningEffort: "high" } },
+      ...humanHistory("history", ["history 0", "history 1"]),
+    ];
+  });
+  pinCopilotHome(t, runtime);
+  await waitFor(() => readTranscript(runtime)?.turns.length === 2, "SDK history missing");
+
+  await liveTurnsAcrossMissingJournalPolls(runtime, ["history-0", "history-1"]);
+  assert.deepEqual(readSnapshot(runtime).model, { name: "fixture-model", reasoningEffort: "high" });
+});
+
+test("polls without a durable journal keep a restored transcript and its dropped turns", {
+  concurrency: false,
+}, async (t) => {
+  const dropped = [snapshotTurn("evicted-1", 0), snapshotTurn("evicted-2", 1_000)];
+  const runtime = await createRuntime(t, (session, runtime) => {
+    session.getEvents = async () => { throw new Error("history unavailable"); };
+    writeRestoredTranscript(runtime, [snapshotTurn("kept-1", 5_000), snapshotTurn("kept-2", 6_000)], dropped);
+  });
+  pinCopilotHome(t, runtime);
+  await waitFor(() => readTranscript(runtime)?.ownerPid === process.pid, "restored transcript not republished");
+
+  const published = await liveTurnsAcrossMissingJournalPolls(runtime, ["kept-1", "kept-2"]);
+  assert.deepEqual(published.droppedTurns, dropped);
+});
+
+test("polls after a completed durable baseline loses its journal keep later live turns", {
+  concurrency: false,
+}, async (t) => {
+  const event = (id, type, data) => ({ id, type, timestamp: new Date().toISOString(), data });
+  const runtime = await createRuntime(t, (session, runtime) => {
+    const journal = durableJournal(runtime);
+    realMkdirSync(join(journal, ".."), { recursive: true });
+    realWriteFileSync(journal, [
+      event("durable", "user.message", { content: "durable task" }),
+      event("durable-reply", "assistant.message", { messageId: "durable-reply", content: "durable result" }),
+      event("durable-idle", "session.idle", {}),
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  });
+  pinCopilotHome(t, runtime);
+  await waitFor(() => runtime.durableReadsFinished > 0
+    && readTranscript(runtime)?.turns.at(-1)?.id === "durable"
+    && readTranscript(runtime).turns.at(-1).endedAt, "durable baseline missing");
+
+  realRmSync(durableJournal(runtime), { force: true });
+  await liveTurnsAcrossMissingJournalPolls(runtime, ["durable"]);
+});
+
+test("polls after an incomplete durable replay rolls back keep later live turns", {
+  concurrency: false,
+}, async (t) => {
+  const dropped = [snapshotTurn("evicted-1", 0), snapshotTurn("evicted-2", 1_000)];
+  const runtime = await createRuntime(t, (session, runtime) => {
+    writeRestoredTranscript(runtime, [snapshotTurn("kept-1", 5_000), snapshotTurn("kept-2", 6_000)], dropped);
+    const journal = durableJournal(runtime);
+    realMkdirSync(join(journal, ".."), { recursive: true });
+    realWriteFileSync(journal, `${JSON.stringify({
+      id: uuid(), type: "session.info", timestamp: new Date().toISOString(), data: {},
+    })}\n`);
+    // The first replay fails mid-read; startup's follow-up reconcile then
+    // loses authority and rolls back to the restored state.
+    runtime.beforeDurableRead = (path) => realRmSync(path, { force: true });
+  });
+  pinCopilotHome(t, runtime);
+  await waitFor(() => runtime.durableReadsFinished > 0, "durable replay never started");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const published = await liveTurnsAcrossMissingJournalPolls(runtime, ["kept-1", "kept-2"]);
+  assert.deepEqual(published.droppedTurns, dropped);
+});
+
 test("an unknown native send outcome upgrades when its exact late SDK reply arrives", {
   concurrency: false,
 }, async (t) => {
