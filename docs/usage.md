@@ -64,7 +64,9 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   local adversarial-review prompt in the current project.
 - **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
   labeled symbol counts appear in the project column; a blue dot on the session row marks work that finished
-  while you were away. With the Copilot CLI hooks installed (below), this is driven automatically.
+  while you were away, and a red exclamation with **Request failed** marks a session whose latest
+  request ended in a Copilot error (hover it for the CLI's message). The failure clears when the
+  next request starts. With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Completed-turn drawer:** Copilot CLI remains the native interactive terminal, while a
   collapsible drawer overlays its right edge with independently scrollable completed turns
   rendered as Markdown. Live work, permissions, shortcuts, and input stay entirely in the CLI.
@@ -536,7 +538,10 @@ terminal views.
 
 The companion Copilot extension records completed root turns through the supported Copilot SDK
 event API. It atomically writes a bounded per-tab transcript snapshot after each turn, including
-stopped turns and compact tool summaries but excluding raw tool arguments and results. Copilot
+stopped turns, failed requests with the CLI's error message, and compact tool summaries but
+excluding raw tool arguments and results. A failure the agent recovers from on its own (a retry,
+or a background agent restarting work) is cleared; model-catalog and other background notices
+are not shown. Copilot
 Projects renders that snapshot in the drawer without parsing private CLI session files or
 changing the terminal's PTY size. The host API supports full or bounded transcript windows
 for optional integrations; image association always precedes windowing. A client can also send

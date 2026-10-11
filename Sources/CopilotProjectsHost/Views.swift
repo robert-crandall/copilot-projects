@@ -367,8 +367,9 @@ struct ProjectRow: View {
 }
 
 /// The indicator at the left of a session tab. A spinner means the agent is busy
-/// (running); orange means it's waiting on your input; blue means it has finished
-/// and you haven't viewed it yet ("ready for interaction"); idle shows nothing.
+/// (running); orange means it's waiting on your input; a red exclamation means
+/// its latest request failed; blue means it has finished and you haven't viewed
+/// it yet ("ready for interaction"); idle shows nothing.
 /// The 9pt frame keeps the slot a constant size whether or not a dot is shown.
 /// SessionRow suppresses its separate unread dot while this indicator is blue.
 struct SessionStateIndicator: View {
@@ -389,6 +390,11 @@ struct SessionStateIndicator: View {
                 Circle()
                     .fill(color)
                     .overlay(Circle().stroke(.black.opacity(0.15), lineWidth: 0.5))
+            case .failed:
+                Image(systemName: "exclamationmark.circle.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(.red)
             case .none:
                 Color.clear
             }
@@ -397,13 +403,15 @@ struct SessionStateIndicator: View {
         .help(help)
     }
 
-    private enum Kind { case busy, dot(Color), none }
+    private enum Kind { case busy, dot(Color), failed, none }
 
     private var kind: Kind {
         switch session.displayStatus {
         case .running: return .busy
         case .waiting: return .dot(.orange)
-        case .idle: return session.finishedUnseen ? .dot(.blue) : .none
+        case .idle:
+            if session.failedRequest != nil { return .failed }
+            return session.finishedUnseen ? .dot(.blue) : .none
         }
     }
 
@@ -411,7 +419,11 @@ struct SessionStateIndicator: View {
         switch session.displayStatus {
         case .running: return "running"
         case .waiting: return "waiting for input"
-        case .idle: return session.finishedUnseen ? "finished — ready for you" : "idle"
+        case .idle:
+            if let failure = session.failedRequest {
+                return "request failed — \(failure.message)"
+            }
+            return session.finishedUnseen ? "finished — ready for you" : "idle"
         }
     }
 }
@@ -752,8 +764,10 @@ struct SessionRow: View {
     @State private var isHovering = false
 
     var showsUnreadIndicator: Bool {
-        // Avoid duplicating the idle completion dot unless the tab-number hint hides it.
-        session.hasUnread && (showNumber || session.displayStatus != .idle || !session.finishedUnseen)
+        // Avoid duplicating the idle completion dot unless the tab-number hint
+        // or a failure indicator hides it.
+        session.hasUnread && (showNumber || session.displayStatus != .idle
+            || !session.finishedUnseen || session.failedRequest != nil)
     }
 
     var accessibilityStatus: String {

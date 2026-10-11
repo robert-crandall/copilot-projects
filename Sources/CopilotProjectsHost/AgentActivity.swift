@@ -74,6 +74,27 @@ struct AgentActivitySnapshot: Codable, Equatable {
     var sessionIdleAtMilliseconds: Int64? = nil
     var workflow: RemoteSessionWorkflow? = nil
     var currentIntent: String? = nil
+    /// The latest request's failure, published only while no request is
+    /// running. Decoded leniently: one malformed field must not fail the whole
+    /// heartbeat decode.
+    var lastTurnError: TrackedTurnError? = nil
+
+    func remoteLastError() -> TranscriptTurnError? {
+        // A disconnected tracker can't see newer requests the status hooks
+        // still report, so its last failure may be stale.
+        guard !reportsTerminalDisconnect,
+              let lastTurnError,
+              let message = lastTurnError.message?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !message.isEmpty else { return nil }
+        return TranscriptTurnError(
+            message: message,
+            errorType: lastTurnError.errorType,
+            statusCode: lastTurnError.statusCode,
+            // A fixed fallback keeps repeated projections equal.
+            timestamp: lastTurnError.timestamp.flatMap(AgentTimestamp.parse)
+                ?? Date(timeIntervalSince1970: 0)
+        )
+    }
 
     func remoteActivityText(expectedSessionId: String?, at now: Date) -> String? {
         guard let expectedSessionId, !expectedSessionId.isEmpty,
@@ -328,6 +349,30 @@ struct TrackedSubagent: Codable, Equatable, Identifiable {
     var name: String
     var description: String
     var model: String?
+}
+
+/// The heartbeat's `lastTurnError`, mirrored from the tracker. A mistyped
+/// field (or a non-object value) decodes as nil instead of rejecting the
+/// whole heartbeat.
+struct TrackedTurnError: Codable, Equatable {
+    var message: String?
+    var errorType: String?
+    var statusCode: Int?
+    var timestamp: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case message, errorType, statusCode, timestamp
+    }
+}
+
+extension TrackedTurnError {
+    init(from decoder: Decoder) throws {
+        let container = try? decoder.container(keyedBy: CodingKeys.self)
+        message = try? container?.decodeIfPresent(String.self, forKey: .message)
+        errorType = try? container?.decodeIfPresent(String.self, forKey: .errorType)
+        statusCode = try? container?.decodeIfPresent(Int.self, forKey: .statusCode)
+        timestamp = try? container?.decodeIfPresent(String.self, forKey: .timestamp)
+    }
 }
 
 /// The session's effective model, mirrored from the extension heartbeat.

@@ -14,7 +14,8 @@ final class NotificationSummaryTests: XCTestCase {
         kind: String = "foreground",
         content: String? = "Fixed **notification previews**. All done.",
         messageAt: TimeInterval = 3,
-        aborted: Bool = false
+        aborted: Bool = false,
+        error: TranscriptTurnError? = nil
     ) -> TranscriptTurn {
         TranscriptTurn(
             id: id,
@@ -28,7 +29,8 @@ final class NotificationSummaryTests: XCTestCase {
                 )]
             } ?? [],
             tools: [TranscriptTool(id: "tool", name: "bash", title: "Run tests", success: true)],
-            isAborted: aborted
+            isAborted: aborted,
+            error: error
         )
     }
 
@@ -237,6 +239,12 @@ final class NotificationSummaryTests: XCTestCase {
             turn(content: ""),
             turn(messageAt: 5),
             turn(aborted: true),
+            turn(error: TranscriptTurnError(
+                message: "Execution failed: 400 internal server error",
+                errorType: "query",
+                statusCode: 400,
+                timestamp: Date(timeIntervalSince1970: 3.5)
+            )),
         ] {
             XCTAssertNil(NotificationSummary.completion(
                 from: snapshot([turn(id: "older"), invalid]), context: context

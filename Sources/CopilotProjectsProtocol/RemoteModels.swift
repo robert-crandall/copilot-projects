@@ -95,6 +95,9 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
     public let operationSupport: RemoteOperationSupport?
     public let operationReceipts: [RemoteOperationReceipt]?
     public let workflow: RemoteSessionWorkflow?
+    /// The session's latest request failed and nothing has started since.
+    /// Present only while the session is idle; omitted by older hosts.
+    public let lastError: TranscriptTurnError?
 
     public init(
         id: String,
@@ -113,7 +116,8 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         conversationEpoch: String? = nil,
         operationSupport: RemoteOperationSupport? = nil,
         operationReceipts: [RemoteOperationReceipt]? = nil,
-        workflow: RemoteSessionWorkflow? = nil
+        workflow: RemoteSessionWorkflow? = nil,
+        lastError: TranscriptTurnError? = nil
     ) {
         self.id = id
         self.title = title
@@ -132,6 +136,7 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         self.operationSupport = operationSupport
         self.operationReceipts = operationReceipts
         self.workflow = workflow
+        self.lastError = lastError
     }
 }
 

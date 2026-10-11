@@ -174,6 +174,14 @@ private struct TranscriptTurnCard: View {
                         .padding(.vertical, 2)
                         .background(Capsule().fill(.orange.opacity(0.12)))
                 }
+                if turn.error != nil {
+                    Text("Failed")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.red)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(.red.opacity(0.12)))
+                }
                 Spacer()
                 Text(turn.startedAt, style: .time)
                     .font(.caption2)
@@ -216,6 +224,9 @@ private struct TranscriptTurnCard: View {
                     )
                 }
             }
+            if let error = turn.error {
+                TranscriptTurnFailure(error: error)
+            }
         }
         .padding(.vertical, 12)
         .overlay(alignment: .bottom) { Divider() }
@@ -225,6 +236,30 @@ private struct TranscriptTurnCard: View {
         MarkdownText(text: text)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The CLI's own failure text, kept selectable so its request ID can be copied.
+private struct TranscriptTurnFailure: View {
+    let error: TranscriptTurnError
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Request failed")
+                    .font(.callout.weight(.semibold))
+                Text(error.message)
+                    .font(.callout)
+                    .foregroundStyle(StudioStyle.secondaryText)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }
 

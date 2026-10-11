@@ -224,6 +224,19 @@ if (validSessionId && socketPath) {
     const queuedTranscriptEvents = [];
     let pendingTranscriptTurn = null;
     let transcriptAssistantTurnActive = false;
+    // `session.idle` is ephemeral, so durable replay cannot tell a failure
+    // inside a request from one after it ended. Live delivery records which
+    // it was for each root `session.error`, keyed by event id. `null` until a
+    // request start or idle is seen live: a tracker can start mid-request.
+    let liveRequestOpen = null;
+    // Durable replay: a prompt hook ran and no request activity followed, so
+    // a failure here happened before the request was sent.
+    let transcriptPromptPhase = false;
+    const liveTranscriptErrorScopes = new Map();
+    // Root turn starts seen live after an idle: a new request with no
+    // classified `user.message` (a remote command, a notification wake).
+    // Replay ends the previous request there, as the unpersisted idle did.
+    const liveRequestOpeners = new Set();
     let latestResumeTranscriptTurnId = null;
     let synthesizedTaskCompletionContent = null;
     let transcriptInitialized = false;
@@ -291,6 +304,30 @@ if (validSessionId && socketPath) {
     const MAX_TRANSCRIPT_ASSISTANT_MESSAGES = 250;
     const MAX_TRANSCRIPT_TOOLS = 400;
     const MAX_TRANSCRIPT_EVENT_IDS = 50_000;
+    const MAX_TRANSCRIPT_ERROR_TEXT = 2_000;
+    const MAX_LIVE_ERROR_SCOPES = 256;
+    // `session.error` categories that fail a request. Others (model catalog,
+    // attribution labels, IDE connection, logged notices) are background
+    // diagnostics, and `model_call` errors are retried by the runtime.
+    const REQUEST_FAILURE_ERROR_TYPES = new Set([
+        "query", "authentication", "authorization", "rate_limit",
+        "context_limit", "quota", "session_limits", "execution",
+    ]);
+    // Raised by the runtime's run-error planner. The CLI also logs
+    // `execution` and `authentication` for terminal shell commands, user
+    // switching, and pre-send gates.
+    const MODEL_RUN_ERROR_TYPES = new Set([
+        "query", "authorization", "rate_limit", "context_limit", "quota",
+        "session_limits",
+    ]);
+    // The one hook that runs before a prompt's `user.message` and reports
+    // its own failure as a `session.error`.
+    const PROMPT_HOOK_TYPES = new Set(["userPromptTransformed"]);
+    const REQUEST_ACTIVITY_EVENT_TYPES = new Set([
+        "user.message", "system.notification", "assistant.turn_start",
+        "assistant.turn_end", "assistant.message", "tool.execution_start",
+        "tool.execution_complete",
+    ]);
     const MAX_DURABLE_EVENT_BYTES = 4 * 1_024 * 1_024;
     const HISTORY_REPLAY_TIMEOUT_MS = 5_000;
     const PENDING_QUESTIONS_TIMEOUT_MS = 2_000;
@@ -1799,6 +1836,7 @@ if (validSessionId && socketPath) {
             terminalDisconnectError = String(error);
         }
         const reportedError = error ? String(error) : terminalDisconnectError;
+        const lastTurnError = latestTranscriptError();
         const snapshot = {
             schemaVersion: 1,
             updatedAt: new Date().toISOString(),
@@ -1828,6 +1866,7 @@ if (validSessionId && socketPath) {
             operationReceiptVersion: OPERATION_RECEIPT_VERSION,
             operationReceipts: operationReceiptSnapshot(),
             workflow: workflowSnapshot(),
+            ...(lastTurnError ? { lastTurnError } : {}),
             ...(reportedError ? { error: reportedError } : {}),
         };
         const temporaryPath = `${snapshotPath}.${process.pid}.tmp`;
@@ -2798,15 +2837,12 @@ if (validSessionId && socketPath) {
     }
 
     function trimTranscriptTurns(maximumTurns = MAX_TRANSCRIPT_TURNS) {
-        // Keep the transcript bounded. Drop the oldest non-foreground turn
-        // first, except for the latest resume marker; if only foreground
-        // conversation plus that marker remain, sacrifice the oldest
-        // foreground turn so the restart boundary is visible.
+        // Keep the transcript bounded. Drop the oldest disposable turn
+        // first; if only foreground conversation, failures, and the resume
+        // marker remain, sacrifice the oldest of those so the restart
+        // boundary is visible.
         while (transcriptTurns.length > maximumTurns) {
-            let index = transcriptTurns.findIndex(
-                (turn) => turn.kind !== "foreground"
-                    && turn.id !== latestResumeTranscriptTurnId
-            );
+            let index = transcriptTurns.findIndex(isDisposableTranscriptTurn);
             if (index === -1) {
                 index = transcriptTurns.findIndex(
                     (turn) => turn.id !== latestResumeTranscriptTurnId
@@ -2851,12 +2887,22 @@ if (validSessionId && socketPath) {
         recentlyDroppedTurnBytes = 0;
     }
 
+    // Scheduled and automated turns go first when the transcript must
+    // shrink, except the latest resume marker and failed requests, which are
+    // kept like human conversation so a failure stays visible.
+    function isDisposableTranscriptTurn(turn) {
+        return turn.kind !== "foreground"
+            && !turn.error
+            && turn.id !== latestResumeTranscriptTurnId;
+    }
+
     function serializedPendingTurn() {
         const turn = pendingTranscriptTurn;
         if (!turn) return null;
         if (!turn.userContent
                 && turn.assistantMessages.length === 0
-                && turn.tools.length === 0) return null;
+                && turn.tools.length === 0
+                && !turn.error) return null;
         const assistantMessages = turn.assistantMessages.slice();
         for (const stream of liveMessageStreams.values()) {
             if (stream.turnId === turn.id && stream.content.trim().length > 0
@@ -2874,6 +2920,7 @@ if (validSessionId && socketPath) {
             assistantMessages,
             tools: turn.tools,
             isAborted: false,
+            ...(turn.error ? { error: turn.error } : {}),
         };
     }
 
@@ -3029,20 +3076,14 @@ if (validSessionId && socketPath) {
 
         // Phase 1: drop whole non-foreground stored turns (oldest first).
         while (overBudget()) {
-            const index = droppableStoredIndex(
-                (turn) => turn.kind !== "foreground"
-                    && turn.id !== latestResumeTranscriptTurnId
-            );
+            const index = droppableStoredIndex(isDisposableTranscriptTurn);
             if (index === -1) break;
             dropStoredTurn(index);
         }
         // Phase 2: shed payload from any remaining non-foreground turn (i.e. an
         // in-progress scheduled/automated turn) before touching foreground.
         while (overBudget()) {
-            if (!shedOldestPayload(
-                (turn) => turn.kind !== "foreground"
-                    && turn.id !== latestResumeTranscriptTurnId
-            )) break;
+            if (!shedOldestPayload(isDisposableTranscriptTurn)) break;
         }
         // Phase 3: drop whole foreground stored turns (oldest), never pending,
         // leaving at least one turn for payload shedding below.
@@ -3170,7 +3211,8 @@ if (validSessionId && socketPath) {
         turn.endedAt = end;
         if (!turn.userContent
                 && turn.assistantMessages.length === 0
-                && turn.tools.length === 0) return;
+                && turn.tools.length === 0
+                && !turn.error) return;
         transcriptTurns.push(turn);
         trimTranscriptTurns();
     }
@@ -3280,6 +3322,124 @@ if (validSessionId && socketPath) {
         transcriptEventIds.clear();
     }
 
+    function transcriptErrorFromEvent(event) {
+        const data = event?.data;
+        if (event?.ephemeral === true || !data || typeof data !== "object") {
+            return null;
+        }
+        if (!REQUEST_FAILURE_ERROR_TYPES.has(data.errorType)) return null;
+        const message = typeof data.message === "string"
+            ? truncatedText(data.message.trim(), MAX_TRANSCRIPT_ERROR_TEXT)
+            : "";
+        if (message.length === 0) return null;
+        const error = {
+            message,
+            errorType: data.errorType,
+            timestamp: normalizedTimestamp(event.timestamp),
+        };
+        if (Number.isSafeInteger(data.statusCode)
+                && data.statusCode >= 100 && data.statusCode <= 599) {
+            error.statusCode = data.statusCode;
+        }
+        return error;
+    }
+
+    function isModelRunFailure(error) {
+        return MODEL_RUN_ERROR_TYPES.has(error.errorType)
+            || (error.errorType === "authentication"
+                && error.statusCode !== undefined);
+    }
+
+    // Mission Control echoes each remote prompt as a `user.message` with a
+    // `command-…` source. It is not shown as a turn, but it starts a request.
+    function isRemoteCommandMessage(event) {
+        return typeof event.data?.source === "string"
+            && event.data.source.startsWith("command-");
+    }
+
+    function observeLiveRequestScope(event) {
+        if (event.agentId) return;
+        if (event.type === "session.error") {
+            if (typeof event.id !== "string" || event.id.length === 0) return;
+            liveTranscriptErrorScopes.set(event.id, liveRequestOpen);
+            while (liveTranscriptErrorScopes.size > MAX_LIVE_ERROR_SCOPES) {
+                liveTranscriptErrorScopes.delete(
+                    liveTranscriptErrorScopes.keys().next().value
+                );
+            }
+        } else if (event.type === "assistant.turn_start"
+                || (event.type === "user.message"
+                    && (classifyUserMessage(event) || isRemoteCommandMessage(event)))) {
+            // Only after an idle seen live is a bare turn start a new request.
+            if (liveRequestOpen === false && event.type === "assistant.turn_start"
+                    && typeof event.id === "string" && event.id.length > 0) {
+                liveRequestOpeners.add(event.id);
+                while (liveRequestOpeners.size > MAX_LIVE_ERROR_SCOPES) {
+                    liveRequestOpeners.delete(liveRequestOpeners.values().next().value);
+                }
+            }
+            liveRequestOpen = true;
+        } else if (event.type === "session.idle" || event.type === "session.shutdown") {
+            liveRequestOpen = false;
+        }
+    }
+
+    // The agent kept working after a failure (a retry, or a background agent
+    // restarting the loop), so the request did not end there.
+    function clearRecoveredTranscriptError() {
+        if (pendingTranscriptTurn) delete pendingTranscriptTurn.error;
+    }
+
+    function recordTranscriptError(event, error) {
+        // A failure right after a prompt hook happened before that prompt was
+        // sent, even when it was queued behind a request still running.
+        // Otherwise the live boundary decides; replay without it (a restarted
+        // tracker) treats a running loop, an unanswered request, or a
+        // model-run failure as part of the open request. Pre-send and
+        // terminal failures are their own entries, so a successful answer is
+        // never marked failed.
+        const unanswered = pendingTranscriptTurn !== null
+            && pendingTranscriptTurn.assistantMessages.length === 0
+            && pendingTranscriptTurn.tools.length === 0;
+        const inRequest = !transcriptPromptPhase
+            && (liveTranscriptErrorScopes.get(event.id)
+                ?? (transcriptAssistantTurnActive || unanswered
+                    || isModelRunFailure(error)));
+        if (inRequest) {
+            // A failure before `user.message` (a prompt hook, say) has no
+            // turn yet; it still gets one so the failure is visible.
+            ensureSyntheticTranscriptTurn(event);
+            pendingTranscriptTurn.error = error;
+            return;
+        }
+        // Outside a request the failure is its own entry. Durable replay
+        // keeps the previous request open (its idle is never persisted), and
+        // that answer must not be marked failed.
+        finishTranscriptTurn(false, event.timestamp);
+        startTranscriptTurn(event, "automated");
+        pendingTranscriptTurn.error = error;
+        finishTranscriptTurn(false, event.timestamp);
+    }
+
+    function latestTranscriptError() {
+        // The named turn handlers set these before they publish, so a new
+        // request hides the old failure even while durable replay catches up.
+        // Background agents keep the request open after the main loop idles,
+        // and they can still restart it.
+        // Attached shells can keep it open with no subagent; a request seen
+        // starting live stays open until its idle.
+        if (foregroundTurnActive || scheduledTurnActive || activeSubagents.size > 0
+                || liveRequestOpen === true) {
+            return null;
+        }
+        if (pendingTranscriptTurn) return pendingTranscriptTurn.error ?? null;
+        // A resume notice is not a request; the one before it is the latest.
+        const latest = transcriptTurns.findLast(
+            (turn) => !turn.id?.startsWith?.(RESUME_TRANSCRIPT_TURN_PREFIX)
+        );
+        return latest?.error ?? null;
+    }
+
     function resetTranscriptReplayState(turns, model, droppedTurns = []) {
         transcriptTurns.length = 0;
         transcriptTurns.push(...turns);
@@ -3287,6 +3447,7 @@ if (validSessionId && socketPath) {
         rememberDroppedTurns(droppedTurns);
         resetPendingTranscriptTurn();
         transcriptAssistantTurnActive = false;
+        transcriptPromptPhase = false;
         latestResumeTranscriptTurnId = null;
         currentModel = model;
         clearTranscriptEventIds();
@@ -3295,6 +3456,12 @@ if (validSessionId && socketPath) {
     function processTranscriptEvent(event, live) {
         if (event.agentId) return;
         if (!rememberTranscriptEvent(event)) return;
+        if (event.type === "hook.start"
+                && PROMPT_HOOK_TYPES.has(event.data?.hookType)) {
+            transcriptPromptPhase = true;
+        } else if (REQUEST_ACTIVITY_EVENT_TYPES.has(event.type)) {
+            transcriptPromptPhase = false;
+        }
 
         switch (event.type) {
         case "user.message": {
@@ -3304,17 +3471,25 @@ if (validSessionId && socketPath) {
                 finishTranscriptTurn(false, event.timestamp);
                 startTranscriptTurn(event, kind);
                 if (live) publishTranscript();
+            } else if (isRemoteCommandMessage(event)) {
+                finishTranscriptTurn(false, event.timestamp);
+                if (live) publishTranscript();
             }
             // Injected context (skill/system) is not its own turn; the work
             // it triggers folds into the current human turn.
             break;
         }
         case "assistant.turn_start":
+            if (liveRequestOpeners.has(event.id)) {
+                finishTranscriptTurn(false, event.timestamp);
+            }
             transcriptAssistantTurnActive = true;
+            clearRecoveredTranscriptError();
             break;
         case "assistant.message":
             if (event.data.content) {
                 const content = boundedText(event.data.content);
+                if (content.trim().length > 0) clearRecoveredTranscriptError();
                 if (content === synthesizedTaskCompletionContent) {
                     synthesizedTaskCompletionContent = null;
                 } else {
@@ -3325,6 +3500,7 @@ if (validSessionId && socketPath) {
             break;
         case "tool.execution_start": {
             ensureSyntheticTranscriptTurn(event);
+            clearRecoveredTranscriptError();
             const toolId = boundedMetadataText(event.data.toolCallId);
             const existing = pendingTranscriptTurn.tools.find(
                 (tool) => tool.id === toolId
@@ -3425,6 +3601,16 @@ if (validSessionId && socketPath) {
             finishTranscriptTurn(event.data.aborted === true, event.timestamp);
             if (live) publishTranscript();
             break;
+        case "session.error": {
+            const error = transcriptErrorFromEvent(event);
+            if (!error) break;
+            recordTranscriptError(event, error);
+            if (live) {
+                publishTranscript();
+                publish();
+            }
+            break;
+        }
         }
     }
 
@@ -3470,6 +3656,7 @@ if (validSessionId && socketPath) {
                 && event.id === rotationConsumedEventId) {
             return;
         }
+        observeLiveRequestScope(event);
         observeWorkflowEvent(event);
         if (!transcriptInitialized) {
             queuedTranscriptEvents.push(event);
@@ -3955,6 +4142,9 @@ if (validSessionId && socketPath) {
         currentIntent = null;
         scheduledTurnActive = false;
         currentTurnKind = null;
+        liveRequestOpen = null;
+        liveTranscriptErrorScopes.clear();
+        liveRequestOpeners.clear();
         closeActivityIdleBaseline = idleGeneration;
         closeActivityState = "pending";
         closeActivityPendingSince = Date.now();
@@ -4492,6 +4682,8 @@ if (validSessionId && socketPath) {
         lastIdleTurnKind = currentTurnKind;
         currentTurnKind = null;
         foregroundTurnActive = false;
+        // Set here too: the generic listener may run after this publish.
+        liveRequestOpen = false;
         currentIntent = null;
         foregroundTransitionAt = transition;
         runtimeIdleAtMilliseconds = Date.parse(foregroundTransitionAt);

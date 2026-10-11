@@ -28,6 +28,8 @@ enum NotificationSummary {
               let turn = snapshot.turns.last,
               turn.kind == "foreground" || turn.kind == "automated",
               !turn.isAborted,
+              // A failed request's earlier progress is not its answer.
+              turn.error == nil,
               // ISO decoding and Unix-ms conversion can differ below millisecond precision.
               (turn.startedAt.timeIntervalSince1970 * 1_000).rounded() <
                   (context.completedAt.timeIntervalSince1970 * 1_000).rounded(),
