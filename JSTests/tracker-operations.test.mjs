@@ -1417,6 +1417,7 @@ test("durable replay attributes failures by the live request boundary", {
     realWriteFileSync(join(directory, "events.jsonl"), [
       event("done", "user.message", { content: "earlier" }, 0),
       event("done-answer", "assistant.message", { messageId: "a", content: "Earlier answer." }, 1),
+      // The reported shape: progress, a failed retry, then the error.
       event("failed", "user.message", { content: "record my voice" }, 2),
       event("failed-start", "assistant.turn_start", { turnId: "60" }, 3),
       event("failed-progress", "assistant.message", { messageId: "p", content: "Capturing playback." }, 4),
@@ -1424,10 +1425,27 @@ test("durable replay attributes failures by the live request boundary", {
       event("failed-retry", "assistant.turn_start", { turnId: "61" }, 6),
       event("failed-retry-end", "assistant.turn_end", { turnId: "61" }, 7),
       event("failed-error", "session.error", queryFailure, 8),
-      event("unanswered", "user.message", { content: "try again" }, 9),
-      event("unanswered-start", "assistant.turn_start", { turnId: "0" }, 10),
-      event("unanswered-end", "assistant.turn_end", { turnId: "0" }, 11),
-      event("unanswered-error", "session.error", { ...queryFailure, statusCode: 503 }, 12),
+      // A background agent restarts the loop before the request ends.
+      event("recovered", "user.message", { content: "fan out" }, 9),
+      event("recovered-progress", "assistant.message", { messageId: "r", content: "Waiting on agents." }, 10),
+      event("recovered-error", "session.error", { ...queryFailure, statusCode: 500 }, 11),
+      event("recovered-wake", "system.notification", { content: "Agent finished" }, 12),
+      event("recovered-start", "assistant.turn_start", { turnId: "1" }, 13),
+      event("recovered-answer", "assistant.message", { messageId: "s", content: "Completed." }, 14),
+      event("recovered-end", "assistant.turn_end", { turnId: "1" }, 14.5),
+      // A prompt hook fails before the next request is sent.
+      event("hook-start", "hook.start", { hookType: "userPromptTransformed" }, 15),
+      event("hook-end", "hook.end", { hookType: "userPromptTransformed", success: false }, 16),
+      event("hook-error", "session.error", { errorType: "query", message: "Prompt hook failed" }, 17),
+      // A request with no answer yet owns the failure that follows it.
+      event("unanswered", "user.message", { content: "try again" }, 18),
+      event("unanswered-start", "assistant.turn_start", { turnId: "0" }, 19),
+      event("unanswered-end", "assistant.turn_end", { turnId: "0" }, 20),
+      event("unanswered-error", "session.error", { ...queryFailure, statusCode: 503 }, 21),
+      // A Mission Control prompt starts a new request without a user turn.
+      event("remote", "user.message", { content: "remote", source: "command-1" }, 22),
+      event("remote-start", "assistant.turn_start", { turnId: "0" }, 23),
+      event("remote-answer", "assistant.message", { messageId: "m", content: "Remote reply." }, 24),
     ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
   });
   const home = process.env.COPILOT_HOME;
@@ -1438,27 +1456,27 @@ test("durable replay attributes failures by the live request boundary", {
   });
   await workflowReady(runtime);
 
-  // A restarted tracker never saw where the request ended, and the same log
-  // shape follows a pre-send hook failure. After an answer, the failure stays
-  // visible as its own entry without marking that answer failed.
-  const cold = await waitFor(
-    () => transcriptTurnsOf(runtime).find((turn) => turn.id === "failed-error"),
-    "cold replay did not show the failure", 4_000
-  );
-  assert.equal(cold.kind, "automated");
-  assert.equal(cold.error.statusCode, 400);
-  for (const id of ["done", "failed"]) {
-    assert.equal("error" in transcriptTurnsOf(runtime).find((turn) => turn.id === id), false, id);
+  // A restarted tracker never saw these requests live.
+  const turns = await waitFor(() => {
+    const current = transcriptTurnsOf(runtime);
+    return current.some((turn) => turn.assistantMessages.some((m) => m.content === "Remote reply."))
+      && current;
+  }, "cold replay did not finish", 4_000);
+  const byId = (id) => turns.find((turn) => turn.id === id);
+  assert.equal("error" in byId("done"), false);
+  assert.equal(byId("failed").error?.statusCode, 400);
+  assert.equal("error" in byId("recovered"), false, "a recovered failure must clear");
+  assert.equal(byId("hook-error")?.kind, "automated");
+  assert.equal(byId("hook-error").error.message, "Prompt hook failed");
+  assert.equal(byId("unanswered").error?.statusCode, 503);
+  const remote = turns.find((turn) => turn.assistantMessages.some((m) => m.content === "Remote reply."));
+  assert.notEqual(remote.id, "unanswered");
+  assert.equal("error" in remote, false);
+  for (const id of ["failed-error", "recovered-error", "unanswered-error"]) {
+    assert.equal(byId(id), undefined, id);
   }
-  // A request with no answer yet owns the failure that follows it.
-  const unanswered = await waitFor(
-    () => transcriptTurnsOf(runtime).find((turn) => turn.id === "unanswered")?.error,
-    "cold replay did not mark the unanswered request", 4_000
-  );
-  assert.equal(unanswered.statusCode, 503);
-  assert.equal(transcriptTurnsOf(runtime).some((turn) => turn.id === "unanswered-error"), false);
-  await waitFor(() => readSnapshot(runtime).lastTurnError?.statusCode === 503,
-    "the session did not report the replayed failure", 4_000);
+  await waitFor(() => readSnapshot(runtime).workflow, "the heartbeat did not settle", 4_000);
+  assert.equal(readSnapshot(runtime).lastTurnError, undefined);
 
   // Delivered live inside a request, the failure belongs to that request.
   const journal = join(runtime.root, "copilot-home", "session-state", runtime.copilotSessionId, "events.jsonl");
@@ -1573,6 +1591,55 @@ test("background agents keep a failure quiet until the request ends", {
   await runtime.session.emit("session.idle");
   await waitFor(() => readSnapshot(runtime).lastTurnError?.statusCode === 400,
     "the failure did not appear once the request ended");
+});
+
+test("a tracker started mid-request does not split it at the next turn start", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session, fixture) => {
+    const directory = join(fixture.root, "copilot-home", "session-state", fixture.copilotSessionId);
+    realMkdirSync(directory, { recursive: true });
+    realWriteFileSync(join(directory, "events.jsonl"), [
+      { id: "running", type: "user.message", data: { content: "long task" } },
+      { id: "running-start", type: "assistant.turn_start", data: { turnId: "0" } },
+      { id: "running-progress", type: "assistant.message", data: { messageId: "a", content: "Working." } },
+      { id: "running-end", type: "assistant.turn_end", data: { turnId: "0" } },
+    ].map((entry) => JSON.stringify({ ...entry, timestamp: new Date().toISOString() })).join("\n") + "\n");
+  });
+  const home = process.env.COPILOT_HOME;
+  process.env.COPILOT_HOME = join(runtime.root, "copilot-home");
+  t.after(() => {
+    if (home === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = home;
+  });
+  await workflowReady(runtime);
+  const journal = join(runtime.root, "copilot-home", "session-state", runtime.copilotSessionId, "events.jsonl");
+  for (const [type, data] of [
+    ["assistant.turn_start", { turnId: "1" }],
+    ["assistant.message", { messageId: "b", content: "Still the same request." }],
+  ]) {
+    fs.appendFileSync(journal, JSON.stringify(await runtime.session.emit(type, data)) + "\n");
+  }
+  const turn = await waitFor(() => transcriptTurnsOf(runtime).find((entry) =>
+    entry.assistantMessages.some((message) => message.content === "Still the same request.")),
+  "the continuation was not recorded", 4_000);
+  assert.equal(turn.id, "running");
+});
+
+test("an attached shell keeps a failure quiet until the request ends", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await runtime.session.emit("user.message", { content: "build in the background" });
+  await runtime.session.emit("assistant.turn_start", { turnId: "0" });
+  await runtime.session.emit("assistant.turn_end", { turnId: "0" });
+  await runtime.session.emit("session.error", queryFailure);
+  await runtime.session.emit("assistant.idle");
+  assert.equal(readSnapshot(runtime).foregroundTurnActive, false);
+  assert.equal(readSnapshot(runtime).lastTurnError, undefined);
+  await runtime.session.emit("session.idle");
+  assert.equal(readSnapshot(runtime).lastTurnError?.statusCode, 400,
+    "the idle publish must already see the request as ended");
 });
 
 test("a failure outlives the turn cap and a later resume notice", {

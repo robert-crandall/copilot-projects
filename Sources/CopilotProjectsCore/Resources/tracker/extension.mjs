@@ -226,8 +226,12 @@ if (validSessionId && socketPath) {
     let transcriptAssistantTurnActive = false;
     // `session.idle` is ephemeral, so durable replay cannot tell a failure
     // inside a request from one after it ended. Live delivery records which
-    // it was for each root `session.error`, keyed by event id.
-    let liveRequestOpen = false;
+    // it was for each root `session.error`, keyed by event id. `null` until a
+    // request start or idle is seen live: a tracker can start mid-request.
+    let liveRequestOpen = null;
+    // Durable replay: a prompt hook ran and no request activity followed, so
+    // a failure here happened before the request was sent.
+    let transcriptPromptPhase = false;
     const liveTranscriptErrorScopes = new Map();
     // Root turn starts seen live after an idle: a new request with no
     // classified `user.message` (a remote command, a notification wake).
@@ -308,6 +312,20 @@ if (validSessionId && socketPath) {
     const REQUEST_FAILURE_ERROR_TYPES = new Set([
         "query", "authentication", "authorization", "rate_limit",
         "context_limit", "quota", "session_limits", "execution",
+    ]);
+    // Raised by the runtime's run-error planner. The CLI also logs
+    // `execution` and `authentication` for terminal shell commands, user
+    // switching, and pre-send gates.
+    const MODEL_RUN_ERROR_TYPES = new Set([
+        "query", "authorization", "rate_limit", "context_limit", "quota",
+        "session_limits",
+    ]);
+    const PROMPT_HOOK_TYPES = new Set([
+        "sessionStart", "userPromptSubmitted", "userPromptTransformed",
+    ]);
+    const REQUEST_ACTIVITY_EVENT_TYPES = new Set([
+        "user.message", "assistant.turn_start", "assistant.turn_end",
+        "assistant.message", "tool.execution_start", "tool.execution_complete",
     ]);
     const MAX_DURABLE_EVENT_BYTES = 4 * 1_024 * 1_024;
     const HISTORY_REPLAY_TIMEOUT_MS = 5_000;
@@ -3325,6 +3343,19 @@ if (validSessionId && socketPath) {
         return error;
     }
 
+    function isModelRunFailure(error) {
+        return MODEL_RUN_ERROR_TYPES.has(error.errorType)
+            || (error.errorType === "authentication"
+                && error.statusCode !== undefined);
+    }
+
+    // Mission Control echoes each remote prompt as a `user.message` with a
+    // `command-…` source. It is not shown as a turn, but it starts a request.
+    function isRemoteCommandMessage(event) {
+        return typeof event.data?.source === "string"
+            && event.data.source.startsWith("command-");
+    }
+
     function observeLiveRequestScope(event) {
         if (event.agentId) return;
         if (event.type === "session.error") {
@@ -3336,8 +3367,10 @@ if (validSessionId && socketPath) {
                 );
             }
         } else if (event.type === "assistant.turn_start"
-                || (event.type === "user.message" && classifyUserMessage(event))) {
-            if (!liveRequestOpen && event.type === "assistant.turn_start"
+                || (event.type === "user.message"
+                    && (classifyUserMessage(event) || isRemoteCommandMessage(event)))) {
+            // Only after an idle seen live is a bare turn start a new request.
+            if (liveRequestOpen === false && event.type === "assistant.turn_start"
                     && typeof event.id === "string" && event.id.length > 0) {
                 liveRequestOpeners.add(event.id);
                 while (liveRequestOpeners.size > MAX_LIVE_ERROR_SCOPES) {
@@ -3357,16 +3390,18 @@ if (validSessionId && socketPath) {
     }
 
     function recordTranscriptError(event, error) {
-        // Replay without the live boundary (a restarted tracker) cannot tell
-        // a failed request from a later pre-send failure such as a prompt
-        // hook. It is unambiguous only while the agent loop is running or
-        // the open turn has no answer yet; anything else is its own entry,
-        // so a successful answer is never marked failed.
+        // Replay without the live boundary (a restarted tracker) relies on
+        // the log. A failure right after a prompt hook happened before the
+        // next request was sent; otherwise a running loop, an unanswered
+        // request, or a model-run failure belongs to the open request.
+        // Pre-send and terminal failures are their own entries, so a
+        // successful answer is never marked failed.
         const unanswered = pendingTranscriptTurn !== null
             && pendingTranscriptTurn.assistantMessages.length === 0
             && pendingTranscriptTurn.tools.length === 0;
         const inRequest = liveTranscriptErrorScopes.get(event.id)
-            ?? (transcriptAssistantTurnActive || unanswered);
+            ?? (!transcriptPromptPhase && (transcriptAssistantTurnActive
+                || unanswered || isModelRunFailure(error)));
         if (inRequest) {
             // A failure before `user.message` (a prompt hook, say) has no
             // turn yet; it still gets one so the failure is visible.
@@ -3388,7 +3423,10 @@ if (validSessionId && socketPath) {
         // request hides the old failure even while durable replay catches up.
         // Background agents keep the request open after the main loop idles,
         // and they can still restart it.
-        if (foregroundTurnActive || scheduledTurnActive || activeSubagents.size > 0) {
+        // Attached shells can keep it open with no subagent; a request seen
+        // starting live stays open until its idle.
+        if (foregroundTurnActive || scheduledTurnActive || activeSubagents.size > 0
+                || liveRequestOpen === true) {
             return null;
         }
         if (pendingTranscriptTurn) return pendingTranscriptTurn.error ?? null;
@@ -3406,6 +3444,7 @@ if (validSessionId && socketPath) {
         rememberDroppedTurns(droppedTurns);
         resetPendingTranscriptTurn();
         transcriptAssistantTurnActive = false;
+        transcriptPromptPhase = false;
         latestResumeTranscriptTurnId = null;
         currentModel = model;
         clearTranscriptEventIds();
@@ -3414,6 +3453,12 @@ if (validSessionId && socketPath) {
     function processTranscriptEvent(event, live) {
         if (event.agentId) return;
         if (!rememberTranscriptEvent(event)) return;
+        if (event.type === "hook.start"
+                && PROMPT_HOOK_TYPES.has(event.data?.hookType)) {
+            transcriptPromptPhase = true;
+        } else if (REQUEST_ACTIVITY_EVENT_TYPES.has(event.type)) {
+            transcriptPromptPhase = false;
+        }
 
         switch (event.type) {
         case "user.message": {
@@ -3422,6 +3467,9 @@ if (validSessionId && socketPath) {
                 latestResumeTranscriptTurnId = null;
                 finishTranscriptTurn(false, event.timestamp);
                 startTranscriptTurn(event, kind);
+                if (live) publishTranscript();
+            } else if (isRemoteCommandMessage(event)) {
+                finishTranscriptTurn(false, event.timestamp);
                 if (live) publishTranscript();
             }
             // Injected context (skill/system) is not its own turn; the work
@@ -4087,7 +4135,7 @@ if (validSessionId && socketPath) {
         currentIntent = null;
         scheduledTurnActive = false;
         currentTurnKind = null;
-        liveRequestOpen = false;
+        liveRequestOpen = null;
         liveTranscriptErrorScopes.clear();
         liveRequestOpeners.clear();
         closeActivityIdleBaseline = idleGeneration;
@@ -4627,6 +4675,8 @@ if (validSessionId && socketPath) {
         lastIdleTurnKind = currentTurnKind;
         currentTurnKind = null;
         foregroundTurnActive = false;
+        // Set here too: the generic listener may run after this publish.
+        liveRequestOpen = false;
         currentIntent = null;
         foregroundTransitionAt = transition;
         runtimeIdleAtMilliseconds = Date.parse(foregroundTransitionAt);
