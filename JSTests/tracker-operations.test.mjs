@@ -1338,22 +1338,32 @@ test("polls after a completed durable baseline loses its journal keep later live
   concurrency: false,
 }, async (t) => {
   const event = (id, type, data) => ({ id, type, timestamp: new Date().toISOString(), data });
+  const durableTurn = (id) => [
+    event(id, "user.message", { content: `${id} task` }),
+    event(`${id}-reply`, "assistant.message", { messageId: `${id}-reply`, content: `${id} result` }),
+    event(`${id}-idle`, "session.idle", {}),
+  ].map((entry) => `${JSON.stringify(entry)}\n`).join("");
   const runtime = await createRuntime(t, (session, runtime) => {
     const journal = durableJournal(runtime);
     realMkdirSync(join(journal, ".."), { recursive: true });
-    realWriteFileSync(journal, [
-      event("durable", "user.message", { content: "durable task" }),
-      event("durable-reply", "assistant.message", { messageId: "durable-reply", content: "durable result" }),
-      event("durable-idle", "session.idle", {}),
-    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    realWriteFileSync(journal, durableTurn("durable"));
   });
   pinCopilotHome(t, runtime);
   await waitFor(() => runtime.durableReadsFinished > 0
     && readTranscript(runtime)?.turns.at(-1)?.id === "durable"
     && readTranscript(runtime).turns.at(-1).endedAt, "durable baseline missing");
 
+  // An incremental read after the baseline does not refresh the fallback,
+  // so rolling back on this loss would drop the appended turn.
+  const readsBefore = runtime.durableReadsFinished;
+  fs.appendFileSync(durableJournal(runtime), durableTurn("appended"));
+  runtime.intervalCallback();
+  await waitFor(() => runtime.durableReadsFinished > readsBefore
+    && readTranscript(runtime)?.turns.at(-1)?.id === "appended"
+    && readTranscript(runtime).turns.at(-1).endedAt, "incremental durable turn missing");
+
   realRmSync(durableJournal(runtime), { force: true });
-  await liveTurnsAcrossMissingJournalPolls(runtime, ["durable"]);
+  await liveTurnsAcrossMissingJournalPolls(runtime, ["durable", "appended"]);
 });
 
 test("polls after an incomplete durable replay rolls back keep later live turns", {
