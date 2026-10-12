@@ -161,6 +161,7 @@ final class RequestFailureTests: XCTestCase {
         let local = model.projects[0].sessions[0]
         XCTAssertEqual(local.failedRequest, expected)
         XCTAssertEqual(local.attentionLabel, "Request failed")
+        XCTAssertEqual(model.projects[0].failedCount, 1)
         XCTAssertEqual(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError, expected)
 
         var running = local
@@ -169,6 +170,7 @@ final class RequestFailureTests: XCTestCase {
         XCTAssertEqual(running.attentionLabel, "Running")
         model.setStatus(sessionId: session.id, status: .running, text: nil)
         XCTAssertEqual(model.projects[0].sessions[0].status, .running)
+        XCTAssertEqual(model.projects[0].failedCount, 0)
         XCTAssertNil(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError)
     }
 }

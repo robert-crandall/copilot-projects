@@ -118,6 +118,7 @@ extension Project {
     var waitingCount: Int { sessions.filter { $0.displayStatus == .waiting }.count }
     var backgroundWorkCount: Int { sessions.filter(\.hasBackgroundWork).count }
     var scheduledCount: Int { sessions.filter { !$0.schedules.isEmpty }.count }
+    var failedCount: Int { sessions.filter { $0.failedRequest != nil }.count }
     var hasUnread: Bool { sessions.contains { $0.hasUnread } }
     var hasBackgroundWork: Bool { backgroundWorkCount > 0 }
 }

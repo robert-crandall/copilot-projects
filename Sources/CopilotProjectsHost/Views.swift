@@ -335,17 +335,20 @@ struct ProjectRow: View {
         let background = project.backgroundWorkCount
         let scheduled = project.scheduledCount
         let waiting = project.waitingCount
+        let failed = project.failedCount
         let descriptions = [
-            (waiting, "waiting for input"), (running, "running"),
+            (waiting, "waiting for input"), (failed, "failed"), (running, "running"),
             (background, "background"), (scheduled, "scheduled"),
         ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
-        if running > 0 || background > 0 || scheduled > 0 || waiting > 0 {
+        if !descriptions.isEmpty {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 7) {
                     if running > 0 { activityCount(running, "play.fill", .green) }
                     if background > 0 { activityCount(background, "person.2.fill", .purple) }
                     if scheduled > 0 { activityCount(scheduled, "clock", .indigo) }
                     if waiting > 0 { activityCount(waiting, "exclamationmark.circle", .orange) }
+                    // Same symbol as the session row's failure indicator.
+                    if failed > 0 { activityCount(failed, "exclamationmark.circle.fill", .red) }
                 }
                 .fixedSize()
                 Text(descriptions[0]).lineLimit(1)
