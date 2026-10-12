@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import CopilotProjectsHost
 import CopilotProjectsProtocol
@@ -13,6 +14,15 @@ final class RequestFailureTests: XCTestCase {
 
     private func failedAtDate() throws -> Date {
         try Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(failedAt)
+    }
+
+    private func failedActivity() throws -> AgentActivitySnapshot {
+        let heartbeat = #"""
+        {"schemaVersion":1,"updatedAt":"\#(failedAt)","foregroundTurnActive":false,
+         "scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,
+         "lastIdleAborted":false,"lastIdleTurnKind":"foreground","lastTurnError":\#(trackerError)}
+        """#
+        return try JSONDecoder().decode(AgentActivitySnapshot.self, from: Data(heartbeat.utf8))
     }
 
     private func transcriptDecoder() -> JSONDecoder {
@@ -175,15 +185,8 @@ final class RequestFailureTests: XCTestCase {
     }
 
     func testProjectRowCountsFailedSessionsAfterWaiting() throws {
-        let heartbeat = #"""
-        {"schemaVersion":1,"updatedAt":"\#(failedAt)","foregroundTurnActive":false,
-         "scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,
-         "lastIdleAborted":false,"lastIdleTurnKind":"foreground","lastTurnError":\#(trackerError)}
-        """#
         var failed = Session(title: "failed", cwd: "/tmp")
-        failed.agentActivity = try JSONDecoder().decode(
-            AgentActivitySnapshot.self, from: Data(heartbeat.utf8)
-        )
+        failed.agentActivity = try failedActivity()
         var waiting = Session(title: "waiting", cwd: "/tmp")
         waiting.status = .waiting
         var running = Session(title: "running", cwd: "/tmp")
@@ -201,5 +204,38 @@ final class RequestFailureTests: XCTestCase {
         retried.status = .running
         XCTAssertEqual(descriptions([retried]), ["1 running"])
         XCTAssertEqual(descriptions([Session(title: "idle", cwd: "/tmp")]), [])
+    }
+
+    @MainActor
+    func testProjectRowDrawsTheRedFailureSymbol() throws {
+        var failed = Session(title: "failed", cwd: "/tmp")
+        failed.agentActivity = try failedActivity()
+        var waiting = Session(title: "waiting", cwd: "/tmp")
+        waiting.status = .waiting
+
+        func redPixels(_ sessions: [Session]) throws -> Int {
+            let renderer = ImageRenderer(
+                content: ProjectRow(project: Project(name: "P", cwd: "/tmp", sessions: sessions))
+                    .frame(width: 176)
+                    .background(Color.white)
+                    .environment(\.colorScheme, .light)
+            )
+            let image = try XCTUnwrap(renderer.cgImage)
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            var count = 0
+            for x in 0..<bitmap.pixelsWide {
+                for y in 0..<bitmap.pixelsHigh {
+                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                    // System red, not orange (waiting) or green (running).
+                    if color.redComponent > 0.8, color.greenComponent < 0.4, color.blueComponent < 0.4 {
+                        count += 1
+                    }
+                }
+            }
+            return count
+        }
+
+        XCTAssertGreaterThan(try redPixels([failed]), 10)
+        XCTAssertEqual(try redPixels([waiting]), 0)
     }
 }
