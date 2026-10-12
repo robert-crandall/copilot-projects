@@ -65,7 +65,8 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 - **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
   labeled symbol counts appear in the project column; a blue dot on the session row marks work that finished
   while you were away, and a red exclamation with **Request failed** marks a session whose latest
-  request ended in a Copilot error (hover it for the CLI's message). The failure clears when the
+  request ended in a Copilot error (hover it for the CLI's message); the project column counts
+  those sessions behind the same red exclamation. The failure clears when the
   next request starts. With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Completed-turn drawer:** Copilot CLI remains the native interactive terminal, while a
   collapsible drawer overlays its right edge with independently scrollable completed turns

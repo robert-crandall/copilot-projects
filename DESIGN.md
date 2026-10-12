@@ -234,8 +234,9 @@ and session-ending safeguards remain.
 
 **Project navigation and creation:** native sidebar List with a stable compact
 activity line. `ViewThatFits` shows activity symbols and counts when they fit,
-otherwise the first active status in waiting/running/background/scheduled
-priority order. Tooltips and accessibility labels retain all active counts;
+otherwise the first active status in waiting/failed/running/background/scheduled
+priority order. Sessions whose latest request failed count behind the session
+row's red exclamation. Tooltips and accessibility labels retain all active counts;
 project names have full-name tooltips. Names, counts, and idle labels inherit
 List ink, with no custom selected-row foreground switch. Cross-project session
 drop requires Projects to be shown. New Project remains a borderless native

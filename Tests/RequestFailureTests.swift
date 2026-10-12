@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import CopilotProjectsHost
 import CopilotProjectsProtocol
@@ -13,6 +14,15 @@ final class RequestFailureTests: XCTestCase {
 
     private func failedAtDate() throws -> Date {
         try Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(failedAt)
+    }
+
+    private func failedActivity() throws -> AgentActivitySnapshot {
+        let heartbeat = #"""
+        {"schemaVersion":1,"updatedAt":"\#(failedAt)","foregroundTurnActive":false,
+         "scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,
+         "lastIdleAborted":false,"lastIdleTurnKind":"foreground","lastTurnError":\#(trackerError)}
+        """#
+        return try JSONDecoder().decode(AgentActivitySnapshot.self, from: Data(heartbeat.utf8))
     }
 
     private func transcriptDecoder() -> JSONDecoder {
@@ -161,6 +171,7 @@ final class RequestFailureTests: XCTestCase {
         let local = model.projects[0].sessions[0]
         XCTAssertEqual(local.failedRequest, expected)
         XCTAssertEqual(local.attentionLabel, "Request failed")
+        XCTAssertEqual(model.projects[0].failedCount, 1)
         XCTAssertEqual(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError, expected)
 
         var running = local
@@ -169,6 +180,62 @@ final class RequestFailureTests: XCTestCase {
         XCTAssertEqual(running.attentionLabel, "Running")
         model.setStatus(sessionId: session.id, status: .running, text: nil)
         XCTAssertEqual(model.projects[0].sessions[0].status, .running)
+        XCTAssertEqual(model.projects[0].failedCount, 0)
         XCTAssertNil(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError)
+    }
+
+    func testProjectRowCountsFailedSessionsAfterWaiting() throws {
+        var failed = Session(title: "failed", cwd: "/tmp")
+        failed.agentActivity = try failedActivity()
+        var waiting = Session(title: "waiting", cwd: "/tmp")
+        waiting.status = .waiting
+        var running = Session(title: "running", cwd: "/tmp")
+        running.status = .running
+
+        func descriptions(_ sessions: [Session]) -> [String] {
+            ProjectRow.activityDescriptions(for: Project(name: "P", cwd: "/tmp", sessions: sessions))
+        }
+        XCTAssertEqual(descriptions([failed, Session(title: "idle", cwd: "/tmp")]), ["1 failed"])
+        XCTAssertEqual(
+            descriptions([running, failed, waiting, failed]),
+            ["1 waiting for input", "2 failed", "1 running"]
+        )
+        var retried = failed
+        retried.status = .running
+        XCTAssertEqual(descriptions([retried]), ["1 running"])
+        XCTAssertEqual(descriptions([Session(title: "idle", cwd: "/tmp")]), [])
+    }
+
+    @MainActor
+    func testProjectRowDrawsTheRedFailureSymbol() throws {
+        var failed = Session(title: "failed", cwd: "/tmp")
+        failed.agentActivity = try failedActivity()
+        var waiting = Session(title: "waiting", cwd: "/tmp")
+        waiting.status = .waiting
+
+        func redPixels(_ sessions: [Session]) throws -> Int {
+            let renderer = ImageRenderer(
+                content: ProjectRow(project: Project(name: "P", cwd: "/tmp", sessions: sessions))
+                    .frame(width: 176)
+                    .background(Color.white)
+                    .environment(\.colorScheme, .light)
+            )
+            let image = try XCTUnwrap(renderer.cgImage)
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            var count = 0
+            for x in 0..<bitmap.pixelsWide {
+                for y in 0..<bitmap.pixelsHigh {
+                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                    // System red, not orange (waiting) or green (running).
+                    if color.redComponent > 0.8, color.greenComponent < 0.4, color.blueComponent < 0.4 {
+                        count += 1
+                    }
+                }
+            }
+            return count
+        }
+
+        XCTAssertGreaterThan(try redPixels([failed]), 10)
+        XCTAssertEqual(try redPixels([waiting]), 0)
     }
 }

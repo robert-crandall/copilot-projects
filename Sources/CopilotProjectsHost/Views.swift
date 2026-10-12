@@ -329,23 +329,33 @@ struct ProjectRow: View {
         )
     }
 
+    /// Active counts in the compact fallback's priority order; the tooltip and
+    /// accessibility label join all of them.
+    static func activityDescriptions(for project: Project) -> [String] {
+        [
+            (project.waitingCount, "waiting for input"), (project.failedCount, "failed"),
+            (project.runningCount, "running"), (project.backgroundWorkCount, "background"),
+            (project.scheduledCount, "scheduled"),
+        ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+    }
+
     // Keep one compact status line so changing activity does not move projects.
     @ViewBuilder private var statusLine: some View {
         let running = project.runningCount
         let background = project.backgroundWorkCount
         let scheduled = project.scheduledCount
         let waiting = project.waitingCount
-        let descriptions = [
-            (waiting, "waiting for input"), (running, "running"),
-            (background, "background"), (scheduled, "scheduled"),
-        ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
-        if running > 0 || background > 0 || scheduled > 0 || waiting > 0 {
+        let failed = project.failedCount
+        let descriptions = Self.activityDescriptions(for: project)
+        if !descriptions.isEmpty {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 7) {
                     if running > 0 { activityCount(running, "play.fill", .green) }
                     if background > 0 { activityCount(background, "person.2.fill", .purple) }
                     if scheduled > 0 { activityCount(scheduled, "clock", .indigo) }
                     if waiting > 0 { activityCount(waiting, "exclamationmark.circle", .orange) }
+                    // Same symbol as the session row's failure indicator.
+                    if failed > 0 { activityCount(failed, "exclamationmark.circle.fill", .red) }
                 }
                 .fixedSize()
                 Text(descriptions[0]).lineLimit(1)
