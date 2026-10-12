@@ -329,6 +329,16 @@ struct ProjectRow: View {
         )
     }
 
+    /// Active counts in the compact fallback's priority order; the tooltip and
+    /// accessibility label join all of them.
+    static func activityDescriptions(for project: Project) -> [String] {
+        [
+            (project.waitingCount, "waiting for input"), (project.failedCount, "failed"),
+            (project.runningCount, "running"), (project.backgroundWorkCount, "background"),
+            (project.scheduledCount, "scheduled"),
+        ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+    }
+
     // Keep one compact status line so changing activity does not move projects.
     @ViewBuilder private var statusLine: some View {
         let running = project.runningCount
@@ -336,10 +346,7 @@ struct ProjectRow: View {
         let scheduled = project.scheduledCount
         let waiting = project.waitingCount
         let failed = project.failedCount
-        let descriptions = [
-            (waiting, "waiting for input"), (failed, "failed"), (running, "running"),
-            (background, "background"), (scheduled, "scheduled"),
-        ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+        let descriptions = Self.activityDescriptions(for: project)
         if !descriptions.isEmpty {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 7) {

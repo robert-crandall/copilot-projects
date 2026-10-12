@@ -173,4 +173,33 @@ final class RequestFailureTests: XCTestCase {
         XCTAssertEqual(model.projects[0].failedCount, 0)
         XCTAssertNil(model.remoteWorkspaceSnapshot().projects[0].sessions[0].lastError)
     }
+
+    func testProjectRowCountsFailedSessionsAfterWaiting() throws {
+        let heartbeat = #"""
+        {"schemaVersion":1,"updatedAt":"\#(failedAt)","foregroundTurnActive":false,
+         "scheduledTurnActive":false,"activeSubagents":[],"schedules":[],"idleGeneration":3,
+         "lastIdleAborted":false,"lastIdleTurnKind":"foreground","lastTurnError":\#(trackerError)}
+        """#
+        var failed = Session(title: "failed", cwd: "/tmp")
+        failed.agentActivity = try JSONDecoder().decode(
+            AgentActivitySnapshot.self, from: Data(heartbeat.utf8)
+        )
+        var waiting = Session(title: "waiting", cwd: "/tmp")
+        waiting.status = .waiting
+        var running = Session(title: "running", cwd: "/tmp")
+        running.status = .running
+
+        func descriptions(_ sessions: [Session]) -> [String] {
+            ProjectRow.activityDescriptions(for: Project(name: "P", cwd: "/tmp", sessions: sessions))
+        }
+        XCTAssertEqual(descriptions([failed, Session(title: "idle", cwd: "/tmp")]), ["1 failed"])
+        XCTAssertEqual(
+            descriptions([running, failed, waiting, failed]),
+            ["1 waiting for input", "2 failed", "1 running"]
+        )
+        var retried = failed
+        retried.status = .running
+        XCTAssertEqual(descriptions([retried]), ["1 running"])
+        XCTAssertEqual(descriptions([Session(title: "idle", cwd: "/tmp")]), [])
+    }
 }
