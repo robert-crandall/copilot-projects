@@ -27,6 +27,37 @@ func requireNodeForJavaScriptTests() throws {
 }
 
 final class CoreLogicTests: XCTestCase {
+    /// Replaces the SDK import in a harness copy of the extension, and gives
+    /// the harness the host's view of the transcript: the sealed file plus the
+    /// live file's in-progress turn when it extends the sealed revision (or the
+    /// previous one it names) and does not repeat a sealed turn.
+    private static let fakeJoinSession = "const joinSession = async () => fakeSession;\n" + #"""
+    function readMergedTranscript(path) {
+      const sealed = JSON.parse(readFileSync(path, "utf8"));
+      if (sealed.schemaVersion !== 4) return sealed;
+      let live = null;
+      try {
+        live = JSON.parse(readFileSync(
+          path.replace(/\.transcript\.json$/, ".transcript-live.json"), "utf8"
+        ));
+      } catch {}
+      const turn = live?.turn;
+      const accepted = live?.schemaVersion === 1
+        && live.copilotSessionId === sealed.copilotSessionId
+        && (live.baseRevision === sealed.revision
+          || live.baseRevision === sealed.previousRevision)
+        && typeof turn?.id === "string"
+        && !sealed.turns.some((stored) => stored.id === turn.id);
+      if (!accepted) return sealed;
+      return {
+        ...sealed,
+        turns: [...sealed.turns, turn],
+        updatedAt: live.updatedAt > sealed.updatedAt ? live.updatedAt : sealed.updatedAt,
+      };
+    }
+
+    """#
+
     func testNormalizedDirectoryDecodesFileURL() {
         XCTAssertEqual(
             Paths.normalizedDirectory("file://localhost/Users/example/My%20Project"),
@@ -255,7 +286,9 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(CopilotExtension.script.contains(#""resolve-session", "--pid""#))
         XCTAssertTrue(CopilotExtension.script.contains("COPILOT_EXTENSION_PARENT_PID"))
         XCTAssertTrue(CopilotExtension.script.contains(#""session.getForeground""#))
-        XCTAssertTrue(CopilotExtension.script.contains("schemaVersion: 3"))
+        XCTAssertTrue(CopilotExtension.script.contains("SEALED_TRANSCRIPT_SCHEMA_VERSION = 4"))
+        XCTAssertTrue(CopilotExtension.script.contains("LIVE_TRANSCRIPT_SCHEMA_VERSION = 1"))
+        XCTAssertTrue(CopilotExtension.script.contains(".transcript-live.json"))
         XCTAssertTrue(CopilotExtension.script.contains("publishTranscript();"))
         XCTAssertTrue(CopilotExtension.script.contains("removeFile(temporaryPath)"))
         XCTAssertTrue(CopilotExtension.script.contains("setScheduledTurnMarker(false)"))
@@ -567,7 +600,7 @@ final class CoreLogicTests: XCTestCase {
             )
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         ).replacingOccurrences(
             of: "const CLOSE_IDLE_TIMEOUT_MS = 5_000;",
             with: "const CLOSE_IDLE_TIMEOUT_MS = 100;"
@@ -836,7 +869,7 @@ final class CoreLogicTests: XCTestCase {
         """#
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -845,7 +878,7 @@ final class CoreLogicTests: XCTestCase {
           + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`;
         const activityPath = `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
           + `${process.env.COPILOT_PROJECTS_SESSION}.agent-activity.json`;
-        const read = () => JSON.parse(readFileSync(transcriptPath, "utf8"));
+        const read = () => readMergedTranscript(transcriptPath);
         const readActivity = () => JSON.parse(readFileSync(activityPath, "utf8"));
         const afterReplay = read();
         const activityAfterReplay = readActivity();
@@ -1067,7 +1100,7 @@ final class CoreLogicTests: XCTestCase {
         )
         let output = stdout.fileHandleForReading.readDataToEndOfFile()
         let summary = try JSONSerialization.jsonObject(with: output) as? [String: Any]
-        XCTAssertEqual(summary?["schemaVersion"] as? Int, 3)
+        XCTAssertEqual(summary?["schemaVersion"] as? Int, 4)
         XCTAssertEqual(summary?["ownerPidIsNumber"] as? Bool, true)
         // Retention caps the total but never evicts the human conversation.
         XCTAssertEqual(summary?["turnCount"] as? Int, 200)
@@ -1168,16 +1201,15 @@ final class CoreLogicTests: XCTestCase {
         """#
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
         await new Promise((resolve) => setImmediate(resolve));
-        const snapshot = JSON.parse(readFileSync(
+        const snapshot = readMergedTranscript(
           `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-          "utf8"
-        ));
+            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+        );
         console.log(JSON.stringify({
           copilotSessionId: snapshot.copilotSessionId,
           firstUserContent: snapshot.turns[0]?.userContent
@@ -1256,7 +1288,7 @@ final class CoreLogicTests: XCTestCase {
         """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -1514,7 +1546,7 @@ final class CoreLogicTests: XCTestCase {
         let extensionScript = CopilotExtension.script
             .replacingOccurrences(
                 of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-                with: "const joinSession = async () => fakeSession;"
+                with: Self.fakeJoinSession
             )
             .replacingOccurrences(
                 of: "const DURABLE_RECONCILE_DEBOUNCE_MS = 200;",
@@ -2002,7 +2034,7 @@ final class CoreLogicTests: XCTestCase {
         )
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -2145,7 +2177,7 @@ final class CoreLogicTests: XCTestCase {
         let extensionScript = CopilotExtension.script
             .replacingOccurrences(
                 of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-                with: "const joinSession = async () => fakeSession;"
+                with: Self.fakeJoinSession
             )
             .replacingOccurrences(
                 of: "const DURABLE_RECONCILE_POLL_MS = 5_000;",
@@ -2241,7 +2273,7 @@ final class CoreLogicTests: XCTestCase {
           reactivatedOwner:afterReactivation.copilotSessionId,
           reactivatedClaimIsNew:afterReactivation.claimedAt > nextOwner.claimedAt,
           rotatedOwner:afterRotation.copilotSessionId,
-          rotatedTranscript:JSON.parse(readFileSync(transcriptPath, "utf8")).copilotSessionId
+          rotatedTranscript:readMergedTranscript(transcriptPath).copilotSessionId
         }));
         process.exit(0);
         """#
@@ -2357,7 +2389,7 @@ final class CoreLogicTests: XCTestCase {
         let extensionScript = CopilotExtension.script
             .replacingOccurrences(
                 of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-                with: "const joinSession = async () => fakeSession;"
+                with: Self.fakeJoinSession
             )
             .replacingOccurrences(
                 of: "const DURABLE_RECONCILE_DEBOUNCE_MS = 200;",
@@ -2504,7 +2536,7 @@ final class CoreLogicTests: XCTestCase {
         let extensionScript = CopilotExtension.script
             .replacingOccurrences(
                 of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-                with: "const joinSession = async () => fakeSession;"
+                with: Self.fakeJoinSession
             )
             .replacingOccurrences(
                 of: "const DURABLE_RECONCILE_DEBOUNCE_MS = 200;",
@@ -2615,7 +2647,7 @@ final class CoreLogicTests: XCTestCase {
         """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -2719,7 +2751,7 @@ final class CoreLogicTests: XCTestCase {
         """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -2850,7 +2882,7 @@ final class CoreLogicTests: XCTestCase {
         """#.replacingOccurrences(of: "__COPILOT_SESSION_ID__", with: copilotSessionId)
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -2965,7 +2997,7 @@ final class CoreLogicTests: XCTestCase {
         """#
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -3022,9 +3054,19 @@ final class CoreLogicTests: XCTestCase {
     }
 
     func testCopilotExtensionPreservesMatchingSnapshotWhenHistoryFails() throws {
+        // A version 3 snapshot predates the split into sealed and live files;
+        // it is restored, then republished in the current format.
         let summary = try copilotExtensionHistoryFailureSummary(schemaVersion: 3)
 
-        XCTAssertEqual(summary["schemaVersion"] as? Int, 3)
+        XCTAssertEqual(summary["schemaVersion"] as? Int, 4)
+        XCTAssertEqual(summary["copilotSessionId"] as? String, "copilot-session")
+        XCTAssertEqual(summary["turnIds"] as? [String], ["preserved-turn"])
+    }
+
+    func testCopilotExtensionPreservesMatchingSealedSnapshotWhenHistoryFails() throws {
+        let summary = try copilotExtensionHistoryFailureSummary(schemaVersion: 4)
+
+        XCTAssertEqual(summary["schemaVersion"] as? Int, 4)
         XCTAssertEqual(summary["copilotSessionId"] as? String, "copilot-session")
         XCTAssertEqual(summary["turnIds"] as? [String], ["preserved-turn"])
     }
@@ -3092,11 +3134,10 @@ final class CoreLogicTests: XCTestCase {
         };
         setTimeout(() => {
           try {
-            const value = JSON.parse(readFileSync(
+            const value = readMergedTranscript(
               `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-                + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-              "utf8"
-            ));
+                + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+            );
             foreignObservedAtInit = value.turns.some(
               (turn) => turn.userContent === "FOREIGN"
             );
@@ -3106,7 +3147,7 @@ final class CoreLogicTests: XCTestCase {
         let extensionScript = CopilotExtension.script
             .replacingOccurrences(
                 of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-                with: "const joinSession = async () => fakeSession;"
+                with: Self.fakeJoinSession
             )
             .replacingOccurrences(
                 of: "const DURABLE_RECONCILE_DEBOUNCE_MS = 200;",
@@ -3130,11 +3171,10 @@ final class CoreLogicTests: XCTestCase {
         async function waitForUsers(count) {
           for (let attempt = 0; attempt < 200; attempt += 1) {
             try {
-              const value = JSON.parse(readFileSync(
+              const value = readMergedTranscript(
                 `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-                  + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-                "utf8"
-              ));
+                  + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+              );
               if (value.turns.filter((turn) => turn.userContent).length >= count) {
                 return value;
               }
@@ -3157,19 +3197,21 @@ final class CoreLogicTests: XCTestCase {
           }
           throw new Error(`timed out waiting for model ${name}`);
         }
-        async function waitForUpdatedAt(previous) {
-          for (let attempt = 0; attempt < 200; attempt += 1) {
-            try {
-              const value = JSON.parse(readFileSync(
-                `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-                  + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-                "utf8"
-              ));
-              if (value.updatedAt !== previous) return value;
-            } catch {}
+        // A republish that changes nothing leaves the transcript alone, so
+        // this returns at the first change, or after the tracker has had many
+        // reconcile polls to make one.
+        async function settledTranscript(previous, settleMs = 300) {
+          const deadline = Date.now() + settleMs;
+          let value;
+          do {
+            value = readMergedTranscript(
+              `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
+                + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+            );
+            if (value.updatedAt !== previous) return value;
             await new Promise((resolve) => setTimeout(resolve, 5));
-          }
-          throw new Error("timed out waiting for transcript update");
+          } while (Date.now() < deadline);
+          return value;
         }
 
         await waitForUsers(1);
@@ -3246,11 +3288,10 @@ final class CoreLogicTests: XCTestCase {
         );
         const stableUpdatedAt = snapshot.updatedAt;
         await new Promise((resolve) => setTimeout(resolve, 75));
-        const afterIdlePolls = JSON.parse(readFileSync(
+        const afterIdlePolls = readMergedTranscript(
           `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-          "utf8"
-        ));
+            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+        );
 
         const rotatedPath = durablePath + ".rotated";
         writeFileSync(rotatedPath, readFileSync(durablePath));
@@ -3259,7 +3300,7 @@ final class CoreLogicTests: XCTestCase {
           id:"rotation-trigger",type:"session.info",
           timestamp:"2026-07-12T01:00:08.100Z",data:{}
         });
-        const afterRotation = await waitForUpdatedAt(stableUpdatedAt);
+        const afterRotation = await settledTranscript(stableUpdatedAt);
 
         const truncated = [
           {
@@ -3284,11 +3325,10 @@ final class CoreLogicTests: XCTestCase {
         });
         let finalSnapshot;
         for (let attempt = 0; attempt < 200; attempt += 1) {
-          finalSnapshot = JSON.parse(readFileSync(
+          finalSnapshot = readMergedTranscript(
             `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-              + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-            "utf8"
-          ));
+              + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+          );
           if (finalSnapshot.turns.map((turn) => turn.userContent)
                 .includes("rotated question")) break;
           await new Promise((resolve) => setTimeout(resolve, 5));
@@ -3484,7 +3524,7 @@ final class CoreLogicTests: XCTestCase {
         let extensionScript = CopilotExtension.script
             .replacingOccurrences(
                 of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-                with: "const joinSession = async () => fakeSession;"
+                with: Self.fakeJoinSession
             )
             .replacingOccurrences(
                 of: "const DURABLE_RECONCILE_DEBOUNCE_MS = 200;",
@@ -3680,7 +3720,7 @@ final class CoreLogicTests: XCTestCase {
         const afterOutOfOrder = await waitFor([
           "synthetic::durable-ask-user::call-fourth"
         ]);
-        const transcript = JSON.parse(readFileSync(transcriptPath, "utf8"));
+        const transcript = readMergedTranscript(transcriptPath);
         const askUserToolCount = (transcript.turns || [])
           .flatMap((turn) => turn.tools || [])
           .filter((tool) => tool.name === "ask_user").length;
@@ -3880,7 +3920,7 @@ final class CoreLogicTests: XCTestCase {
         // it must be discarded, not restored.
         let summary = try copilotExtensionHistoryFailureSummary(schemaVersion: 2)
 
-        XCTAssertEqual(summary["schemaVersion"] as? Int, 3)
+        XCTAssertEqual(summary["schemaVersion"] as? Int, 4)
         XCTAssertEqual(summary["copilotSessionId"] as? String, "copilot-session")
         XCTAssertEqual(summary["turnIds"] as? [String], [])
     }
@@ -3929,15 +3969,14 @@ final class CoreLogicTests: XCTestCase {
         """#
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
-        const snapshot = JSON.parse(readFileSync(
+        const snapshot = readMergedTranscript(
           `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
-          "utf8"
-        ));
+            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+        );
         console.log(JSON.stringify({
           schemaVersion: snapshot.schemaVersion,
           copilotSessionId: snapshot.copilotSessionId,
@@ -4020,7 +4059,7 @@ final class CoreLogicTests: XCTestCase {
         """#
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 
@@ -4256,7 +4295,7 @@ final class CoreLogicTests: XCTestCase {
         """#
         let extensionScript = CopilotExtension.script.replacingOccurrences(
             of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
-            with: "const joinSession = async () => fakeSession;"
+            with: Self.fakeJoinSession
         )
         let epilogue = #"""
 

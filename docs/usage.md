@@ -540,7 +540,11 @@ terminal views.
 The companion Copilot extension records completed root turns through the supported Copilot SDK
 event API. It atomically writes a bounded per-tab transcript snapshot after each turn, including
 stopped turns, failed requests with the CLI's error message, and compact tool summaries but
-excluding raw tool arguments and results. A failure the agent recovers from on its own (a retry,
+excluding raw tool arguments and results. The snapshot is two files: finished turns in
+`<tab>.transcript.json`, rewritten only when they change, and the turn in progress in
+`<tab>.transcript-live.json`, rewritten as it streams. A publish that changes neither file
+writes nothing. The host merges the two, using the live file only when it names the revision of
+the finished-turns file it extends. A failure the agent recovers from on its own (a retry,
 or a background agent restarting work) is cleared; model-catalog and other background notices
 are not shown. Copilot
 Projects renders that snapshot in the drawer without parsing private CLI session files or
@@ -553,8 +557,8 @@ The extension keeps the turns its 200-turn cap evicted most recently (at most 10
 by start time (for a cursor, only those that started at or after it), so a turn added and
 evicted between two fetches still reaches the client whatever it fetches next. A window's
 `limit` and `totalTurns` count those turns too. That buffer is never sent as its own field.
-Turns the 5 MB byte budget drops are not buffered, and the buffer only uses the room the live
-transcript leaves under that budget, keeping its newest turns that fit.
+Turns the 5 MB byte budget (both files together) drops are not buffered, and the buffer only
+uses the room the live transcript leaves under that budget, keeping its newest turns that fit.
 A response with an empty `copilotSessionId` means the host has no transcript it may show for
 the tab, and clients replace what they have with it. The host rereads (up to three reads in all)
 a transcript that came back empty only because it was being rewritten mid-read; if it is still

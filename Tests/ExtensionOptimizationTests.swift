@@ -358,8 +358,13 @@ extension ExtensionOptimizationTests {
     const MAX_RECENTLY_DROPPED_BYTES = 256 * 1024;
     const recentlyDroppedTurns = [];
     let recentlyDroppedTurnBytes = 0;
+    const encodedTranscriptTurns = new WeakMap();
     const DROPPED_TURNS_SECTION_BYTES = Buffer.byteLength(',"droppedTurns":[]');
     const RESUME_TRANSCRIPT_TURN_PREFIX = "session-resume-";
+    const SEALED_TRANSCRIPT_SCHEMA_VERSION = 4;
+    const LIVE_TRANSCRIPT_SCHEMA_VERSION = 1;
+    const TRANSCRIPT_REVISION_SHAPE = "00000000-0000-0000-0000-000000000000";
+    const TRANSCRIPT_TIMESTAMP_SHAPE = "0000-00-00T00:00:00.000Z";
 
     const realStringify = JSON.stringify;
     let stringifyCalls = 0;
@@ -387,13 +392,43 @@ extension ExtensionOptimizationTests {
 
     const clone = (value) => JSON.parse(realStringify(value));
     const itemBytes = (value) => Buffer.byteLength(realStringify(value));
-    const documentBytes = (turns, pending) => Buffer.byteLength(realStringify({
-        schemaVersion: 3,
-        updatedAt: new Date().toISOString(),
+    const REVISION = "11111111-2222-4333-8444-555555555555";
+    const UPDATED_AT = "2026-07-12T00:00:00.000Z";
+    // Both files' size, encoded independently of the shipped code: the sealed
+    // file with `turns`, plus the live file holding `pending`.
+    const documentBytes = (turns, pending) => itemBytes({
+        schemaVersion: 4,
         copilotSessionId: boundedMetadataText(copilotSessionId),
         ownerPid: process.pid,
-        turns: pending ? [...turns, pending] : turns.slice(),
-    }));
+        turns: turns.slice(),
+        updatedAt: UPDATED_AT,
+        revision: REVISION,
+        previousRevision: REVISION,
+    }) + (pending ? itemBytes({
+        schemaVersion: 1,
+        copilotSessionId: boundedMetadataText(copilotSessionId),
+        baseRevision: REVISION,
+        updatedAt: UPDATED_AT,
+        turn: pending,
+    }) : 0);
+    // Runs the shipped budget and writes its two files the way the writer
+    // does. Assembling them is not counted as encoding work.
+    function encodeTranscript(pending, droppedTurns = []) {
+        const result = encodedTranscriptWithinBudget(pending, droppedTurns);
+        const counters = [stringifyCalls, stringifyBytes, largeEncodes];
+        const sealed = result.sealedBody
+            + sealedTranscriptTail(UPDATED_AT, REVISION, REVISION);
+        const live = result.pendingJson === null
+            ? null
+            : liveTranscriptDocument(REVISION, UPDATED_AT, result.pendingJson);
+        [stringifyCalls, stringifyBytes, largeEncodes] = counters;
+        const bytes = Buffer.byteLength(sealed)
+            + (live === null ? 0 : Buffer.byteLength(live));
+        equal(result.bytes, bytes, "the accounted size is the written size");
+        const document = JSON.parse(sealed);
+        if (live !== null) document.turns.push(JSON.parse(live).turn);
+        return { bytes, document, sealed, live };
+    }
 
     function message(id, content) {
         return { id, timestamp: "2026-07-12T00:00:00.000Z", content };
@@ -433,32 +468,38 @@ extension ExtensionOptimizationTests {
 
     MAX_TRANSCRIPT_BYTES = Number.MAX_SAFE_INTEGER;
     load(baseTurns);
-    resetCounters();
-    const untouched = encodedTranscriptWithinBudget(null);
-    const fullBytes = Buffer.byteLength(untouched);
-    equal(stringifyCalls, 1, "an in-budget transcript costs exactly one encode");
+    // Encodes of at least one turn's size: per-turn work, not envelope text.
+    const turnBytes = itemBytes(baseTurns[0]);
+    resetCounters(turnBytes);
+    const untouched = encodeTranscript(null);
+    const fullBytes = untouched.bytes;
+    equal(largeEncodes, 1, "an in-budget transcript encodes its stored turn once");
+    equal(fullBytes, documentBytes(baseTurns, null), "the accounting matches an independent encode");
     check(
-        fullBytes !== untouched.length,
+        Buffer.byteLength(untouched.sealed) !== untouched.sealed.length,
         "fixture must contain multi-byte content (UTF-8 bytes != UTF-16 length)"
     );
+    resetCounters(turnBytes);
+    equal(encodeTranscript(null).bytes, fullBytes, "a republish is the same size");
+    equal(largeEncodes, 0, "a republish reuses the stored turn's encoding");
 
     // Exactly at the budget: nothing is trimmed.
     MAX_TRANSCRIPT_BYTES = fullBytes;
     load(baseTurns);
-    resetCounters();
-    const atBudget = encodedTranscriptWithinBudget(null);
-    equal(Buffer.byteLength(atBudget), fullBytes, "budget == size keeps every byte");
+    resetCounters(turnBytes);
+    const atBudget = encodeTranscript(null);
+    equal(atBudget.bytes, fullBytes, "budget == size keeps every byte");
     equal(
         transcriptTurns[0].assistantMessages.length, 3,
         "budget == size sheds nothing"
     );
-    equal(stringifyCalls, 1, "budget == size still costs one encode");
+    equal(largeEncodes, 1, "budget == size still encodes the turn once");
 
     // One byte of headroom: nothing is trimmed.
     MAX_TRANSCRIPT_BYTES = fullBytes + 1;
     load(baseTurns);
     equal(
-        Buffer.byteLength(encodedTranscriptWithinBudget(null)), fullBytes,
+        encodeTranscript(null).bytes, fullBytes,
         "budget == size + 1 keeps every byte"
     );
 
@@ -466,27 +507,27 @@ extension ExtensionOptimizationTests {
     const firstMessageCost = itemBytes(unicodeMessages[0]) + 1;
     MAX_TRANSCRIPT_BYTES = fullBytes - 1;
     load(baseTurns);
-    const overByOne = encodedTranscriptWithinBudget(null);
+    const overByOne = encodeTranscript(null);
     equal(
-        Buffer.byteLength(overByOne), fullBytes - firstMessageCost,
+        overByOne.bytes, fullBytes - firstMessageCost,
         "budget == size - 1 sheds exactly one message plus its separator"
     );
     equal(transcriptTurns[0].assistantMessages.length, 2, "exactly one message shed");
     check(
-        Buffer.byteLength(overByOne) <= MAX_TRANSCRIPT_BYTES,
+        overByOne.bytes <= MAX_TRANSCRIPT_BYTES,
         "result honors the hard budget"
     );
 
     // Landing exactly on the post-shed size must not shed a second message.
     MAX_TRANSCRIPT_BYTES = fullBytes - firstMessageCost;
     load(baseTurns);
-    const exactlyOneShed = encodedTranscriptWithinBudget(null);
+    const exactlyOneShed = encodeTranscript(null);
     equal(
         transcriptTurns[0].assistantMessages.length, 2,
         "budget equal to the post-shed size sheds exactly one message"
     );
     equal(
-        Buffer.byteLength(exactlyOneShed), fullBytes - firstMessageCost,
+        exactlyOneShed.bytes, fullBytes - firstMessageCost,
         "post-shed size is exact"
     );
 
@@ -494,10 +535,10 @@ extension ExtensionOptimizationTests {
     const secondMessageCost = itemBytes(unicodeMessages[1]) + 1;
     MAX_TRANSCRIPT_BYTES = fullBytes - firstMessageCost - 1;
     load(baseTurns);
-    const twoShed = encodedTranscriptWithinBudget(null);
+    const twoShed = encodeTranscript(null);
     equal(transcriptTurns[0].assistantMessages.length, 1, "exactly two messages shed");
     equal(
-        Buffer.byteLength(twoShed), fullBytes - firstMessageCost - secondMessageCost,
+        twoShed.bytes, fullBytes - firstMessageCost - secondMessageCost,
         "two-message shed size is exact"
     );
 
@@ -516,15 +557,17 @@ extension ExtensionOptimizationTests {
 
     MAX_TRANSCRIPT_BYTES = Number.MAX_SAFE_INTEGER;
     load(storedTurns, "resume");
-    const fullWithPending = Buffer.byteLength(
-        encodedTranscriptWithinBudget(clone(pendingTurn))
+    const fullWithPending = encodeTranscript(clone(pendingTurn)).bytes;
+    equal(
+        fullWithPending, documentBytes(storedTurns, pendingTurn),
+        "the two files' accounting matches an independent encode"
     );
 
     // A single byte over budget sacrifices the scheduled turn, nothing else.
     MAX_TRANSCRIPT_BYTES = fullWithPending - 1;
     load(storedTurns, "resume");
     let pending = clone(pendingTurn);
-    encodedTranscriptWithinBudget(pending);
+    encodeTranscript(pending);
     equal(
         transcriptTurns.map((entry) => entry.id).join(","), "fg1,resume,fg2",
         "non-foreground stored turns are sacrificed first"
@@ -538,7 +581,7 @@ extension ExtensionOptimizationTests {
         - itemBytes(pendingTurn.assistantMessages[0]) - 1;
     load(storedTurns, "resume");
     pending = clone(pendingTurn);
-    encodedTranscriptWithinBudget(pending);
+    encodeTranscript(pending);
     equal(
         transcriptTurns.map((entry) => entry.id).join(","), "fg1,resume,fg2",
         "foreground turns survive while pending payload can still be shed"
@@ -555,12 +598,12 @@ extension ExtensionOptimizationTests {
     );
     load(storedTurns, "resume");
     pending = clone(pendingTurn);
-    const squeezed = encodedTranscriptWithinBudget(pending);
+    const squeezed = encodeTranscript(pending);
     equal(
-        Buffer.byteLength(squeezed), MAX_TRANSCRIPT_BYTES,
+        squeezed.bytes, MAX_TRANSCRIPT_BYTES,
         "reduction lands exactly on the reachable floor"
     );
-    const survivors = JSON.parse(squeezed).turns.map((entry) => entry.id);
+    const survivors = squeezed.document.turns.map((entry) => entry.id);
     check(survivors.includes("resume"), "the resume marker is never dropped");
     check(survivors.includes("pending"), "the in-progress turn is never dropped");
     check(!survivors.includes("fg1"), "the oldest foreground turn is dropped first");
@@ -570,24 +613,24 @@ extension ExtensionOptimizationTests {
     load(storedTurns, "resume");
     pending = clone(pendingTurn);
     let rejected = false;
-    try { encodedTranscriptWithinBudget(pending); }
+    try { encodeTranscript(pending); }
     catch (error) { rejected = error instanceof RangeError; }
     check(rejected, "an unreachable budget is rejected");
     check(transcriptTurns.some((turn) => turn.id === "resume"), "resume remains protected");
     equal(pending.id, "pending", "pending remains protected");
 
     // ---------------------------------------------------------------- republish
-    // Trimming mutates the shared turn objects, so the next publish is a plain
-    // encode with nothing left to do.
+    // Trimming mutates the shared turn objects, so the next publish has
+    // nothing left to do and reuses the trimmed turn's fresh encoding.
     MAX_TRANSCRIPT_BYTES = fullBytes - firstMessageCost - 1;
     load(baseTurns);
-    encodedTranscriptWithinBudget(null);
+    encodeTranscript(null);
     const retained = clone(transcriptTurns);
-    resetCounters();
-    const republished = encodedTranscriptWithinBudget(null);
-    equal(stringifyCalls, 1, "a republish after trimming costs one encode");
+    resetCounters(itemBytes(transcriptTurns[0]));
+    const republished = encodeTranscript(null);
+    equal(largeEncodes, 0, "a republish after trimming encodes no turn");
     check(
-        Buffer.byteLength(republished) <= MAX_TRANSCRIPT_BYTES,
+        republished.bytes <= MAX_TRANSCRIPT_BYTES,
         "republish stays within budget"
     );
     equal(
@@ -651,12 +694,12 @@ extension ExtensionOptimizationTests {
     ];
     MAX_TRANSCRIPT_BYTES = Number.MAX_SAFE_INTEGER;
     load(budgetTurns);
-    const fullBytes = Buffer.byteLength(encodedTranscriptWithinBudget(null));
+    const fullBytes = encodeTranscript(null).bytes;
 
     clearRecentlyDroppedTurns();
     MAX_TRANSCRIPT_BYTES = fullBytes - 1;
     load(budgetTurns);
-    encodedTranscriptWithinBudget(null);
+    encodeTranscript(null);
     equal(ids(transcriptTurns), "fg1,fg2", "the budget dropped the scheduled turn");
     equal(recentlyDroppedTurns.length, 0, "byte-budget drops are never buffered");
 
@@ -665,108 +708,101 @@ extension ExtensionOptimizationTests {
     // Bytes the buffer adds to a document: `,"droppedTurns":` plus its array.
     const section = (turns) => Buffer.byteLength(',"droppedTurns":') + itemBytes(turns);
     const gone = [small("gone-1"), small("gone-2"), small("gone-3")];
+    // Encodes at least as large as the smallest turn: per-turn work only.
+    const turnEncodeThreshold = Math.min(...[...budgetTurns, ...gone].map(itemBytes));
 
-    // The buffer rides along while it fits, at no extra encode…
+    // The buffer rides along while it fits, each turn encoded once…
     MAX_TRANSCRIPT_BYTES = Number.MAX_SAFE_INTEGER;
     load(budgetTurns);
-    resetCounters();
-    const roomy = JSON.parse(encodedTranscriptWithinBudget(null, entries(clone(gone))));
-    equal(stringifyCalls, 1, "a buffer that fits costs one encode");
+    resetCounters(turnEncodeThreshold);
+    const roomy = encodeTranscript(null, entries(clone(gone))).document;
+    equal(largeEncodes, 6, "a buffer that fits encodes each turn once");
     equal(ids(roomy.droppedTurns), "gone-1,gone-2,gone-3", "the buffer is published");
     equal(ids(roomy.turns), "scheduled,fg1,fg2", "next to every live turn");
 
     // …and near the budget keeps the newest buffered turns that fit in the
-    // room the live transcript leaves, with one more encode.
+    // room the live transcript leaves.
     MAX_TRANSCRIPT_BYTES = fullBytes + section(gone.slice(1));
     load(budgetTurns);
-    resetCounters();
-    const twoFit = encodedTranscriptWithinBudget(null, entries(clone(gone)));
-    equal(Buffer.byteLength(twoFit), MAX_TRANSCRIPT_BYTES, "the newest two fill the room exactly");
-    equal(ids(JSON.parse(twoFit).droppedTurns), "gone-2,gone-3", "the newest turns that fit are kept");
+    resetCounters(turnEncodeThreshold);
+    const twoFit = encodeTranscript(null, entries(clone(gone)));
+    equal(twoFit.bytes, MAX_TRANSCRIPT_BYTES, "the newest two fill the room exactly");
+    equal(ids(twoFit.document.droppedTurns), "gone-2,gone-3", "the newest turns that fit are kept");
     equal(ids(transcriptTurns), "scheduled,fg1,fg2", "no live turn made room for them");
-    equal(stringifyCalls, 2, "keeping part of the buffer costs one re-encode");
+    equal(largeEncodes, 6, "keeping part of the buffer still encodes each turn once");
 
     MAX_TRANSCRIPT_BYTES = fullBytes + section(gone.slice(1)) - 1;
     load(budgetTurns);
-    const oneFits = JSON.parse(encodedTranscriptWithinBudget(null, entries(clone(gone))));
+    const oneFits = encodeTranscript(null, entries(clone(gone))).document;
     equal(ids(oneFits.droppedTurns), "gone-3", "one byte less keeps only the newest");
 
     // With no room left, the buffer is omitted and nothing else changes.
     MAX_TRANSCRIPT_BYTES = fullBytes;
     load(budgetTurns);
-    const tight = encodedTranscriptWithinBudget(null, entries(clone(gone)));
-    equal(Buffer.byteLength(tight), fullBytes, "only the buffer was shed");
-    equal("droppedTurns" in JSON.parse(tight), false, "the buffer is omitted");
+    const tight = encodeTranscript(null, entries(clone(gone)));
+    equal(tight.bytes, fullBytes, "only the buffer was shed");
+    equal("droppedTurns" in tight.document, false, "the buffer is omitted");
     equal(ids(transcriptTurns), "scheduled,fg1,fg2", "no live turn made room for it");
 
     // The usual state after a byte-budget trim: the live transcript fits with
     // less room left than the newest buffered turn needs. That publish is the
-    // live-only document at the cost of one more whole-document encode — no
-    // measuring pass.
-    const withoutUpdatedAt = (encoded) => realStringify({ ...JSON.parse(encoded), updatedAt: null });
+    // live-only document, with no measuring pass.
     MAX_TRANSCRIPT_BYTES = Number.MAX_SAFE_INTEGER;
     load(budgetTurns);
-    const liveOnly = encodedTranscriptWithinBudget(null);
+    const liveOnly = encodeTranscript(null);
     MAX_TRANSCRIPT_BYTES = fullBytes + section(gone.slice(2)) - 1;
     load(budgetTurns);
-    resetCounters(fullBytes);
-    const noneFit = encodedTranscriptWithinBudget(null, entries(clone(gone)));
-    equal(largeEncodes, 2, "the probe and the live-only encode, nothing more");
-    equal(stringifyCalls, 2, "no per-turn measuring either");
-    equal(withoutUpdatedAt(noneFit), withoutUpdatedAt(liveOnly), "the live-only encoding");
-    equal(Buffer.byteLength(noneFit), fullBytes, "exactly the live transcript's size");
+    resetCounters(turnEncodeThreshold);
+    const noneFit = encodeTranscript(null, entries(clone(gone)));
+    equal(largeEncodes, 4, "the stored turns and the newest buffered turn, once each");
+    equal(noneFit.sealed, liveOnly.sealed, "the live-only encoding");
+    equal(noneFit.bytes, fullBytes, "exactly the live transcript's size");
     equal(ids(transcriptTurns), "scheduled,fg1,fg2", "nothing was trimmed");
 
-    // That shortcut still checks its encode against the budget. Here the live
-    // transcript is one byte over, but the oldest buffered turn's stored size
-    // is overstated, so by the stored sizes the live transcript seems to fit
-    // with less room than the newest buffered turn needs. The live-only encode
-    // misses the budget, and the publish takes the measuring path, trimming
+    // Buffered sizes are re-read from the turns themselves, so a stale stored
+    // size can neither push a buffered turn past the budget nor change what
+    // the measuring path does. Here the live transcript is one byte over and
+    // the oldest buffered turn's stored size is overstated: the publish trims
     // exactly as it would with no buffer at all.
     MAX_TRANSCRIPT_BYTES = fullBytes - 1;
     load(budgetTurns);
-    const unbuffered = encodedTranscriptWithinBudget(null);
+    const unbuffered = encodeTranscript(null);
     load(budgetTurns);
-    const overstated = encodedTranscriptWithinBudget(null, [
+    const overstated = encodeTranscript(null, [
         { turn: clone(gone[0]), bytes: itemBytes(gone[0]) + 64 },
         { turn: clone(gone[1]), bytes: itemBytes(gone[1]) },
         { turn: clone(gone[2]), bytes: itemBytes(gone[2]) },
     ]);
     check(
-        Buffer.byteLength(overstated) <= MAX_TRANSCRIPT_BYTES,
-        "the shortcut never publishes past the budget: " + Buffer.byteLength(overstated)
+        overstated.bytes <= MAX_TRANSCRIPT_BYTES,
+        "a stale size never publishes past the budget: " + overstated.bytes
     );
-    equal("droppedTurns" in JSON.parse(overstated), false, "no buffer beside a trimmed transcript");
+    equal("droppedTurns" in overstated.document, false, "no buffer beside a trimmed transcript");
     equal(ids(transcriptTurns), "fg1,fg2", "the measuring path trimmed the scheduled turn");
     equal(
-        withoutUpdatedAt(overstated), withoutUpdatedAt(unbuffered),
+        overstated.sealed, unbuffered.sealed,
         "the same document the measuring path publishes without a buffer"
     );
 
-    // A re-encode that misses the budget (sizes that no longer match their
-    // turns: the oldest overstated, so the room looks bigger, and the newest
-    // understated, so they look like they fit it) falls back to no buffer
-    // rather than an oversized document.
+    // Understated sizes (they look like they fit the room) cannot sneak the
+    // buffered turns in either: none of them actually fits.
     MAX_TRANSCRIPT_BYTES = fullBytes + 64;
     load(budgetTurns);
-    // Count only whole-document encodes.
-    resetCounters(fullBytes);
-    const misjudged = encodedTranscriptWithinBudget(null, [
+    const misjudged = encodeTranscript(null, [
         { turn: clone(gone[0]), bytes: itemBytes(gone[0]) + 1_000 },
         { turn: clone(gone[1]), bytes: 1 },
         { turn: clone(gone[2]), bytes: 1 },
     ]);
-    equal(largeEncodes, 3, "probe, the partial buffer's re-encode, then the fallback");
-    equal(Buffer.byteLength(misjudged), fullBytes, "the fallback is the live transcript alone");
-    equal("droppedTurns" in JSON.parse(misjudged), false, "the misjudged buffer is omitted");
+    equal(misjudged.bytes, fullBytes, "the live transcript alone");
+    equal("droppedTurns" in misjudged.document, false, "the misjudged buffer is omitted");
 
     // A live transcript over the budget drops the buffer and trims exactly as
     // it would without one.
     MAX_TRANSCRIPT_BYTES = fullBytes - 1;
     load(budgetTurns);
-    const over = encodedTranscriptWithinBudget(null, entries(clone(gone)));
-    check(Buffer.byteLength(over) <= MAX_TRANSCRIPT_BYTES, "the trimmed document honors the budget");
-    equal("droppedTurns" in JSON.parse(over), false, "no buffer beside a trimmed transcript");
+    const over = encodeTranscript(null, entries(clone(gone)));
+    check(over.bytes <= MAX_TRANSCRIPT_BYTES, "the trimmed document honors the budget");
+    equal("droppedTurns" in over.document, false, "no buffer beside a trimmed transcript");
     equal(ids(transcriptTurns), "fg1,fg2", "trimming is unchanged by the buffer");
 
     // ----------------------------------------------------------- resume markers
@@ -805,10 +841,10 @@ extension ExtensionOptimizationTests {
     // Count only encodes of at least 1 MiB: those are whole-document passes,
     // the cost the accounting exists to avoid.
     resetCounters(1024 * 1024);
-    const trimmed = encodedTranscriptWithinBudget(null);
+    const trimmed = encodeTranscript(null);
     check(
-        Buffer.byteLength(trimmed) <= MAX_TRANSCRIPT_BYTES,
-        "heavy transcript honors the hard budget: " + Buffer.byteLength(trimmed)
+        trimmed.bytes <= MAX_TRANSCRIPT_BYTES,
+        "heavy transcript honors the hard budget: " + trimmed.bytes
     );
     check(
         transcriptTurns[0].assistantMessages.length < 250,
@@ -817,7 +853,7 @@ extension ExtensionOptimizationTests {
 
     console.log(realStringify({
         initialBytes,
-        finalBytes: Buffer.byteLength(trimmed),
+        finalBytes: trimmed.bytes,
         largeEncodes,
         stringifyBytes,
         remainingMessages: transcriptTurns[0].assistantMessages.length,

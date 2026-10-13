@@ -160,8 +160,15 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).close-session-request").path
     }
 
+    /// The sealed transcript: the finished turns, rewritten only when they change.
     public static func transcriptSnapshotPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).transcript.json").path
+    }
+
+    /// The turn in progress, rewritten as it streams. It only counts while it
+    /// extends the sealed transcript's revision (see `TranscriptFiles`).
+    public static func transcriptLivePath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).transcript-live.json").path
     }
 
     public static func transcriptOwnerPath(sessionId: String) -> String {

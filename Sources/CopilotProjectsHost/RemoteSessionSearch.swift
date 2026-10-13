@@ -12,17 +12,22 @@ actor SessionSearchIndex {
         let transcript: FileSignature?
         let owner: FileSignature?
         let quarantine: FileSignature?
+        let live: FileSignature?
 
-        /// When the transcript last changed, as the Mac finder orders sessions.
+        /// When the transcript last changed, as the Mac finder orders sessions:
+        /// the later of its sealed file and the live file of the turn in progress.
         var lastActivity: Date? {
-            transcript.map { Date(timeIntervalSinceReferenceDate: $0.modifiedAt) }
+            transcript.map {
+                Date(timeIntervalSinceReferenceDate: max($0.modifiedAt, live?.modifiedAt ?? 0))
+            }
         }
 
         static func current(sessionId: String) -> Stamp {
             Stamp(
                 transcript: signature(Paths.transcriptSnapshotPath(sessionId: sessionId)),
                 owner: signature(Paths.transcriptOwnerPath(sessionId: sessionId)),
-                quarantine: signature(Paths.transcriptQuarantinePath(sessionId: sessionId))
+                quarantine: signature(Paths.transcriptQuarantinePath(sessionId: sessionId)),
+                live: signature(Paths.transcriptLivePath(sessionId: sessionId))
             )
         }
 

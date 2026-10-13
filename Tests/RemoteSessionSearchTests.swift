@@ -50,7 +50,7 @@ private final class FakeTranscripts: @unchecked Sendable {
                     .modificationDate: date ?? Date(),
                 ])
             },
-            owner: nil, quarantine: nil
+            owner: nil, quarantine: nil, live: nil
         )
     }
 

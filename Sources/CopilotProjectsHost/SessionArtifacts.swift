@@ -316,6 +316,7 @@ enum SessionArtifacts {
             Paths.elicitationResponsePath(sessionId: sessionId),
             Paths.closeSessionRequestPath(sessionId: sessionId),
             Paths.transcriptSnapshotPath(sessionId: sessionId),
+            Paths.transcriptLivePath(sessionId: sessionId),
             Paths.transcriptOwnerPath(sessionId: sessionId),
             Paths.legacyTranscriptOwnerLockPath(sessionId: sessionId),
             Paths.transcriptQuarantinePath(sessionId: sessionId),

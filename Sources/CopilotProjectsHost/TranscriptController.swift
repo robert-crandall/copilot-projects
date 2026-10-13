@@ -27,6 +27,18 @@ final class TranscriptController: ObservableObject {
         let transcript: FileSignature
         let owner: FileSignature?
         let quarantine: FileSignature?
+        let live: FileSignature?
+
+        /// Whether a read under `other` saw the same transcript provenance.
+        /// The live file only adds the turn in progress to the sealed file it
+        /// extends (`TranscriptFiles` checks that), so it never changes whose
+        /// transcript a read saw, and streaming does not make reads stale.
+        func hasSameProvenance(as other: LoadSignature?) -> Bool {
+            guard let other else { return false }
+            return transcript == other.transcript
+                && owner == other.owner
+                && quarantine == other.quarantine
+        }
     }
 
     private struct LoadResult: Sendable {
@@ -134,9 +146,14 @@ final class TranscriptController: ObservableObject {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             return nil
         }
-        let decoder = transcriptDecoder()
-        guard let snapshot = try? decoder.decode(TranscriptSnapshot.self, from: data),
-              snapshot.schemaVersion == 3 else {
+        let liveData = try? Data(
+            contentsOf: URL(fileURLWithPath: Paths.transcriptLivePath(sessionId: sessionId))
+        )
+        guard let snapshot = TranscriptFiles.snapshot(
+            sealed: data,
+            live: liveData,
+            decoder: transcriptDecoder()
+        ) else {
             return LoadResult(signature: signature, snapshot: nil)
         }
         guard transcriptOwnerAllowsSnapshot(
@@ -170,6 +187,7 @@ final class TranscriptController: ObservableObject {
                 fileGeneration(Paths.transcriptSnapshotPath(sessionId: sessionId)),
                 fileGeneration(Paths.transcriptOwnerPath(sessionId: sessionId)),
                 fileGeneration(Paths.transcriptQuarantinePath(sessionId: sessionId)),
+                fileGeneration(Paths.transcriptLivePath(sessionId: sessionId)),
             ].joined(separator: "|")
         )
     }
@@ -239,13 +257,19 @@ final class TranscriptController: ObservableObject {
             return nil
         }
         let data = try? Data(contentsOf: URL(fileURLWithPath: path))
+        let liveData = try? Data(
+            contentsOf: URL(fileURLWithPath: Paths.transcriptLivePath(sessionId: sessionId))
+        )
         duringRead?()
-        guard let data, data.count <= 6 * 1_024 * 1_024 else {
+        let maximumBytes = 6 * 1_024 * 1_024
+        guard let data, data.count <= maximumBytes else {
             return nil
         }
-        let decoder = transcriptDecoder()
-        guard let snapshot = try? decoder.decode(TranscriptSnapshot.self, from: data),
-              snapshot.schemaVersion == 3 else {
+        guard let snapshot = TranscriptFiles.snapshot(
+            sealed: data,
+            live: liveData.flatMap { $0.count <= maximumBytes ? $0 : nil },
+            decoder: transcriptDecoder()
+        ) else {
             return nil
         }
         guard transcriptOwnerAllowsSnapshot(
@@ -356,7 +380,7 @@ final class TranscriptController: ObservableObject {
            loadSignature(
                sessionId: sessionId,
                transcriptPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
-           ) != expectedSignature {
+           )?.hasSameProvenance(as: expectedSignature) != true {
             return false
         }
 
@@ -614,7 +638,7 @@ final class TranscriptController: ObservableObject {
         guard loadSignature(
             sessionId: sessionId,
             transcriptPath: Paths.transcriptSnapshotPath(sessionId: sessionId)
-        ) == expectedSignature else {
+        )?.hasSameProvenance(as: expectedSignature) == true else {
             return false
         }
         let path = Paths.transcriptQuarantinePath(sessionId: sessionId)
@@ -671,7 +695,8 @@ final class TranscriptController: ObservableObject {
         return LoadSignature(
             transcript: transcript,
             owner: fileSignature(Paths.transcriptOwnerPath(sessionId: sessionId)),
-            quarantine: fileSignature(Paths.transcriptQuarantinePath(sessionId: sessionId))
+            quarantine: fileSignature(Paths.transcriptQuarantinePath(sessionId: sessionId)),
+            live: fileSignature(Paths.transcriptLivePath(sessionId: sessionId))
         )
     }
 
