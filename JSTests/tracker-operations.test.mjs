@@ -51,6 +51,14 @@ fs.writeFileSync = (path, ...args) => {
   }
   return result;
 };
+fs.readFileSync = (path, ...args) => {
+  const result = realReadFileSync(path, ...args);
+  const runtime = [...runtimes].find((entry) =>
+    String(path).startsWith(entry.root)
+  );
+  runtime?.afterRead?.(String(path));
+  return result;
+};
 fs.openSync = (path, ...args) => {
   const fd = originalOpenSync(path, ...args);
   const runtime = [...runtimes].find((entry) =>
@@ -1447,6 +1455,72 @@ test("a restarted tracker restores the in-progress turn from a matching live fil
     }, "restored transcript not republished");
     assert.deepEqual(restored.turns.map((entry) => entry.id), expected, baseRevision);
     assert.equal(realExistsSync(liveTranscriptFile(transcriptFile(runtime))), false, baseRevision);
+  }
+});
+
+test("a restarted tracker reads the live file first, so a sealed rewrite between the reads keeps the turn", {
+  concurrency: false,
+}, async (t) => {
+  const turn = (id, endedAt, content = id) => ({
+    id,
+    startedAt: new Date(1_700_000_000_000).toISOString(),
+    endedAt,
+    kind: "foreground",
+    userContent: content,
+    assistantMessages: [],
+    tools: [],
+    isAborted: false,
+  });
+  const ended = new Date(1_700_000_000_500).toISOString();
+  const sealedDocument = (runtime, turns, revision, previousRevision) => JSON.stringify({
+    schemaVersion: 4,
+    copilotSessionId: runtime.copilotSessionId,
+    ownerPid: 1,
+    turns,
+    updatedAt: new Date(1_700_000_010_000).toISOString(),
+    revision,
+    previousRevision,
+  });
+  const liveDocument = (runtime, baseRevision, content) => JSON.stringify({
+    schemaVersion: 1,
+    copilotSessionId: runtime.copilotSessionId,
+    baseRevision,
+    updatedAt: new Date(1_700_000_010_000).toISOString(),
+    turn: turn("pending", null, content),
+  });
+  // What the tracker writes between the restore's two reads: the turn
+  // sealed with the live file gone, or a sealed advance mid-turn that names
+  // the live file's previous base before the live file is rewritten.
+  const rewrites = {
+    sealed: (runtime, sealedPath) => {
+      realWriteFileSync(sealedPath, sealedDocument(
+        runtime, [turn("kept", ended), turn("pending", ended)], "r2", "r2"
+      ));
+      realRmSync(liveTranscriptFile(sealedPath));
+    },
+    advanced: (runtime, sealedPath) => {
+      realWriteFileSync(sealedPath, sealedDocument(runtime, [turn("kept", ended)], "r2", "r1"));
+      realWriteFileSync(liveTranscriptFile(sealedPath), liveDocument(runtime, "r2", "second"));
+    },
+  };
+  for (const [name, rewrite] of Object.entries(rewrites)) {
+    const runtime = await createRuntime(t, (session, runtime) => {
+      session.getEvents = async () => { throw new Error("history unavailable"); };
+      const sealedPath = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
+      realWriteFileSync(sealedPath, sealedDocument(runtime, [turn("kept", ended)], "r1", "r1"));
+      realWriteFileSync(liveTranscriptFile(sealedPath), liveDocument(runtime, "r1", "first"));
+      let rewritten = false;
+      runtime.afterRead = (path) => {
+        if (rewritten || !/\.transcript(-live)?\.json$/.test(path)) return;
+        rewritten = true;
+        rewrite(runtime, sealedPath);
+      };
+    });
+    const restored = await waitFor(() => {
+      const value = readTranscript(runtime);
+      return value?.ownerPid === process.pid && value;
+    }, "restored transcript not republished");
+    assert.deepEqual(restored.turns.map((entry) => entry.id), ["kept", "pending"], name);
   }
 });
 
