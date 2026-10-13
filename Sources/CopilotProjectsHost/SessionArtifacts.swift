@@ -266,6 +266,38 @@ enum SessionArtifacts {
         "status", "status-timestamp", "prompt-status-timestamp", "copilot-allow-all",
     ]
 
+    /// Turn markers only the hook script names (`CopilotHooks.script`). The hook
+    /// clears them on sessionEnd, which a close that has to kill the CLI never runs.
+    private static let hookMarkerSuffixes = ["active-turn", "agent-stop-completion"]
+
+    /// Files replaced by writing a pid-named sibling and renaming it over the
+    /// original: `<name>.<pid>` by the hook, `<name>.<pid>.tmp` by the tracker. A
+    /// writer killed between the two steps leaves the sibling behind.
+    private static let hookTemporaryFileBases = ["status-record.json"]
+    private static let trackerTemporaryFileBases = [
+        "copilot-session", "agent-activity.json", "transcript.json",
+        "transcript-live.json", "transcript-owner.json",
+    ]
+
+    /// `name` is a session file name without its `<sessionId>.` prefix.
+    private static func isAbandonedTemporaryFile(_ name: String) -> Bool {
+        func isPID(_ value: Substring) -> Bool {
+            !value.isEmpty && value.allSatisfy { $0.isASCII && $0.isNumber }
+        }
+        for base in hookTemporaryFileBases where name.hasPrefix("\(base).") {
+            if isPID(name.dropFirst(base.count + 1)) { return true }
+        }
+        for base in trackerTemporaryFileBases
+            where name.hasPrefix("\(base).") && name.hasSuffix(".tmp") {
+            if isPID(name.dropFirst(base.count + 1).dropLast(4)) { return true }
+        }
+        return false
+    }
+
+    private static func isLeakedFile(_ name: String) -> Bool {
+        hookMarkerSuffixes.contains(name) || isAbandonedTemporaryFile(name)
+    }
+
     static func removeFiles(sessionId: String) {
         let fm = FileManager.default
         for suffix in RemoteSessionActionKind.allCases.map({ "\($0.rawValue).json" }) {
@@ -275,7 +307,7 @@ enum SessionArtifacts {
                 catch { NSLog("copilot-projects: could not remove session workflow file: \(error)") }
             }
         }
-        let retired = retiredFileSuffixes.map {
+        let suffixed = (retiredFileSuffixes + hookMarkerSuffixes).map {
             Paths.sessionsDir.appendingPathComponent("\(sessionId).\($0)").path
         }
         for path in [
@@ -288,15 +320,54 @@ enum SessionArtifacts {
             Paths.agentActivitySnapshotPath(sessionId: sessionId),
             Paths.userInputResponsePath(sessionId: sessionId),
             Paths.elicitationResponsePath(sessionId: sessionId),
+            Paths.setModelRequestPath(sessionId: sessionId),
             Paths.closeSessionRequestPath(sessionId: sessionId),
             Paths.transcriptSnapshotPath(sessionId: sessionId),
             Paths.transcriptLivePath(sessionId: sessionId),
             Paths.transcriptOwnerPath(sessionId: sessionId),
             Paths.transcriptQuarantinePath(sessionId: sessionId),
-        ] + retired {
+        ] + suffixed {
             try? fm.removeItem(atPath: path)
         }
+        let prefix = "\(sessionId)."
+        for name in (try? fm.contentsOfDirectory(atPath: Paths.sessionsDir.path)) ?? []
+            where name.hasPrefix(prefix)
+                && isAbandonedTemporaryFile(String(name.dropFirst(prefix.count))) {
+            try? fm.removeItem(at: Paths.sessionsDir.appendingPathComponent(name))
+        }
         removeTranscriptOwnerLock(sessionId: sessionId)
+    }
+
+    /// Deletes the files `removeFiles` used to leave behind (hook turn markers and
+    /// abandoned temp files) for tabs that no longer exist. Only UUID-named tabs
+    /// outside `keeping` with no dtach socket are considered, so a live session or
+    /// a close still in progress is never touched; every other file is kept.
+    static func removeLeakedFiles(
+        keeping sessionIds: Set<String>,
+        sessionsDirectory: URL = Paths.sessionsDir
+    ) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: sessionsDirectory.path) else {
+            return
+        }
+        let kept = Set(sessionIds.compactMap(UUID.init(uuidString:)))
+        var attached = Set<UUID>()
+        var leaked: [(sessionId: UUID, name: String)] = []
+        for name in names {
+            let parts = name.split(separator: ".", maxSplits: 1)
+            guard parts.count == 2, let sessionId = UUID(uuidString: String(parts[0])) else {
+                continue
+            }
+            if parts[1] == "sock" {
+                attached.insert(sessionId)
+            } else if isLeakedFile(String(parts[1])) {
+                leaked.append((sessionId, name))
+            }
+        }
+        for file in leaked
+            where !kept.contains(file.sessionId) && !attached.contains(file.sessionId) {
+            try? fm.removeItem(at: sessionsDirectory.appendingPathComponent(file.name))
+        }
     }
 
     /// Trackers exclude each other with a kernel lock on this file, so it is

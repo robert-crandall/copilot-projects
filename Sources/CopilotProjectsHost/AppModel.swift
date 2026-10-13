@@ -423,6 +423,9 @@ final class AppModel: ObservableObject {
     private(set) var capturedResumeLaunches: [String: String] = [:]
     private var stateLoadFailure: String?
     private var didFailToLoadWorkspaceState = false
+    /// Only a cleanly loaded state file lists every tab that may still own files;
+    /// a missing or backup-recovered workspace can't prove a tab is gone.
+    private var didLoadWorkspaceState = false
     private var stateRecoveryMessage: String?
     private var didPresentStateMessage = false
     private var server: ControlServer?
@@ -1942,6 +1945,13 @@ final class AppModel: ObservableObject {
             }
             forcedSessionDestroyer(Array(intent.sessionIds))
             finishPersistedSessionCloses()
+            if didLoadWorkspaceState {
+                SessionArtifacts.removeLeakedFiles(
+                    keeping: Set(projects.flatMap { $0.sessions.map(\.id) })
+                        .union(intent.sessionIds),
+                    sessionsDirectory: agentActivityDirectory
+                )
+            }
         } catch {
             let message = "Could not recover session closes (intent: \(stateRepository.closeIntentPath.path)): \(error)"
             stateLoadFailure = message
@@ -5399,6 +5409,7 @@ final class AppModel: ObservableObject {
             return
         case .loaded(let loaded):
             state = loaded
+            didLoadWorkspaceState = true
         case .recovered(let recovered, let message):
             state = recovered
             stateRecoveryMessage = message

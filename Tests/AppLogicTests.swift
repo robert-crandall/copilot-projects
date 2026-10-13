@@ -5997,6 +5997,138 @@ final class AppLogicTests: XCTestCase {
         }
     }
 
+    func testSessionArtifactCleanupRemovesHookMarkersAndAbandonedTemporaryFiles() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let previous = ProcessInfo.processInfo.environment["COPILOT_PROJECTS_STATE_DIR"]
+        setenv("COPILOT_PROJECTS_STATE_DIR", root.path, 1)
+        defer {
+            if let previous { setenv("COPILOT_PROJECTS_STATE_DIR", previous, 1) }
+            else { unsetenv("COPILOT_PROJECTS_STATE_DIR") }
+            try? FileManager.default.removeItem(at: root)
+        }
+        Paths.ensureStateDir()
+        let sessionId = UUID().uuidString
+        let otherId = UUID().uuidString
+        let removed = [
+            "active-turn", "agent-stop-completion", "set-model-request.json",
+            "status-record.json.4242", "copilot-session.17.tmp", "agent-activity.json.17.tmp",
+            "transcript.json.17.tmp", "transcript-live.json.17.tmp",
+            "transcript-owner.json.17.tmp",
+        ].map { "\(sessionId).\($0)" }
+        let kept = [
+            "\(sessionId).status-record.json.old", "\(sessionId).transcript.json.tmp",
+            "\(sessionId).transcript.json.17.tmp.bak", "\(sessionId).unrelated",
+            "\(otherId).active-turn", "\(otherId).status-record.json.4242",
+            "\(otherId).transcript.json.17.tmp",
+        ]
+        for name in removed + kept {
+            try Data("x".utf8).write(to: Paths.sessionsDir.appendingPathComponent(name))
+        }
+
+        SessionArtifacts.removeFiles(sessionId: sessionId)
+
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(atPath: Paths.sessionsDir.path)),
+            Set(kept)
+        )
+    }
+
+    @MainActor
+    func testStartupRemovesLeakedFilesOnlyForTabsThatAreGone() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let live = Session(title: "live", cwd: root.path)
+        let project = Project(
+            name: "project", cwd: root.path, sessions: [live], selectedSessionId: live.id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+        let closing = UUID().uuidString
+        try repository.acceptCloses(sessionIds: [closing])
+        let gone = UUID().uuidString
+        let attached = UUID().uuidString.lowercased()
+        let removed = [
+            "\(gone).active-turn", "\(gone).agent-stop-completion",
+            "\(gone).status-record.json.4242", "\(gone).transcript.json.17.tmp",
+            "\(gone.lowercased()).agent-stop-completion",
+        ]
+        let kept = [
+            "\(gone).status-record.json", "\(gone).transcript.json", "\(gone).copilot-session",
+            "\(live.id).active-turn", "\(live.id).status-record.json.4242",
+            "\(live.id.lowercased()).agent-stop-completion",
+            "\(attached).sock", "\(attached).active-turn",
+            "\(closing).agent-stop-completion",
+            "session-1.active-turn",
+        ]
+        for name in removed + kept {
+            try Data("x".utf8).write(to: sessions.appendingPathComponent(name))
+        }
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: sessions,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(
+                root: root.appendingPathComponent("kitty-images", isDirectory: true)
+            ),
+            forcedSessionDestroyer: { _ in }
+        )
+
+        model.finishInterruptedSessionDestroys()
+
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(atPath: sessions.path)),
+            Set(kept)
+        )
+    }
+
+    @MainActor
+    func testStartupKeepsLeakedFilesWhenWorkspaceWasNotLoadedCleanly() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = sessions.appendingPathComponent("\(UUID().uuidString).agent-stop-completion")
+        try Data().write(to: marker)
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        let project = Project(name: "project", cwd: root.path)
+        let state = PersistedState(projects: [project], selectedProjectId: project.id)
+
+        func finishStartup() {
+            AppModel(
+                stateRepository: repository,
+                isAppActive: { false },
+                agentActivityDirectory: sessions,
+                kittyImageDiskStore: RemoteKittyImageDiskStore(
+                    root: root.appendingPathComponent("kitty-images", isDirectory: true)
+                ),
+                forcedSessionDestroyer: { _ in }
+            ).finishInterruptedSessionDestroys()
+        }
+
+        // Missing state file.
+        finishStartup()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+
+        // Unreadable state file recovered from its backup.
+        try repository.save(state)
+        try repository.save(state)
+        try Data("{".utf8).write(to: repository.path)
+        finishStartup()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+
+        // Unreadable state file without a usable backup.
+        try FileManager.default.removeItem(at: repository.backupPath)
+        finishStartup()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
     @MainActor
     func testTranscriptDrawerRequiresExplicitOpen() throws {
         let root = FileManager.default.temporaryDirectory
