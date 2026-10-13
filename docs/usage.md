@@ -451,11 +451,8 @@ Keep an immutable request body and UUID for an explicit retry after a network
 or 5xx error. Do not automatically resubmit prompts, reuse a UUID after changing
 the project or launch options, or retain pending retries indefinitely. A matching
 retry returns the original session, even if it moved projects; a changed intent
-returns 409. Historical sessions without an intent fingerprint accept retries
-only through the legacy `sessions/create` route. Configured and review routes
-return 409 for those unverifiable historical replays, including optionless
-configured requests and old review attempts. The host persists intent hashes,
-not starting-prompt text.
+returns 409, as does a retry for a session with no recorded intent. The host
+persists intent hashes, not starting-prompt text.
 An existing terminal socket without a stored intent cannot satisfy a configured
 or review create, even if its master may have exited; it returns 409 rather than assuming
 the requested intent is safe to repeat. Fresh configured and review
