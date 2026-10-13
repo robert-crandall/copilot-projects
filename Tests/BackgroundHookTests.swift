@@ -499,4 +499,32 @@ final class BackgroundHookTests: XCTestCase {
             XCTAssertEqual(record.statusTimestamp, 100)
         }
     }
+
+    func testSessionCleanupRemovesEveryFileAnInterruptedTurnLeaves() throws {
+        let fixture = try Fixture()
+        let previous = ProcessInfo.processInfo.environment["COPILOT_PROJECTS_STATE_DIR"]
+        setenv("COPILOT_PROJECTS_STATE_DIR", fixture.root.path, 1)
+        defer {
+            if let previous { setenv("COPILOT_PROJECTS_STATE_DIR", previous, 1) }
+            else { unsetenv("COPILOT_PROJECTS_STATE_DIR") }
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.file("active-turn").path))
+        try fixture.run("idle", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":200}"#)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.file("agent-stop-completion").path))
+        // A hook killed between writing its record and renaming it into place.
+        try Data("{}".utf8).write(to: fixture.file("status-record.json.4242"))
+        let other = fixture.sessions.appendingPathComponent("\(UUID().uuidString).active-turn")
+        try Data().write(to: other)
+
+        SessionArtifacts.removeFiles(sessionId: fixture.tabId)
+
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.sessions.path),
+            [other.lastPathComponent])
+    }
 }

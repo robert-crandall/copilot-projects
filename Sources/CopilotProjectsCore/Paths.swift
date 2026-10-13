@@ -133,6 +133,12 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).elicitation-response.json").path
     }
 
+    /// Model switch request the host atomically writes; the extension applies it
+    /// over RPC, then removes it.
+    public static func setModelRequestPath(sessionId: String) -> String {
+        sessionsDir.appendingPathComponent("\(sessionId).set-model-request.json").path
+    }
+
     /// Host-written request asking the owning tracker extension to terminate the
     /// Copilot CLI through its in-app `/exit` path before dtach is destroyed.
     public static func closeSessionRequestPath(sessionId: String) -> String {
