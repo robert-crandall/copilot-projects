@@ -119,7 +119,6 @@ class FakeSession {
     this.modelSwitchCalls = [];
     this.closeCalls = [];
     this.history = [];
-    this.pendingQuestionCalls = [];
     this.questionEvents = [];
     this.questionEventCalls = [];
     this.questionEventHandler = async ({ cursor, max }) => {
@@ -132,9 +131,6 @@ class FakeSession {
         cursorStatus: "ok",
       };
     };
-    this.pendingQuestionsHandler = async () => ({
-      userInputRequests: [], elicitationRequests: [],
-    });
     this.processing = false;
     this.runtimeCalls = [];
     this.workflowCalls = [];
@@ -210,10 +206,6 @@ class FakeSession {
         if (method === "status.get") return this.statusHandler();
         if (method === "session.getForeground") {
           return { sessionId: this.foregroundSessionId ?? this.sessionId };
-        }
-        if (method === "session.ui.pendingRequests") {
-          this.pendingQuestionCalls.push(params);
-          return this.pendingQuestionsHandler(params);
         }
         if (method === "session.eventLog.read") {
           this.questionEventCalls.push(params);
@@ -2333,13 +2325,15 @@ test("late attach recovers a free-text form and answers its real request exactly
   let durable;
   const runtime = await createRuntime(t, (session, runtime) => {
     durable = writeDurableQuestion(runtime, question);
-    session.pendingQuestionsHandler = async () => ({
-      userInputRequests: [], elicitationRequests: [question],
+    session.questionEvents.push({
+      ...questionEvent("elicitation.requested", question),
+      // Older than the durable ask_user, so suppression relies on the matching toolCallId.
+      timestamp: "2026-08-31T23:59:59.000Z",
     });
   });
-  assert.deepEqual(runtime.session.pendingQuestionCalls, [{
-    sessionId: runtime.copilotSessionId,
-  }]);
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 1
+    && readSnapshot(runtime).trackedElicitations[0].requestId === question.requestId,
+  "late attach did not recover the real form");
   let snapshot = readSnapshot(runtime);
   assert.equal(snapshot.trackedElicitations.length, 1);
   assert.equal(snapshot.trackedElicitations[0].requestId, question.requestId);
@@ -2415,15 +2409,16 @@ test("published form schemas record the agent's property order and drop forged o
     },
   });
   const runtime = await createRuntime(t, (session) => {
-    session.pendingQuestionsHandler = async () => ({
-      userInputRequests: [],
-      elicitationRequests: [
-        question,
-        unorderable("no-properties", {}),
-        unorderable("array-properties", { properties: [] }),
-      ],
-    });
+    for (const data of [
+      question,
+      unorderable("no-properties", {}),
+      unorderable("array-properties", { properties: [] }),
+    ]) {
+      session.questionEvents.push(questionEvent("elicitation.requested", data));
+    }
   });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 3,
+    "recovered forms were not published");
   const entries = readSnapshot(runtime).trackedElicitations;
   const schemaFor = (requestId) =>
     entries.find((entry) => entry.requestId === requestId)?.schema;
@@ -2435,127 +2430,19 @@ test("published form schemas record the agent's property order and drop forged o
   assert.deepEqual(schemaFor("array-properties"), { type: "object", properties: [] });
 });
 
-test("recovery excludes racing completions and preserves live and subagent requests", {
-  concurrency: false,
-}, async (t) => {
-  const childId = uuid();
-  const runtime = await createRuntime(t, (session) => {
-    session.pendingQuestionsHandler = async () => {
-      await session.emit("elicitation.completed", { requestId: "completed" });
-      await session.emit("user_input.completed", { requestId: "completed-input" });
-      await session.emit("elicitation.requested", { ...pendingURLQuestion("live"), message: "New live prompt" });
-      await session.emit("elicitation.requested", pendingURLQuestion("child"), { agentId: childId });
-      return {
-        userInputRequests: [{ requestId: "completed-input", question: "Old input" }],
-        elicitationRequests: [
-          pendingURLQuestion("completed"),
-          pendingURLQuestion("live"),
-          pendingURLQuestion("child"),
-          pendingURLQuestion("recovered"),
-        ],
-      };
-    };
-  });
-  const snapshot = readSnapshot(runtime);
-  assert.deepEqual(snapshot.trackedUserInputs, []);
-  assert.deepEqual(snapshot.trackedElicitations.map((entry) => entry.requestId), [
-    "live", "child", "recovered",
-  ]);
-  assert.equal(snapshot.trackedElicitations[0].message, "New live prompt");
-  assert.equal(snapshot.trackedElicitations[1].agentId, childId);
-});
-
-test("conversation rotation discards a stale pending-question snapshot", {
-  concurrency: false,
-}, async (t) => {
-  const nextId = uuid();
-  const runtime = await createRuntime(t, (session) => {
-    session.pendingQuestionsHandler = async ({ sessionId }) => {
-      if (sessionId === nextId) {
-        return { userInputRequests: [], elicitationRequests: [pendingURLQuestion("new")] };
-      }
-      session.sessionId = nextId;
-      await session.emit("session.start", { sessionId: nextId });
-      return { userInputRequests: [], elicitationRequests: [pendingURLQuestion("old")] };
-    };
-  });
-  await waitFor(() => readSnapshot(runtime).trackedElicitations.some((entry) =>
-    entry.requestId === "new"
-  ), "new conversation question not recovered");
-  assert.equal(readSnapshot(runtime).copilotSessionId, nextId);
-  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), ["new"]);
-  assert.equal(runtime.session.pendingQuestionCalls.length, 2);
-});
-
-test("recovered questions remain cached while another tracker owns publication", {
-  concurrency: false,
-}, async (t) => {
-  const runtime = await createRuntime(t);
-  let finish;
-  runtime.session.pendingQuestionsHandler = () => new Promise((resolve) => { finish = resolve; });
-  runtime.session.sessionId = uuid();
-  await runtime.session.emit("session.start", { sessionId: runtime.session.sessionId });
-  await waitFor(() => finish, "recovery query was not issued");
-  const owner = JSON.parse(realReadFileSync(runtime.ownerPath, "utf8"));
-  realWriteFileSync(runtime.ownerPath, JSON.stringify({ ...owner, pid: process.ppid }));
-  const writesBefore = runtime.activityWrites.length;
-  finish({ userInputRequests: [], elicitationRequests: [pendingURLQuestion()] });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(runtime.activityWrites.length, writesBefore, "a non-owner published the snapshot");
-
-  realWriteFileSync(runtime.ownerPath, JSON.stringify(owner));
-  runtime.intervalCallback();
-  assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), ["url-request"]);
-  assert.equal(runtime.session.pendingQuestionCalls.length, 2, "ownership recovery did not need another RPC");
-});
-
-test("recovery never evicts live questions to make room for older snapshots", {
-  concurrency: false,
-}, async (t) => {
-  const runtime = await createRuntime(t, (session) => {
-    session.pendingQuestionsHandler = async () => {
-      for (let index = 0; index < 50; index += 1) {
-        await session.emit("elicitation.requested", pendingURLQuestion(`live-${index}`));
-        await session.emit("user_input.requested", { requestId: `input-${index}`, question: "Live input" });
-      }
-      return {
-        userInputRequests: [{ requestId: "older-input", question: "Old input" }],
-        elicitationRequests: [pendingURLQuestion("older-form")],
-      };
-    };
-  });
-  const snapshot = readSnapshot(runtime);
-  assert.equal(snapshot.trackedUserInputs.length, 50);
-  assert.equal(snapshot.trackedElicitations.length, 50);
-  assert.ok(snapshot.trackedUserInputs.every((entry) => entry.requestId.startsWith("input-")));
-  assert.ok(snapshot.trackedElicitations.every((entry) => entry.requestId.startsWith("live-")));
-});
-
-test("recovery timeout keeps the terminal prompt and safely ignores a late rejection", {
-  concurrency: false,
-}, async (t) => {
-  let rejectLate;
-  const runtime = await createRuntime(t, (session, runtime) => {
-    writeDurableQuestion(runtime);
-    session.pendingQuestionsHandler = () => new Promise((_, reject) => { rejectLate = reject; });
-  });
-  assert.equal(readSnapshot(runtime).trackedElicitations[0].mode, "terminal");
-  rejectLate(new Error("late RPC rejection"));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(readSnapshot(runtime).trackedElicitations[0].mode, "terminal");
-});
-
-test("unsupported or failed recovery keeps the original terminal fallback", {
+test("unsupported or failed cursor recovery keeps the original terminal fallback", {
   concurrency: false,
 }, async (t) => {
   for (const error of [
     Object.assign(new Error("method not found"), { code: -32601 }),
-    new Error("pending store unavailable"),
+    new Error("event log unavailable"),
   ]) {
     const runtime = await createRuntime(t, (session, runtime) => {
       writeDurableQuestion(runtime);
-      session.pendingQuestionsHandler = async () => { throw error; };
+      session.questionEventHandler = async () => { throw error; };
     });
+    await waitFor(() => runtime.session.questionEventCalls.length > 0, "cursor read was not attempted");
+    await new Promise((resolve) => setImmediate(resolve));
     const requests = readSnapshot(runtime).trackedElicitations;
     assert.equal(requests.length, 1);
     assert.equal(requests[0].requestId, "synthetic::durable-ask-user::call-url");
@@ -2568,11 +2455,14 @@ test("recovering an unrelated question does not suppress a terminal prompt", {
 }, async (t) => {
   const runtime = await createRuntime(t, (session, runtime) => {
     writeDurableQuestion(runtime);
-    session.pendingQuestionsHandler = async () => ({
-      userInputRequests: [],
-      elicitationRequests: [pendingURLQuestion("other", "different-tool")],
+    session.questionEvents.push({
+      ...questionEvent("elicitation.requested", pendingURLQuestion("other", "different-tool")),
+      // Older than the durable ask_user, so only a matching toolCallId could suppress it.
+      timestamp: "2026-08-31T23:59:59.000Z",
     });
   });
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 2,
+    "unrelated question was not recovered");
   assert.deepEqual(readSnapshot(runtime).trackedElicitations.map((entry) => entry.requestId), [
     "other", "synthetic::durable-ask-user::call-url",
   ]);
@@ -2581,11 +2471,7 @@ test("recovering an unrelated question does not suppress a terminal prompt", {
 test("cursor reads recover text, boolean, choice, and multiselect when live notifications disappear", {
   concurrency: false,
 }, async (t) => {
-  const runtime = await createRuntime(t, (session) => {
-    session.pendingQuestionsHandler = async () => {
-      throw Object.assign(new Error("old CLI"), { code: -32601 });
-    };
-  });
+  const runtime = await createRuntime(t);
   for (const [kind, field, answer] of [
     ["text", { type: "string" }, "https://example.com"],
     ["boolean", { type: "boolean", default: true }, true],

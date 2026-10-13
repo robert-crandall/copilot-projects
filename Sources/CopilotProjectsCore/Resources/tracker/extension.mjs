@@ -294,8 +294,8 @@ if (validSessionId && socketPath) {
     const closeSessionRequestName = `${appSessionId}.close-session-request`;
     const activeSubagents = new Map();
     // All outstanding structured questions (root and subagent), keyed by
-    // requestId. Rebuilt from live events and the runtime's pending snapshot,
-    // never resurrected from disk.
+    // requestId. Rebuilt from live events and the runtime's question event
+    // log, never resurrected from disk.
     const pendingUserInputs = new Map();
     const inFlightUserInputResponses = new Set();
     // Outstanding elicitations (schema-form / url questions), keyed by
@@ -303,7 +303,6 @@ if (validSessionId && socketPath) {
     const pendingElicitations = new Map();
     const recoveredQuestionToolCallIds = new Set();
     const completedQuestionRequests = new Set();
-    let pendingQuestionRecovery = null;
     let questionEventStream = null;
     const inFlightElicitationResponses = new Set();
     const operationReceipts = new Map();
@@ -2462,7 +2461,6 @@ if (validSessionId && socketPath) {
     }
 
     function noteQuestionCompleted(requestId) {
-        pendingQuestionRecovery?.completed.add(requestId);
         questionEventStream?.inputs.delete(requestId);
         questionEventStream?.elicitations.delete(requestId);
         // Runtime request IDs are unique; a delayed notification must not reopen an answered form.
@@ -2649,70 +2647,6 @@ if (validSessionId && socketPath) {
         } finally {
             clearTimeout(timeout);
             stream.inFlight = false;
-        }
-    }
-
-    async function recoverPendingQuestions(generation) {
-        if (generation !== conversationGeneration || shuttingDown) return;
-        const recovery = {
-            sessionId: copilotSessionId,
-            completed: new Set(),
-        };
-        pendingQuestionRecovery = recovery;
-        let timeout = null;
-        const current = () => !shuttingDown
-            && pendingQuestionRecovery === recovery
-            && generation === conversationGeneration
-            && recovery.sessionId === copilotSessionId;
-        try {
-            if (typeof session.connection?.sendRequest !== "function") {
-                throw Object.assign(new Error("pending question RPC unavailable"), { code: -32601 });
-            }
-            const result = await Promise.race([
-                session.connection.sendRequest("session.ui.pendingRequests", {
-                    sessionId: recovery.sessionId,
-                }),
-                new Promise((_, reject) => {
-                    timeout = setTimeout(
-                        () => reject(new Error("pending question recovery timed out")),
-                        PENDING_QUESTIONS_TIMEOUT_MS
-                    );
-                }),
-            ]);
-            if (!current()) return;
-            if (!Array.isArray(result?.userInputRequests)
-                    || !Array.isArray(result?.elicitationRequests)) {
-                throw new Error("invalid pending question snapshot");
-            }
-            for (const [items, pending, parse, maximum] of [
-                [result.userInputRequests, pendingUserInputs, userInputEntry, MAX_USER_INPUTS],
-                [result.elicitationRequests, pendingElicitations, elicitationEntry, MAX_ELICITATIONS],
-            ]) {
-                for (const data of items.slice(-maximum)) {
-                    if (recovery.completed.has(data?.requestId) || completedQuestionRequests.has(data?.requestId)) continue;
-                    const entry = parse({ data });
-                    if (!entry) continue;
-                    // Live events win over an older snapshot, including their agent ownership.
-                    if (!pending.has(entry.requestId)) {
-                        if (pending.size >= maximum) continue;
-                        pending.set(entry.requestId, entry);
-                    }
-                    if (!pending.get(entry.requestId).agentId) {
-                        suppressRecoveredDurableQuestion(data.toolCallId);
-                    }
-                }
-            }
-            publish();
-        } catch (error) {
-            if (!current()) return;
-            if (error?.code === -32601) {
-                console.error("[copilot-projects] pending snapshot unavailable; using question event recovery");
-            } else {
-                console.error("[copilot-projects] pending question recovery failed:", error);
-            }
-        } finally {
-            clearTimeout(timeout);
-            if (pendingQuestionRecovery === recovery) pendingQuestionRecovery = null;
         }
     }
 
@@ -4352,7 +4286,6 @@ if (validSessionId && socketPath) {
         // empty and would otherwise blank the model line the rotation event
         // just taught us.
         const preservedModel = currentModel;
-        const pendingQuestions = recoverPendingQuestions(generation);
         reconcileQuestionEvents();
         let history = [];
 
@@ -4450,8 +4383,6 @@ if (validSessionId && socketPath) {
             }
         }
         queuedTranscriptEvents.length = 0;
-        await pendingQuestions;
-        if (stale()) return;
         publish();
         if (durableTranscriptAuthoritative) {
             scheduleDurableReconcile(0);
@@ -4485,7 +4416,6 @@ if (validSessionId && socketPath) {
         pendingElicitations.clear();
         recoveredQuestionToolCallIds.clear();
         completedQuestionRequests.clear();
-        pendingQuestionRecovery = null;
         questionEventStream = null;
         inFlightElicitationResponses.clear();
         pendingPermissionRequests.clear();
