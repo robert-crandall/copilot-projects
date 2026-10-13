@@ -10,6 +10,20 @@ struct Session: Identifiable, Codable, Equatable {
     var cwd: String
     var creationFingerprint: String?
     var pullRequestKeys: [String]?
+    /// Persisted only while set, so unmarked sessions keep their saved shape.
+    private var manuallyMarkedUnread: Bool?
+
+    /// "Mark as Unread": a reminder to come back to this session. Unlike `hasUnread`,
+    /// it survives relaunch, viewing other tabs in the project, and reactivating the
+    /// app. Only navigating to the session or marking it read clears it.
+    var markedUnread: Bool {
+        get { manuallyMarkedUnread == true }
+        set { manuallyMarkedUnread = newValue ? true : nil }
+    }
+
+    /// Either an unseen notification or a manual mark. Drives the unread dot,
+    /// project bell, Dock count, and the `unread` flag mirrored to remotes.
+    var isUnread: Bool { hasUnread || markedUnread }
 
     // Transient (not persisted): reset on load.
     var status: SessionStatus = .idle
@@ -65,7 +79,10 @@ struct Session: Identifiable, Codable, Equatable {
         }
     }
 
-    private enum CodingKeys: String, CodingKey { case id, title, cwd, creationFingerprint, pullRequestKeys }
+    private enum CodingKeys: String, CodingKey {
+        case id, title, cwd, creationFingerprint, pullRequestKeys
+        case manuallyMarkedUnread = "markedUnread"
+    }
 
     init(
         id: String = UUID().uuidString,
@@ -119,7 +136,7 @@ extension Project {
     var backgroundWorkCount: Int { sessions.filter(\.hasBackgroundWork).count }
     var scheduledCount: Int { sessions.filter { !$0.schedules.isEmpty }.count }
     var failedCount: Int { sessions.filter { $0.failedRequest != nil }.count }
-    var hasUnread: Bool { sessions.contains { $0.hasUnread } }
+    var hasUnread: Bool { sessions.contains { $0.isUnread } }
     var hasBackgroundWork: Bool { backgroundWorkCount > 0 }
 }
 

@@ -709,6 +709,8 @@ final class AppModel: ObservableObject {
         // per-project eager start), not just the visible tab.
         ensureSelectedProjectControllers()
         refreshSelectedTranscriptController()
+        // Manual unread marks persist, so restore their Dock count on launch.
+        updateDockBadge()
     }
 
     @discardableResult
@@ -1656,6 +1658,7 @@ final class AppModel: ObservableObject {
         terminateController: Bool
     ) {
         guard let pi = projectIndex(pid) else { return }
+        let previousGlobalSelection = globalSelectedSessionId
         if terminateController {
             controllers[sid]?.terminate()
         }
@@ -1694,6 +1697,7 @@ final class AppModel: ObservableObject {
                 projects[pi].selectedSessionId = projects[pi].sessions[newIndex].id
             }
         }
+        clearManualMarkIfShown(replacing: previousGlobalSelection)
         refreshSelectedTranscriptController()
         updateDockBadge()
         save()
@@ -2020,7 +2024,7 @@ final class AppModel: ObservableObject {
                                     at: promptNow
                                 )
                                 : session.statusText,
-                            unread: session.hasUnread,
+                            unread: session.isUnread,
                             ready: session.finishedUnseen,
                             background: session.hasBackgroundWork,
                             scheduled: !session.schedules.isEmpty,
@@ -3179,6 +3183,7 @@ final class AppModel: ObservableObject {
 
     func closeProject(_ pid: String) {
         guard let pi = projectIndex(pid) else { return }
+        let previousGlobalSelection = globalSelectedSessionId
         guard acceptSessionCloses(
             sessionIds: projects[pi].sessions.map(\.id),
             projectIds: [pid]
@@ -3222,6 +3227,7 @@ final class AppModel: ObservableObject {
             selectedProjectId = projects.first?.id
             if let sid = currentSelectedSessionId { controller(for: sid) }
         }
+        clearManualMarkIfShown(replacing: previousGlobalSelection)
         refreshSelectedTranscriptController()
         updateDockBadge()
         save()
@@ -3258,6 +3264,7 @@ final class AppModel: ObservableObject {
             if let sid = projects[pi].selectedSessionId,
                let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
                 projects[pi].sessions[si].finishedUnseen = false
+                projects[pi].sessions[si].markedUnread = false
             }
             for session in projects[pi].sessions {
                 controller(for: session.id)
@@ -3273,6 +3280,7 @@ final class AppModel: ObservableObject {
         if let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
             projects[pi].sessions[si].hasUnread = false
             projects[pi].sessions[si].finishedUnseen = false
+            projects[pi].sessions[si].markedUnread = false
         }
         projects[pi].selectedSessionId = sid
         controller(for: sid)
@@ -3344,6 +3352,7 @@ final class AppModel: ObservableObject {
         if selectInTarget || targetWasEmpty {
             projects[tpi].selectedSessionId = session.id
         }
+        clearManualMarkIfShown(replacing: previousGlobalSelection)
         if globalSelectedSessionId != previousGlobalSelection {
             refreshSelectedTranscriptController()
         }
@@ -4774,11 +4783,14 @@ final class AppModel: ObservableObject {
 
     /// Selects a session, or a project's shown session, and marks it read.
     private func show(projectId: String?, sessionId: String?) {
+        var clearedMark = false
         if let sessionId, let loc = locateIndex(sessionId) {
             selectedProjectId = projects[loc.p].id
             projects[loc.p].selectedSessionId = sessionId
             projects[loc.p].sessions[loc.s].hasUnread = false
             projects[loc.p].sessions[loc.s].finishedUnseen = false
+            clearedMark = projects[loc.p].sessions[loc.s].markedUnread
+            projects[loc.p].sessions[loc.s].markedUnread = false
         } else if let projectId, let pi = projectIndex(projectId) {
             selectedProjectId = projectId
             for i in projects[pi].sessions.indices {
@@ -4787,11 +4799,14 @@ final class AppModel: ObservableObject {
             if let sid = projects[pi].selectedSessionId,
                let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }) {
                 projects[pi].sessions[si].finishedUnseen = false
+                clearedMark = projects[pi].sessions[si].markedUnread
+                projects[pi].sessions[si].markedUnread = false
             }
         }
         if let sid = currentSelectedSessionId { controller(for: sid) }
         refreshSelectedTranscriptController()
         updateDockBadge()
+        if clearedMark { save() }
     }
 
     // MARK: - Copilot Pull Requests
@@ -5199,26 +5214,59 @@ final class AppModel: ObservableObject {
     }
 
     /// Mark a session read on behalf of a remote client that is now viewing it (iOS
-    /// session screen on-screen). Clears the same flags local focus does — `hasUnread`
-    /// (mirrored to remotes as `unread`) and the Mac-local `finishedUnseen` dot — so a
-    /// read on the phone clears the indicator everywhere via the workspace-snapshot diff.
+    /// session screen on-screen), or from the Mac's "Mark as Read". Clears the same
+    /// flags local focus does — `hasUnread` and a manual `markedUnread` (mirrored to
+    /// remotes as `unread`) and the Mac-local `finishedUnseen` dot — so a read on the
+    /// phone clears the indicator everywhere via the workspace-snapshot diff.
     /// Unlike `focus`, it does NOT change the Mac's selection or activate the app: a
-    /// phone read must not yank the desktop UI. `hasUnread`/`finishedUnseen` are
-    /// transient (not persisted), so there's nothing to `save()`.
+    /// phone read must not yank the desktop UI. Only `markedUnread` is persisted, so
+    /// that's the only change that needs a `save()`.
     func markSessionRead(sessionId: String) {
-        guard let loc = locateIndex(sessionId) else { return }
-        guard projects[loc.p].sessions[loc.s].hasUnread
-            || projects[loc.p].sessions[loc.s].finishedUnseen else { return }
-        projects[loc.p].sessions[loc.s].hasUnread = false
-        projects[loc.p].sessions[loc.s].finishedUnseen = false
+        clearUnread(sessionId: sessionId, includingManualMark: true)
+    }
+
+    /// "Mark as Unread": flag a session so you remember to come back to it after
+    /// working elsewhere. It stays marked until you navigate to it or mark it read.
+    func markSessionUnread(sessionId: String) {
+        guard let loc = locateIndex(sessionId),
+              !projects[loc.p].sessions[loc.s].markedUnread else { return }
+        projects[loc.p].sessions[loc.s].markedUnread = true
         updateDockBadge()
+        save()
+    }
+
+    func markSelectedSessionUnread() {
+        guard let sid = currentSelectedSessionId else { return }
+        markSessionUnread(sessionId: sid)
+    }
+
+    /// Closing or moving the visible tab, or ending the selected project, puts a
+    /// fallback session on screen. That brings you back to it just like selecting
+    /// it, so its manual mark clears. Callers update the Dock badge and save.
+    private func clearManualMarkIfShown(replacing previous: String?) {
+        guard let sid = globalSelectedSessionId, sid != previous,
+              let loc = locateIndex(sid) else { return }
+        projects[loc.p].sessions[loc.s].markedUnread = false
     }
 
     /// Clear the visible session's attention flags when the app is brought forward.
-    /// Other tabs stay unread until you view them.
+    /// Other tabs stay unread until you view them. A manual mark survives: you set
+    /// it while looking at the session, so coming back to the app isn't a return to it.
     func markActiveSessionSeen() {
         guard let sid = currentSelectedSessionId else { return }
-        markSessionRead(sessionId: sid)
+        clearUnread(sessionId: sid, includingManualMark: false)
+    }
+
+    private func clearUnread(sessionId: String, includingManualMark: Bool) {
+        guard let loc = locateIndex(sessionId) else { return }
+        let session = projects[loc.p].sessions[loc.s]
+        let clearsMark = includingManualMark && session.markedUnread
+        guard session.hasUnread || session.finishedUnseen || clearsMark else { return }
+        projects[loc.p].sessions[loc.s].hasUnread = false
+        projects[loc.p].sessions[loc.s].finishedUnseen = false
+        if clearsMark { projects[loc.p].sessions[loc.s].markedUnread = false }
+        updateDockBadge()
+        if clearsMark { save() }
     }
 
     /// Make the visible session's terminal the first responder on activation or
@@ -5231,7 +5279,7 @@ final class AppModel: ObservableObject {
 
     private func updateDockBadge() {
         let count = projects.reduce(0) { acc, p in
-            acc + p.sessions.filter { $0.hasUnread }.count
+            acc + p.sessions.filter { $0.isUnread }.count
         }
         NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
     }
@@ -5378,7 +5426,7 @@ final class AppModel: ObservableObject {
         for p in projects {
             for s in p.sessions {
                 let extra = s.statusText.map { " — \($0)" } ?? ""
-                let unread = s.hasUnread ? " [unread]" : ""
+                let unread = s.isUnread ? " [unread]" : ""
                 lines.append("\(p.name)/\(s.title)  \(s.displayStatus.rawValue)\(unread)\(extra)  \(s.id)")
             }
         }

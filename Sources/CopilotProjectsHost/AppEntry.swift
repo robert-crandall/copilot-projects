@@ -65,6 +65,9 @@ private struct WorkspaceCommands: Commands {
                 Button("New Terminal") { model.addTerminalToSelected() }
                     .keyboardShortcut("t", modifiers: [.command, .option])
                 Divider()
+                Button("Mark as Unread") { model.markSelectedSessionUnread() }
+                    .keyboardShortcut("u", modifiers: [.command, .shift])
+                Divider()
                 Button("End Session") { model.closeSelectedSession() }
                     .keyboardShortcut("w", modifiers: .command)
                 Divider()
