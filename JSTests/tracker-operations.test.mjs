@@ -51,6 +51,14 @@ fs.writeFileSync = (path, ...args) => {
   }
   return result;
 };
+fs.readFileSync = (path, ...args) => {
+  const result = realReadFileSync(path, ...args);
+  const runtime = [...runtimes].find((entry) =>
+    String(path).startsWith(entry.root)
+  );
+  runtime?.afterRead?.(String(path));
+  return result;
+};
 fs.openSync = (path, ...args) => {
   const fd = originalOpenSync(path, ...args);
   const runtime = [...runtimes].find((entry) =>
@@ -1025,9 +1033,9 @@ test("completed tasks preserve transcripts without diff capture or result sideca
     await runtime.session.emit("assistant.message", { messageId: turnId, content: `Response: ${status}` });
     await runtime.session.emit("session.task_complete", { summary: status, success: status !== "blocked" });
     await runtime.session.emit("session.idle", { aborted: status === "stopped" });
-    await waitFor(() => JSON.parse(realReadFileSync(transcript, "utf8")).turns
+    await waitFor(() => readMergedTranscript(transcript).turns
       .find((turn) => turn.id === turnId)?.endedAt, "completed turn missing");
-    const saved = JSON.parse(realReadFileSync(transcript, "utf8"));
+    const saved = readMergedTranscript(transcript);
     assert.ok(saved.turns.find((turn) => turn.id === turnId).assistantMessages
       .some((message) => message.content === `Response: ${status}`));
     assert.equal(realExistsSync(sidecar), false);
@@ -1053,8 +1061,8 @@ test("live deltas are replaced by final messages without duplicate transcript te
   await runtime.session.emit("assistant.message", { messageId: "stream-1", content: "complete" });
   await runtime.session.emit("session.idle");
   const path = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
-  await waitFor(() => JSON.parse(realReadFileSync(path, "utf8")).turns.length, "transcript missing");
-  const messages = JSON.parse(realReadFileSync(path, "utf8")).turns.at(-1).assistantMessages;
+  await waitFor(() => readMergedTranscript(path).turns.length, "transcript missing");
+  const messages = readMergedTranscript(path).turns.at(-1).assistantMessages;
   assert.deepEqual(messages.map((message) => message.content), ["complete"]);
 });
 
@@ -1076,7 +1084,7 @@ test("live transcripts omit blank assistant messages without dropping tools", {
   }
   const path = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
   const turn = await waitFor(() => {
-    const turn = JSON.parse(realReadFileSync(path, "utf8")).turns.at(-1);
+    const turn = readMergedTranscript(path).turns.at(-1);
     return turn?.tools.length === blanks.length && turn.tools.every((tool) => tool.success) && turn;
   }, "tool-only messages did not reach the live transcript");
   assert.equal(turn.endedAt, null);
@@ -1085,7 +1093,7 @@ test("live transcripts omit blank assistant messages without dropping tools", {
   ]);
   await runtime.session.emit("session.idle");
   const completed = await waitFor(() => {
-    const turn = JSON.parse(realReadFileSync(path, "utf8")).turns.at(-1);
+    const turn = readMergedTranscript(path).turns.at(-1);
     return turn?.endedAt && turn;
   }, "completed transcript missing");
   assert.deepEqual(completed.assistantMessages, turn.assistantMessages);
@@ -1101,7 +1109,7 @@ test("blank live deltas preserve whitespace and identity when text arrives", {
   await runtime.session.emit("assistant.message_delta", { messageId: "stream", deltaContent: " \n" });
   await runtime.session.emit("tool.execution_start", { toolCallId: "marker", toolName: "view" });
   const path = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
-  const readTurn = () => JSON.parse(realReadFileSync(path, "utf8")).turns.at(-1);
+  const readTurn = () => readMergedTranscript(path).turns.at(-1);
   await waitFor(() => readTurn()?.tools.length === 1, "live transcript not published");
   assert.deepEqual(readTurn().assistantMessages, []);
 
@@ -1132,10 +1140,34 @@ function transcriptFile(runtime) {
 
 function readTranscript(runtime) {
   try {
-    return JSON.parse(realReadFileSync(transcriptFile(runtime), "utf8"));
+    return readMergedTranscript(transcriptFile(runtime));
   } catch {
     return null;
   }
+}
+
+function liveTranscriptFile(path) {
+  return path.replace(/\.transcript\.json$/, ".transcript-live.json");
+}
+
+// The transcript as the host reads it: the sealed file plus the live file's
+// in-progress turn when that file extends the sealed revision (or the
+// previous one it names) and does not repeat a sealed turn.
+function readMergedTranscript(path) {
+  // The live file first, as the host reads it.
+  let live = null;
+  try {
+    live = JSON.parse(realReadFileSync(liveTranscriptFile(path), "utf8"));
+  } catch {}
+  const sealed = JSON.parse(realReadFileSync(path, "utf8"));
+  if (sealed.schemaVersion !== 4) return sealed;
+  const turn = live?.turn;
+  const accepted = live?.schemaVersion === 1
+    && live.copilotSessionId === sealed.copilotSessionId
+    && (live.baseRevision === sealed.revision || live.baseRevision === sealed.previousRevision)
+    && typeof turn?.id === "string"
+    && !sealed.turns.some((stored) => stored.id === turn.id);
+  return accepted ? { ...sealed, turns: [...sealed.turns, turn] } : sealed;
 }
 
 // Completed root turns as SDK history: a human message and its idle each.
@@ -1314,6 +1346,233 @@ test("a restarted tracker restores its dropped-turn buffer with the transcript",
   const restored = readTranscript(runtime);
   assert.deepEqual(restored.turns.map((entry) => entry.id), ["kept-1", "kept-2"]);
   assert.deepEqual(restored.droppedTurns, dropped);
+});
+
+function transcriptFileIdentity(path) {
+  const stats = fs.statSync(path, { bigint: true });
+  return `${stats.ino}:${stats.size}:${stats.mtimeNs}`;
+}
+
+async function startPendingTurn(runtime, content = "first") {
+  await runtime.session.emit("user.message", { content: "work" });
+  await runtime.session.emit("assistant.turn_start");
+  await runtime.session.emit("assistant.message", { messageId: content, content });
+  return waitFor(() => {
+    const turn = readTranscript(runtime)?.turns.at(-1);
+    return turn?.endedAt === null
+      && turn.assistantMessages.some((message) => message.content === content)
+      && turn;
+  }, "in-progress turn missing");
+}
+
+test("an in-progress turn rewrites only the live transcript file", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const sealedPath = transcriptFile(runtime);
+  const livePath = liveTranscriptFile(sealedPath);
+  await startPendingTurn(runtime);
+  const sealedBefore = transcriptFileIdentity(sealedPath);
+  const liveBefore = transcriptFileIdentity(livePath);
+  const sealed = JSON.parse(realReadFileSync(sealedPath, "utf8"));
+  assert.equal(sealed.schemaVersion, 4);
+  assert.equal(sealed.turns.some((turn) => turn.endedAt === null), false);
+
+  await runtime.session.emit("tool.execution_start", { toolCallId: "tool", toolName: "view" });
+  await runtime.session.emit("tool.execution_complete", { toolCallId: "tool", success: true });
+  await waitFor(() => readTranscript(runtime)?.turns.at(-1)?.tools[0]?.success, "tool update missing");
+  assert.equal(transcriptFileIdentity(sealedPath), sealedBefore, "the sealed file was rewritten mid-turn");
+  assert.notEqual(transcriptFileIdentity(livePath), liveBefore);
+
+  await runtime.session.emit("session.idle");
+  await waitFor(() => !realExistsSync(livePath), "the live file outlived its turn");
+  const finished = JSON.parse(realReadFileSync(sealedPath, "utf8")).turns.at(-1);
+  assert.ok(finished.endedAt);
+  assert.deepEqual(finished.tools.map((tool) => tool.id), ["tool"]);
+});
+
+test("a publish that changes nothing rewrites neither transcript file", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await startPendingTurn(runtime);
+  const writes = [];
+  runtime.failWrite = (path) => {
+    if (path.includes(".transcript")) writes.push(path);
+    return false;
+  };
+  // A loop iteration ending flushes progress without changing the turn.
+  await runtime.session.emit("assistant.turn_end");
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepEqual(writes, []);
+
+  await runtime.session.emit("assistant.message", { messageId: "second", content: "second" });
+  await waitFor(() => writes.length > 0, "a changed turn was not published");
+  assert.ok(writes.every((path) => path.includes(".transcript-live.json.")), writes.join(","));
+});
+
+test("a restarted tracker restores the in-progress turn from a matching live file", {
+  concurrency: false,
+}, async (t) => {
+  const turn = (id, endedAt) => ({
+    id,
+    startedAt: new Date(1_700_000_000_000).toISOString(),
+    endedAt,
+    kind: "foreground",
+    userContent: id,
+    assistantMessages: [],
+    tools: [],
+    isAborted: false,
+  });
+  for (const [baseRevision, expected] of [
+    ["sealed-revision", ["kept", "pending"]],
+    ["previous-revision", ["kept", "pending"]],
+    ["unrelated-revision", ["kept"]],
+  ]) {
+    const runtime = await createRuntime(t, (session, runtime) => {
+      session.getEvents = async () => { throw new Error("history unavailable"); };
+      const sealedPath = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
+      realWriteFileSync(sealedPath, JSON.stringify({
+        schemaVersion: 4,
+        copilotSessionId: runtime.copilotSessionId,
+        ownerPid: 1,
+        turns: [turn("kept", new Date(1_700_000_000_500).toISOString())],
+        updatedAt: new Date(1_700_000_010_000).toISOString(),
+        revision: "sealed-revision",
+        previousRevision: "previous-revision",
+      }));
+      realWriteFileSync(liveTranscriptFile(sealedPath), JSON.stringify({
+        schemaVersion: 1,
+        copilotSessionId: runtime.copilotSessionId,
+        baseRevision,
+        updatedAt: new Date(1_700_000_010_000).toISOString(),
+        turn: turn("pending", null),
+      }));
+    });
+    const restored = await waitFor(() => {
+      const value = readTranscript(runtime);
+      return value?.ownerPid === process.pid && value;
+    }, "restored transcript not republished");
+    assert.deepEqual(restored.turns.map((entry) => entry.id), expected, baseRevision);
+    assert.equal(realExistsSync(liveTranscriptFile(transcriptFile(runtime))), false, baseRevision);
+  }
+});
+
+test("a restarted tracker reads the live file first, so a sealed rewrite between the reads keeps the turn", {
+  concurrency: false,
+}, async (t) => {
+  const turn = (id, endedAt, content = id) => ({
+    id,
+    startedAt: new Date(1_700_000_000_000).toISOString(),
+    endedAt,
+    kind: "foreground",
+    userContent: content,
+    assistantMessages: [],
+    tools: [],
+    isAborted: false,
+  });
+  const ended = new Date(1_700_000_000_500).toISOString();
+  const sealedDocument = (runtime, turns, revision, previousRevision) => JSON.stringify({
+    schemaVersion: 4,
+    copilotSessionId: runtime.copilotSessionId,
+    ownerPid: 1,
+    turns,
+    updatedAt: new Date(1_700_000_010_000).toISOString(),
+    revision,
+    previousRevision,
+  });
+  const liveDocument = (runtime, baseRevision, content) => JSON.stringify({
+    schemaVersion: 1,
+    copilotSessionId: runtime.copilotSessionId,
+    baseRevision,
+    updatedAt: new Date(1_700_000_010_000).toISOString(),
+    turn: turn("pending", null, content),
+  });
+  // What the tracker writes between the restore's two reads: the turn
+  // sealed with the live file gone, or a sealed advance mid-turn that names
+  // the live file's previous base before the live file is rewritten.
+  const rewrites = {
+    sealed: (runtime, sealedPath) => {
+      realWriteFileSync(sealedPath, sealedDocument(
+        runtime, [turn("kept", ended), turn("pending", ended)], "r2", "r2"
+      ));
+      realRmSync(liveTranscriptFile(sealedPath));
+    },
+    advanced: (runtime, sealedPath) => {
+      realWriteFileSync(sealedPath, sealedDocument(runtime, [turn("kept", ended)], "r2", "r1"));
+      realWriteFileSync(liveTranscriptFile(sealedPath), liveDocument(runtime, "r2", "second"));
+    },
+  };
+  for (const [name, rewrite] of Object.entries(rewrites)) {
+    const runtime = await createRuntime(t, (session, runtime) => {
+      session.getEvents = async () => { throw new Error("history unavailable"); };
+      const sealedPath = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
+      realWriteFileSync(sealedPath, sealedDocument(runtime, [turn("kept", ended)], "r1", "r1"));
+      realWriteFileSync(liveTranscriptFile(sealedPath), liveDocument(runtime, "r1", "first"));
+      let rewritten = false;
+      runtime.afterRead = (path) => {
+        if (rewritten || !/\.transcript(-live)?\.json$/.test(path)) return;
+        rewritten = true;
+        rewrite(runtime, sealedPath);
+      };
+    });
+    const restored = await waitFor(() => {
+      const value = readTranscript(runtime);
+      return value?.ownerPid === process.pid && value;
+    }, "restored transcript not republished");
+    assert.deepEqual(restored.turns.map((entry) => entry.id), ["kept", "pending"], name);
+  }
+});
+
+test("a failed live write after the sealed file advances keeps the turn visible", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  const sealedPath = transcriptFile(runtime);
+  await startPendingTurn(runtime, "first");
+  const first = JSON.parse(realReadFileSync(sealedPath, "utf8"));
+  assert.equal(
+    JSON.parse(realReadFileSync(liveTranscriptFile(sealedPath), "utf8")).baseRevision,
+    first.revision
+  );
+
+  // Another process replaces the sealed file, so the next publish rewrites
+  // it under a new revision, and the live rewrite that should follow fails.
+  realWriteFileSync(`${sealedPath}.foreign`, realReadFileSync(sealedPath));
+  fs.renameSync(`${sealedPath}.foreign`, sealedPath);
+  runtime.failWrite = (path) => path.includes(".transcript-live.json.");
+  await runtime.session.emit("assistant.message", { messageId: "second", content: "second" });
+  const advanced = await waitFor(() => {
+    const value = JSON.parse(realReadFileSync(sealedPath, "utf8"));
+    return value.revision !== first.revision && value;
+  }, "the sealed file was not republished");
+  assert.equal(advanced.previousRevision, first.revision);
+  assert.deepEqual(
+    readTranscript(runtime).turns.at(-1).assistantMessages.map((message) => message.content),
+    ["first"],
+    "the last published state of the turn stays visible"
+  );
+
+  runtime.failWrite = null;
+  await runtime.session.emit("assistant.message", { messageId: "third", content: "third" });
+  await waitFor(() => readTranscript(runtime)?.turns.at(-1)?.assistantMessages
+    .some((message) => message.content === "third"), "the live file was not repaired");
+});
+
+test("a conversation rotation discards the previous conversation's live file", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await startPendingTurn(runtime);
+  const livePath = liveTranscriptFile(transcriptFile(runtime));
+  assert.ok(realExistsSync(livePath));
+
+  const next = uuid();
+  runtime.session.foregroundSessionId = next;
+  runtime.session.history = humanHistory("next", numbered("next", 2), 1_700_200_000_000);
+  await runtime.session.emit("session.start", { sessionId: next });
+  await waitFor(() => readTranscript(runtime)?.copilotSessionId === next, "rotated transcript missing");
+  assert.equal(realExistsSync(livePath), false);
 });
 
 test("losing durable authority before its baseline keeps the restored dropped-turn buffer", {
@@ -1574,7 +1833,7 @@ test("durable history streams the pending turn and live text follows newer input
   await workflowReady(runtime);
   await runtime.session.emit("assistant.message_delta", { messageId: "current", deltaContent: "live text" });
   const transcript = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
-  await waitFor(() => JSON.parse(realReadFileSync(transcript, "utf8")).turns
+  await waitFor(() => readMergedTranscript(transcript).turns
     .find((turn) => turn.id === pendingID)?.assistantMessages.some((message) => message.content === "live text"),
   "durable-authoritative transcript did not expose live text", 4_000);
   const liveID = uuid();
@@ -1587,10 +1846,10 @@ test("durable history streams the pending turn and live text follows newer input
     event("new-start", "assistant.turn_start", {}),
   ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
   await runtime.session.emit("assistant.message", { messageId: "new-live", content: "new final text" });
-  await waitFor(() => JSON.parse(realReadFileSync(transcript, "utf8")).turns
+  await waitFor(() => readMergedTranscript(transcript).turns
     .find((turn) => turn.id === liveID)?.assistantMessages.some((message) => message.content === "new final text"),
   "live text did not follow the new turn after the journal caught up", 4_000);
-  const previousTurn = JSON.parse(realReadFileSync(transcript, "utf8")).turns.find((turn) => turn.id === pendingID);
+  const previousTurn = readMergedTranscript(transcript).turns.find((turn) => turn.id === pendingID);
   assert.equal(previousTurn.assistantMessages.some((message) => message.content.startsWith("new ")), false);
 });
 

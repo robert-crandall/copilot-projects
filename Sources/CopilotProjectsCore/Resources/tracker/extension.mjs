@@ -261,6 +261,7 @@ if (validSessionId && socketPath) {
     const sessionsDir = join(dirname(socketPath), "sessions");
     const snapshotPath = join(sessionsDir, `${appSessionId}.agent-activity.json`);
     const transcriptPath = join(sessionsDir, `${appSessionId}.transcript.json`);
+    const liveTranscriptPath = join(sessionsDir, `${appSessionId}.transcript-live.json`);
     const transcriptOwnerPath = join(sessionsDir, `${appSessionId}.transcript-owner.json`);
     const transcriptOwnerLockPath = `${transcriptOwnerPath}.flock`;
     const scheduledTurnPath = join(sessionsDir, `${appSessionId}.scheduled-turn`);
@@ -374,6 +375,14 @@ if (validSessionId && socketPath) {
     // and evicted between two of its fetches).
     const recentlyDroppedTurns = [];
     let recentlyDroppedTurnBytes = 0;
+    // Each stored turn's encoding, keyed by the turn object. A turn never
+    // changes once it is stored, except for the byte budget's payload
+    // shedding, which forgets the turn's entry.
+    const encodedTranscriptTurns = new WeakMap();
+    // What this process last published to each transcript file, so a publish
+    // that changes neither leaves both alone.
+    let publishedSealedTranscript = null;
+    let publishedLiveTranscript = null;
     const transcriptEventIds = new Set();
     const queuedTranscriptEvents = [];
     let pendingTranscriptTurn = null;
@@ -447,6 +456,16 @@ if (validSessionId && socketPath) {
 
     const MAX_TRANSCRIPT_TURNS = 200;
     const MAX_TRANSCRIPT_BYTES = 5 * 1024 * 1024;
+    // The transcript is two files: the sealed file (finished turns, rewritten
+    // only when they change) and the live file (the turn in progress,
+    // rewritten as it streams). Version 3 was a single file holding both.
+    const LEGACY_TRANSCRIPT_SCHEMA_VERSION = 3;
+    const SEALED_TRANSCRIPT_SCHEMA_VERSION = 4;
+    const LIVE_TRANSCRIPT_SCHEMA_VERSION = 1;
+    // Same-length stand-ins for a revision and an `updatedAt`, which the byte
+    // budget counts before the real values exist.
+    const TRANSCRIPT_REVISION_SHAPE = "00000000-0000-0000-0000-000000000000";
+    const TRANSCRIPT_TIMESTAMP_SHAPE = "0000-00-00T00:00:00.000Z";
     const MAX_RECENTLY_DROPPED_TURNS = 10;
     const MAX_RECENTLY_DROPPED_BYTES = 256 * 1024;
     // `,"droppedTurns":[]` — the buffer's section of an encoded snapshot,
@@ -549,22 +568,62 @@ if (validSessionId && socketPath) {
 
     function restoreMatchingTranscript() {
         try {
+            // The live file first: it is replaced after the sealed file, so
+            // read first it is never ahead of the sealed file read after it.
+            const liveEncoded = readLiveTranscript();
             const encoded = readFileSync(transcriptPath, "utf8");
             if (Buffer.byteLength(encoded) > MAX_TRANSCRIPT_BYTES) return false;
             const snapshot = JSON.parse(encoded);
-            if (snapshot.schemaVersion !== 3
+            if ((snapshot.schemaVersion !== LEGACY_TRANSCRIPT_SCHEMA_VERSION
+                        && snapshot.schemaVersion !== SEALED_TRANSCRIPT_SCHEMA_VERSION)
                     || snapshot.copilotSessionId
                         !== boundedMetadataText(copilotSessionId)
                     || !Array.isArray(snapshot.turns)) return false;
-            transcriptTurns.push(
-                ...snapshot.turns.slice(-MAX_TRANSCRIPT_TURNS)
-            );
+            // A version 3 snapshot (from a tracker that predates the live
+            // file) already carries its in-progress turn inline.
+            const liveTurn = snapshot.schemaVersion === SEALED_TRANSCRIPT_SCHEMA_VERSION
+                ? liveTranscriptTurn(snapshot, liveEncoded)
+                : null;
+            const turns = liveTurn ? [...snapshot.turns, liveTurn] : snapshot.turns;
+            transcriptTurns.push(...turns.slice(-MAX_TRANSCRIPT_TURNS));
             if (Array.isArray(snapshot.droppedTurns)) {
                 rememberDroppedTurns(snapshot.droppedTurns);
             }
             return true;
         } catch {
             return false;
+        }
+    }
+
+    function readLiveTranscript() {
+        try {
+            return readFileSync(liveTranscriptPath, "utf8");
+        } catch {
+            return null;
+        }
+    }
+
+    // The in-progress turn the live file adds to `sealed`, or null. The host
+    // applies the same rule: the live file must extend this sealed file's
+    // revision, or the previous revision it names while the same turn is
+    // still in progress, and must not repeat a turn the sealed file holds.
+    function liveTranscriptTurn(sealed, encoded) {
+        if (encoded === null) return null;
+        try {
+            if (Buffer.byteLength(encoded) > MAX_TRANSCRIPT_BYTES) return null;
+            const live = JSON.parse(encoded);
+            const turn = live?.turn;
+            const accepted = live.schemaVersion === LIVE_TRANSCRIPT_SCHEMA_VERSION
+                && live.copilotSessionId === sealed.copilotSessionId
+                && typeof live.baseRevision === "string"
+                && (live.baseRevision === sealed.revision
+                    || live.baseRevision === sealed.previousRevision)
+                && turn !== null && typeof turn === "object"
+                && typeof turn.id === "string"
+                && !sealed.turns.some((stored) => stored?.id === turn.id);
+            return accepted ? turn : null;
+        } catch {
+            return null;
         }
     }
 
@@ -914,6 +973,9 @@ if (validSessionId && socketPath) {
     // per-session history is never removed.
     function discardRotatedTranscript() {
         removeFile(transcriptPath);
+        removeFile(liveTranscriptPath);
+        publishedSealedTranscript = null;
+        publishedLiveTranscript = null;
         clearRecentlyDroppedTurns();
     }
 
@@ -3022,7 +3084,7 @@ if (validSessionId && socketPath) {
             }
             let bytes;
             try {
-                bytes = Buffer.byteLength(JSON.stringify(turn) ?? "null");
+                bytes = encodedTranscriptTurn(turn).bytes;
             } catch {
                 continue;
             }
@@ -3079,7 +3141,8 @@ if (validSessionId && socketPath) {
     }
 
     // Serializes the transcript within the byte budget while protecting the
-    // human conversation. Reduction order sacrifices the least valuable
+    // human conversation. The budget covers both files together. Reduction
+    // order sacrifices the least valuable
     // content first: whole non-foreground turns, then non-foreground payload
     // (including an in-progress scheduled/automated turn), then whole
     // foreground turns, then foreground payload — never the in-progress
@@ -3097,72 +3160,67 @@ if (validSessionId && socketPath) {
     // surrogates included — and each removal subtracts that item's bytes
     // plus the separating comma it takes with it, so the running total
     // tracks the final encoding byte for byte.
+    //
+    // Returns the sealed file up to its volatile tail (`sealedBody`), the
+    // in-progress turn's encoding (`pendingJson`, or null), and the exact
+    // UTF-8 size of both files once written (`bytes`).
     function encodedTranscriptWithinBudget(pending, droppedTurns = []) {
-        // `droppedTurns` holds `{ turn, bytes }` entries, oldest first, each
-        // `bytes` the turn's own encoded UTF-8 size.
+        // `droppedTurns` holds `{ turn, bytes }` entries, oldest first. Their
+        // sizes come from the encoding cache rather than `bytes`, so the room
+        // they need is exact.
         //
-        // The envelope, `updatedAt` included, is captured once: all the
-        // accounting below is anchored to this exact prefix, and a
-        // timestamp that drifted mid-trim would invalidate it.
-        const snapshot = {
-            schemaVersion: 3,
-            updatedAt: new Date().toISOString(),
-            copilotSessionId: boundedMetadataText(copilotSessionId),
-            ownerPid: process.pid,
-            turns: pending ? [...transcriptTurns, pending] : transcriptTurns.slice(),
+        // `n` array members carry `n - 1` separating commas.
+        const separators = (count) => (count > 0 ? count - 1 : 0);
+        const sum = (values) => values.reduce((carry, value) => carry + value, 0);
+        const sectionBytes = (count, memberBytes) => (count === 0
+            ? 0
+            : DROPPED_TURNS_SECTION_BYTES + memberBytes + count - 1);
+        const envelope = transcriptEnvelopeBytes(pending !== null);
+        const storedBytes = () => {
+            const sizes = transcriptTurns.map((turn) => encodedTranscriptTurn(turn).bytes);
+            return sum(sizes) + separators(sizes.length);
         };
-        if (droppedTurns.length > 0) {
-            snapshot.droppedTurns = droppedTurns.map(({ turn }) => turn);
-        }
-        let encoded = JSON.stringify(snapshot);
-        // Overwhelmingly common case: one encode, exactly as before.
-        const documentBytes = Buffer.byteLength(encoded);
-        if (documentBytes <= MAX_TRANSCRIPT_BYTES) return encoded;
-        if (droppedTurns.length > 0) {
+        const parts = (pendingJson, dropped, bytes) => {
+            const stored = transcriptTurns
+                .map((turn) => encodedTranscriptTurn(turn).json)
+                .join(",");
+            const droppedSection = dropped.length > 0
+                ? `,"droppedTurns":[${dropped.map((turn) => encodedTranscriptTurn(turn).json).join(",")}]`
+                : "";
+            return {
+                sealedBody: `${sealedTranscriptHead()}${stored}]${droppedSection}`,
+                pendingJson,
+                bytes,
+            };
+        };
+
+        // Overwhelmingly common case: only the in-progress turn is encoded.
+        const pendingJson = pending ? encodedTranscriptItem(pending) : null;
+        const liveBytes = envelope + storedBytes()
+            + (pendingJson === null ? 0 : Buffer.byteLength(pendingJson));
+        if (liveBytes <= MAX_TRANSCRIPT_BYTES) {
             // Already-evicted turns only help a client catch up, so they get
             // only the room the live transcript leaves: the newest of them
             // that fit, and none when the live transcript itself is over (the
             // accounting below never sees them).
-            const sectionBytes = (count, memberBytes) => (count === 0
-                ? 0
-                : DROPPED_TURNS_SECTION_BYTES + memberBytes + count - 1);
-            const room = MAX_TRANSCRIPT_BYTES - documentBytes + sectionBytes(
-                droppedTurns.length,
-                droppedTurns.reduce((carry, { bytes }) => carry + bytes, 0)
-            );
+            const room = MAX_TRANSCRIPT_BYTES - liveBytes;
             let kept = 0;
             let keptBytes = 0;
             while (kept < droppedTurns.length) {
-                const { bytes } = droppedTurns[droppedTurns.length - 1 - kept];
+                const { turn } = droppedTurns[droppedTurns.length - 1 - kept];
+                const { bytes } = encodedTranscriptTurn(turn);
                 if (sectionBytes(kept + 1, keptBytes + bytes) > room) break;
                 kept += 1;
                 keptBytes += bytes;
             }
-            if (kept > 0) {
-                snapshot.droppedTurns = snapshot.droppedTurns.slice(-kept);
-                encoded = JSON.stringify(snapshot);
-                if (Buffer.byteLength(encoded) <= MAX_TRANSCRIPT_BYTES) return encoded;
-            }
-            delete snapshot.droppedTurns;
-            // No buffered turn fits beside a live transcript that does — the
-            // usual state after a byte-budget trim, which leaves less room
-            // than one turn — so the live transcript is the whole document:
-            // one more encode, no measuring pass.
-            if (kept === 0 && room >= 0) {
-                encoded = JSON.stringify(snapshot);
-                if (Buffer.byteLength(encoded) <= MAX_TRANSCRIPT_BYTES) return encoded;
-            }
+            return parts(
+                pendingJson,
+                droppedTurns.slice(droppedTurns.length - kept).map(({ turn }) => turn),
+                liveBytes + sectionBytes(kept, keptBytes)
+            );
         }
 
-        // `n` array members carry `n - 1` separating commas.
-        const separators = (count) => (count > 0 ? count - 1 : 0);
-        const encodedBytes = (value) => {
-            const item = JSON.stringify(value);
-            // A member that stringifies to `undefined` is emitted as `null`
-            // by the enclosing array.
-            return Buffer.byteLength(item === undefined ? "null" : item);
-        };
-        const sum = (values) => values.reduce((carry, value) => carry + value, 0);
+        const encodedBytes = (value) => Buffer.byteLength(encodedTranscriptItem(value));
         // Measures one turn: the shell it encodes to with both payload
         // arrays empty, plus every member's own encoded size. A turn from a
         // restored snapshot whose payload is not an array is measured
@@ -3189,17 +3247,19 @@ if (validSessionId && socketPath) {
             };
         };
 
-        const turns = snapshot.turns;
+        const turns = pending ? [...transcriptTurns, pending] : transcriptTurns.slice();
         const entries = turns.map(measure);
         // `turns` mirrors `transcriptTurns` with `pending` appended, so a
-        // stored turn shares its index across both arrays.
+        // stored turn shares its index across both arrays. Only the stored
+        // turns share the sealed file's array (and its commas); the pending
+        // turn is the live file's whole `turn`.
         let storedCount = pending ? turns.length - 1 : turns.length;
-        let total = Buffer.byteLength(JSON.stringify({ ...snapshot, turns: [] }))
+        let total = envelope
             + sum(entries.map((entry) => entry.bytes))
-            + separators(entries.length);
+            + separators(storedCount);
         const overBudget = () => total > MAX_TRANSCRIPT_BYTES;
         const dropStoredTurn = (index) => {
-            total -= entries[index].bytes + (turns.length > 1 ? 1 : 0);
+            total -= entries[index].bytes + (storedCount > 1 ? 1 : 0);
             transcriptTurns.splice(index, 1);
             turns.splice(index, 1);
             entries.splice(index, 1);
@@ -3220,6 +3280,7 @@ if (validSessionId && socketPath) {
                     // another member survives beside it.
                     const removed = sizes.shift() + (sizes.length > 0 ? 1 : 0);
                     items.shift();
+                    encodedTranscriptTurns.delete(entry.turn);
                     entry.bytes -= removed;
                     total -= removed;
                     return true;
@@ -3254,29 +3315,172 @@ if (validSessionId && socketPath) {
             if (!shedOldestPayload(() => true)) break;
         }
 
-        encoded = JSON.stringify(snapshot);
+        // Payload shedding left the shed turns' cache entries gone, so this
+        // re-encodes only those turns and the pending one.
+        const trimmedPendingJson = pending ? encodedTranscriptItem(pending) : null;
+        const trimmedBytes = envelope + storedBytes()
+            + (trimmedPendingJson === null ? 0 : Buffer.byteLength(trimmedPendingJson));
         // Reject an impossible budget rather than discard protected turns or
         // overwrite the last good snapshot with an oversized document.
-        if (Buffer.byteLength(encoded) > MAX_TRANSCRIPT_BYTES) {
+        if (trimmedBytes > MAX_TRANSCRIPT_BYTES) {
             throw new RangeError("Transcript exceeds its byte budget after trimming");
         }
-        return encoded;
+        return parts(trimmedPendingJson, [], trimmedBytes);
     }
 
-    function writeTranscriptSnapshot() {
+    // Item encodings exactly as an enclosing array emits them: a member that
+    // stringifies to `undefined` is written as `null`.
+    function encodedTranscriptItem(value) {
+        return JSON.stringify(value) ?? "null";
+    }
+
+    // A stored turn's encoding and UTF-8 size, computed once per turn object
+    // instead of once per publish.
+    function encodedTranscriptTurn(turn) {
+        const cacheable = turn !== null && typeof turn === "object";
+        let entry = cacheable ? encodedTranscriptTurns.get(turn) : undefined;
+        if (!entry) {
+            const json = encodedTranscriptItem(turn);
+            entry = { json, bytes: Buffer.byteLength(json) };
+            if (cacheable) encodedTranscriptTurns.set(turn, entry);
+        }
+        return entry;
+    }
+
+    // The sealed file is `head`, the stored turns, `]`, the optional dropped
+    // turns, then `tail`. The volatile fields come last so everything before
+    // them identifies the content.
+    function sealedTranscriptHead() {
+        return `{"schemaVersion":${SEALED_TRANSCRIPT_SCHEMA_VERSION}`
+            + `,"copilotSessionId":${JSON.stringify(boundedMetadataText(copilotSessionId))}`
+            + `,"ownerPid":${process.pid},"turns":[`;
+    }
+
+    function sealedTranscriptTail(updatedAt, revision, previousRevision) {
+        return `,"updatedAt":${JSON.stringify(updatedAt)}`
+            + `,"revision":${JSON.stringify(revision)}`
+            + `,"previousRevision":${JSON.stringify(previousRevision)}}`;
+    }
+
+    function liveTranscriptDocument(baseRevision, updatedAt, turnJson) {
+        return `{"schemaVersion":${LIVE_TRANSCRIPT_SCHEMA_VERSION}`
+            + `,"copilotSessionId":${JSON.stringify(boundedMetadataText(copilotSessionId))}`
+            + `,"baseRevision":${JSON.stringify(baseRevision)}`
+            + `,"updatedAt":${JSON.stringify(updatedAt)},"turn":${turnJson}}`;
+    }
+
+    // Bytes both files spend outside their turns: the sealed file's envelope
+    // and closing `]`, plus the live file's envelope when a turn is pending.
+    function transcriptEnvelopeBytes(hasPending) {
+        const sealed = Buffer.byteLength(sealedTranscriptHead()) + 1
+            + Buffer.byteLength(sealedTranscriptTail(
+                TRANSCRIPT_TIMESTAMP_SHAPE,
+                TRANSCRIPT_REVISION_SHAPE,
+                TRANSCRIPT_REVISION_SHAPE
+            ));
+        if (!hasPending) return sealed;
+        return sealed + Buffer.byteLength(liveTranscriptDocument(
+            TRANSCRIPT_REVISION_SHAPE,
+            TRANSCRIPT_TIMESTAMP_SHAPE,
+            ""
+        ));
+    }
+
+    function writeTranscriptSnapshot(force = false) {
         const pending = serializedPendingTurn();
         trimTranscriptTurns(pending ? MAX_TRANSCRIPT_TURNS - 1 : MAX_TRANSCRIPT_TURNS);
-        const temporaryPath = `${transcriptPath}.${process.pid}.tmp`;
+        let encoded;
         try {
-            const encoded = encodedTranscriptWithinBudget(
-                pending,
-                recentlyDroppedTurns
+            encoded = encodedTranscriptWithinBudget(pending, recentlyDroppedTurns);
+        } catch (error) {
+            console.error("copilot-projects: could not publish transcript", error);
+            return;
+        }
+        const updatedAt = new Date().toISOString();
+        const sealed = publishedSealedTranscript;
+        const sealedCurrent = !force && sealed !== null
+            && sealed.body === encoded.sealedBody
+            && transcriptFileStillPublished(transcriptPath, sealed.signature);
+        if (!sealedCurrent) {
+            const revision = randomUUID();
+            // A new sealed revision orphans the live file until its own
+            // rewrite lands. While the same turn is still in progress, name
+            // the revision the live file on disk extends, so readers keep
+            // showing that turn if the rewrite fails or never happens.
+            const live = publishedLiveTranscript;
+            const carried = pending !== null && live !== null
+                && live.turnId === pending.id
+                && transcriptFileStillPublished(liveTranscriptPath, live.signature)
+                ? live.baseRevision
+                : revision;
+            const signature = publishTranscriptFile(
+                transcriptPath,
+                encoded.sealedBody + sealedTranscriptTail(updatedAt, revision, carried)
             );
-            writeFileSync(temporaryPath, encoded, { mode: 0o600 });
-            renameSync(temporaryPath, transcriptPath);
+            if (signature === null) {
+                publishedSealedTranscript = null;
+                return;
+            }
+            publishedSealedTranscript = { body: encoded.sealedBody, signature, revision };
+        }
+        const revision = publishedSealedTranscript.revision;
+        if (encoded.pendingJson === null) {
+            if (publishedLiveTranscript !== null || !sealedCurrent) {
+                removeFile(liveTranscriptPath);
+                publishedLiveTranscript = null;
+            }
+            return;
+        }
+        const live = publishedLiveTranscript;
+        if (live !== null && live.body === encoded.pendingJson
+                && live.baseRevision === revision
+                && transcriptFileStillPublished(liveTranscriptPath, live.signature)) {
+            return;
+        }
+        const signature = publishTranscriptFile(
+            liveTranscriptPath,
+            liveTranscriptDocument(revision, updatedAt, encoded.pendingJson)
+        );
+        // A failed write leaves the previous live file, and the record of
+        // it, in place.
+        if (signature !== null) {
+            publishedLiveTranscript = {
+                body: encoded.pendingJson,
+                signature,
+                baseRevision: revision,
+                turnId: pending.id,
+            };
+        }
+    }
+
+    // Writes `contents` to `path` atomically and returns the new file's
+    // signature, taken before the rename so it describes this write even if
+    // another process replaces the file right after.
+    function publishTranscriptFile(path, contents) {
+        const temporaryPath = `${path}.${process.pid}.tmp`;
+        try {
+            writeFileSync(temporaryPath, contents, { mode: 0o600 });
+            const signature = transcriptFileSignature(temporaryPath);
+            renameSync(temporaryPath, path);
+            return signature;
         } catch (error) {
             console.error("copilot-projects: could not publish transcript", error);
             removeFile(temporaryPath);
+            return null;
+        }
+    }
+
+    function transcriptFileSignature(path) {
+        const stats = lstatSync(path, { bigint: true });
+        return `${stats.ino}:${stats.size}:${stats.mtimeNs}`;
+    }
+
+    // Whether `path` is still the file this process last published there.
+    function transcriptFileStillPublished(path, signature) {
+        try {
+            return transcriptFileSignature(path) === signature;
+        } catch {
+            return false;
         }
     }
 
@@ -3290,7 +3494,7 @@ if (validSessionId && socketPath) {
         clearTimeout(transcriptDeltaPublishTimer);
         transcriptDeltaPublishTimer = null;
         transcriptPublishTimer = null;
-        writeTranscriptSnapshot();
+        writeTranscriptSnapshot(force);
     }
 
     function schedulePublishTranscript() {

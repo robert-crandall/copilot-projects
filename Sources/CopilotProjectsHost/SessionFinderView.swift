@@ -237,15 +237,25 @@ final class SessionFinderModel: ObservableObject, Identifiable {
 }
 
 extension AppModel {
+    /// When the transcript last changed: the later of its sealed file and the
+    /// live file of the turn in progress. `nil` without a sealed file.
+    nonisolated static func transcriptLastActivity(sessionId: String) -> Date? {
+        let modified = { (path: String) in
+            (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        }
+        guard let sealed = modified(Paths.transcriptSnapshotPath(sessionId: sessionId)) else {
+            return nil
+        }
+        return max(sealed, modified(Paths.transcriptLivePath(sessionId: sessionId)) ?? sealed)
+    }
+
     var sessionFinderSources: [SessionFinderSource] {
         projects.flatMap { project in
             project.sessions.map {
                 SessionFinderSource(
                     sessionId: $0.id, projectId: project.id, projectName: project.name,
                     title: $0.title, cwd: $0.cwd,
-                    lastActivity: (try? FileManager.default.attributesOfItem(
-                        atPath: Paths.transcriptSnapshotPath(sessionId: $0.id)
-                    ))?[.modificationDate] as? Date
+                    lastActivity: Self.transcriptLastActivity(sessionId: $0.id)
                 )
             }
         }
