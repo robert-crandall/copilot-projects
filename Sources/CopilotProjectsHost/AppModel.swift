@@ -5235,9 +5235,21 @@ final class AppModel: ObservableObject {
         save()
     }
 
-    func markSelectedSessionUnread() {
+    /// Whether the Session menu offers Mark as Read, rather than Mark as Unread,
+    /// for the current session.
+    var selectedSessionOffersMarkAsRead: Bool {
+        guard let sid = currentSelectedSessionId, let loc = locateIndex(sid) else { return false }
+        return projects[loc.p].sessions[loc.s].offersMarkAsRead
+    }
+
+    /// Session ▸ Mark as Unread / Mark as Read (⇧⌘U), matching the context menu.
+    func toggleSelectedSessionRead() {
         guard let sid = currentSelectedSessionId else { return }
-        markSessionUnread(sessionId: sid)
+        if selectedSessionOffersMarkAsRead {
+            markSessionRead(sessionId: sid)
+        } else {
+            markSessionUnread(sessionId: sid)
+        }
     }
 
     /// Closing or moving the visible tab, or ending the selected project, puts a

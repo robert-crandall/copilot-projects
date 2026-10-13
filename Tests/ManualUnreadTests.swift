@@ -65,7 +65,7 @@ final class ManualUnreadTests: XCTestCase {
         let shown = f.project.sessions[0].id
         let otherTab = f.project.sessions[1].id
 
-        f.model.markSelectedSessionUnread()
+        f.model.toggleSelectedSessionRead()
         XCTAssertTrue(f.session(shown).markedUnread)
         f.model.selectProject(f.other.id)
         XCTAssertTrue(f.session(shown).markedUnread)
@@ -148,6 +148,34 @@ final class ManualUnreadTests: XCTestCase {
         XCTAssertFalse(f.model.remoteWorkspaceSnapshot().projects[0].sessions[1].unread)
         XCTAssertEqual(try f.savedSessions()[target]?.markedUnread, false)
         XCTAssertEqual(f.model.projects[0].selectedSessionId, f.project.sessions[0].id)
+    }
+
+    @MainActor
+    func testSessionMenuTogglesBetweenMarkAsUnreadAndMarkAsRead() throws {
+        let f = try ManualUnreadFixture()
+        defer { f.clean() }
+        let shown = f.project.sessions[0].id
+
+        XCTAssertFalse(f.model.selectedSessionOffersMarkAsRead)
+        f.model.toggleSelectedSessionRead()
+        XCTAssertTrue(f.session(shown).markedUnread)
+        XCTAssertTrue(f.model.selectedSessionOffersMarkAsRead, "⇧⌘U now offers Mark as Read")
+        XCTAssertEqual(NSApp.dockTile.badgeLabel, "1")
+
+        f.model.toggleSelectedSessionRead()
+        XCTAssertFalse(f.session(shown).isUnread)
+        XCTAssertFalse(f.model.selectedSessionOffersMarkAsRead)
+        XCTAssertNil(NSApp.dockTile.badgeLabel)
+        XCTAssertEqual(try f.savedSessions()[shown]?.markedUnread, false)
+        XCTAssertFalse(try f.stateText().contains("markedUnread"))
+
+        var notified = Session(title: "Notified", cwd: f.root.path)
+        XCTAssertFalse(notified.offersMarkAsRead)
+        notified.hasUnread = true
+        XCTAssertTrue(notified.offersMarkAsRead)
+        var finished = Session(title: "Finished", cwd: f.root.path)
+        finished.finishedUnseen = true
+        XCTAssertTrue(finished.offersMarkAsRead, "A finished dot also offers Mark as Read")
     }
 }
 

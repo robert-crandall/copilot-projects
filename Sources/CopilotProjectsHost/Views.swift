@@ -607,7 +607,7 @@ private struct SessionList: View {
                                 Button("Copy Starting Prompt") { model.copyStartingPrompt(for: session.id) }
                                 Divider()
                             }
-                            if session.isUnread || session.finishedUnseen {
+                            if session.offersMarkAsRead {
                                 Button("Mark as Read") { model.markSessionRead(sessionId: session.id) }
                             } else {
                                 Button("Mark as Unread") { model.markSessionUnread(sessionId: session.id) }

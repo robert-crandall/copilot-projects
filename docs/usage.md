@@ -108,7 +108,8 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   needing to switch sessions. To come back to a session later, choose **Mark as Unread**
   from its context menu (or press `⇧⌘U` for the current session). The mark survives
   relaunch and returning to the app, and clears when you go back to that session or choose
-  **Mark as Read**.
+  **Mark as Read**. Both menus offer **Mark as Read** instead while a session shows an
+  unread or finished indicator, so `⇧⌘U` toggles the current session.
 - **Control socket + CLI:** the same `copilot-projects` binary is also a CLI that talks to the
   running app over a Unix socket — ideal for agent hooks.
 - **Resumable sessions:** each terminal runs under a bundled [dtach](https://github.com/crigler/dtach),

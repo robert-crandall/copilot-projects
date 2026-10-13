@@ -25,6 +25,10 @@ struct Session: Identifiable, Codable, Equatable {
     /// project bell, Dock count, and the `unread` flag mirrored to remotes.
     var isUnread: Bool { hasUnread || markedUnread }
 
+    /// A session showing an unread or finished indicator offers Mark as Read;
+    /// any other offers Mark as Unread.
+    var offersMarkAsRead: Bool { isUnread || finishedUnseen }
+
     // Transient (not persisted): reset on load.
     var status: SessionStatus = .idle
     var statusIsRuntimeDerived = false
