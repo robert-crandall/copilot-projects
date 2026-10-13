@@ -120,8 +120,8 @@ final class RemoteOperationContractTests: XCTestCase {
 
     func testWorkspaceNegotiatesFreshTrackerStateAndBoundsCurrentEpochReceipts() throws {
         let now = Date()
-        let legacy = snapshot(at: now)
-        XCTAssertEqual(legacy.remoteOperationProjection(at: now).support, .legacy)
+        let receiptless = snapshot(at: now)
+        XCTAssertEqual(receiptless.remoteOperationProjection(at: now).support, .unavailable)
 
         var receipts = (0..<70).map { index in
             TrackedOperationReceipt(

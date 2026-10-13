@@ -3403,7 +3403,10 @@ final class AppLogicTests: XCTestCase {
                         requestedAt: ISO8601DateFormatter().string(from: updatedAt),
                         agentId: "agent-2"
                     ),
-                ]
+                ],
+                copilotSessionId: "copilot-session",
+                conversationEpoch: "epoch-1",
+                operationReceiptVersion: 1
             )
             try JSONEncoder().encode(snapshot).write(to: snapshotURL)
         }
@@ -3597,7 +3600,10 @@ final class AppLogicTests: XCTestCase {
                         disabled: true,
                         category: nil
                     ),
-                ]
+                ],
+                copilotSessionId: "copilot-session",
+                conversationEpoch: "epoch-1",
+                operationReceiptVersion: 1
             )
             try JSONEncoder().encode(snapshot).write(to: requestURL.deletingLastPathComponent()
                 .appendingPathComponent("\(session.id).agent-activity.json"))
@@ -3884,7 +3890,10 @@ final class AppLogicTests: XCTestCase {
                         requestedAt: ISO8601DateFormatter().string(from: updatedAt),
                         agentId: nil
                     )
-                ]
+                ],
+                copilotSessionId: "copilot-session",
+                conversationEpoch: "epoch-1",
+                operationReceiptVersion: 1
             )
             try JSONEncoder().encode(snapshot).write(to: snapshotURL)
         }
@@ -7063,7 +7072,9 @@ final class AppLogicTests: XCTestCase {
         // A tombstone exists but the session is gone from the workspace.
         try ledger.remember(SessionCreationRecord(
             requestId: requestId.uuidString, projectId: "p1",
-            sessionId: requestId.uuidString, createdAt: Date()))
+            sessionId: requestId.uuidString, createdAt: Date(),
+            creationFingerprint: SessionCreationRecord.fingerprint(
+                projectId: "p1", kind: .copilot, initialPrompt: nil, pullRequestURL: nil)))
 
         var launches = 0
         let model = try makeRemoteCreateModel(
@@ -7748,7 +7759,7 @@ final class AppLogicTests: XCTestCase {
     }
 
     @MainActor
-    func testCreateRemoteSessionPreservesUnboundLegacyReplayWithoutTrustingNewOptions() throws {
+    func testCreateRemoteSessionRejectsReplaysWithoutAnIntentFingerprint() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -7764,9 +7775,8 @@ final class AppLogicTests: XCTestCase {
             selectedProjectId: "p2", reposDirectory: { root.path }, ledger: ledger,
             onLaunch: { _, _, _ in launches += 1 }
         )
-        let legacy = RemoteCreateSessionRequest(requestId: id, projectId: "p1")
-        XCTAssertEqual(model.createRemoteSession(legacy), .existing(
-            RemoteCreateSessionResponse(requestId: id, projectId: "p2", sessionId: id.uuidString)))
+        XCTAssertEqual(model.createRemoteSession(
+            RemoteCreateSessionRequest(requestId: id, projectId: "p1")), .conflict)
         for kind in [nil, RemoteSessionKind.copilot, .terminal] {
             XCTAssertEqual(model.createRemoteConfiguredSession(RemoteCreateSessionRequest(
                 requestId: id, projectId: "p1", kind: kind)), .conflict)

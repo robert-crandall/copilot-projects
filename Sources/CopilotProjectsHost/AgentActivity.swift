@@ -220,18 +220,6 @@ struct AgentActivitySnapshot: Codable, Equatable {
             return .unavailable
         }
 
-        let hasReceiptMetadata = copilotSessionId != nil
-            || conversationEpoch != nil
-            || operationReceiptVersion != nil
-            || operationReceipts != nil
-        guard hasReceiptMetadata else {
-            return AgentOperationProjection(
-                conversationEpoch: nil,
-                support: .legacy,
-                receipts: nil
-            )
-        }
-
         guard operationReceiptVersion == 1,
               Self.nonEmpty(copilotSessionId) != nil,
               let conversationEpoch = Self.nonEmpty(conversationEpoch) else {

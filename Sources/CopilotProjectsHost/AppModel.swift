@@ -1272,7 +1272,7 @@ final class AppModel: ObservableObject {
         }
         return createRemoteSession(
             request,
-            isLegacyRequest: true,
+            isPlainCreate: true,
             kind: .copilot,
             title: "Copilot",
             initialPrompt: nil,
@@ -1296,7 +1296,7 @@ final class AppModel: ObservableObject {
             .replacingOccurrences(of: "\r", with: "\n")
         return createRemoteSession(
             request,
-            isLegacyRequest: false,
+            isPlainCreate: false,
             kind: kind,
             title: kind == .terminal ? "shell" : "Copilot",
             initialPrompt: prompt,
@@ -1326,7 +1326,7 @@ final class AppModel: ObservableObject {
         return createRemoteSession(
             RemoteCreateSessionRequest(
                 requestId: requestId, projectId: projectId, kind: .copilot, initialPrompt: prompt),
-            isLegacyRequest: false,
+            isPlainCreate: false,
             kind: .copilot,
             title: title,
             initialPrompt: prompt,
@@ -1382,7 +1382,7 @@ final class AppModel: ObservableObject {
         }
         return createRemoteSession(
             request,
-            isLegacyRequest: false,
+            isPlainCreate: false,
             kind: .copilot,
             title: target.title,
             initialPrompt: Self.adversarialReviewPrompt(for: target),
@@ -1401,9 +1401,11 @@ final class AppModel: ObservableObject {
         case project
     }
 
+    /// `isPlainCreate` is the unconfigured `sessions/create` route, which re-adopts an
+    /// orphaned terminal for its request and resumes that tab's recorded Copilot session.
     private func createRemoteSession(
         _ request: RemoteCreateSessionRequest,
-        isLegacyRequest: Bool,
+        isPlainCreate: Bool,
         kind: RemoteSessionKind,
         title: String,
         initialPrompt: String?,
@@ -1452,8 +1454,9 @@ final class AppModel: ObservableObject {
             if let sessionFingerprint, sessionFingerprint != fingerprint {
                 return .conflict
             }
-            let boundFingerprint = creationRecord?.creationFingerprint ?? sessionFingerprint
-            guard boundFingerprint != nil || isLegacyRequest else { return .conflict }
+            guard let boundFingerprint = creationRecord?.creationFingerprint ?? sessionFingerprint else {
+                return .conflict
+            }
             let response = RemoteCreateSessionResponse(
                 requestId: request.requestId,
                 projectId: owningProjectId,
@@ -1464,8 +1467,6 @@ final class AppModel: ObservableObject {
                       record.sessionId == sessionId else {
                     return .conflict
                 }
-            } else if boundFingerprint == nil {
-                guard owningProjectId == request.projectId else { return .conflict }
             }
             projects[loc.p].sessions[loc.s].creationFingerprint = boundFingerprint
             guard persistRemoteCreation(
@@ -1481,14 +1482,11 @@ final class AppModel: ObservableObject {
 
         // Processed before, but the session is gone: it is a tombstone, never resurrect it.
         if let creationRecord {
-            guard creationRecord.creationFingerprint != nil || isLegacyRequest else {
-                return .conflict
-            }
-            return .gone
+            return creationRecord.creationFingerprint == nil ? .conflict : .gone
         }
 
         // An orphaned terminal has no trustworthy intent binding to replay.
-        if !isLegacyRequest,
+        if !isPlainCreate,
            FileManager.default.fileExists(atPath: Paths.dtachSocketPath(sessionId: sessionId)) {
             return .conflict
         }
@@ -1515,7 +1513,7 @@ final class AppModel: ObservableObject {
             cwd = folder
         }
 
-        if !isLegacyRequest {
+        if !isPlainCreate {
             let marker = resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-session")
             if unlink(marker.path) != 0 {
                 let code = errno
@@ -1541,7 +1539,7 @@ final class AppModel: ObservableObject {
             sessionId,
             executable: copilotExecutable,
             initialPrompt: initialPrompt,
-            resumeRecordedSession: isLegacyRequest
+            resumeRecordedSession: isPlainCreate
         )
         // Like Start Session in the app, never keep a tab whose terminal didn't
         // start; nothing is recorded, so nothing was created.
@@ -4955,7 +4953,7 @@ final class AppModel: ObservableObject {
         let outcome = createRemoteSession(
             RemoteCreateSessionRequest(
                 requestId: requestId, projectId: projectId, kind: .copilot, initialPrompt: prompt),
-            isLegacyRequest: false,
+            isPlainCreate: false,
             kind: .copilot,
             title: "Copilot",
             initialPrompt: prompt,
