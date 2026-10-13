@@ -77,7 +77,161 @@ const appSessionResolution = resolveAppSessionId();
 const appSessionId = appSessionResolution.sessionId;
 const validSessionId = /^[0-9A-Fa-f-]{36}$/.test(appSessionId || "");
 
-const session = await joinSession();
+// The CLI can reject an extension's join while it is still reloading hooks for
+// the session it just started ("workspace changed while reloading native
+// hooks"). The extension host never relaunches an extension that fails before
+// it is ready, so a lost race would leave the session without a tracker until
+// someone reloads extensions by hand. Retry only those optimistic-concurrency
+// races, within a bounded window; every other error still fails the load.
+const JOIN_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000];
+const JOIN_RETRY_DEADLINE_MS = 20_000;
+const retryableJoinError = /workspace changed (?:while reloading native hooks|before accepting repository hook trust)|hook reload changed repeatedly|plugins changed during hook adoption/;
+
+function snapshotListeners(stream) {
+    return new Map(stream.eventNames().map((name) => [name, new Set(stream.rawListeners(name))]));
+}
+
+function removeListenersAddedSince(stream, snapshot, keep) {
+    for (const name of stream.eventNames()) {
+        const before = snapshot.get(name);
+        for (const listener of stream.rawListeners(name)) {
+            if (listener !== keep && !before?.has(listener)) stream.removeListener(name, listener);
+        }
+    }
+}
+
+// Follows JSON-RPC framing (a `Content-Length` header block, then that many
+// body bytes) on stdin alongside the SDK's reader, so a failed join can hand
+// the next reader the part of a frame the abandoned reader had already taken.
+function createFrameTracker() {
+    let chunks = [];
+    let bytes = 0;
+    let frameEnd = null;
+    let synced = true;
+
+    function reset() {
+        chunks = [];
+        bytes = 0;
+        frameEnd = null;
+    }
+
+    function observe(chunk) {
+        if (!synced) return;
+        try {
+            chunks.push(chunk);
+            bytes += chunk.length;
+            while (bytes > 0) {
+                if (frameEnd === null) {
+                    const buffered = Buffer.concat(chunks, bytes);
+                    chunks = [buffered];
+                    const headerEnd = buffered.indexOf("\r\n\r\n");
+                    if (headerEnd < 0) return;
+                    const length = /(?:^|\r\n)content-length:[ \t]*(\d+)[ \t]*(?:\r\n|$)/i
+                        .exec(buffered.toString("ascii", 0, headerEnd));
+                    if (!length) {
+                        synced = false;
+                        reset();
+                        return;
+                    }
+                    frameEnd = headerEnd + 4 + Number(length[1]);
+                }
+                if (bytes < frameEnd) return;
+                const rest = Buffer.concat(chunks, bytes).subarray(frameEnd);
+                chunks = rest.length > 0 ? [rest] : [];
+                bytes = rest.length;
+                frameEnd = null;
+            }
+        } catch {
+            synced = false;
+            reset();
+        }
+    }
+
+    function takeIncompleteFrame() {
+        const tail = Buffer.concat(chunks, bytes);
+        reset();
+        return tail;
+    }
+
+    return { observe, takeIncompleteFrame, isSynced: () => synced };
+}
+
+function withinRetryWindow(pending, deadline, lastFailure) {
+    let timer;
+    const elapsed = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            const error = new Error(`joinSession retry window elapsed after: ${lastFailure}`);
+            error.retryWindowElapsed = true;
+            reject(error);
+        }, Math.max(0, deadline - performance.now()));
+    });
+    return Promise.race([pending, elapsed]).finally(() => clearTimeout(timer));
+}
+
+// Each joinSession() builds a new SDK client on this process's stdio, and a
+// rejected join never disposes the old one. Before retrying, detach that
+// client from both pipes, hold stdin, and put back any partial frame its
+// reader consumed, so the next client's reader starts on a frame boundary.
+// Retrying is only safe when the SDK attaches its reader synchronously inside
+// joinSession(); otherwise the frame boundary cannot be followed.
+async function joinSessionWithRetry() {
+    const frames = createFrameTracker();
+    let observing = false;
+    let deadline = null;
+    let lastFailure = "";
+    try {
+        for (let attempt = 0; ; attempt += 1) {
+            const stdio = [process.stdin, process.stdout];
+            const listenersBefore = stdio.map(snapshotListeners);
+            const readersBefore = process.stdin.listenerCount("data");
+            const pending = joinSession();
+            if (!observing && process.stdin.listenerCount("data") > readersBefore) {
+                process.stdin.on("data", frames.observe);
+                observing = true;
+            }
+            if (attempt > 0) process.stdin.resume();
+            try {
+                return await (deadline === null
+                    ? pending
+                    : withinRetryWindow(pending, deadline, lastFailure));
+            } catch (error) {
+                const message = String(error?.message ?? error);
+                lastFailure = message;
+                const delay = JOIN_RETRY_DELAYS_MS[attempt];
+                deadline ??= performance.now() + JOIN_RETRY_DEADLINE_MS;
+                if (delay === undefined
+                        || error?.retryWindowElapsed
+                        || !observing
+                        || !retryableJoinError.test(message)
+                        || performance.now() + delay >= deadline) {
+                    throw error;
+                }
+                stdio.forEach((stream, index) => {
+                    removeListenersAddedSince(stream, listenersBefore[index], frames.observe);
+                });
+                process.stdin.pause();
+                const partialFrame = frames.takeIncompleteFrame();
+                if (!frames.isSynced()) throw error;
+                if (partialFrame.length > 0) {
+                    try {
+                        process.stdin.unshift(partialFrame);
+                    } catch {
+                        throw error;
+                    }
+                }
+                console.error(
+                    `[copilot-projects] joinSession attempt ${attempt + 1} failed: ${message}; `
+                        + `retrying in ${delay}ms`
+                );
+                await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+        }
+    } finally {
+        if (observing) process.stdin.removeListener("data", frames.observe);
+    }
+}
+
+const session = await joinSessionWithRetry();
 const extensionParentPid = Number(process.env.COPILOT_EXTENSION_PARENT_PID);
 const validExtensionParentPid = Number.isSafeInteger(extensionParentPid)
     && extensionParentPid > 1;

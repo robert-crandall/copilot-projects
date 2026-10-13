@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { registerHooks, syncBuiltinESMExports } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -74,6 +75,8 @@ syncBuiltinESMExports();
 
 const fakeSDKURL = `data:text/javascript,${encodeURIComponent(`
   export async function joinSession() {
+    const join = globalThis.__copilotProjectsTrackerJoin;
+    if (join) return join();
     return globalThis.__copilotProjectsTrackerSession;
   }
 `)}`;
@@ -402,6 +405,144 @@ async function createRuntime(t, configure = () => {}, { ready = true } = {}) {
 function readSnapshot(runtime) {
   return JSON.parse(realReadFileSync(runtime.snapshotPath, "utf8"));
 }
+
+const hookReloadRace = "Request session.resume failed with message: session construction failed: "
+  + "workspace changed while reloading native hooks";
+
+function rpcFrame(body) {
+  return Buffer.from(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+}
+
+// Backoff sleeps, without the retry-window timers raced against each attempt
+// or the harness's own short polls.
+function backoff(delays) {
+  return delays.filter((delay) => delay >= 250 && delay <= 4_000);
+}
+
+// Runs the tracker against a fake SDK whose joins attach a reader to stdin
+// synchronously, as the real SDK does, over a stdin the test controls.
+async function withJoinAttempts(join, body, { expireRetryWindow = false } = {}) {
+  const recordedDelays = [];
+  const savedSetTimeout = globalThis.setTimeout;
+  const savedStdin = Object.getOwnPropertyDescriptor(process, "stdin");
+  const input = new PassThrough();
+  Object.defineProperty(process, "stdin", { configurable: true, get: () => input });
+  globalThis.__copilotProjectsTrackerJoin = join;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    recordedDelays.push(delay);
+    const immediate = expireRetryWindow || !(delay > 4_000);
+    return savedSetTimeout(callback, immediate ? 0 : delay, ...args);
+  };
+  try {
+    return await body(recordedDelays, input);
+  } finally {
+    globalThis.setTimeout = savedSetTimeout;
+    delete globalThis.__copilotProjectsTrackerJoin;
+    Object.defineProperty(process, "stdin", savedStdin);
+    input.destroy();
+  }
+}
+
+test("a join that loses the hook-reload race resumes on the next frame boundary", {
+  timeout: 10_000,
+}, async (t) => {
+  const delivered = rpcFrame(JSON.stringify({ jsonrpc: "2.0", method: "session.lifecycle", params: {} }));
+  const split = rpcFrame(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: 3 } }));
+  const staleInput = () => {};
+  const staleOutput = () => {};
+  const keptInput = () => {};
+  let attempts = 0;
+  let session = null;
+  let received = Buffer.alloc(0);
+  await withJoinAttempts(async () => {
+    attempts += 1;
+    const stdin = process.stdin;
+    // Pipe input arrives on a later turn than the one that attaches the reader.
+    const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+    if (attempts <= 2) {
+      stdin.on("data", staleInput);
+      process.stdout.on("close", staleOutput);
+      await nextTurn();
+      if (attempts === 1) stdin.write(Buffer.concat([delivered, split.subarray(0, 20)]));
+      await nextTurn();
+      throw new Error(hookReloadRace);
+    }
+    assert.equal(stdin.listeners("data").includes(staleInput), false);
+    assert.equal(process.stdout.listeners("close").includes(staleOutput), false);
+    assert.equal(stdin.listeners("end").includes(keptInput), true);
+    stdin.on("data", (chunk) => { received = Buffer.concat([received, chunk]); });
+    await nextTurn();
+    stdin.write(split.subarray(20));
+    await waitFor(() => received.length >= split.length, "the retried reader got no frame");
+    return session;
+  }, async (delays, input) => {
+    input.on("end", keptInput);
+    const runtime = await createRuntime(t, (fakeSession) => { session = fakeSession; });
+    assert.equal(attempts, 3);
+    assert.deepEqual(received, split);
+    assert.deepEqual(backoff(delays).slice(0, 2), [250, 500]);
+    assert.equal(
+      realReadFileSync(join(runtime.sessions, `${runtime.appSessionId}.copilot-session`), "utf8"),
+      runtime.copilotSessionId
+    );
+  });
+});
+
+test("a join error outside the hook-reload race still fails the load", async (t) => {
+  let attempts = 0;
+  await withJoinAttempts(async () => {
+    attempts += 1;
+    process.stdin.on("data", () => {});
+    throw new Error("Request session.resume failed with message: permission denied");
+  }, async () => {
+    await assert.rejects(createRuntime(t), /permission denied/);
+  });
+  assert.equal(attempts, 1);
+});
+
+test("a join is not retried when the SDK has no stdin reader to follow", async (t) => {
+  let attempts = 0;
+  await withJoinAttempts(async () => {
+    attempts += 1;
+    throw new Error(hookReloadRace);
+  }, async () => {
+    await assert.rejects(createRuntime(t), /workspace changed while reloading native hooks/);
+  });
+  assert.equal(attempts, 1);
+});
+
+test("hook-reload races are retried on a bounded backoff before failing", async (t) => {
+  let attempts = 0;
+  await withJoinAttempts(async () => {
+    attempts += 1;
+    process.stdin.on("data", () => {});
+    throw new Error(hookReloadRace);
+  }, async (delays) => {
+    await assert.rejects(createRuntime(t), /workspace changed while reloading native hooks/);
+    assert.deepEqual(backoff(delays), [250, 500, 1_000, 2_000, 4_000]);
+  });
+  assert.equal(attempts, 6);
+});
+
+test("a retried join that never settles is abandoned within the retry window", {
+  timeout: 10_000,
+}, async (t) => {
+  let attempts = 0;
+  await withJoinAttempts(async () => {
+    attempts += 1;
+    process.stdin.on("data", () => {});
+    if (attempts === 1) throw new Error(hookReloadRace);
+    return new Promise(() => {});
+  }, async (delays) => {
+    await assert.rejects(
+      createRuntime(t),
+      /retry window elapsed after: .*workspace changed while reloading native hooks/
+    );
+    assert.equal(delays[0], 250);
+    assert.ok(delays[1] > 0 && delays[1] <= 20_000);
+  }, { expireRetryWindow: true });
+  assert.equal(attempts, 2);
+});
 
 test("tracker never reads permission mode or writes an allow-all marker", async (t) => {
   let reads = 0;

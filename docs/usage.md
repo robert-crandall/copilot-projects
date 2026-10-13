@@ -573,6 +573,10 @@ controls, and reboot conversation resume are unavailable. Existing CLI sessions 
 the extension or use `/restart`. Wait for current work and interactive prompts to finish before
 restarting.
 Relaunching Copilot Projects only reattaches the terminals; it does not reload their extensions.
+Copilot can reject the tracker's join while it is still reloading hooks for a session that just
+started. The tracker retries that race for up to 20 seconds. Any other join failure, or a race that
+outlasts that window, leaves the session without tracker metadata until you reload the extension or
+use `/restart`.
 
 While the app is running, the first elicitation or permission prompt and each successfully
 completed turn also post a native macOS banner. The banner includes the project and session name,
