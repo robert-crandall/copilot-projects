@@ -325,9 +325,8 @@ Projects over its control socket. While it isn't answering, lanes keep its last
 known sessions with their state shown as "Status unknown" and no indicator, the
 goal column's button becomes Open Copilot Projects, and the footer's trailing note
 says so in secondary ink; no-session nudges wait until sessions are known again.
-A Copilot Projects too old to list sessions puts "Update Copilot Projects to match
-sessions" behind the native orange warning symbol in the same note, as does a copy
-that couldn't lock its state folder and so saves nothing. None of these states
+A copy that couldn't lock its state folder and so saves nothing puts its warning
+behind the native orange warning symbol in the same note. None of these states
 uses `ContentUnavailableView`, which stays for having no data at all. The most urgent chip is
 preselected and the lanes take focus: arrows move and announce, Return goes to the
 chip's session (or GitHub when it has none), Command-Return opens GitHub, and

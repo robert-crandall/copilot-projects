@@ -208,23 +208,10 @@ final class PullRequestsWorkspaceBridgeTests: XCTestCase {
         XCTAssertEqual(resumed, .done(code: "created", text: "back"))
     }
 
-    func testAnOlderHostIsIncompatibleAndAMissingOneIsUnreachable() async throws {
-        let server = try TestControlSocket { .failure("unknown command: \($0.command)") }
-        let older = ControlWorkspaceBridge(socketPath: server.path, timeout: 2)
-        let fetch = await older.snapshot()
-        XCTAssertEqual(fetch, .incompatibleHost)
-        let reveal = await older.revealSession(projectId: nil, sessionId: "s1")
-        XCTAssertEqual(reveal, .incompatibleHost)
-        let start = await older.startCopilotSession(projectId: "p", requestId: UUID(), prompt: "go")
-        XCTAssertEqual(start, .incompatibleHost)
-        let resume = await older.resumeCopilotSession(
-            projectId: "p", requestId: UUID(), copilotSessionId: "0f1e2d3c-4b5a-4000-8000-000000000002"
-        )
-        XCTAssertEqual(resume, .incompatibleHost)
-
+    func testAnUnreadableOrMissingHostIsUnreachable() async throws {
         let garbled = try TestControlSocket { _ in .success("not a snapshot") }
         let unreadable = await ControlWorkspaceBridge(socketPath: garbled.path, timeout: 2).snapshot()
-        XCTAssertEqual(unreadable, .incompatibleHost)
+        XCTAssertEqual(unreadable, .unreachable)
 
         let missing = FileManager.default.temporaryDirectory.appendingPathComponent("prq-missing.sock").path
         let away = await ControlWorkspaceBridge(socketPath: missing, timeout: 2).snapshot()
@@ -324,17 +311,6 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         XCTAssertFalse(model.isConnected)
     }
 
-    func testAnOlderHostIsIncompatibleAndMatchesNothing() async {
-        let model = makeModel(FakeWorkspace(fetches: [.incompatibleHost]))
-        let pr = makePR(1, branch: "me/ship-it-branch")
-        model.show([pr], links: [pr.key: "s1"])
-        await model.pollWorkspace()
-        XCTAssertEqual(model.workspace, .incompatibleHost)
-        XCTAssertTrue(model.liveSessions.isEmpty)
-        XCTAssertFalse(model.sessionsKnown)
-        XCTAssertEqual(model.goals(now: testNow).flatMap(\.items).flatMap(\.assessment.reasons), [])
-    }
-
     func testGoToSessionRevealsBeforeActivatingSoTheRightSessionIsMarkedRead() async throws {
         let workspace = FakeWorkspace(fetches: [.snapshot(fixtureSnapshot)])
         let recorder = HostRecorder()
@@ -363,16 +339,6 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         model.refresh()
         try await waitUntil { !model.isRefreshing && model.lastUpdated != nil }
         XCTAssertEqual(try Data(contentsOf: index), saved, "matching against no sessions must not empty the index")
-
-        // A host that answered once and then can't be understood: its sessions are unknown again.
-        let incompatible = FakeWorkspace(fetches: [.snapshot(fixtureSnapshot), .incompatibleHost])
-        let later = makeModel(incompatible)
-        await later.pollWorkspace()
-        await later.pollWorkspace()
-        XCTAssertEqual(later.workspace, .incompatibleHost)
-        later.refresh()
-        try await waitUntil { !later.isRefreshing && later.lastUpdated != nil }
-        XCTAssertEqual(try Data(contentsOf: index), saved, "an incompatible host must not empty the index")
     }
 
     func testGoToSessionDoesNotActivateForAnEndedSessionAndRereadsIt() async throws {
@@ -561,14 +527,6 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         XCTAssertTrue(model.resumable.isEmpty)
         XCTAssertNil(model.goals(now: testNow).first?.resumable, "a session that's gone is no longer offered")
         XCTAssertTrue(recorder.activations.isEmpty)
-
-        model.show([pr], links: [:], resumable: [pr.key: candidate])
-        workspace.answer(resumes: [.incompatibleHost])
-        model.resume(candidate, projectId: "p")
-        try await waitUntil { model.resumingSessions.isEmpty }
-        XCTAssertNotEqual(workspace.resumeCalls.last?.requestId, workspace.resumeCalls.first?.requestId)
-        XCTAssertEqual(recorder.alerts.last, "Could Not Resume Session: Update Copilot Projects to resume sessions from here.")
-        XCTAssertEqual(model.resumable[pr.key], candidate, "an older Copilot Projects says nothing about the session")
     }
 
     func testSessionLinksArePrunedOnlyWhileConnected() async throws {
