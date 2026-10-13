@@ -6,11 +6,15 @@ import CopilotProjectsProtocol
 final class TranscriptFilesTests: XCTestCase {
     private let session = "copilot-session"
 
-    private func turnJSON(_ id: String, endedAt: String? = "2026-07-12T00:00:01Z") -> String {
+    private func turnJSON(
+        _ id: String,
+        endedAt: String? = "2026-07-12T00:00:01Z",
+        content: String? = nil
+    ) -> String {
         """
         {"id":"\(id)","startedAt":"2026-07-12T00:00:00Z",\
         "endedAt":\(endedAt.map { "\"\($0)\"" } ?? "null"),"kind":"foreground",\
-        "userContent":"\(id)","assistantMessages":[],"tools":[],"isAborted":false}
+        "userContent":"\(content ?? id)","assistantMessages":[],"tools":[],"isAborted":false}
         """
     }
 
@@ -37,12 +41,13 @@ final class TranscriptFilesTests: XCTestCase {
         baseRevision: String = "r2",
         copilotSessionId: String? = nil,
         turnId: String = "pending",
+        content: String? = nil,
         updatedAt: String = "2026-07-12T00:00:09Z"
     ) -> Data {
         Data("""
         {"schemaVersion":1,"copilotSessionId":"\(copilotSessionId ?? session)",\
         "baseRevision":"\(baseRevision)","updatedAt":"\(updatedAt)",\
-        "turn":\(turnJSON(turnId, endedAt: nil))}
+        "turn":\(turnJSON(turnId, endedAt: nil, content: content))}
         """.utf8)
     }
 
@@ -168,5 +173,81 @@ final class TranscriptFilesTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(20))
         }
         XCTAssertEqual(controller.snapshot?.turns.map(\.id), ["stored"])
+    }
+
+    // MARK: - One file changing while the other is read
+
+    private struct Files {
+        let sessionId = UUID().uuidString
+        var sealed: URL { URL(fileURLWithPath: Paths.transcriptSnapshotPath(sessionId: sessionId)) }
+        var live: URL { URL(fileURLWithPath: Paths.transcriptLivePath(sessionId: sessionId)) }
+    }
+
+    private func remoteRead(
+        _ files: Files,
+        betweenFiles: @escaping (Int) throws -> Void
+    ) -> TranscriptSnapshot? {
+        TranscriptController.loadRemoteSnapshotIfSettled(
+            sessionId: files.sessionId,
+            betweenFiles: { attempt in try? betweenFiles(attempt) }
+        )
+    }
+
+    /// The tracker seals the turn in progress and deletes the live file after
+    /// the reader has read the live file: the turn shows once, sealed.
+    func testATurnSealedBetweenTheReadsShowsOnce() throws {
+        Paths.ensureStateDir()
+        let files = Files()
+        defer { SessionArtifacts.removeFiles(sessionId: files.sessionId) }
+        try sealed(revision: "r1", previousRevision: "r1").write(to: files.sealed, options: .atomic)
+        try live(baseRevision: "r1").write(to: files.live, options: .atomic)
+
+        let snapshot = try XCTUnwrap(remoteRead(files) { attempt in
+            guard attempt == 1 else { return }
+            try self.sealed(turns: ["stored", "pending"]).write(to: files.sealed, options: .atomic)
+            try FileManager.default.removeItem(at: files.live)
+        })
+        XCTAssertEqual(snapshot.turns.map(\.id), ["stored", "pending"])
+        XCTAssertNotNil(snapshot.turns[1].endedAt)
+    }
+
+    /// The tracker trims the sealed file mid-turn and rewrites the live file
+    /// after the reader has read the old live file: the turn still shows once.
+    func testASealedAdvanceMidTurnBetweenTheReadsKeepsTheTurn() throws {
+        Paths.ensureStateDir()
+        let files = Files()
+        defer { SessionArtifacts.removeFiles(sessionId: files.sessionId) }
+        try sealed(turns: ["old", "stored"], revision: "r1", previousRevision: "r1")
+            .write(to: files.sealed, options: .atomic)
+        try live(baseRevision: "r1", content: "first").write(to: files.live, options: .atomic)
+
+        let snapshot = try XCTUnwrap(remoteRead(files) { attempt in
+            guard attempt == 1 else { return }
+            try self.sealed(turns: ["stored"], revision: "r2", previousRevision: "r1")
+                .write(to: files.sealed, options: .atomic)
+            try self.live(baseRevision: "r2", content: "second").write(to: files.live, options: .atomic)
+        })
+        XCTAssertEqual(snapshot.turns.map(\.id), ["stored", "pending"])
+        XCTAssertEqual(snapshot.turns[1].userContent, "second")
+    }
+
+    /// The live file streams on after the reader has read it: the read keeps
+    /// the version it saw, merged with the unchanged sealed file.
+    func testALiveRewriteBetweenTheReadsKeepsTheVersionRead() throws {
+        Paths.ensureStateDir()
+        let files = Files()
+        defer { SessionArtifacts.removeFiles(sessionId: files.sessionId) }
+        try sealed().write(to: files.sealed, options: .atomic)
+        try live(content: "first").write(to: files.live, options: .atomic)
+        var attempts = 0
+
+        let snapshot = try XCTUnwrap(remoteRead(files) { attempt in
+            attempts = attempt
+            guard attempt == 1 else { return }
+            try self.live(content: "second").write(to: files.live, options: .atomic)
+        })
+        XCTAssertEqual(attempts, 1, "a live-only change never makes a read stale")
+        XCTAssertEqual(snapshot.turns.map(\.id), ["stored", "pending"])
+        XCTAssertEqual(snapshot.turns[1].userContent, "first")
     }
 }

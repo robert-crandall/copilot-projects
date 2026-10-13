@@ -143,12 +143,15 @@ final class TranscriptController: ObservableObject {
         guard transcriptOwnerAllowsRead(sessionId: sessionId) else {
             return LoadResult(signature: signature, snapshot: nil)
         }
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
-            return nil
-        }
+        // The live file first: the tracker replaces the sealed file before the
+        // live one, so a live file read first is never ahead of the sealed file
+        // read after it, and `TranscriptFiles` decides whether it extends it.
         let liveData = try? Data(
             contentsOf: URL(fileURLWithPath: Paths.transcriptLivePath(sessionId: sessionId))
         )
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            return nil
+        }
         guard let snapshot = TranscriptFiles.snapshot(
             sealed: data,
             live: liveData,
@@ -209,10 +212,13 @@ final class TranscriptController: ObservableObject {
     ///
     /// `duringRead` runs inside each attempt, after the transcript bytes are
     /// read and before they are validated, with the 1-based attempt number;
-    /// tests use it to land a rewrite mid-read. It is `nil` in production.
+    /// `betweenFiles` runs after the live file is read and before the sealed
+    /// one. Tests use them to land a rewrite mid-read. Both are `nil` in
+    /// production.
     nonisolated static func loadRemoteSnapshotIfSettled(
         sessionId: String,
-        duringRead: ((_ attempt: Int) -> Void)? = nil
+        duringRead: ((_ attempt: Int) -> Void)? = nil,
+        betweenFiles: ((_ attempt: Int) -> Void)? = nil
     ) -> TranscriptSnapshot? {
         let path = Paths.transcriptSnapshotPath(sessionId: sessionId)
         for attempt in 1...maximumRemoteSnapshotReadAttempts {
@@ -221,7 +227,8 @@ final class TranscriptController: ObservableObject {
                 sessionId: sessionId,
                 path: path,
                 signature: signature,
-                duringRead: duringRead.map { hook in { hook(attempt) } }
+                duringRead: duringRead.map { hook in { hook(attempt) } },
+                betweenFiles: betweenFiles.map { hook in { hook(attempt) } }
             )
             if let snapshot, !snapshot.copilotSessionId.isEmpty {
                 return snapshot
@@ -250,16 +257,19 @@ final class TranscriptController: ObservableObject {
         sessionId: String,
         path: String,
         signature: LoadSignature?,
-        duringRead: (() -> Void)?
+        duringRead: (() -> Void)?,
+        betweenFiles: (() -> Void)?
     ) -> TranscriptSnapshot? {
         guard let signature else { return nil }
         guard transcriptOwnerAllowsRead(sessionId: sessionId) else {
             return nil
         }
-        let data = try? Data(contentsOf: URL(fileURLWithPath: path))
+        // The live file first, as in `load`.
         let liveData = try? Data(
             contentsOf: URL(fileURLWithPath: Paths.transcriptLivePath(sessionId: sessionId))
         )
+        betweenFiles?()
+        let data = try? Data(contentsOf: URL(fileURLWithPath: path))
         duringRead?()
         let maximumBytes = 6 * 1_024 * 1_024
         guard let data, data.count <= maximumBytes else {

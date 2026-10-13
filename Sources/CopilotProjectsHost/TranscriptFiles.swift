@@ -67,7 +67,9 @@ enum TranscriptFiles {
         let turn: TranscriptTurn
     }
 
-    /// Merges the sealed file's bytes with the live file's, read after them.
+    /// Merges the sealed file's bytes with the live file's. Read the live file
+    /// first: the tracker replaces the sealed file before the live one, so a
+    /// live file read first is never ahead of the sealed file read after it.
     /// `nil` when the sealed file is not a transcript this host understands.
     static func snapshot(
         sealed sealedData: Data,

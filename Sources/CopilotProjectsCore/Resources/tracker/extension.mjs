@@ -568,6 +568,9 @@ if (validSessionId && socketPath) {
 
     function restoreMatchingTranscript() {
         try {
+            // The live file first: it is replaced after the sealed file, so
+            // read first it is never ahead of the sealed file read after it.
+            const liveEncoded = readLiveTranscript();
             const encoded = readFileSync(transcriptPath, "utf8");
             if (Buffer.byteLength(encoded) > MAX_TRANSCRIPT_BYTES) return false;
             const snapshot = JSON.parse(encoded);
@@ -579,7 +582,7 @@ if (validSessionId && socketPath) {
             // A version 3 snapshot (from a tracker that predates the live
             // file) already carries its in-progress turn inline.
             const liveTurn = snapshot.schemaVersion === SEALED_TRANSCRIPT_SCHEMA_VERSION
-                ? liveTranscriptTurn(snapshot)
+                ? liveTranscriptTurn(snapshot, liveEncoded)
                 : null;
             const turns = liveTurn ? [...snapshot.turns, liveTurn] : snapshot.turns;
             transcriptTurns.push(...turns.slice(-MAX_TRANSCRIPT_TURNS));
@@ -592,13 +595,21 @@ if (validSessionId && socketPath) {
         }
     }
 
+    function readLiveTranscript() {
+        try {
+            return readFileSync(liveTranscriptPath, "utf8");
+        } catch {
+            return null;
+        }
+    }
+
     // The in-progress turn the live file adds to `sealed`, or null. The host
     // applies the same rule: the live file must extend this sealed file's
     // revision, or the previous revision it names while the same turn is
     // still in progress, and must not repeat a turn the sealed file holds.
-    function liveTranscriptTurn(sealed) {
+    function liveTranscriptTurn(sealed, encoded) {
+        if (encoded === null) return null;
         try {
-            const encoded = readFileSync(liveTranscriptPath, "utf8");
             if (Buffer.byteLength(encoded) > MAX_TRANSCRIPT_BYTES) return null;
             const live = JSON.parse(encoded);
             const turn = live?.turn;

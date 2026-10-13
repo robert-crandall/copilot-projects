@@ -1146,12 +1146,13 @@ function liveTranscriptFile(path) {
 // in-progress turn when that file extends the sealed revision (or the
 // previous one it names) and does not repeat a sealed turn.
 function readMergedTranscript(path) {
-  const sealed = JSON.parse(realReadFileSync(path, "utf8"));
-  if (sealed.schemaVersion !== 4) return sealed;
+  // The live file first, as the host reads it.
   let live = null;
   try {
     live = JSON.parse(realReadFileSync(liveTranscriptFile(path), "utf8"));
   } catch {}
+  const sealed = JSON.parse(realReadFileSync(path, "utf8"));
+  if (sealed.schemaVersion !== 4) return sealed;
   const turn = live?.turn;
   const accepted = live?.schemaVersion === 1
     && live.copilotSessionId === sealed.copilotSessionId

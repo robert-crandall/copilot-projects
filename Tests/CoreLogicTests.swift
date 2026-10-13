@@ -33,14 +33,15 @@ final class CoreLogicTests: XCTestCase {
     /// previous one it names) and does not repeat a sealed turn.
     private static let fakeJoinSession = "const joinSession = async () => fakeSession;\n" + #"""
     function readMergedTranscript(path) {
-      const sealed = JSON.parse(readFileSync(path, "utf8"));
-      if (sealed.schemaVersion !== 4) return sealed;
+      // The live file first, as the host reads it.
       let live = null;
       try {
         live = JSON.parse(readFileSync(
           path.replace(/\.transcript\.json$/, ".transcript-live.json"), "utf8"
         ));
       } catch {}
+      const sealed = JSON.parse(readFileSync(path, "utf8"));
+      if (sealed.schemaVersion !== 4) return sealed;
       const turn = live?.turn;
       const accepted = live?.schemaVersion === 1
         && live.copilotSessionId === sealed.copilotSessionId
@@ -3197,21 +3198,21 @@ final class CoreLogicTests: XCTestCase {
           }
           throw new Error(`timed out waiting for model ${name}`);
         }
-        // A republish that changes nothing leaves the transcript alone, so
-        // this returns at the first change, or after the tracker has had many
-        // reconcile polls to make one.
-        async function settledTranscript(previous, settleMs = 300) {
-          const deadline = Date.now() + settleMs;
-          let value;
-          do {
-            value = readMergedTranscript(
-              `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
-                + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
-            );
-            if (value.updatedAt !== previous) return value;
+        async function waitForAssistant(content) {
+          for (let attempt = 0; attempt < 200; attempt += 1) {
+            try {
+              const value = readMergedTranscript(
+                `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
+                  + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
+              );
+              if (value.turns.some((turn) => turn.assistantMessages
+                    .some((message) => message.content === content))) {
+                return value;
+              }
+            } catch {}
             await new Promise((resolve) => setTimeout(resolve, 5));
-          } while (Date.now() < deadline);
-          return value;
+          }
+          throw new Error(`timed out waiting for assistant text ${content}`);
         }
 
         await waitForUsers(1);
@@ -3293,14 +3294,20 @@ final class CoreLogicTests: XCTestCase {
             + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`
         );
 
+        // A rotated journal of the same size, which only its new inode
+        // reveals, with an edit that only a full replay can surface.
         const rotatedPath = durablePath + ".rotated";
-        writeFileSync(rotatedPath, readFileSync(durablePath));
+        writeFileSync(
+          rotatedPath,
+          readFileSync(durablePath, "utf8")
+            .replace('"live answer"', '"LIVE ANSWER"')
+        );
         renameSync(rotatedPath, durablePath);
         transcriptListener?.({
           id:"rotation-trigger",type:"session.info",
           timestamp:"2026-07-12T01:00:08.100Z",data:{}
         });
-        const afterRotation = await settledTranscript(stableUpdatedAt);
+        const afterRotation = await waitForAssistant("LIVE ANSWER");
 
         const truncated = [
           {
