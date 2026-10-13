@@ -345,31 +345,6 @@ can collapse without recreating the terminal; session details stay secondary. Th
 the [product context](PRODUCT.md). Appearance follows macOS rather than a separate
 theme picker.
 
-### Native workspace screenshots
-
-The **Capture macOS workspace** Actions workflow renders the actual native views
-with isolated synthetic sessions on the M4 runner. It uploads dark, light, compact,
-and collapsed-project captures with a source-SHA manifest and diagnostic logs. Each
-successful image must contain the terminal's unique OCR marker and use the Metal
-renderer; an empty terminal or unavailable GUI/capture permission fails the run.
-It never captures the whole desktop, launches a live host, or changes TCC grants.
-
-Capture runs are triggered by pushes to `sirfergy/studio-console` and
-`sirfergy/studio-console-bold`. Manual
-dispatch becomes available after the workflow is present on the default branch.
-Ordinary test runs skip the capture. The driver packages a debug-only SwiftPM
-application and launches that test-owned app through LaunchServices, without
-starting the shipping host's bootstrap or services. Its real
-AppKit event loop runs the same asynchronous fixture as the XCTest wrapper.
-Headless runs exercise the production input dispatcher for preview dismissal,
-workspace-action suppression/restoration, and zero terminal input, plus native
-accessibility controls and actual own-window screenshots. They do not require
-an active/key window or claim OS-level physical-key validation. The
-driver uses a private temporary home and state directory, a harmless terminal
-process, a bounded application lifetime, and a replacement environment that does
-not expose runner credentials to the fixture. Successful captures also verify
-that the fixture's terminal processes have exited.
-
 ## Build and contribute
 
 Requires Xcode 26 or later and macOS 26 or later.
