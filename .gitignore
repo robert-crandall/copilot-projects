@@ -3,19 +3,10 @@
 *.xcodeproj
 DerivedData/
 *.app
-AuthKey_*.p8
 *.p8
 dist/
 .DS_Store
 __pycache__/
 
-# vendored dtach build artifacts (source is kept, binaries are rebuilt)
-vendor/dtach/dtach
-vendor/dtach/*.o
-vendor/dtach/config.h
-vendor/dtach/config.log
-vendor/dtach/config.status
-vendor/dtach/Makefile
-vendor/dtach/autom4te.cache/
-vendor/dtach/dtach-universal
+# dtach build output (vendor/dtach/.gitignore covers configure/make artifacts)
 vendor/dtach/dtach-arm64

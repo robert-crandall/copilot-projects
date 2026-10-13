@@ -235,7 +235,7 @@ public enum CLIMain {
     public static let maximumPromptBytes = 8_192
 
     /// Exit statuses by response code, so automation can tell a retryable failure
-    /// from a terminal one. An older app answers `unknown command` without a code (1).
+    /// from a terminal one. Missing or unrecognized codes exit 1.
     static func exitStatus(forCode code: String?) -> Int32 {
         switch code {
         case "bad-request": return 2

@@ -79,6 +79,11 @@ final class BackgroundHookTests: XCTestCase {
                 "")
         }
 
+        func statusRecord() throws -> SessionStatusRecord {
+            try JSONDecoder().decode(
+                SessionStatusRecord.self, from: Data(contentsOf: file("status-record.json")))
+        }
+
         func markerContents() throws -> [String: Data] {
             let files = try FileManager.default.contentsOfDirectory(
                 at: sessions, includingPropertiesForKeys: nil)
@@ -98,7 +103,6 @@ final class BackgroundHookTests: XCTestCase {
                 status: try XCTUnwrap(SessionStatus(rawValue: status)),
                 statusTimestamp: 100, promptStatusTimestamp: 90)
             try JSONEncoder().encode(record).write(to: fixture.file("status-record.json"))
-            try Data(status.utf8).write(to: fixture.file("status"))
             let before = try fixture.markerContents()
             let calls = try Data(contentsOf: fixture.capture)
             for action in ["running", "pre", "post"] {
@@ -201,10 +205,8 @@ final class BackgroundHookTests: XCTestCase {
             XCTAssertEqual(record.status, .running)
             XCTAssertEqual(record.promptStatusTimestamp, timestamp)
         }
-        try Data("idle".utf8).write(to: fixture.file("status"))
         try fixture.run("pre", payload:
             #"{"sessionId":"\#(fixture.ownerId)","toolCalls":[{"name":"read_bash","result":null}]}"#)
-        XCTAssertEqual(try String(contentsOf: fixture.file("status")), "running")
         XCTAssertEqual(
             try String(contentsOf: fixture.capture).split(separator: "\n").last,
             "set-status running --session \(fixture.tabId)")
@@ -274,10 +276,10 @@ final class BackgroundHookTests: XCTestCase {
 
         try fixture.run("post", payload:
             #"{"sessionId":"\#(fixture.ownerId)","timestamp":500}"#)
-        XCTAssertEqual(try String(contentsOf: fixture.file("status")), "running")
+        XCTAssertEqual(try fixture.statusRecord().status, .running)
         try fixture.run("notify", payload:
             #"{"sessionId":"\#(fixture.ownerId)","timestamp":600,"notification_type":"session_idle"}"#)
-        XCTAssertEqual(try String(contentsOf: fixture.file("status")), "idle")
+        XCTAssertEqual(try fixture.statusRecord().status, .idle)
     }
 
     func testMissingOrInvalidIdentityKeepsLegacyActivityStatus() throws {
@@ -322,7 +324,7 @@ final class BackgroundHookTests: XCTestCase {
         let nextOwner = UUID().uuidString.lowercased()
         try fixture.run("start", payload:
             #"{"sessionId":"\#(nextOwner)","timestamp":300}"#)
-        XCTAssertEqual(try String(contentsOf: fixture.file("status")), "idle")
+        XCTAssertEqual(try fixture.statusRecord().status, .idle)
         let beforeRotation = try fixture.markerContents()
         for action in ["running", "pre"] {
             try fixture.run(action, payload:
@@ -349,7 +351,6 @@ final class BackgroundHookTests: XCTestCase {
         let poisoned = SessionStatusRecord(
             status: .running, statusTimestamp: 300, promptStatusTimestamp: 300)
         try JSONEncoder().encode(poisoned).write(to: fixture.file("status-record.json"))
-        try Data("running".utf8).write(to: fixture.file("status"))
 
         try fixture.run("post", payload:
             #"{"sessionId":"\#(fixture.childId)","timestamp":400}"#)
@@ -378,7 +379,6 @@ final class BackgroundHookTests: XCTestCase {
                 status: try XCTUnwrap(SessionStatus(rawValue: status)),
                 statusTimestamp: 100, promptStatusTimestamp: 90)
             try JSONEncoder().encode(record).write(to: fixture.file("status-record.json"))
-            try Data(status.utf8).write(to: fixture.file("status"))
             for suffix in ["background-agents", "session-idle-hook",
                            "active-turn", "agent-stop-completion", "scheduled-turn"] {
                 try Data("preserve".utf8).write(to: fixture.file(suffix))

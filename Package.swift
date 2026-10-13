@@ -14,7 +14,6 @@ let package = Package(
         .executable(name: "copilot-projects", targets: ["copilot-projects"]),
         .executable(name: "copilot-projects-link", targets: ["copilot-projects-link"]),
         .executable(name: "copilot-pull-requests", targets: ["copilot-pull-requests"]),
-        .executable(name: "workspace-capture-host", targets: ["WorkspaceCaptureHost"]),
         .library(name: "CopilotProjectsUI", targets: ["CopilotProjectsUI"]),
         .library(
             name: "CopilotProjectsProtocol",
@@ -113,23 +112,9 @@ let package = Package(
                 "CopilotProjectsHost",
                 "CopilotProjectsPullRequests",
                 "CopilotProjectsStyle",
-                "WorkspaceCaptureSupport",
-            ],
-            path: "Tests",
-            exclude: ["WorkspaceCaptureSupport", "WorkspaceCaptureHost"]
-        ),
-        .target(
-            name: "WorkspaceCaptureSupport",
-            dependencies: [
-                "CopilotProjectsHost", "CopilotProjectsCore", "CopilotProjectsProtocol",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
-            path: "Tests/WorkspaceCaptureSupport"
+            path: "Tests"
         ),
-        .executableTarget(
-            name: "WorkspaceCaptureHost",
-            dependencies: ["WorkspaceCaptureSupport"],
-            path: "Tests/WorkspaceCaptureHost"
-        )
     ]
 )

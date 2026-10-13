@@ -111,11 +111,11 @@ final class RemoteTranscriptOptimizationTests: XCTestCase {
         XCTAssertEqual(wide.turns.map(\.id), full.turns.map(\.id))
         XCTAssertEqual(wide.totalTurns, 6)
 
-        // The pure slice keeps the legacy default when constructed directly.
+        // A directly constructed snapshot omits the count; a window always reports it.
         XCTAssertNil(fixtureSnapshot(turnCount: 3).totalTurns)
-        XCTAssertEqual(fixtureSnapshot(turnCount: 3).limitedToMostRecentTurns(1).totalTurns, 3)
+        XCTAssertEqual(fixtureSnapshot(turnCount: 3).remoteWindow(limit: 1, after: nil).totalTurns, 3)
         XCTAssertEqual(
-            fixtureSnapshot(turnCount: 3).limitedToMostRecentTurns(1).turns.map(\.id),
+            fixtureSnapshot(turnCount: 3).remoteWindow(limit: 1, after: nil).turns.map(\.id),
             ["turn-2"]
         )
     }
@@ -238,7 +238,7 @@ final class RemoteTranscriptOptimizationTests: XCTestCase {
         // With a window, it's the usual window.
         XCTAssertEqual(
             snapshot.remoteWindow(limit: 2, after: other),
-            snapshot.limitedToMostRecentTurns(2)
+            snapshot.remoteWindow(limit: 2, after: nil)
         )
 
         // An unreadable transcript is served as an empty snapshot with no
@@ -394,7 +394,9 @@ final class RemoteTranscriptOptimizationTests: XCTestCase {
         // Without dropped turns, every shape is exactly what it was.
         let plain = fixtureSnapshot(turnCount: 4)
         XCTAssertEqual(plain.remoteWindow(limit: nil, after: nil), plain)
-        XCTAssertEqual(plain.remoteWindow(limit: 2, after: nil), plain.limitedToMostRecentTurns(2))
+        let window = plain.remoteWindow(limit: 2, after: nil)
+        XCTAssertEqual(window.turns, Array(plain.turns.suffix(2)))
+        XCTAssertEqual(window.totalTurns, plain.turns.count)
     }
 
     func testDroppedTurnsNeverLeaveTheHost() throws {

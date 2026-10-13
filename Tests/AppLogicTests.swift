@@ -496,15 +496,6 @@ final class AppLogicTests: XCTestCase {
 
         var disconnected = snapshot
         disconnected.error = "Connection is closed."
-        XCTAssertEqual(
-            AppModel.backgroundOnlyEvidenceMs(
-                snapshot: disconnected,
-                backgroundAgentsActive: false,
-                now: now,
-                nowMs: nowMs
-            ),
-            transitionMs
-        )
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             status: .idle,
             snapshot: disconnected,
@@ -826,12 +817,6 @@ final class AppLogicTests: XCTestCase {
             sessionId: preservedSessionId,
             sessionsDirectory: root
         ))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: request.path))
-
-        XCTAssertEqual(
-            Set(try SessionArtifacts.closeSessionRequests(sessionsDirectory: root)),
-            Set([sessionId, secondSessionId, preservedSessionId])
-        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: request.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: secondRequest.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: preservedRequest.path))
@@ -2361,17 +2346,9 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: capability.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: backgroundAgents.path))
-        XCTAssertEqual(
-            try String(contentsOf: sessions.appendingPathComponent("\(tabId).status"), encoding: .utf8),
-            "idle"
-        )
-        XCTAssertEqual(
-            try String(
-                contentsOf: sessions.appendingPathComponent("\(tabId).status-timestamp"),
-                encoding: .utf8
-            ),
-            "200"
-        )
+        let record = try hookStatusRecord(root: root, tabId: tabId)
+        XCTAssertEqual(record.status, .idle)
+        XCTAssertEqual(record.statusTimestamp, 200)
         XCTAssertTrue(
             try String(contentsOf: capture, encoding: .utf8)
                 .contains(
@@ -2447,10 +2424,10 @@ final class AppLogicTests: XCTestCase {
 
         let sessions = root.appendingPathComponent("sessions", isDirectory: true)
         XCTAssertTrue(FileManager.default.fileExists(
-            atPath: sessions.appendingPathComponent("\(resolved).status").path
+            atPath: sessions.appendingPathComponent("\(resolved).status-record.json").path
         ))
         XCTAssertFalse(FileManager.default.fileExists(
-            atPath: sessions.appendingPathComponent("\(stale).status").path
+            atPath: sessions.appendingPathComponent("\(stale).status-record.json").path
         ))
         XCTAssertEqual(
             try cliCallLines(in: capture),
@@ -2678,11 +2655,9 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
-        let promptTimestamp = root
-            .appendingPathComponent("sessions/\(tabId).prompt-status-timestamp")
         XCTAssertEqual(
-            try String(contentsOf: promptTimestamp, encoding: .utf8),
-            "100"
+            try hookStatusRecord(root: root, tabId: tabId).promptStatusTimestamp,
+            100
         )
         try runHook(
             hookURL: hookURL,
@@ -2862,8 +2837,6 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
 
         let tabId = UUID().uuidString
-        let promptTimestamp = root
-            .appendingPathComponent("sessions/\(tabId).prompt-status-timestamp")
         try runHook(
             hookURL: hookURL,
             action: "running",
@@ -2882,15 +2855,7 @@ final class AppLogicTests: XCTestCase {
             bin: bin,
             capture: capture
         )
-        XCTAssertEqual(
-            try String(contentsOf: promptTimestamp, encoding: .utf8),
-            "100"
-        )
-        let record = try JSONDecoder().decode(
-            SessionStatusRecord.self,
-            from: Data(contentsOf: root
-                .appendingPathComponent("sessions/\(tabId).status-record.json"))
-        )
+        let record = try hookStatusRecord(root: root, tabId: tabId)
         XCTAssertEqual(record.status, .idle)
         XCTAssertEqual(record.statusTimestamp, 110)
         XCTAssertEqual(record.promptStatusTimestamp, 100)
@@ -2927,8 +2892,8 @@ final class AppLogicTests: XCTestCase {
             "set-status idle --session \(tabId) --timestamp 120 --source session-idle"
         ))
         XCTAssertEqual(
-            try String(contentsOf: promptTimestamp, encoding: .utf8),
-            "120"
+            try hookStatusRecord(root: root, tabId: tabId).promptStatusTimestamp,
+            120
         )
         XCTAssertFalse(calls.contains { $0.contains("--notification completed") })
         XCTAssertFalse(FileManager.default.fileExists(
@@ -5281,42 +5246,14 @@ final class AppLogicTests: XCTestCase {
                 promptStatusTimestamp: 123_400
             )
         )
-        XCTAssertEqual(
-            try String(
-                contentsOf: root.appendingPathComponent("\(sessionId).status"),
-                encoding: .utf8
-            ),
-            "running"
-        )
-        XCTAssertEqual(
-            try String(
-                contentsOf: root.appendingPathComponent("\(sessionId).status-timestamp"),
-                encoding: .utf8
-            ),
-            "123456"
-        )
-        XCTAssertEqual(
-            try String(
-                contentsOf: root
-                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
-                encoding: .utf8
-            ),
-            "123400"
-        )
     }
 
-    func testInvalidAtomicStatusRecordDoesNotFallBackToLegacyMarkers() throws {
+    func testInvalidAtomicStatusRecordLoadsAsInvalid() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let sessionId = UUID().uuidString
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try Data("running".utf8).write(
-            to: root.appendingPathComponent("\(sessionId).status"))
-        try Data("200".utf8).write(
-            to: root.appendingPathComponent("\(sessionId).status-timestamp"))
-        try Data("100".utf8).write(
-            to: root.appendingPathComponent("\(sessionId).prompt-status-timestamp"))
         try Data(#"{"schemaVersion":1,"status":"running"}"#.utf8).write(
             to: root.appendingPathComponent("\(sessionId).status-record.json"))
 
@@ -5987,7 +5924,6 @@ final class AppLogicTests: XCTestCase {
             Paths.transcriptSnapshotPath(sessionId: sessionId),
             Paths.transcriptOwnerPath(sessionId: sessionId),
             Paths.transcriptOwnerLockPath(sessionId: sessionId),
-            Paths.legacyTranscriptOwnerLockPath(sessionId: sessionId),
         ]
         for path in paths {
             try Data("{}".utf8).write(to: URL(fileURLWithPath: path))
@@ -6035,16 +5971,21 @@ final class AppLogicTests: XCTestCase {
         }
     }
 
-    func testSessionArtifactCleanupRemovesPromptStatusTimestamp() throws {
+    func testSessionArtifactCleanupRemovesRetiredFiles() throws {
         let sessionId = UUID().uuidString
         Paths.ensureStateDir()
-        let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
-        try Data("123".utf8).write(to: URL(fileURLWithPath: path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        let paths = ["status", "status-timestamp", "prompt-status-timestamp", "copilot-allow-all"]
+            .map { Paths.sessionsDir.appendingPathComponent("\(sessionId).\($0)").path }
+        for path in paths {
+            try Data("123".utf8).write(to: URL(fileURLWithPath: path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        }
 
         SessionArtifacts.removeFiles(sessionId: sessionId)
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        for path in paths {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        }
     }
 
     @MainActor
@@ -8539,6 +8480,14 @@ final class AppLogicTests: XCTestCase {
         try String(contentsOf: capture, encoding: .utf8)
             .split(whereSeparator: \.isNewline)
             .map(String.init)
+    }
+
+    private func hookStatusRecord(root: URL, tabId: String) throws -> SessionStatusRecord {
+        try JSONDecoder().decode(
+            SessionStatusRecord.self,
+            from: Data(contentsOf: root
+                .appendingPathComponent("sessions/\(tabId).status-record.json"))
+        )
     }
 
     private func completionSignals(in calls: [String]) -> Int {

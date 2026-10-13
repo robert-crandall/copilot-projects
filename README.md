@@ -178,9 +178,7 @@ in **Review** and **Ready**.
   before you click. GitHub freshness, incomplete status, and the connection to Copilot Projects are
   shown separately, and session creation waits until matching finishes.
 - **Copilot Projects closed?** The lanes keep the sessions it last reported, with
-  their states unknown, and their buttons become **Open Copilot Projects**. A
-  Copilot Projects too old to list its sessions is called out above the lanes in
-  the window: update it to match sessions again.
+  their states unknown, and their buttons become **Open Copilot Projects**.
 - **Owners** limits the window to one or more organizations or users, such as
   `github` and `my-org`; each is its own token in the Owners popover. Only pull
   requests in those owners appear. Leave it empty to include every owner, up to
@@ -312,7 +310,7 @@ or is the selected tab of the selected project is left alone and the command
 exits 8 (busy); retry later. `--project` refuses (exit 3) a session that has since
 been moved to another project. Exit 4 means the session no longer exists, 5 means
 the workspace state is unavailable (retry), 2 invalid arguments, and 1 anything
-else. An app too old to support the command exits 2 or 1 with `unknown command`.
+else.
 
 Commands inside an app-managed terminal automatically target its current
 project and session. Hooks for other agents can use:
@@ -344,31 +342,6 @@ can collapse without recreating the terminal; session details stay secondary. Th
 [design record](DESIGN.md) and [token sidecar](.impeccable/design.json) accompany
 the [product context](PRODUCT.md). Appearance follows macOS rather than a separate
 theme picker.
-
-### Native workspace screenshots
-
-The **Capture macOS workspace** Actions workflow renders the actual native views
-with isolated synthetic sessions on the M4 runner. It uploads dark, light, compact,
-and collapsed-project captures with a source-SHA manifest and diagnostic logs. Each
-successful image must contain the terminal's unique OCR marker and use the Metal
-renderer; an empty terminal or unavailable GUI/capture permission fails the run.
-It never captures the whole desktop, launches a live host, or changes TCC grants.
-
-Capture runs are triggered by pushes to `sirfergy/studio-console` and
-`sirfergy/studio-console-bold`. Manual
-dispatch becomes available after the workflow is present on the default branch.
-Ordinary test runs skip the capture. The driver packages a debug-only SwiftPM
-application and launches that test-owned app through LaunchServices, without
-starting the shipping host's bootstrap or services. Its real
-AppKit event loop runs the same asynchronous fixture as the XCTest wrapper.
-Headless runs exercise the production input dispatcher for preview dismissal,
-workspace-action suppression/restoration, and zero terminal input, plus native
-accessibility controls and actual own-window screenshots. They do not require
-an active/key window or claim OS-level physical-key validation. The
-driver uses a private temporary home and state directory, a harmless terminal
-process, a bounded application lifetime, and a replacement environment that does
-not expose runner credentials to the fixture. Successful captures also verify
-that the fixture's terminal processes have exited.
 
 ## Build and contribute
 

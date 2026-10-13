@@ -1930,13 +1930,9 @@ final class AppModel: ObservableObject {
         finishPersistedSessionCloses()
     }
 
-    func finishInterruptedSessionDestroys(sessionsDirectory: URL = Paths.sessionsDir) {
+    func finishInterruptedSessionDestroys() {
         guard stateLoadFailure == nil else { return }
         do {
-            let legacyRequests = try SessionArtifacts.closeSessionRequests(sessionsDirectory: sessionsDirectory)
-            if !legacyRequests.isEmpty {
-                try stateRepository.acceptCloses(sessionIds: legacyRequests)
-            }
             let intent = try stateRepository.pendingCloses()
             let state = try stateRepository.normalized(intent.applying(
                 to: PersistedState(projects: projects, selectedProjectId: selectedProjectId)
@@ -1949,7 +1945,7 @@ final class AppModel: ObservableObject {
             forcedSessionDestroyer(Array(intent.sessionIds))
             finishPersistedSessionCloses()
         } catch {
-            let message = "Could not recover session closes (intent: \(stateRepository.closeIntentPath.path), requests: \(sessionsDirectory.path)): \(error)"
+            let message = "Could not recover session closes (intent: \(stateRepository.closeIntentPath.path)): \(error)"
             stateLoadFailure = message
             NSLog("copilot-projects: \(message)")
         }
@@ -1969,13 +1965,6 @@ final class AppModel: ObservableObject {
 
     func startIntegration() {
         integration?.start()
-    }
-
-    /// Count of sessions with an in-flight agent (running or waiting).
-    var activeSessionCount: Int {
-        projects.reduce(0) { acc, project in
-            acc + project.sessions.filter { $0.status == .running || $0.status == .waiting }.count
-        }
     }
 
     /// Fleet roll-ups across every project, for the title-bar status line.
@@ -2468,20 +2457,6 @@ final class AppModel: ObservableObject {
     /// array, yet they keep `session.idle` from firing exactly like scheduled and
     /// subagent work — so a `.running` session whose foreground has gone idle while
     /// they run must count as background-only too, or it reads "working" forever.
-    nonisolated static func backgroundOnlyEvidenceMs(
-        snapshot: AgentActivitySnapshot?,
-        backgroundAgentsActive: Bool,
-        now: Date,
-        nowMs: Int64
-    ) -> Int64? {
-        SessionSemanticsAdapter.backgroundOnlyEvidenceMilliseconds(
-            snapshot: snapshot,
-            backgroundAgentsActive: backgroundAgentsActive,
-            now: now,
-            nowMilliseconds: nowMs
-        )
-    }
-
     nonisolated static func backgroundOnlyPromptEvidence(
         status: SessionStatus,
         snapshot: AgentActivitySnapshot?,
@@ -3587,8 +3562,8 @@ final class AppModel: ObservableObject {
                 backgroundAgentsSuppressed.insert(sessionId)
             }
         }
-        // Completion signals mark ready through postCompletionIfReady, after
-        // background work drains. Preserve immediate attention for legacy idle events.
+        // Completion signals mark ready through postCompletionIfReady, after background
+        // work drains. Idle events without one (aborts, session end) need attention now.
         if status == .idle, previous == .running || previous == .waiting,
            !hasCompletionSignal, !startsScheduledTurn, !endsScheduledTurn,
            !isVisible(projectIndex: loc.p, sessionIndex: loc.s) {
@@ -5441,9 +5416,6 @@ final class AppModel: ObservableObject {
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let sid = projects[pi].sessions[si].id
-                // Migrate any legacy `file://host/path` cwds (stored before OSC 7 was
-                // normalized) to plain paths so inherited/new sessions don't chdir-fail to /.
-                projects[pi].sessions[si].cwd = Paths.normalizedDirectory(projects[pi].sessions[si].cwd)
                 let restored = restoredStatusState(forSession: sid)
                 let status = restored.status
                 let statusTimestamp = restored.statusTimestamp
@@ -5491,41 +5463,13 @@ final class AppModel: ObservableObject {
                 record.promptStatusTimestamp, record.inputWait
             )
         case .invalid:
-            // A present but unreadable atomic record must never fall back to a possibly
-            // torn set of legacy files. Restore busy and put the prompt clock at app
-            // startup time, so only fresh post-recovery background evidence can bypass it.
+            // Restore busy and put the prompt clock at app startup time, so only fresh
+            // post-recovery background evidence can bypass an unreadable record.
             NSLog("copilot-projects: invalid status record for \(sessionId); restoring busy")
             return (.running, nil, SessionArtifacts.currentStatusTimestamp(), nil)
         case .missing:
-            return (
-                restoredLegacyStatus(forSession: sessionId),
-                restoredLegacyStatusTimestamp(forSession: sessionId),
-                restoredLegacyPromptStatusTimestamp(forSession: sessionId),
-                nil
-            )
+            return (.idle, nil, nil, nil)
         }
-    }
-
-    /// Restore pre-record app versions from their compatibility markers.
-    private func restoredLegacyStatus(forSession sessionId: String) -> SessionStatus {
-        let path = Paths.statusMarkerPath(sessionId: sessionId)
-        if let raw = try? String(contentsOfFile: path, encoding: .utf8) {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let status = SessionStatus(rawValue: trimmed) { return status }
-        }
-        return .idle
-    }
-
-    private func restoredLegacyStatusTimestamp(forSession sessionId: String) -> Int64? {
-        let path = Paths.statusTimestampMarkerPath(sessionId: sessionId)
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-        return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-
-    private func restoredLegacyPromptStatusTimestamp(forSession sessionId: String) -> Int64? {
-        let path = Paths.promptStatusTimestampMarkerPath(sessionId: sessionId)
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-        return Int64(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func scheduleSave() {

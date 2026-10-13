@@ -69,21 +69,6 @@ enum SessionArtifacts {
                 to: sessionsDirectory.appendingPathComponent("\(sessionId).status-record.json"),
                 options: .atomic
             )
-            try Data(String(timestamp).utf8).write(
-                to: sessionsDirectory.appendingPathComponent("\(sessionId).status-timestamp"),
-                options: .atomic
-            )
-            try Data(String(promptStatusTimestamp).utf8).write(
-                to: sessionsDirectory
-                    .appendingPathComponent("\(sessionId).prompt-status-timestamp"),
-                options: .atomic
-            )
-            // Compatibility markers are written only after the complete record, with
-            // status last so older app versions cannot combine it with stale clocks.
-            try Data(status.rawValue.utf8).write(
-                to: sessionsDirectory.appendingPathComponent("\(sessionId).status"),
-                options: .atomic
-            )
             return true
         } catch {
             NSLog("copilot-projects: could not persist status for \(sessionId): \(error)")
@@ -274,42 +259,31 @@ enum SessionArtifacts {
         }
     }
 
-    static func closeSessionRequests(
-        sessionsDirectory: URL = Paths.sessionsDir
-    ) throws -> [String] {
-        guard FileManager.default.fileExists(atPath: sessionsDirectory.path) else { return [] }
-        let entries = try FileManager.default.contentsOfDirectory(
-            at: sessionsDirectory,
-            includingPropertiesForKeys: nil
-        )
-        return entries.compactMap { url in
-            let name = url.lastPathComponent
-            guard name.hasSuffix(closeRequestSuffix) else { return nil }
-            let sessionId = String(name.dropLast(closeRequestSuffix.count))
-            return UUID(uuidString: sessionId) != nil ? sessionId : nil
-        }
-    }
+    /// Per-session files earlier releases wrote but nothing reads any more. Removed
+    /// with the session so leftovers from sessions that predate their retirement
+    /// don't linger.
+    private static let retiredFileSuffixes = [
+        "status", "status-timestamp", "prompt-status-timestamp", "copilot-allow-all",
+    ]
 
     static func removeFiles(sessionId: String) {
         let fm = FileManager.default
-        for suffix in RemoteSessionActionKind.allCases.map({ "\($0.rawValue).json" })
-            + ["task-result.json"] {
+        for suffix in RemoteSessionActionKind.allCases.map({ "\($0.rawValue).json" }) {
             let path = Paths.sessionsDir.appendingPathComponent("\(sessionId).\(suffix)").path
             if fm.fileExists(atPath: path) {
                 do { try fm.removeItem(atPath: path) }
                 catch { NSLog("copilot-projects: could not remove session workflow file: \(error)") }
             }
         }
+        let retired = retiredFileSuffixes.map {
+            Paths.sessionsDir.appendingPathComponent("\(sessionId).\($0)").path
+        }
         for path in [
             Paths.dtachSocketPath(sessionId: sessionId),
-            Paths.statusMarkerPath(sessionId: sessionId),
-            Paths.statusTimestampMarkerPath(sessionId: sessionId),
-            Paths.promptStatusTimestampMarkerPath(sessionId: sessionId),
             Paths.statusRecordPath(sessionId: sessionId),
             Paths.backgroundAgentsMarkerPath(sessionId: sessionId),
             Paths.sessionIdleHookMarkerPath(sessionId: sessionId),
             Paths.copilotSessionMarkerPath(sessionId: sessionId),
-            Paths.legacyCopilotAllowAllMarkerPath(sessionId: sessionId),
             Paths.scheduledTurnMarkerPath(sessionId: sessionId),
             Paths.agentActivitySnapshotPath(sessionId: sessionId),
             Paths.userInputResponsePath(sessionId: sessionId),
@@ -318,9 +292,8 @@ enum SessionArtifacts {
             Paths.transcriptSnapshotPath(sessionId: sessionId),
             Paths.transcriptLivePath(sessionId: sessionId),
             Paths.transcriptOwnerPath(sessionId: sessionId),
-            Paths.legacyTranscriptOwnerLockPath(sessionId: sessionId),
             Paths.transcriptQuarantinePath(sessionId: sessionId),
-        ] {
+        ] + retired {
             try? fm.removeItem(atPath: path)
         }
         removeTranscriptOwnerLock(sessionId: sessionId)

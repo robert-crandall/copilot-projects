@@ -213,10 +213,6 @@ struct PullRequestsView: View {
                      : "Copilot Projects unavailable · session states unknown")
                     .lineLimit(2)
                     .help("Open Copilot Projects to see current session states.")
-            case .incompatibleHost:
-                Label("Update Copilot Projects", systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                    .help("This version of Copilot Projects can’t list its sessions.")
             case .connected:
                 EmptyView()
             }
@@ -477,7 +473,7 @@ struct PullRequestsView: View {
         switch pullRequests.workspace {
         case .connected: return .connected
         case .disconnected: return pullRequests.canOpenHost ? .openable : .unavailable
-        case .connecting, .incompatibleHost: return .unavailable
+        case .connecting: return .unavailable
         }
     }
 

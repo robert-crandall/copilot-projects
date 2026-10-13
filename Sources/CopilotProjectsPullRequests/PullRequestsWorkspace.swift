@@ -10,14 +10,11 @@ enum WorkspaceState: Equatable, Sendable {
     /// Copilot Projects isn't answering. Its last snapshot, if it ever sent one,
     /// still groups pull requests, but session states are unknown.
     case disconnected(lastGood: WorkspaceSnapshot?)
-    /// Copilot Projects answers but can't list its sessions: it is older than this app.
-    case incompatibleHost
 }
 
 enum WorkspaceFetch: Equatable, Sendable {
     case snapshot(WorkspaceSnapshot)
     case unreachable
-    case incompatibleHost
 }
 
 /// How Copilot Projects answered a command.
@@ -25,7 +22,6 @@ enum WorkspaceCommandResult: Equatable, Sendable {
     case done(code: String?, text: String?)
     case refused(code: String?, message: String)
     case unreachable
-    case incompatibleHost
 }
 
 /// The workspace the Pull Requests app reads sessions from and acts on.
@@ -51,14 +47,11 @@ actor ControlWorkspaceBridge: PullRequestsWorkspace {
     }
 
     func snapshot() async -> WorkspaceFetch {
-        guard case .success(let response) = await send(ControlRequest(command: "list-sessions")) else {
-            return .unreachable
-        }
-        if Self.isUnknownCommand(response) { return .incompatibleHost }
-        guard response.ok else { return .unreachable }
-        guard let text = response.text,
-              let snapshot = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(text.utf8)),
-              snapshot.version >= 1 else { return .incompatibleHost }
+        guard case .success(let response) = await send(ControlRequest(command: "list-sessions")),
+              response.ok,
+              let text = response.text,
+              let snapshot = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(text.utf8))
+        else { return .unreachable }
         return .snapshot(snapshot)
     }
 
@@ -85,14 +78,8 @@ actor ControlWorkspaceBridge: PullRequestsWorkspace {
         return Self.result(await send(request))
     }
 
-    /// Older versions of Copilot Projects answer commands they don't know this way.
-    static func isUnknownCommand(_ response: ControlResponse) -> Bool {
-        !response.ok && (response.error ?? "").hasPrefix("unknown command:")
-    }
-
     static func result(_ reply: Result<ControlResponse, Error>) -> WorkspaceCommandResult {
         guard case .success(let response) = reply else { return .unreachable }
-        if isUnknownCommand(response) { return .incompatibleHost }
         return response.ok
             ? .done(code: response.code, text: response.text)
             : .refused(code: response.code, message: response.error ?? "Copilot Projects refused the request.")

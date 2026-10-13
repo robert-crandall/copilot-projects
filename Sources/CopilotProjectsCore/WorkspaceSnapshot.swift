@@ -64,7 +64,6 @@ public struct WorkspaceSnapshot: Codable, Equatable, Sendable {
 /// Where the Copilot Pull Requests app lives and what crosses into it.
 public enum PullRequestsAppBundle {
     public static let name = "Copilot Pull Requests"
-    public static let executableName = "copilot-pull-requests"
     /// Appended to the host's bundle identifier.
     public static let bundleIdentifierSuffix = ".pull-requests"
     /// The helper's Info.plist key naming the host's bundle identifier, whose

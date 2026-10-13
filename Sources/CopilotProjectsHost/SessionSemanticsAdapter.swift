@@ -47,23 +47,6 @@ enum SessionSemanticsAdapter {
         }
     }
 
-    static func backgroundOnlyEvidenceMilliseconds(
-        snapshot: AgentActivitySnapshot?,
-        backgroundAgentsActive: Bool,
-        now: Date,
-        nowMilliseconds: Int64
-    ) -> Int64? {
-        guard let snapshot else { return nil }
-        return SessionSemantics.backgroundOnlyEvidenceMilliseconds(
-            evidence: backgroundEvidence(
-                snapshot: snapshot,
-                backgroundAgentsActive: backgroundAgentsActive,
-                now: now
-            ),
-            nowMilliseconds: nowMilliseconds
-        )
-    }
-
     static func hasBackgroundOnlyPromptEvidence(
         status: SessionStatus,
         snapshot: AgentActivitySnapshot?,

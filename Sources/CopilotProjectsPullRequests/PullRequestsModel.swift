@@ -208,7 +208,7 @@ final class PullRequestsModel: ObservableObject {
             return PullRequestSession.sessions(in: snapshot)
         case .disconnected(let lastGood?):
             return PullRequestSession.sessions(in: lastGood).mapValues(\.withUnknownState)
-        case .connecting, .disconnected, .incompatibleHost:
+        case .connecting, .disconnected:
             return [:]
         }
     }
@@ -218,7 +218,7 @@ final class PullRequestsModel: ObservableObject {
     private var knowsSessions: Bool {
         switch workspace {
         case .connected, .disconnected(lastGood: _?): return true
-        case .connecting, .disconnected, .incompatibleHost: return false
+        case .connecting, .disconnected: return false
         }
     }
 
@@ -319,8 +319,6 @@ final class PullRequestsModel: ObservableObject {
             state = .connected(snapshot)
         case .unreachable:
             state = .disconnected(lastGood: lastGoodSnapshot)
-        case .incompatibleHost:
-            state = .incompatibleHost
         }
         if workspace != state { workspace = state }
         if hostedReadOnly, wasConnected, !isConnected { cancelResumableSearch() }
@@ -680,7 +678,7 @@ final class PullRequestsModel: ObservableObject {
                 return true
             }
             return false
-        case .refused, .unreachable, .incompatibleHost:
+        case .refused, .unreachable:
             // An ended session drops out of the next snapshot, and with it its button.
             await pollWorkspace()
             return false
@@ -784,10 +782,6 @@ final class PullRequestsModel: ObservableObject {
                 "Could Not Start Copilot",
                 "Copilot Projects isn’t answering. Try again; a session that did start won’t start twice."
             )
-        case .incompatibleHost:
-            pendingStarts[goalId] = nil
-            await pollWorkspace()
-            presentError("Could Not Start Copilot", "Update Copilot Projects to start sessions from here.")
         }
     }
 
@@ -843,11 +837,6 @@ final class PullRequestsModel: ObservableObject {
             resumingSessions.remove(copilotId)
             await pollWorkspace()
             presentError(title, "Copilot Projects isn’t answering. Try again; a session that did resume won’t open twice.")
-        case .incompatibleHost:
-            pendingResumes[copilotId] = nil
-            resumingSessions.remove(copilotId)
-            await pollWorkspace()
-            presentError(title, "Update Copilot Projects to resume sessions from here.")
         }
     }
 

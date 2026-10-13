@@ -340,7 +340,6 @@ async function createRuntime(t, configure = () => {}, { ready = true } = {}) {
     durableReadsFinished: 0,
   };
   runtime.session = new FakeSession(runtime.copilotSessionId);
-  runtime.allowAllPath = join(sessions, `${runtime.appSessionId}.copilot-allow-all`);
   await configure(runtime.session, runtime);
   runtimes.add(runtime);
 
@@ -552,7 +551,7 @@ test("a retried join that never settles is abandoned within the retry window", {
   assert.equal(attempts, 2);
 });
 
-test("tracker never reads permission mode or writes an allow-all marker", async (t) => {
+test("tracker never reads permission mode", async (t) => {
   let reads = 0;
   const runtime = await createRuntime(t, (session) => {
     session.rpc.permissions = {
@@ -565,7 +564,6 @@ test("tracker never reads permission mode or writes an allow-all marker", async 
   await runtime.session.emit("session.start", { sessionId: runtime.session.sessionId });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(reads, 0);
-  assert.equal(realExistsSync(runtime.allowAllPath), false);
 });
 
 test("scheduled activity does not accept late intents while its agents drain", async (t) => {
@@ -1010,7 +1008,7 @@ test("usage uses accumulated runtime totals without summing child or ephemeral u
   await waitFor(() => readSnapshot(runtime).workflow.totalAiCredits === null, "usage failure fabricated a total");
 });
 
-test("completed tasks preserve transcripts without diff capture or result sidecars", {
+test("completed tasks preserve transcripts without diff capture", {
   concurrency: false,
 }, async (t) => {
   let diffCalls = 0;
@@ -1018,7 +1016,6 @@ test("completed tasks preserve transcripts without diff capture or result sideca
     session.diffHandler = async () => { diffCalls += 1; return null; };
   });
   await workflowReady(runtime);
-  const sidecar = join(runtime.sessions, `${runtime.appSessionId}.task-result.json`);
   const transcript = join(runtime.sessions, `${runtime.appSessionId}.transcript.json`);
   for (const status of ["finished", "blocked", "stopped"]) {
     const turnId = uuid();
@@ -1038,17 +1035,8 @@ test("completed tasks preserve transcripts without diff capture or result sideca
     const saved = readMergedTranscript(transcript);
     assert.ok(saved.turns.find((turn) => turn.id === turnId).assistantMessages
       .some((message) => message.content === `Response: ${status}`));
-    assert.equal(realExistsSync(sidecar), false);
     assert.equal(diffCalls, 0);
   }
-  realWriteFileSync(sidecar, "retained legacy artifact");
-  await runtime.session.emit("session.idle");
-  const next = uuid();
-  runtime.session.foregroundSessionId = next;
-  await runtime.session.emit("session.start", { sessionId: next });
-  await workflowReady(runtime);
-  assert.equal(realReadFileSync(sidecar, "utf8"), "retained legacy artifact");
-  assert.equal(diffCalls, 0);
 });
 
 test("live deltas are replaced by final messages without duplicate transcript text", {
@@ -4373,15 +4361,6 @@ function seedDeadOwner(runtime) {
   }));
   return ownerPath;
 }
-
-test("an older tracker's leftover lock file does not block the tab from claiming", async (t) => {
-  const runtime = await createRuntime(t, (_session, runtime) => {
-    realWriteFileSync(`${seedDeadOwner(runtime)}.lock`, "");
-  });
-  const owner = JSON.parse(realReadFileSync(runtime.ownerPath, "utf8"));
-  assert.equal(owner.copilotSessionId, runtime.copilotSessionId);
-  assert.equal(owner.pid, process.pid);
-});
 
 test("another process holding the owner lock blocks the claim until it dies", async (t) => {
   let holder;

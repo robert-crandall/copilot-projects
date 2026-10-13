@@ -87,24 +87,9 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).sock").path
     }
 
-    /// Per-session status marker, written by the Copilot hook so status survives
-    /// an app restart (and stays current even while the app isn't running).
-    public static func statusMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).status").path
-    }
-
-    /// Timestamp of the most recent hook-driven status transition. Used to reject
-    /// late async notification hooks that arrive after a newer lifecycle event.
-    public static func statusTimestampMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).status-timestamp").path
-    }
-
-    public static func promptStatusTimestampMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).prompt-status-timestamp").path
-    }
-
-    /// Atomically replaced status + clock record. New app versions restore from this
-    /// record so independently written compatibility markers can never be combined.
+    /// Atomically replaced status + clock record, written by the Copilot hook and the
+    /// app so status survives an app restart (and stays current while the app isn't
+    /// running).
     public static func statusRecordPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).status-record.json").path
     }
@@ -127,12 +112,6 @@ public enum Paths {
     /// shell — `copilot --resume=<id>` — instead of guessing per tab.
     public static func copilotSessionMarkerPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).copilot-session").path
-    }
-
-    /// Retired per-tab allow-all marker. Nothing writes or reads it any more;
-    /// session cleanup still removes it so files left by older trackers don't linger.
-    public static func legacyCopilotAllowAllMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).copilot-allow-all").path
     }
 
     public static func scheduledTurnMarkerPath(sessionId: String) -> String {
@@ -177,11 +156,6 @@ public enum Paths {
 
     public static func transcriptOwnerLockPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).transcript-owner.json.flock").path
-    }
-
-    /// Exclusive-create lock used by trackers before the kernel lock above.
-    public static func legacyTranscriptOwnerLockPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).transcript-owner.json.lock").path
     }
 
     public static func transcriptQuarantinePath(sessionId: String) -> String {
@@ -265,29 +239,6 @@ public enum Paths {
     /// in-memory grace cache.
     public static var kittyImagesDir: URL {
         stateDir.appendingPathComponent("kitty-images", isDirectory: true)
-    }
-
-    /// Directory holding one file per retained `(session, imageId, version)`
-    /// entry's exact PNG bytes.
-    public static var kittyImagesDataDir: URL {
-        kittyImagesDir.appendingPathComponent("data", isDirectory: true)
-    }
-
-    /// Directory holding one empty marker file per deliberately-destroyed
-    /// session, written synchronously *before* that session's terminal/dtach
-    /// teardown proceeds, so the marker survives even an immediate app exit —
-    /// startup cleanup consults it to guarantee a destroyed session's images
-    /// can never be resurrected, regardless of whether the async removal of
-    /// its manifest entries/data files had a chance to finish first.
-    public static var kittyImagesTombstonesDir: URL {
-        kittyImagesDir.appendingPathComponent("tombstones", isDirectory: true)
-    }
-
-    /// The single schema-versioned manifest recording every retained disk
-    /// entry and persisted current-selection/placement record, across every
-    /// session, process-wide.
-    public static var kittyImagesManifestPath: URL {
-        kittyImagesDir.appendingPathComponent("manifest.json")
     }
 
     /// The bundled dtach helper (resumability backend), or an override, or nil.
