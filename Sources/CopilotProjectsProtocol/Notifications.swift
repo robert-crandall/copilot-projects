@@ -16,7 +16,6 @@ public enum NotificationSyncContract {
     public static let notificationIDKey = "id"
     public static let actionKey = "action"
     public static let dismissPath = "notifications/dismiss"
-    public static let appGroupIdentifier = "group.com.sirfergy.copilotprojects"
 }
 
 public struct RemoteNotificationPayload: Codable, Equatable, Sendable {

@@ -1967,13 +1967,6 @@ final class AppModel: ObservableObject {
         integration?.start()
     }
 
-    /// Count of sessions with an in-flight agent (running or waiting).
-    var activeSessionCount: Int {
-        projects.reduce(0) { acc, project in
-            acc + project.sessions.filter { $0.status == .running || $0.status == .waiting }.count
-        }
-    }
-
     /// Fleet roll-ups across every project, for the title-bar status line.
     var totalRunning: Int { projects.reduce(0) { $0 + $1.runningCount } }
     var totalWaiting: Int { projects.reduce(0) { $0 + $1.waitingCount } }
@@ -2464,20 +2457,6 @@ final class AppModel: ObservableObject {
     /// array, yet they keep `session.idle` from firing exactly like scheduled and
     /// subagent work — so a `.running` session whose foreground has gone idle while
     /// they run must count as background-only too, or it reads "working" forever.
-    nonisolated static func backgroundOnlyEvidenceMs(
-        snapshot: AgentActivitySnapshot?,
-        backgroundAgentsActive: Bool,
-        now: Date,
-        nowMs: Int64
-    ) -> Int64? {
-        SessionSemanticsAdapter.backgroundOnlyEvidenceMilliseconds(
-            snapshot: snapshot,
-            backgroundAgentsActive: backgroundAgentsActive,
-            now: now,
-            nowMilliseconds: nowMs
-        )
-    }
-
     nonisolated static func backgroundOnlyPromptEvidence(
         status: SessionStatus,
         snapshot: AgentActivitySnapshot?,

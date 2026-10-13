@@ -102,23 +102,6 @@ final class HostNotificationPoster: NotificationPosting {
     }
 }
 
-@MainActor
-final class CompositeNotificationPoster: NotificationPosting {
-    private let posters: [any NotificationPosting]
-
-    init(_ posters: [any NotificationPosting]) {
-        self.posters = posters
-    }
-
-    func post(_ event: NotificationEvent) {
-        for poster in posters { poster.post(event) }
-    }
-
-    func dismiss(id: UUID) {
-        for poster in posters { poster.dismiss(id: id) }
-    }
-}
-
 /// Thin wrapper over UNUserNotificationCenter. Posts banners and routes taps back
 /// to the app via `onActivate(projectId, sessionId)`.
 @MainActor

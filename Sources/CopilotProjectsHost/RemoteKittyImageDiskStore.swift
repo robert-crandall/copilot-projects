@@ -515,20 +515,6 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         }
     }
 
-    func totalByteCountForTesting() async -> Int {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
-            enqueue { [self] in continuation.resume(returning: manifest.entries.reduce(0) { $0 + $1.byteCount }) }
-        }
-    }
-
-    func selectionCountForTesting(sessionId: String) async -> Int {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Int, Never>) in
-            enqueue { [self] in
-                continuation.resume(returning: manifest.selections.filter { $0.sessionId == sessionId }.count)
-            }
-        }
-    }
-
     func entryExistsForTesting(sessionId: String, imageId: UInt32, version: UInt64) async -> Bool {
         await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             enqueue { [self] in

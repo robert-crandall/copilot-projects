@@ -9,7 +9,7 @@ import UniformTypeIdentifiers
 // instead: the same squircle with primer/octicons `git-pull-request-24` (MIT).
 // The octicon path data is embedded and rasterized by the small SVG-path
 // parser below, then composited; no external tools required.
-// Usage: swift make-icon.swift <out.png> [--opaque] [--pull-requests]
+// Usage: swift make-icon.swift <out.png> [--pull-requests]
 
 
 // Minimal SVG path-data -> CGPath (supports M m L l H h V v C c S s Q q T t A a Z z).
@@ -139,7 +139,6 @@ let copilotMouthPath = "M28.998 28.516c1.104 0 1.999.895 1.999 1.999v3.998a2 2 0
 
 let S = 1024.0
 let arguments = CommandLine.arguments.dropFirst()
-let opaque = arguments.contains("--opaque")
 let pullRequests = arguments.contains("--pull-requests")
 let out = arguments.first { !$0.hasPrefix("--") } ?? "icon-1024.png"
 let cs = CGColorSpaceCreateDeviceRGB()
@@ -153,21 +152,15 @@ func rrect(_ rect: CGRect, _ radius: Double) -> CGPath {
 guard let ctx = CGContext(
     data: nil, width: Int(S), height: Int(S), bitsPerComponent: 8, bytesPerRow: 0,
     space: cs,
-    bitmapInfo: (
-        opaque
-            ? CGImageAlphaInfo.noneSkipLast
-            : CGImageAlphaInfo.premultipliedLast
-    ).rawValue
+    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
 ) else { exit(1) }
 ctx.clear(CGRect(x: 0, y: 0, width: S, height: S))
 
 // teal squircle background
 let margin = 70.0
-let bg = opaque
-    ? CGRect(x: 0, y: 0, width: S, height: S)
-    : CGRect(x: margin, y: margin, width: S - 2 * margin, height: S - 2 * margin)
+let bg = CGRect(x: margin, y: margin, width: S - 2 * margin, height: S - 2 * margin)
 ctx.saveGState()
-ctx.addPath(opaque ? CGPath(rect: bg, transform: nil) : rrect(bg, 208))
+ctx.addPath(rrect(bg, 208))
 ctx.clip()
 let grad = CGGradient(colorsSpace: cs,
                       colors: [col(45, 212, 191), col(13, 148, 136)] as CFArray,

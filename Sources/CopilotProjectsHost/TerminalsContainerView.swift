@@ -207,10 +207,6 @@ private final class EmptyStateView: NSView {
         self.onNew = onNew
     }
 
-    func matchBackground(to color: NSColor) {
-        layer?.backgroundColor = color.cgColor
-    }
-
     @objc private func tapped() { onNew?() }
 }
 

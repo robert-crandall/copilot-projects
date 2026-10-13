@@ -496,15 +496,6 @@ final class AppLogicTests: XCTestCase {
 
         var disconnected = snapshot
         disconnected.error = "Connection is closed."
-        XCTAssertEqual(
-            AppModel.backgroundOnlyEvidenceMs(
-                snapshot: disconnected,
-                backgroundAgentsActive: false,
-                now: now,
-                nowMs: nowMs
-            ),
-            transitionMs
-        )
         XCTAssertFalse(AppModel.backgroundOnlyPromptEvidence(
             status: .idle,
             snapshot: disconnected,

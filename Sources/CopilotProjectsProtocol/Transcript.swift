@@ -52,23 +52,6 @@ public struct TranscriptSnapshot: Codable, Equatable, Sendable {
         droppedTurns = try? container.decodeIfPresent([TranscriptTurn].self, forKey: .droppedTurns)
     }
 
-    /// The most recent `limit` turns, tagged with the full turn count so a
-    /// client knows how many older turns it can still ask for. Always reports
-    /// `totalTurns` — even when nothing was dropped — so a client that asked for
-    /// a window can distinguish "this is everything" from "an older host ignored
-    /// my request and sent the whole transcript" (which omits the field).
-    public func limitedToMostRecentTurns(_ limit: Int) -> TranscriptSnapshot {
-        let bounded = max(0, limit)
-        let dropped = max(0, turns.count - bounded)
-        return TranscriptSnapshot(
-            schemaVersion: schemaVersion,
-            updatedAt: updatedAt,
-            copilotSessionId: copilotSessionId,
-            turns: dropped > 0 ? Array(turns.suffix(bounded)) : turns,
-            totalTurns: turns.count
-        )
-    }
-
     /// The part of the transcript a remote client asked for: every turn from
     /// the first one that started at or after `cursor`, then at most the most
     /// recent `limit` of those. A cursor for a different conversation (the tab

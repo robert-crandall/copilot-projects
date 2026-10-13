@@ -73,13 +73,6 @@ final class HostIntegrationTests: XCTestCase {
         poster.dismiss(id: second)
         XCTAssertEqual(native.dismissed, [second])
         XCTAssertEqual(integration.dismissed, [second])
-
-        let composite = CompositeNotificationPoster([standalone, poster])
-        let third = UUID()
-        composite.dismiss(id: third)
-        XCTAssertEqual(standaloneNative.dismissed, [first, third])
-        XCTAssertEqual(native.dismissed, [second, third])
-        XCTAssertEqual(integration.dismissed, [second, third])
     }
 
     func testUnsupportedCommandsPreserveSettingsAndInjectedLifecycleStopsOnce() {
