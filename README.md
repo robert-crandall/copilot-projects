@@ -178,9 +178,7 @@ in **Review** and **Ready**.
   before you click. GitHub freshness, incomplete status, and the connection to Copilot Projects are
   shown separately, and session creation waits until matching finishes.
 - **Copilot Projects closed?** The lanes keep the sessions it last reported, with
-  their states unknown, and their buttons become **Open Copilot Projects**. A
-  Copilot Projects too old to list its sessions is called out above the lanes in
-  the window: update it to match sessions again.
+  their states unknown, and their buttons become **Open Copilot Projects**.
 - **Owners** limits the window to one or more organizations or users, such as
   `github` and `my-org`; each is its own token in the Owners popover. Only pull
   requests in those owners appear. Leave it empty to include every owner, up to
@@ -312,7 +310,7 @@ or is the selected tab of the selected project is left alone and the command
 exits 8 (busy); retry later. `--project` refuses (exit 3) a session that has since
 been moved to another project. Exit 4 means the session no longer exists, 5 means
 the workspace state is unavailable (retry), 2 invalid arguments, and 1 anything
-else. An app too old to support the command exits 2 or 1 with `unknown command`.
+else.
 
 Commands inside an app-managed terminal automatically target its current
 project and session. Hooks for other agents can use:
