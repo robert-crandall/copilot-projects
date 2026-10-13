@@ -27,9 +27,8 @@ final class ControlServer: @unchecked Sendable {
     @discardableResult
     func start() -> Bool {
         Paths.ensureStateDir()
-        // Don't steal the socket from a still-running instance (possible during the
-        // bundle-id transition, when macOS no longer treats old + new as one app):
-        // only remove a stale socket file that nothing is listening on.
+        // Don't steal the socket from a still-running instance: only remove a stale
+        // socket file that nothing is listening on.
         if socketIsAlive(socketPath) {
             NSLog("copilot-projects control: another instance is already listening on \(socketPath); not starting a second control server")
             return false

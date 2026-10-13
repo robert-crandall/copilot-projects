@@ -910,9 +910,7 @@ if (validSessionId && socketPath) {
     // The kernel holds this lock (O_EXLOCK) and releases it when the
     // descriptor closes, including when the holder dies, so a crash can never
     // leave the tab locked. The file stays after release (the host deletes it
-    // only while holding the lock); only the lock matters. It is not the
-    // `.lock` file older trackers create and unlink, so a leftover one of
-    // those, or an older tracker still running, can't block or unlock this one.
+    // only while holding the lock); only the lock matters.
     const exclusiveLockFlag = 0x20; // O_EXLOCK from Darwin <fcntl.h>; Node doesn't export it.
 
     function withTranscriptOwnerLock(action) {

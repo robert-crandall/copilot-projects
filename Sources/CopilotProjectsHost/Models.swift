@@ -136,17 +136,6 @@ struct PersistedState: Codable {
         self.projects = projects
         self.selectedProjectId = selectedProjectId
     }
-
-    private enum CodingKeys: String, CodingKey {
-        case schemaVersion, projects, selectedProjectId
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
-        projects = try values.decode([Project].self, forKey: .projects)
-        selectedProjectId = try values.decodeIfPresent(String.self, forKey: .selectedProjectId)
-    }
 }
 
 /// Which number-key overlay to show while a modifier is held.

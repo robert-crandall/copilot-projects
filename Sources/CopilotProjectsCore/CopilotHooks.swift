@@ -66,10 +66,6 @@ public enum CopilotHooks {
       value="$(sed -n \
         's/.*"promptStatusTimestamp":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "$record" 2>/dev/null | head -1)"
-      if [ -z "$value" ]; then
-        value="$(cat "$state_dir/sessions/$session_id.prompt-status-timestamp" \
-          2>/dev/null || true)"
-      fi
       case "$value" in
         ""|*[!0-9]*) printf '' ;;
         *) printf '%s' "$value" ;;
@@ -101,24 +97,12 @@ public enum CopilotHooks {
         || { rm -f "$record_tmp" 2>/dev/null || true; return 1; }
     }
     # Persist status and both ordering clocks as one atomic record (survives an app
-    # restart and stays current even while the app isn't running), then update the
-    # legacy compatibility markers and notify the live app.
+    # restart and stays current even while the app isn't running), then notify the
+    # live app.
     status() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true
       if [ -n "${2:-}" ]; then
-        if persist_status_record "$1" "$2" "${3:-}" "${5:-}"; then
-          printf '%s' "$2" \
-            > "$state_dir/sessions/$session_id.status-timestamp" 2>/dev/null || true
-          if [ "${3:-}" != "scheduled-active" ]; then
-            printf '%s' "$2" \
-              > "$state_dir/sessions/$session_id.prompt-status-timestamp" 2>/dev/null || true
-          fi
-          # Write status last for pre-record app versions so they also avoid
-          # observing a new status paired with older clock markers.
-          printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
-        fi
-      else
-        printf '%s' "$1" > "$state_dir/sessions/$session_id.status" 2>/dev/null || true
+        persist_status_record "$1" "$2" "${3:-}" "${5:-}" || true
       fi
       # Synchronous (not backgrounded) so rapid transitions — e.g. running→waiting —
       # reach the app in order; backgrounding let them race and the "waiting" dot get
@@ -138,8 +122,7 @@ public enum CopilotHooks {
       record="$state_dir/sessions/$session_id.status-record.json"
       value="$(sed -n 's/.*"status":[[:space:]]*"\([^"]*\)".*/\1/p' \
         "$record" 2>/dev/null | head -1)"
-      [ -n "$value" ] && printf '%s' "$value" \
-        || cat "$state_dir/sessions/$session_id.status" 2>/dev/null || true
+      printf '%s' "$value"
     }
     mark_turn_active() {
       mkdir -p "$state_dir/sessions" 2>/dev/null || true

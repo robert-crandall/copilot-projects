@@ -267,7 +267,6 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(CopilotExtension.script.contains(#"session.on("session.idle""#))
         XCTAssertFalse(CopilotExtension.script.contains("session.rpc.permissions"))
         XCTAssertFalse(CopilotExtension.script.contains("session.permissions_changed"))
-        XCTAssertFalse(CopilotExtension.script.contains("copilot-allow-all"))
         XCTAssertTrue(CopilotExtension.script.contains("writeMarker(copilotSessionPath, copilotSessionId)"))
         XCTAssertTrue(CopilotExtension.script.contains("await sdkHistoryWithTimeout()"))
         XCTAssertTrue(CopilotExtension.script.contains("scheduleDurableReconcile(0)"))
@@ -1297,7 +1296,6 @@ final class CoreLogicTests: XCTestCase {
         const base = `${sessionsDir}/${process.env.COPILOT_PROJECTS_SESSION}`;
         const ownerPath = `${base}.transcript-owner.json`;
         const copilotSessionPath = `${base}.copilot-session`;
-        const allowAllPath = `${base}.copilot-allow-all`;
         await new Promise((resolve) => setImmediate(resolve));
 
         writeFileSync(copilotSessionPath, "old-session");
@@ -1321,7 +1319,7 @@ final class CoreLogicTests: XCTestCase {
           await new Promise((resolve) => setTimeout(resolve, 80));
           waited += 80;
         }
-        // Let pending async work settle before checking that no allow-all marker appears.
+        // Let pending async work settle before checking that no permission reads happen.
         await new Promise((resolve) => setTimeout(resolve, 200));
 
         const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
@@ -1329,7 +1327,6 @@ final class CoreLogicTests: XCTestCase {
           ownerSessionId: owner.copilotSessionId,
           ownerPidIsCurrent: owner.pid === process.pid,
           copilotSessionMarker: readFileSync(copilotSessionPath, "utf8"),
-          allowAllMarkerExists: fileExistsSync(allowAllPath),
           permissionChecks
         }));
         process.exit(0);
@@ -1370,7 +1367,6 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertEqual(summary["ownerSessionId"] as? String, copilotSessionId)
         XCTAssertEqual(summary["ownerPidIsCurrent"] as? Bool, true)
         XCTAssertEqual(summary["copilotSessionMarker"] as? String, copilotSessionId)
-        XCTAssertEqual(summary["allowAllMarkerExists"] as? Bool, false)
         XCTAssertEqual(summary["permissionChecks"] as? Int, 0)
     }
 

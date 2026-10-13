@@ -172,42 +172,6 @@ final class GracefulCloseTests: XCTestCase {
         await gate.open()
     }
 
-    @MainActor
-    func testStartupReplaysLegacyMarkerEvenWithPersistedRow() throws {
-        let root = try root()
-        let (repository, project) = try fixture(root)
-        let sessions = root.appendingPathComponent("sessions")
-        XCTAssertTrue(SessionArtifacts.writeCloseSessionRequest(
-            sessionId: project.sessions[0].id, sessionsDirectory: sessions))
-        var destroyed: [String] = []
-        let model = AppModel(stateRepository: repository, isAppActive: { false },
-            agentActivityDirectory: root,
-            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images")),
-            forcedSessionDestroyer: { destroyed += $0 })
-        model.finishInterruptedSessionDestroys(sessionsDirectory: sessions)
-        XCTAssertEqual(destroyed, project.sessions.map(\.id))
-        XCTAssertTrue(model.projects[0].sessions.isEmpty)
-        try Data("corrupt".utf8).write(to: repository.path)
-        XCTAssertTrue(try loaded(repository).projects[0].sessions.isEmpty)
-    }
-
-    @MainActor
-    func testUnreadableLegacyRequestsDoNotSilentlyCancelUnknownCloseIntent() throws {
-        let root = try root()
-        let (repository, project) = try fixture(root)
-        let requests = root.appendingPathComponent("not-a-directory")
-        try Data().write(to: requests)
-        let original = try Data(contentsOf: repository.path)
-        let model = AppModel(stateRepository: repository, isAppActive: { false },
-            agentActivityDirectory: root,
-            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images")),
-            forcedSessionDestroyer: { _ in XCTFail("Unknown recovery must not destroy sessions") })
-        model.finishInterruptedSessionDestroys(sessionsDirectory: requests)
-        XCTAssertEqual(model.closeRemoteSession(sessionId: project.sessions[0].id), .failed)
-        model.save()
-        XCTAssertEqual(try Data(contentsOf: repository.path), original)
-    }
-
     func testWaitTracksRestartedOwnerAndWaitsForTrackerAfterCLIExit() async {
         let clock = CloseWaitClock()
         let cli = CloseIdentity(pid: 1, startSeconds: 1, startMicroseconds: 0)

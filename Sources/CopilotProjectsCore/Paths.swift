@@ -87,24 +87,9 @@ public enum Paths {
         sessionsDir.appendingPathComponent("\(sessionId).sock").path
     }
 
-    /// Per-session status marker, written by the Copilot hook so status survives
-    /// an app restart (and stays current even while the app isn't running).
-    public static func statusMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).status").path
-    }
-
-    /// Timestamp of the most recent hook-driven status transition. Used to reject
-    /// late async notification hooks that arrive after a newer lifecycle event.
-    public static func statusTimestampMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).status-timestamp").path
-    }
-
-    public static func promptStatusTimestampMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).prompt-status-timestamp").path
-    }
-
-    /// Atomically replaced status + clock record. New app versions restore from this
-    /// record so independently written compatibility markers can never be combined.
+    /// Atomically replaced status + clock record, written by the Copilot hook and the
+    /// app so status survives an app restart (and stays current while the app isn't
+    /// running).
     public static func statusRecordPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).status-record.json").path
     }
@@ -127,12 +112,6 @@ public enum Paths {
     /// shell — `copilot --resume=<id>` — instead of guessing per tab.
     public static func copilotSessionMarkerPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).copilot-session").path
-    }
-
-    /// Retired per-tab allow-all marker. Nothing writes or reads it any more;
-    /// session cleanup still removes it so files left by older trackers don't linger.
-    public static func legacyCopilotAllowAllMarkerPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).copilot-allow-all").path
     }
 
     public static func scheduledTurnMarkerPath(sessionId: String) -> String {
@@ -177,11 +156,6 @@ public enum Paths {
 
     public static func transcriptOwnerLockPath(sessionId: String) -> String {
         sessionsDir.appendingPathComponent("\(sessionId).transcript-owner.json.flock").path
-    }
-
-    /// Exclusive-create lock used by trackers before the kernel lock above.
-    public static func legacyTranscriptOwnerLockPath(sessionId: String) -> String {
-        sessionsDir.appendingPathComponent("\(sessionId).transcript-owner.json.lock").path
     }
 
     public static func transcriptQuarantinePath(sessionId: String) -> String {
