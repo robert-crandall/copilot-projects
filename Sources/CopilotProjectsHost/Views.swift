@@ -607,6 +607,12 @@ private struct SessionList: View {
                                 Button("Copy Starting Prompt") { model.copyStartingPrompt(for: session.id) }
                                 Divider()
                             }
+                            if session.offersMarkAsRead {
+                                Button("Mark as Read") { model.markSessionRead(sessionId: session.id) }
+                            } else {
+                                Button("Mark as Unread") { model.markSessionUnread(sessionId: session.id) }
+                            }
+                            Divider()
                             Button("End Session", role: .destructive) {
                                 model.requestCloseSession(projectId: project.id, sessionId: session.id)
                             }
@@ -776,7 +782,7 @@ struct SessionRow: View {
     var showsUnreadIndicator: Bool {
         // Avoid duplicating the idle completion dot unless the tab-number hint
         // or a failure indicator hides it.
-        session.hasUnread && (showNumber || session.displayStatus != .idle
+        session.isUnread && (showNumber || session.displayStatus != .idle
             || !session.finishedUnseen || session.failedRequest != nil)
     }
 
@@ -784,7 +790,7 @@ struct SessionRow: View {
         var states: [String] = []
         if isActive { states.append("Selected") }
         states.append(stateLabel)
-        if session.hasUnread { states.append("Unread") }
+        if session.isUnread { states.append("Unread") }
         if session.hasBackgroundWork { states.append("Background work active") }
         if !session.schedules.isEmpty { states.append("Scheduled work") }
         return states.joined(separator: ", ")

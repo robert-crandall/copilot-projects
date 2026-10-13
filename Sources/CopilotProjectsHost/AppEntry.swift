@@ -33,6 +33,19 @@ struct OpenPullRequestsButton: View {
     }
 }
 
+/// Session ▸ Mark as Unread / Mark as Read (⇧⌘U). Observes the model on its own so
+/// the title follows the current session without re-rendering the whole menu bar.
+private struct SessionReadStateButton: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button(model.selectedSessionOffersMarkAsRead ? "Mark as Read" : "Mark as Unread") {
+            model.toggleSelectedSessionRead()
+        }
+        .keyboardShortcut("u", modifiers: [.command, .shift])
+    }
+}
+
 private struct WorkspaceCommands: Commands {
     let model: AppModel
     @ObservedObject var input: WorkspaceInputController
@@ -64,6 +77,8 @@ private struct WorkspaceCommands: Commands {
                 Button("Start with Prompt…") { model.addPromptedSessionToSelected() }
                 Button("New Terminal") { model.addTerminalToSelected() }
                     .keyboardShortcut("t", modifiers: [.command, .option])
+                Divider()
+                SessionReadStateButton(model: model)
                 Divider()
                 Button("End Session") { model.closeSelectedSession() }
                     .keyboardShortcut("w", modifiers: .command)
