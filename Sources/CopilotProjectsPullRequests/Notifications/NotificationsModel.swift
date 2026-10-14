@@ -151,8 +151,10 @@ final class NotificationsModel: ObservableObject {
     /// Per `account|org`: the user's teams there, whether that list was whole, and when it was read.
     private var viewerTeams: [String: (teams: Set<String>, complete: Bool, readAt: Date)] = [:]
     /// Threads marked done here, hidden from refreshes that started before
-    /// GitHub saw it, until they change after the action.
-    private var doneLocally: [NotificationThread.Key: Date] = [:]
+    /// GitHub saw it, until they change after the action. Only the latest
+    /// removal of a thread may undo it, so a stale failure can't revive it.
+    private var doneLocally: [NotificationThread.Key: (covers: Date, by: Int)] = [:]
+    private var removals = 0
     /// Threads marked read here, kept read across refreshes racing the request.
     private var readLocally: [NotificationThread.Key: Date] = [:]
     private var lookStarted: Date?
@@ -448,7 +450,7 @@ final class NotificationsModel: ObservableObject {
         for (_, result) in fetched {
             for var thread in result.threads {
                 if let done = doneLocally[thread.key] {
-                    if thread.updatedAt <= done { continue }
+                    if thread.updatedAt <= done.covers { continue }
                     doneLocally[thread.key] = nil
                 }
                 if let read = readLocally[thread.key] {
@@ -512,8 +514,11 @@ final class NotificationsModel: ObservableObject {
             }
             let versions = Dictionary(uniqueKeysWithValues: threads.map { ($0.key, $0.updatedAt) })
             for key in result.settled {
-                // A subject GitHub didn't answer for is asked about again next time.
-                if answered[key] != nil {
+                // A subject GitHub didn't answer for, or erred inside, is asked
+                // about again next time; what it could show still counts meanwhile.
+                if result.erred.contains(key) {
+                    detailVersions[key] = nil
+                } else if answered[key] != nil {
                     detailVersions[key] = versions[key]
                     detailReadAt[key] = now
                 }
@@ -724,13 +729,15 @@ final class NotificationsModel: ObservableObject {
             let current = try await api.thread(account: account, threadId: id)
             if let was = judged[id], current.updatedAt > was { throw ChangedSinceJudged() }
             try await api.markDone(account: account, threadId: id)
-        } failed: { [weak self] failed in
+        } failed: { [weak self] failed, restored in
             guard let self else { return }
-            let keys = Set(failed.map(\.key))
-            self.clearedAnswered.removeAll { keys.contains($0.key) }
+            // Only this clear's own copy leaves the list; a later one's stays.
+            let judgedAt = Dictionary(failed.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: { first, _ in first })
+            self.clearedAnswered.removeAll { judgedAt[$0.key] == $0.updatedAt }
             // Whatever stopped it, what was known no longer stands, a closed
-            // state included: it needs the user until read again.
-            for key in keys {
+            // state included: it needs the user until read again. A newer copy
+            // that arrived meanwhile was judged on its own and keeps that.
+            for key in restored.map(\.key) {
                 self.detailVersions[key] = nil
                 self.details[key] = nil
                 self.settled.remove(key)
@@ -742,7 +749,7 @@ final class NotificationsModel: ObservableObject {
     private func remove(
         _ targets: [NotificationThread], verb: String, coversUntilNow: Bool = true,
         action: @escaping @Sendable (GitHubNotificationsAPI, GitHubAccount, String) async throws -> Void,
-        failed onFailure: (([NotificationThread]) -> Void)? = nil
+        failed onFailure: ((_ failed: [NotificationThread], _ restored: [NotificationThread]) -> Void)? = nil
     ) {
         guard !targets.isEmpty else { return }
         let keys = Set(targets.map(\.key))
@@ -750,15 +757,21 @@ final class NotificationsModel: ObservableObject {
         // older; a copy dated ahead of this clock is covered too. Clearing an
         // answered thread covers only the copy it was judged on.
         let now = clock()
-        for thread in targets { doneLocally[thread.key] = coversUntilNow ? max(now, thread.updatedAt) : thread.updatedAt }
+        removals += 1
+        let removal = removals
+        for thread in targets {
+            doneLocally[thread.key] = (coversUntilNow ? max(now, thread.updatedAt) : thread.updatedAt, removal)
+        }
         animate { self.threads.removeAll { keys.contains($0.key) } }
         publish()
         perform(targets, verb: verb, action: action) { [weak self] failed in
             guard let self else { return }
-            for thread in failed { self.doneLocally[thread.key] = nil }
+            // A newer copy, or a later removal of it, has moved on: leave that be.
+            let restored = failed.filter { self.doneLocally[$0.key]?.by == removal }
+            for thread in restored { self.doneLocally[thread.key] = nil }
             let present = Set(self.threads.map(\.key))
-            self.animate { self.threads += failed.filter { !present.contains($0.key) } }
-            onFailure?(failed)
+            self.animate { self.threads += restored.filter { !present.contains($0.key) } }
+            onFailure?(failed, restored)
         }
     }
 

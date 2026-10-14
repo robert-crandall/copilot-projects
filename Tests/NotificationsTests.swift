@@ -26,6 +26,12 @@ final class FakeGitHub: @unchecked Sendable {
     private var current: [String: [String: Any]] = [:]
     /// What `GET /notifications/threads/{id}` answers, when it differs from the listed copy.
     func setCurrent(_ thread: [String: Any]) { lock.withLock { current[thread["id"] as! String] = thread } }
+    private var holding: Set<String> = []
+    private var held: [String: CheckedContinuation<Void, Never>] = [:]
+    /// Holds the next `GET /notifications/threads/{id}` until `release(id)`.
+    func holdNextRead(_ id: String) { lock.withLock { _ = holding.insert(id) } }
+    func isHolding(_ id: String) -> Bool { lock.withLock { held[id] != nil } }
+    func release(_ id: String) { lock.withLock { held.removeValue(forKey: id) }?.resume() }
     var actions: [String] { lock.withLock { _actions } }
 
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
@@ -51,6 +57,9 @@ final class FakeGitHub: @unchecked Sendable {
         let modified = ["Last-Modified": "Tue, 13 Oct 2026 22:52:51 GMT"]
         if url.path.hasPrefix("/notifications/threads/") {
             let id = url.lastPathComponent
+            if lock.withLock({ holding.remove(id) != nil }) {
+                await withCheckedContinuation { continuation in lock.withLock { held[id] = continuation } }
+            }
             let thread: [String: Any]? = lock.withLock {
                 current[id] ?? passes.values.flatMap { $0.flatMap { $0 } }.first { $0["id"] as? String == id }
             }
@@ -950,17 +959,22 @@ final class NotificationsTests: XCTestCase {
         let fetcher = NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: GraphQLStub.endpoint))
         let threads = [thread("1", "mention", number: 1), thread("2", "mention", number: 2)]
         let subject = #"{"issueOrPullRequest":{"state":"OPEN","createdAt":"2026-10-14T09:00:00Z","author":{"login":"author"},"prActivity":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"__typename":"MentionedEvent","createdAt":"2026-10-14T10:00:00Z","actor":{"login":"octocat"}},{"__typename":"IssueComment","createdAt":"2026-10-14T11:00:00Z","body":"done","author":{"login":"octocat"}}]}}}"#
+        var erred: Set<String> = []
         func answered(errors: String) async -> [String: Bool] {
             GraphQLStub.respond = { _, _ in (200, #"{"data":{"viewer":{"login":"octocat"},"t0":\#(subject),"t1":\#(subject)}\#(errors)}"#) }
             let result = await fetcher.details(for: threads, account: GitHubAccount(login: "octocat", token: "token"))
+            erred = Set(result.erred.map(\.id))
             return result.details.reduce(into: [:]) { $0[$1.key.id] = $1.value.isAnswered { _ in nil } }
         }
         let clean = await answered(errors: "")
         XCTAssertEqual(clean, ["1": true, "2": true])
+        XCTAssertEqual(erred, [])
         let placed = await answered(errors: #","errors":[{"message":"timeout","path":["t1","issueOrPullRequest","reviews"]}]"#)
         XCTAssertEqual(placed, ["1": true, "2": false], "an error inside one subject may hide a later ask there")
+        XCTAssertEqual(erred, ["2"], "and it's read again")
         let unplaced = await answered(errors: #","errors":[{"message":"Something went wrong"}]"#)
         XCTAssertEqual(unplaced, ["1": false, "2": false], "an error that can't be placed may be inside any of them")
+        XCTAssertEqual(erred, ["1", "2"])
     }
 
     func testATeamListWithErrorsOrUnnamedTeamsIsNotWhole() async {
@@ -988,6 +1002,8 @@ final class NotificationsTests: XCTestCase {
         private let lock = NSLock()
         private var details: [String: NotificationSubjectDetail]
         var failing = false
+        /// Subjects GitHub erred inside: what they show is kept, any answer isn't.
+        var erring: Set<String> = []
         init(_ details: [String: NotificationSubjectDetail]) { self.details = details }
         func set(_ id: String, _ detail: NotificationSubjectDetail) { lock.withLock { details[id] = detail } }
         subscript(_ id: String) -> NotificationSubjectDetail? { lock.withLock { details[id] } }
@@ -1001,6 +1017,10 @@ final class NotificationsTests: XCTestCase {
             for thread in threads {
                 result.settled.insert(thread.key)
                 result.details[thread.key] = box[thread.key.id]
+                if box.erring.contains(thread.key.id) {
+                    result.details[thread.key]?.viewerActedAt = nil
+                    result.erred.insert(thread.key)
+                }
             }
             return result
         }
@@ -1129,6 +1149,45 @@ final class NotificationsTests: XCTestCase {
         box.failing = true
         await model.refreshNow()
         XCTAssertEqual(model.counts.needsYou, 1, "the old answer was for an older copy")
+    }
+
+    func testASubjectThatErredIsReadAgainUnchanged() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", number: 1, updated: now.addingTimeInterval(-60))]])
+        let box = DetailBox(["1": answeredDetail])
+        box.erring = ["1"]
+        let model = answeringModel(github, details: box, clears: true, clock: TestClock(now))
+        await model.refreshNow()
+        XCTAssertEqual(model.counts.needsYou, 1, "what GitHub erred inside may have asked again")
+        // GitHub recovers; the thread hasn't changed.
+        box.erring = []
+        await model.refreshNow()
+        try await waitUntil { github.actions.contains("DELETE /notifications/threads/1") }
+        XCTAssertEqual(model.clearedAnswered.map(\.key.id), ["1"])
+    }
+
+    func testAStaleClearNeverRevivesWhatANewerOneCleared() async throws {
+        let github = FakeGitHub()
+        let older = now.addingTimeInterval(-60), newer = now.addingTimeInterval(-30)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", number: 1, updated: older)]])
+        github.holdNextRead("1")
+        let model = answeringModel(github, details: DetailBox(["1": answeredDetail]), clears: true, clock: TestClock(now))
+        await model.refreshNow()
+        try await waitUntil { github.isHolding("1") }
+        // While the first clear looks again, the thread moves on, is judged answered
+        // again, and a second clear finishes first.
+        let moved = FakeGitHub.thread("1", reason: "mention", number: 1, updated: newer)
+        github.answer("participating", pages: [[moved]])
+        github.setCurrent(moved)
+        await model.refreshNow()
+        try await waitUntil { github.actions.contains("DELETE /notifications/threads/1") }
+        github.release("1")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(github.actions, ["DELETE /notifications/threads/1"], "the first saw the change and stood down")
+        XCTAssertFalse(model.threads.contains { $0.key.id == "1" }, "without bringing back its older copy")
+        XCTAssertEqual(model.clearedAnswered.map(\.updatedAt), [newer])
+        XCTAssertEqual(model.counts.needsYou, 0)
+        XCTAssertNil(model.warning)
     }
 
     func testReadOnlyCopiesNeverClearAnsweredThreads() async throws {
