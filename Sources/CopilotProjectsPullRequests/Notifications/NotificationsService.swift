@@ -323,7 +323,11 @@ struct NotificationDetailsFetcher: Sendable {
                 guard next < batches.count else { return }
                 let batch = batches[next]
                 next += 1
-                group.addTask { (batch, await query(batch, account: account)) }
+                group.addTask {
+                    // Awaited before the tuple is built, as the inbox refresh must be.
+                    let answer = await query(batch, account: account)
+                    return (batch, answer)
+                }
             }
             for _ in 0..<concurrency { addNext() }
             for await (batch, answer) in group {

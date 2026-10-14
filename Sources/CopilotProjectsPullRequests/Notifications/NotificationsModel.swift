@@ -370,7 +370,11 @@ final class NotificationsModel: ObservableObject {
                         interval = page.pollInterval
                     }
                     do {
-                        return (account.login, .success(try await plan.fetch(account: account, api: api, now: started)), stamp, interval)
+                        // Awaited on its own line: with the await inside the returned
+                        // tuple, release builds ended the loop below before any
+                        // account's result arrived.
+                        let result = try await plan.fetch(account: account, api: api, now: started)
+                        return (account.login, .success(result), stamp, interval)
                     } catch {
                         return (account.login, .failure(error), stamp, interval)
                     }
