@@ -940,6 +940,45 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(found.teams, ["github/copilot-reviewers"])
     }
 
+    func testASubjectGitHubErredInsideIsNeverAnswered() async {
+        URLProtocol.registerClass(GraphQLStub.self)
+        defer { URLProtocol.unregisterClass(GraphQLStub.self); GraphQLStub.respond = { _, _ in (500, "") } }
+        let fetcher = NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: GraphQLStub.endpoint))
+        let threads = [thread("1", "mention", number: 1), thread("2", "mention", number: 2)]
+        let subject = #"{"issueOrPullRequest":{"state":"OPEN","createdAt":"2026-10-14T09:00:00Z","author":{"login":"author"},"prActivity":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"__typename":"MentionedEvent","createdAt":"2026-10-14T10:00:00Z","actor":{"login":"octocat"}},{"__typename":"IssueComment","createdAt":"2026-10-14T11:00:00Z","body":"done","author":{"login":"octocat"}}]}}}"#
+        func answered(errors: String) async -> [String: Bool] {
+            GraphQLStub.respond = { _, _ in (200, #"{"data":{"viewer":{"login":"octocat"},"t0":\#(subject),"t1":\#(subject)}\#(errors)}"#) }
+            let result = await fetcher.details(for: threads, account: GitHubAccount(login: "octocat", token: "token"))
+            return result.details.reduce(into: [:]) { $0[$1.key.id] = $1.value.isAnswered { _ in nil } }
+        }
+        let clean = await answered(errors: "")
+        XCTAssertEqual(clean, ["1": true, "2": true])
+        let placed = await answered(errors: #","errors":[{"message":"timeout","path":["t1","issueOrPullRequest","reviews"]}]"#)
+        XCTAssertEqual(placed, ["1": true, "2": false], "an error inside one subject may hide a later ask there")
+        let unplaced = await answered(errors: #","errors":[{"message":"Something went wrong"}]"#)
+        XCTAssertEqual(unplaced, ["1": false, "2": false], "an error that can't be placed may be inside any of them")
+    }
+
+    func testATeamListWithErrorsOrUnnamedTeamsIsNotWhole() async {
+        URLProtocol.registerClass(GraphQLStub.self)
+        defer { URLProtocol.unregisterClass(GraphQLStub.self); GraphQLStub.respond = { _, _ in (500, "") } }
+        let fetcher = NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: GraphQLStub.endpoint))
+        func read(nodes: String, errors: String = "") async -> (teams: Set<String>, complete: Bool)? {
+            GraphQLStub.respond = { _, _ in
+                (200, #"{"data":{"organization":{"teams":{"pageInfo":{"hasNextPage":false},"nodes":[\#(nodes)]}}}\#(errors)}"#)
+            }
+            return await fetcher.viewerTeams(organization: "Octo", account: GitHubAccount(login: "octocat", token: "token"), login: "octocat")
+        }
+        let whole = await read(nodes: #"{"login":"Reviewers"}"#)
+        XCTAssertEqual(whole?.teams, ["octo/reviewers"])
+        XCTAssertEqual(whole?.complete, true)
+        let unnamed = await read(nodes: #"{"login":"Reviewers"},null,{"login":null}"#)
+        XCTAssertEqual(unnamed?.teams, ["octo/reviewers"], "the teams it could name are kept")
+        XCTAssertEqual(unnamed?.complete, false)
+        let erred = await read(nodes: #"{"login":"Reviewers"}"#, errors: #","errors":[{"message":"timeout","path":["organization","teams"]}]"#)
+        XCTAssertEqual(erred?.complete, false)
+    }
+
     /// Details GitHub would answer, changeable between refreshes.
     final class DetailBox: @unchecked Sendable {
         private let lock = NSLock()
@@ -1037,11 +1076,15 @@ final class NotificationsTests: XCTestCase {
         // A new mention landed after the inbox was read.
         github.setCurrent(FakeGitHub.thread("1", reason: "mention", number: 1, updated: now))
         let model = answeringModel(github, details: DetailBox(["1": answeredDetail]), clears: true, clock: TestClock(now))
+        var published: [NotificationCounts] = []
+        model.onCounts = { published.append($0) }
         await model.refreshNow()
         try await waitUntil { model.threads.contains { $0.key.id == "1" } && model.clearedAnswered.isEmpty }
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertFalse(github.actions.contains { $0.hasPrefix("DELETE") }, "never done without a fresh look")
         XCTAssertNil(model.warning, "a thread that moved on isn't a failure")
+        XCTAssertEqual(model.counts.needsYou, 1, "it may ask again, so it needs you until read again")
+        XCTAssertEqual(published.last?.needsYou, 1, "and the badge says so")
     }
 
     func testAStaleAnswerNeverHidesANewerCopy() async throws {

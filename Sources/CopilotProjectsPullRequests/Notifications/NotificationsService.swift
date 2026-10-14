@@ -397,6 +397,9 @@ struct NotificationDetailsFetcher: Sendable {
         let login: String?
         let issueOrPullRequest: Subject?
     }
+    /// A batch's answer, and which of its subjects (by index) GitHub reported
+    /// an error inside; nil when an error can't be placed, so any may be.
+    typealias Answer = (nodes: [String: Node?], erred: Set<Int>?)
 
     func details(
         for threads: [NotificationThread], account: GitHubAccount
@@ -407,8 +410,8 @@ struct NotificationDetailsFetcher: Sendable {
             Array(subjects[$0..<min($0 + batchSize, subjects.count)])
         }
         var result = Result(details: [:], settled: [], viewerLogin: account.login.isEmpty ? nil : account.login)
-        var answers: [([NotificationThread], [String: Node?])] = []
-        await withTaskGroup(of: ([NotificationThread], [String: Node?]?).self) { group in
+        var answers: [([NotificationThread], Answer)] = []
+        await withTaskGroup(of: ([NotificationThread], Answer?).self) { group in
             var next = 0
             func addNext() {
                 guard next < batches.count else { return }
@@ -427,19 +430,22 @@ struct NotificationDetailsFetcher: Sendable {
             }
         }
         if result.viewerLogin == nil {
-            result.viewerLogin = answers.lazy.compactMap { $0.1["viewer"]??.login }.first
+            result.viewerLogin = answers.lazy.compactMap { $0.1.nodes["viewer"]??.login }.first
         }
         for (batch, answer) in answers {
             for (index, thread) in batch.enumerated() {
                 result.settled.insert(thread.key)
-                guard let subject = answer["t\(index)"]??.issueOrPullRequest else { continue }
-                result.details[thread.key] = Self.detail(subject, viewer: result.viewerLogin)
+                guard let subject = answer.nodes["t\(index)"]??.issueOrPullRequest else { continue }
+                var detail = Self.detail(subject, viewer: result.viewerLogin)
+                // What GitHub failed to read may have asked again: it's never answered.
+                if answer.erred?.contains(index) != false { detail.viewerActedAt = nil }
+                result.details[thread.key] = detail
             }
         }
         return result
     }
 
-    private func query(_ batch: [NotificationThread], account: GitHubAccount) async -> [String: Node?]? {
+    private func query(_ batch: [NotificationThread], account: GitHubAccount) async -> Answer? {
         var declarations: [String] = []
         var fields = ["viewer { login }"]
         var variables: [String: Any] = [:]
@@ -461,7 +467,17 @@ struct NotificationDetailsFetcher: Sendable {
         let text = "query\(header) {\n\(fields.joined(separator: "\n"))\n}\n" + fragments.compactMap { $0 }.joined(separator: "\n")
         do {
             // Partial answers are kept: a subject GitHub won't show settles without detail.
-            return try await graphQL.run(text, variables: variables, token: account.token, as: [String: Node?].self).data
+            let response = try await graphQL.run(text, variables: variables, token: account.token, as: [String: Node?].self)
+            guard let nodes = response.data else { return nil }
+            var erred: Set<Int>? = []
+            for error in response.errors ?? [] {
+                if case .field(let alias)? = error.path?.first, alias.hasPrefix("t"), let index = Int(alias.dropFirst()) {
+                    erred?.insert(index)
+                } else {
+                    erred = nil
+                }
+            }
+            return (nodes, erred)
         } catch {
             NSLog("copilot-notifications: subject details failed for \(account.login): \(error)")
             return nil
@@ -602,10 +618,13 @@ struct NotificationDetailsFetcher: Sendable {
           organization(login: $org) { teams(first: 100, userLogins: [$login]) { pageInfo { hasNextPage } nodes { login: slug } } }
         }
         """
-        guard let answer = try? await graphQL.run(
+        guard let response = try? await graphQL.run(
             text, variables: ["org": organization, "login": login], token: account.token, as: Teams.self
-        ).data, let connection = answer.organization?.teams, let nodes = connection.nodes else { return nil }
+        ), let connection = response.data?.organization?.teams, let nodes = connection.nodes else { return nil }
         let teams = Set(nodes.compactMap { $0?.login.map { "\(organization)/\($0)".lowercased() } })
-        return (teams, connection.pageInfo?.hasNextPage == false)
+        // An error or an unnamed team leaves the list short, however it was paged.
+        let whole = connection.pageInfo?.hasNextPage == false && response.errors?.isEmpty != false
+            && nodes.allSatisfy { $0?.login != nil }
+        return (teams, whole)
     }
 }

@@ -726,8 +726,12 @@ final class NotificationsModel: ObservableObject {
             if let was = judged[id], current.updatedAt > was { throw ChangedSinceJudged() }
             try await api.markDone(account: account, threadId: id)
         } failed: { [weak self] failed in
+            guard let self else { return }
             let keys = Set(failed.map(\.key))
-            self?.clearedAnswered.removeAll { keys.contains($0.key) }
+            self.clearedAnswered.removeAll { keys.contains($0.key) }
+            // Whatever stopped it, the judgment no longer stands: it needs the user until read again.
+            for key in keys { self.detailVersions[key] = nil }
+            self.publish()
         }
     }
 
