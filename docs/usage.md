@@ -115,7 +115,11 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   alert. Permission and completion alerts are not withdrawn automatically. Unread sessions
   get a bell badge + a Dock badge count. Completed sessions show one blue attention dot, not two.
   Returning to the Mac app marks the selected session read without
-  needing to switch sessions.
+  needing to switch sessions. To come back to a session later, choose **Mark as Unread**
+  from its context menu (or press `⇧⌘U` for the current session). The mark survives
+  relaunch and returning to the app, and clears when you go back to that session or choose
+  **Mark as Read**. Both menus offer **Mark as Read** instead while a session shows an
+  unread or finished indicator, so `⇧⌘U` toggles the current session.
 - **Control socket + CLI:** the same `copilot-projects` binary is also a CLI that talks to the
   running app over a Unix socket — ideal for agent hooks.
 - **Resumable sessions:** each terminal runs under a bundled [dtach](https://github.com/crigler/dtach),

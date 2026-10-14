@@ -110,6 +110,7 @@ accessibility labels.
 | New Copilot session | `⌘T` |
 | New plain terminal | `⌥⌘T` |
 | End the current session | `⌘W` |
+| Mark the current session unread / read | `⇧⌘U` |
 | Next / previous session | `⌃Tab` / `⌃⇧Tab` |
 | Find a session | `⌘K` |
 | Show pull requests | `⇧⌘P` |
