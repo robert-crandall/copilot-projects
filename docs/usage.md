@@ -684,25 +684,6 @@ The Mac host reads copied terminal snapshots rather than mutable terminal intern
 process output passes through an ordered main-actor consumer so Kitty capture, durable-image
 restoration and parser feeds retain their ordering independently of the render thread.
 
-### Renderer diagnostics
-
-The fork records diagnostic events in unified logging under the static subsystem
-`org.tirania.SwiftTerm`, category `MetalDiagnostics`. The process filter excludes test runs:
-
-```sh
-log show --last 1d --style compact --predicate 'process == "copilot-projects" AND subsystem == "org.tirania.SwiftTerm" AND category == "MetalDiagnostics"'
-```
-
-Events cover transient rasterization failures, actual Metal command errors, delayed completion
-observations after a refused draw, and existing idle-wait timeouts. At most the first five events
-of each kind per process are recorded (20 total); terminal contents, glyph identities, session
-IDs, and paths are not logged.
-
-A slow-completion warning means the completion callback has not been observed for more than
-five seconds, **not** that a GPU hang is proven. Delay checks occur only on a subsequent draw
-refusal or existing idle wait, not while a terminal is fully idle. This logging adds no timers,
-watchdogs, automatic retries, or recovery policy.
-
 ## How it works
 
 - The small executable entrypoint calls `CopilotProjectsApplication` in `Sources/CopilotProjectsHost`:
