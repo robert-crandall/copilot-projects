@@ -131,6 +131,35 @@ final class ManualUnreadTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteClientsMarkUnreadAndReadThroughTheBridge() throws {
+        let f = try ManualUnreadFixture()
+        defer { f.clean() }
+        let shown = f.project.sessions[0].id
+        let target = f.project.sessions[1].id
+        let bridge: any SessionHost = RemoteModelBridge(model: f.model)
+        XCTAssertTrue(bridge.supportsMarkUnread)
+
+        bridge.markUnread(sessionId: target)
+        XCTAssertTrue(f.session(target).markedUnread)
+        XCTAssertEqual(f.model.projects[0].selectedSessionId, shown, "A remote mark doesn't move the Mac")
+        XCTAssertEqual(NSApp.dockTile.badgeLabel, "1")
+        var sessions = try XCTUnwrap(bridge.workspace()?.projects[0].sessions)
+        XCTAssertEqual(sessions[1].unread, true)
+        XCTAssertEqual(sessions[1].markedUnread, true)
+        XCTAssertNil(sessions[0].markedUnread)
+        XCTAssertEqual(try f.savedSessions()[target]?.markedUnread, true)
+
+        bridge.markRead(sessionId: target)
+        sessions = try XCTUnwrap(bridge.workspace()?.projects[0].sessions)
+        XCTAssertFalse(sessions[1].unread)
+        XCTAssertNil(sessions[1].markedUnread)
+        XCTAssertEqual(try f.savedSessions()[target]?.markedUnread, false)
+
+        bridge.markUnread(sessionId: "does-not-exist")
+        XCTAssertNil(NSApp.dockTile.badgeLabel)
+    }
+
+    @MainActor
     func testMarkAsReadClearsTheManualMarkAndAllAttention() throws {
         let f = try ManualUnreadFixture()
         defer { f.clean() }

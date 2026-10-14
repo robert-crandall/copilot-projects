@@ -144,6 +144,12 @@ final class RemoteModelBridge: SessionHost {
         model?.markSessionRead(sessionId: sessionId)
     }
 
+    var supportsMarkUnread: Bool { model != nil }
+
+    func markUnread(sessionId: String) {
+        model?.markSessionUnread(sessionId: sessionId)
+    }
+
     func closeSession(sessionId: String) -> RemoteSessionCloseResult {
         model?.closeRemoteSession(sessionId: sessionId) ?? .failed
     }

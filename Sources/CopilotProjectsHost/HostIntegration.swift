@@ -52,6 +52,10 @@ public protocol SessionHost: AnyObject, Sendable {
     func sendCommand(sessionId: String, requestId: String, value: String) -> RemoteCommandResult
     func sendScroll(sessionId: String, delta: Int)
     func markRead(sessionId: String)
+    /// Whether `markUnread` is implemented. A gateway routes
+    /// `RemoteMarkUnreadContract.controlType` and advertises its capability only when true.
+    var supportsMarkUnread: Bool { get }
+    func markUnread(sessionId: String)
     func closeSession(sessionId: String) -> RemoteSessionCloseResult
     func moveSession(sessionId: String, toProjectId: String) -> RemoteSessionMoveResult
     func sendPrompt(sessionId: String, value: String) -> RemotePromptResult
@@ -72,6 +76,10 @@ public protocol SessionHost: AnyObject, Sendable {
 
 public extension SessionHost {
     var supportsPullRequests: Bool { false }
+
+    var supportsMarkUnread: Bool { false }
+
+    func markUnread(sessionId: String) {}
 
     /// Hosts without incremental support send their usual response. Clients
     /// merge by turn id, so ignoring the cursor costs only bandwidth.
