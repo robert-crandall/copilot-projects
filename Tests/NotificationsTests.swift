@@ -1190,6 +1190,32 @@ final class NotificationsTests: XCTestCase {
         XCTAssertNil(model.warning)
     }
 
+    func testAReopenedRequestUnreadAfterAStaleClearNeedsYouAgain() async throws {
+        let github = FakeGitHub()
+        let older = now.addingTimeInterval(-60), newer = now.addingTimeInterval(-30)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: older)]])
+        github.holdNextRead("1")
+        var closed = answeredDetail
+        closed.state = .closed
+        let box = DetailBox(["1": closed])
+        let model = answeringModel(github, details: box, clears: true, clock: TestClock(now))
+        await model.refreshNow()
+        try await waitUntil { github.isHolding("1") }
+        // While the clear looks again, the pull request is reopened and asks
+        // again, and its details can't be read.
+        let reopened = FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: newer)
+        github.answer("participating", pages: [[reopened]])
+        github.setCurrent(reopened)
+        box.failing = true
+        await model.refreshNow()
+        XCTAssertTrue(model.threads.contains { $0.key.id == "1" })
+        github.release("1")
+        try await waitUntil { model.clearedAnswered.isEmpty }
+        XCTAssertFalse(github.actions.contains { $0.hasPrefix("DELETE") })
+        XCTAssertEqual(model.counts.needsYou, 1, "the closed state the stale clear was judged on no longer stands")
+        XCTAssertEqual(model.counts.settled, 0)
+    }
+
     func testReadOnlyCopiesNeverClearAnsweredThreads() async throws {
         let github = FakeGitHub()
         github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now)]])

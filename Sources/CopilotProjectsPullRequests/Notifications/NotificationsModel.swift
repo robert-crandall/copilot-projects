@@ -729,15 +729,15 @@ final class NotificationsModel: ObservableObject {
             let current = try await api.thread(account: account, threadId: id)
             if let was = judged[id], current.updatedAt > was { throw ChangedSinceJudged() }
             try await api.markDone(account: account, threadId: id)
-        } failed: { [weak self] failed, restored in
+        } failed: { [weak self] failed in
             guard let self else { return }
             // Only this clear's own copy leaves the list; a later one's stays.
             let judgedAt = Dictionary(failed.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: { first, _ in first })
             self.clearedAnswered.removeAll { judgedAt[$0.key] == $0.updatedAt }
             // Whatever stopped it, what was known no longer stands, a closed
-            // state included: it needs the user until read again. A newer copy
-            // that arrived meanwhile was judged on its own and keeps that.
-            for key in restored.map(\.key) {
+            // state included: it needs the user until read again. What was
+            // read since, or a later removal, has moved on and keeps that.
+            for (key, judged) in judgedAt where self.doneLocally[key] == nil && self.detailVersions[key] == judged {
                 self.detailVersions[key] = nil
                 self.details[key] = nil
                 self.settled.remove(key)
@@ -749,7 +749,7 @@ final class NotificationsModel: ObservableObject {
     private func remove(
         _ targets: [NotificationThread], verb: String, coversUntilNow: Bool = true,
         action: @escaping @Sendable (GitHubNotificationsAPI, GitHubAccount, String) async throws -> Void,
-        failed onFailure: ((_ failed: [NotificationThread], _ restored: [NotificationThread]) -> Void)? = nil
+        failed onFailure: (([NotificationThread]) -> Void)? = nil
     ) {
         guard !targets.isEmpty else { return }
         let keys = Set(targets.map(\.key))
@@ -771,7 +771,7 @@ final class NotificationsModel: ObservableObject {
             for thread in restored { self.doneLocally[thread.key] = nil }
             let present = Set(self.threads.map(\.key))
             self.animate { self.threads += restored.filter { !present.contains($0.key) } }
-            onFailure?(failed, restored)
+            onFailure?(failed)
         }
     }
 
