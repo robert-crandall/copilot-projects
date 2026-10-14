@@ -160,4 +160,14 @@ final class HostLifetimeTests: XCTestCase {
         defaults.set(false, forKey: HostLifetimePolicy.settingKey)
         XCTAssertTrue(HostLifetimePolicy.shouldTerminateAfterLastWindowClosed(defaults: defaults))
     }
+
+    /// SwiftUI can't key-value observe a dotted @AppStorage key, so it rebuilds
+    /// the App scene on every defaults write. The menu bar extra writes its
+    /// isInserted binding back on each rebuild, so launch never settles.
+    @MainActor
+    func testAppSceneSettingKeysAreObservable() {
+        for key in [HostLifetimePolicy.settingKey, NotificationsAppLauncher.startsWithHostKey] {
+            XCTAssertFalse(key.contains("."), "\(key) can't be observed by @AppStorage in the App scene")
+        }
+    }
 }
