@@ -25,11 +25,9 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // SwiftTerm 2.0 with embedding APIs, caret ordering, renderer diagnostics,
-        // and close-on-exec protection for the private PTY write descriptor.
         .package(
-            url: "https://github.com/sirfergy/SwiftTerm",
-            revision: "0cea152eaa0123269460b768bb1bb06516558696"
+            url: "https://github.com/migueldeicaza/SwiftTerm",
+            revision: "95a8b00bf691ffa0d1561c36d6872a0008f143c3"
         ),
     ],
     targets: [
