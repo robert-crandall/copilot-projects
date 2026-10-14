@@ -416,6 +416,31 @@ final class NotificationsTests: XCTestCase {
         XCTAssertTrue(model.warning?.contains("Couldn’t mark as done") == true, model.warning ?? "no warning")
     }
 
+    func testDoneCoversActivityUpToTheClickNotJustTheCopyOnScreen() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
+        let model = makeModel(github, clock: TestClock(now))
+        await model.refreshNow()
+        // Activity the window hasn't shown yet arrives before the click.
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-300))]])
+        model.markDone(model.items)
+        try await waitUntil { github.actions.contains("DELETE /notifications/threads/1") }
+        await model.refreshNow()
+        XCTAssertTrue(model.threads.isEmpty, "the done covered it")
+
+        // A copy dated ahead of this clock stays done too.
+        github.answer("participating", pages: [[FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(120))]])
+        await model.refreshNow()
+        model.markDone(model.items)
+        try await waitUntil { github.actions.contains("DELETE /notifications/threads/2") }
+        await model.refreshNow()
+        XCTAssertTrue(model.threads.isEmpty)
+
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(60))]])
+        await model.refreshNow()
+        XCTAssertEqual(model.threads.map(\.key.id), ["1"], "activity after the click brings it back")
+    }
+
     func testOneRevokedAccountDoesNotBlockActingForTheOthers() async throws {
         let github = FakeGitHub()
         github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now)]])
@@ -558,6 +583,36 @@ final class NotificationsTests: XCTestCase {
         await model.refreshNow()
         let titles = banners.posted.flatMap { $0 }.map(\.title)
         XCTAssertTrue(titles.contains("You were mentioned"), "\(titles)")
+    }
+
+    func testOneAccountsFailedRefreshKeepsItsTruncationCaveat() async {
+        let github = FakeGitHub()
+        let ci: (String) -> [[String: Any]] = { [now] id in
+            [FakeGitHub.thread(id, reason: "ci_activity", type: "CheckSuite", number: nil, updated: now)]
+        }
+        github.answer("unread", pages: [ci("1"), ci("2")])
+        var plan = NotificationsFetchPlan()
+        plan.unreadPages = 1
+        let model = NotificationsModel(
+            workspace: FakeWorkspace(), defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            api: GitHubNotificationsAPI(send: github.send), plan: plan,
+            detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "good"), GitHubAccount(login: "hubot", token: "flaky")] },
+            transcriptPath: { _ in nil }, clock: { self.now }
+        )
+        model.setBadge = { _ in }
+        await model.refreshNow()
+        XCTAssertEqual(model.truncatedAccounts, ["octocat", "hubot"])
+
+        // hubot fails while octocat's inbox now fits in what one refresh reads.
+        github.revoke("flaky")
+        github.answer("unread", pages: [ci("1")])
+        await model.refreshNow()
+        XCTAssertEqual(model.truncatedAccounts, ["hubot"], "hubot's older threads are still unseen")
+
+        github.restore("flaky")
+        await model.refreshNow()
+        XCTAssertTrue(model.truncatedAccounts.isEmpty)
     }
 
     func testGoingToTheLinkedSessionMarksTheThreadRead() async throws {

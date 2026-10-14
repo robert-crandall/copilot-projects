@@ -143,7 +143,7 @@ final class NotificationsModel: ObservableObject {
     private var detailVersions: [NotificationThread.Key: Date] = [:]
     private var viewerTeams: [String: Set<String>] = [:]
     /// Threads marked done here, hidden from refreshes that started before
-    /// GitHub saw it, until they change again.
+    /// GitHub saw it, until they change after the action.
     private var doneLocally: [NotificationThread.Key: Date] = [:]
     /// Threads marked read here, kept read across refreshes racing the request.
     private var readLocally: [NotificationThread.Key: Date] = [:]
@@ -437,7 +437,9 @@ final class NotificationsModel: ObservableObject {
                 merged.append(thread)
             }
         }
-        truncatedAccounts = Set(fetched.filter(\.value.truncated).map(\.key))
+        // An account that wasn't read this time keeps its caveat with its threads.
+        truncatedAccounts = truncatedAccounts.filter { fetched[$0] == nil && known.contains($0) }
+            .union(fetched.filter(\.value.truncated).map(\.key))
         // A done still in flight keeps its details, in case it fails and comes back.
         let present = Set(merged.map(\.key)).union(doneLocally.keys)
         details = details.filter { present.contains($0.key) }
@@ -661,7 +663,10 @@ final class NotificationsModel: ObservableObject {
     ) {
         guard !targets.isEmpty else { return }
         let keys = Set(targets.map(\.key))
-        for thread in targets { doneLocally[thread.key] = thread.updatedAt }
+        // The action covers activity up to now, even if this copy is older;
+        // a copy dated ahead of this clock is covered too.
+        let now = clock()
+        for thread in targets { doneLocally[thread.key] = max(now, thread.updatedAt) }
         animate { self.threads.removeAll { keys.contains($0.key) } }
         publish()
         perform(targets, verb: verb, action: action) { [weak self] failed in
