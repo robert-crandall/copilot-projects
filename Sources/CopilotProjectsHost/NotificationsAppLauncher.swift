@@ -9,7 +9,9 @@ import CopilotProjectsCore
 enum NotificationsAppLauncher {
     /// Whether Copilot Projects starts Copilot Notifications when it launches.
     /// Opening Notifications once turns it on; the app menu turns it off.
-    static let startsWithHostKey = "notifications.startsWithHost"
+    /// No dots: the App scene reads it through @AppStorage, and a dotted key
+    /// makes SwiftUI rebuild the scene on every defaults write.
+    static let startsWithHostKey = "notificationsStartWithHost"
 
     static func open(
         hostBundle: Bundle? = RunningExecutable.applicationBundle,
