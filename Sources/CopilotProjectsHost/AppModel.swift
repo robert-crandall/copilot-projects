@@ -2061,7 +2061,8 @@ final class AppModel: ObservableObject {
                             workflow: session.agentActivity?.workflow,
                             lastError: status == .idle
                                 ? session.agentActivity?.remoteLastError()
-                                : nil
+                                : nil,
+                            markedUnread: session.markedUnread ? true : nil
                         )
                     }
                 )

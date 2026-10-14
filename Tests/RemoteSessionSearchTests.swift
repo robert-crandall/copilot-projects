@@ -623,6 +623,12 @@ final class RemoteSessionSearchTests: XCTestCase {
         }
     }
 
+    func testOtherHostsDoNotSupportMarkUnread() {
+        let host: any SessionHost = MinimalSessionHost()
+        XCTAssertFalse(host.supportsMarkUnread)
+        host.markUnread(sessionId: "s")
+    }
+
     func testOlderHostsAnswerCursorRequestsWithTheirUsualTranscript() async throws {
         let host: any SessionHost = MinimalSessionHost()
         let cursor = try XCTUnwrap(TranscriptCursor(afterMilliseconds: 1, copilotSessionId: "c"))

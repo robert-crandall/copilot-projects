@@ -496,6 +496,15 @@ implement; other conformers default to `unsupported` and none. `RemoteProtocolIn
 omits `session-search-v1` and `session-search-recent-v1`: a gateway advertises each
 only when it serves `RemoteSessionSearchContract.path` for a host that declares it.
 
+#### Remote mark as unread
+
+`SessionHost.markUnread` sets the same mark as the Mac's **Mark as Unread**; the
+existing `markRead` clears it. A marked session's snapshot carries `unread` and
+`markedUnread: true`; unmarked sessions omit `markedUnread`. Hosts report
+`supportsMarkUnread`, and other conformers default to unsupported. `RemoteProtocolInfo.current`
+omits `mark-unread-v1`: a gateway advertises it only when it routes the
+`mark-unread` control to a host that declares it.
+
 ### Notification deep links
 
 External notifications can focus an existing project or session through the

@@ -98,6 +98,10 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
     /// The session's latest request failed and nothing has started since.
     /// Present only while the session is idle; omitted by older hosts.
     public let lastError: TranscriptTurnError?
+    /// The user marked this session unread to come back to it. `unread` already
+    /// includes it; this says why. Present only while set, so unmarked sessions
+    /// and older hosts omit it.
+    public let markedUnread: Bool?
 
     public init(
         id: String,
@@ -117,7 +121,8 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         operationSupport: RemoteOperationSupport? = nil,
         operationReceipts: [RemoteOperationReceipt]? = nil,
         workflow: RemoteSessionWorkflow? = nil,
-        lastError: TranscriptTurnError? = nil
+        lastError: TranscriptTurnError? = nil,
+        markedUnread: Bool? = nil
     ) {
         self.id = id
         self.title = title
@@ -137,6 +142,7 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         self.operationReceipts = operationReceipts
         self.workflow = workflow
         self.lastError = lastError
+        self.markedUnread = markedUnread
     }
 }
 

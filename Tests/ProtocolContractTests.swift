@@ -347,6 +347,32 @@ final class ProtocolContractTests: XCTestCase {
         try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any])
     }
 
+    func testMarkUnreadContractIsNotAdvertisedByTheHostProtocol() throws {
+        XCTAssertEqual(RemoteMarkUnreadContract.capability, "mark-unread-v1")
+        XCTAssertEqual(RemoteMarkUnreadContract.controlType, "mark-unread")
+        // Only a gateway that routes the control advertises it.
+        XCTAssertFalse(RemoteProtocolInfo.current.supports(RemoteMarkUnreadContract.capability))
+
+        let unmarked = RemoteSessionSnapshot(
+            id: "s", title: "t", status: "idle", statusText: nil,
+            unread: false, ready: false, background: false, scheduled: false
+        )
+        XCTAssertNil(unmarked.markedUnread)
+        XCTAssertFalse(try jsonObject(unmarked).keys.contains("markedUnread"))
+        let marked = RemoteSessionSnapshot(
+            id: "s", title: "t", status: "idle", statusText: nil,
+            unread: true, ready: false, background: false, scheduled: false, markedUnread: true
+        )
+        XCTAssertEqual(try jsonObject(marked)["markedUnread"] as? Bool, true)
+        XCTAssertEqual(
+            try JSONDecoder().decode(RemoteSessionSnapshot.self, from: JSONEncoder().encode(marked)),
+            marked
+        )
+        for fixture in ["served-workspace", "legacy-workspace"] {
+            XCTAssertNil(try workspace(fixture).projects.first?.sessions.first?.markedUnread, fixture)
+        }
+    }
+
     func testSessionSearchContractIsNotAdvertisedByTheHostProtocol() {
         XCTAssertEqual(RemoteSessionSearchContract.capability, "session-search-v1")
         XCTAssertEqual(RemoteSessionSearchContract.recentCapability, "session-search-recent-v1")
