@@ -78,8 +78,9 @@ for the same cue; no protocol change is required.
 each goal whose `needsYouCount` is positive, including no-session/stale nudges,
 and keeps every PR in that goal. It does not change triage, grouping, urgency, or
 the header's all-fetched-PR counts. The status row reports visible/total goals;
-stage counts follow visible lanes. The native segmented picker is 180pt wide
-and disabled before the loaded phase. An empty filtered result says
+stage counts follow visible lanes. The native segmented picker keeps its natural
+width on the 14pt leading edge the headline shares, and is disabled before the
+loaded phase. An empty filtered result says
 "Nothing needs you" with Show All Goals only when status is complete. Otherwise
 it repeats the header's "Checking PR status…" or "Some PR status is unknown"
 with a question-mark icon, distinct from having no open PRs.

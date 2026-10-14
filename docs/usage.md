@@ -52,6 +52,16 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   Copilot Projects over the control socket (`list-sessions`, `reveal-session`,
   `start-copilot-session`, `resume-copilot-session`), so it never touches terminals itself.
   Only one copy per state directory writes its goals; see the README for the rules.
+- **Notifications (`⇧⌘N`):** opens Copilot Notifications, a separate app nested beside
+  Copilot Pull Requests, with its own Dock icon, Dock badge, and `⌘Tab` entry. It keeps
+  running after its window closes so the badge and banners stay current, and Copilot
+  Projects starts it in the background once you've opened it (**Start Notifications with
+  Copilot Projects** in the app menu turns that off). It mirrors the GitHub inbox of every
+  `gh` account in lanes by reason, banded **To you**, **Via your teams**, **Watching**, and
+  **Quiet** (CI and the rest, never badged), with columns **Since you looked**, **Today**,
+  **This week**, and **Older**. Review requests are split by each pull request's
+  review-request history. Opening a thread marks it read on GitHub; `E` marks it done.
+  Pull request threads a live session works on offer **Go to Session**.
 - **Prompt-first sessions:** the **+** split button's dropdown, Session menu, and project context
   menu offer **Start with Prompt…**. Compose multiple lines, then use `⌘Return` to launch
   an interactive session (not a one-shot/headless command). Cancel creates no session.
@@ -214,10 +224,10 @@ Requires Xcode 26+, macOS 26+.
 ```
 
 `build-app.sh` runs `swift build`, assembles `dist/Copilot Projects.app` (with the
-Copilot Projects Link and Copilot Pull Requests helper apps under `Contents/Helpers/`),
-precompiles SwiftTerm's Metal shaders, and signs the nested executables inner-first.
-`swift run copilot-projects` has no helpers, so Pull Requests explains that it needs
-the built app. Local builds
+Copilot Projects Link, Copilot Pull Requests, and Copilot Notifications helper apps
+under `Contents/Helpers/`), precompiles SwiftTerm's Metal shaders, and signs the nested
+executables inner-first. `swift run copilot-projects` has no helpers, so Pull Requests
+and Notifications explain that they need the built app. Local builds
 use an available Developer ID identity, falling back to ad-hoc signing. Set
 `CODESIGN_IDENTITY=-` to force ad-hoc signing for a validation build.
 
@@ -710,8 +720,9 @@ watchdogs, automatic retries, or recovery policy.
 
 Override locations with `COPILOT_PROJECTS_SOCKET` and `COPILOT_PROJECTS_STATE_DIR` to run an isolated
 instance. An app launched with either override does not replace the global CLI symlink or Copilot
-hooks. It opens its own Copilot Pull Requests; when only the socket moves out of the state
-directory, that copy keeps its goals and lock under `pull-requests/socket-<hash>/`.
+hooks. It opens its own Copilot Pull Requests and Copilot Notifications; when only the socket
+moves out of the state directory, those copies keep their state and locks under
+`pull-requests/socket-<hash>/` and `notifications/socket-<hash>/`.
 
 ## License
 

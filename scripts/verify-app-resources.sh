@@ -2,7 +2,8 @@
 # Smoke-test an assembled Copilot Projects.app: prove the SwiftPM resource
 # bundles the runtime loads are actually inside the app, resolvable from the
 # exact paths PackagedResource searches, and byte-identical to the reviewed
-# sources, and that the nested Copilot Pull Requests app is intact and signed.
+# sources, and that the nested Copilot Pull Requests and Copilot Notifications
+# apps are intact and signed.
 #
 #   scripts/verify-app-resources.sh ["/path/to/Copilot Projects.app"]
 #
@@ -101,6 +102,35 @@ if [ ! -s "$PR_ICON" ]; then
 fi
 codesign --verify --strict "$PR_APP"
 echo "ok: $PR_APP"
+
+# Copilot Notifications ships the same way, beside it.
+NOTIF_APP="$APP/Contents/Helpers/Copilot Notifications.app"
+NOTIF_INFO="$NOTIF_APP/Contents/Info.plist"
+if [ ! -f "$NOTIF_INFO" ]; then
+  echo "error: missing nested app $NOTIF_APP" >&2
+  exit 1
+fi
+NOTIF_ID="$(plist_value "$NOTIF_INFO" CFBundleIdentifier)"
+if [ "$NOTIF_ID" != "$HOST_ID.notifications" ]; then
+  echo "error: Copilot Notifications has bundle id '$NOTIF_ID', expected '$HOST_ID.notifications'" >&2
+  exit 1
+fi
+if [ "$(plist_value "$NOTIF_INFO" CopilotProjectsHostBundleIdentifier)" != "$HOST_ID" ]; then
+  echo "error: Copilot Notifications doesn't name its host's bundle id" >&2
+  exit 1
+fi
+NOTIF_EXE="$NOTIF_APP/Contents/MacOS/$(plist_value "$NOTIF_INFO" CFBundleExecutable)"
+if [ "$NOTIF_EXE" = "$NOTIF_APP/Contents/MacOS/" ] || [ ! -x "$NOTIF_EXE" ]; then
+  echo "error: Copilot Notifications executable is missing or not executable: $NOTIF_EXE" >&2
+  exit 1
+fi
+NOTIF_ICON="$NOTIF_APP/Contents/Resources/$(plist_value "$NOTIF_INFO" CFBundleIconFile).icns"
+if [ ! -s "$NOTIF_ICON" ]; then
+  echo "error: Copilot Notifications icon is missing: $NOTIF_ICON" >&2
+  exit 1
+fi
+codesign --verify --strict "$NOTIF_APP"
+echo "ok: $NOTIF_APP"
 
 "$APP/Contents/MacOS/copilot-projects" check-assets
 

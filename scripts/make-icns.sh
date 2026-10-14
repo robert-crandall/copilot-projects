@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Render the app icons and build Resources/AppIcon.icns and
-# Resources/PullRequestsIcon.icns from them.
+# Render the app icons and build Resources/AppIcon.icns,
+# Resources/PullRequestsIcon.icns, and Resources/NotificationsIcon.icns from them.
 #   scripts/make-icns.sh
 set -euo pipefail
 
@@ -25,4 +25,5 @@ render() {
 
 render AppIcon
 render PullRequestsIcon --pull-requests
+render NotificationsIcon --notifications
 echo "wrote macOS app icons"

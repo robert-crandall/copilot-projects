@@ -7,6 +7,7 @@ import CopilotProjectsProtocol
 struct CopilotProjectsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage(HostLifetimePolicy.settingKey) private var keepRunning = false
+    @AppStorage(NotificationsAppLauncher.startsWithHostKey) private var startsNotifications = false
     @State private var showsProjects = true
 
     var body: some Scene {
@@ -17,10 +18,13 @@ struct CopilotProjectsApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             WorkspaceCommands(model: appDelegate.model, input: appDelegate.input,
-                              keepRunning: $keepRunning, showsProjects: $showsProjects)
+                              keepRunning: $keepRunning, startsNotifications: $startsNotifications,
+                              showsProjects: $showsProjects)
         }
-        MenuBarExtra("Copilot Projects", systemImage: "terminal", isInserted: $keepRunning) {
+        MenuBarExtra(isInserted: $keepRunning) {
             HostStatusMenu(keepRunning: $keepRunning)
+        } label: {
+            HostStatusLabel()
         }
     }
 }
@@ -37,6 +41,7 @@ private struct WorkspaceCommands: Commands {
     let model: AppModel
     @ObservedObject var input: WorkspaceInputController
     @Binding var keepRunning: Bool
+    @Binding var startsNotifications: Bool
     @Binding var showsProjects: Bool
 
     var body: some Commands {
@@ -47,6 +52,7 @@ private struct WorkspaceCommands: Commands {
         }
         CommandGroup(after: .appSettings) {
             Toggle("Keep Running When Window Closes", isOn: $keepRunning)
+            Toggle("Start Notifications with Copilot Projects", isOn: $startsNotifications)
         }
         CommandGroup(before: .sidebar) {
             Toggle("Show Projects", isOn: $showsProjects)
@@ -55,6 +61,7 @@ private struct WorkspaceCommands: Commands {
         }
         CommandGroup(before: .windowList) {
             OpenPullRequestsButton()
+            OpenNotificationsButton()
             Divider()
         }
         CommandMenu("Session") {
@@ -156,6 +163,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             CopilotExtension.installIfPossible()
         }
         registerDeepLinkHelper()
+        NotificationsSummaryWatcher.shared.start()
+        NotificationsAppLauncher.startInBackgroundIfWanted()
 
         NSApp.activate(ignoringOtherApps: true)
 

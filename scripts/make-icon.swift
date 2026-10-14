@@ -7,9 +7,11 @@ import UniformTypeIdentifiers
 // Copilot mascot (primer/octicons `copilot-48`, MIT) in white on a teal
 // squircle. With --pull-requests it renders the Copilot Pull Requests icon
 // instead: the same squircle with primer/octicons `git-pull-request-24` (MIT).
+// With --notifications it renders the Copilot Notifications icon: the same
+// squircle with primer/octicons `bell-24` (MIT).
 // The octicon path data is embedded and rasterized by the small SVG-path
 // parser below, then composited; no external tools required.
-// Usage: swift make-icon.swift <out.png> [--pull-requests]
+// Usage: swift make-icon.swift <out.png> [--pull-requests | --notifications]
 
 
 // Minimal SVG path-data -> CGPath (supports M m L l H h V v C c S s Q q T t A a Z z).
@@ -133,6 +135,8 @@ let copilotBodyPath = "M47.801 34.003c-1.72 2.988-11.706 10.037-23.82 10.037S1.8
 // primer/octicons git-pull-request-24 (MIT): rings (even-odd), then branch line and arrow.
 let pullRequestRingsPath = "M16 19.25a3.25 3.25 0 1 1 6.5 0 3.25 3.25 0 0 1-6.5 0Zm-14.5 0a3.25 3.25 0 1 1 6.5 0 3.25 3.25 0 0 1-6.5 0Zm0-14.5a3.25 3.25 0 1 1 6.5 0 3.25 3.25 0 0 1-6.5 0ZM4.75 3a1.75 1.75 0 1 0 .001 3.501A1.75 1.75 0 0 0 4.75 3Zm0 14.5a1.75 1.75 0 1 0 .001 3.501A1.75 1.75 0 0 0 4.75 17.5Zm14.5 0a1.75 1.75 0 1 0 .001 3.501 1.75 1.75 0 0 0-.001-3.501Z"
 let pullRequestStrokesPath = "M13.405 1.72a.75.75 0 0 1 0 1.06L12.185 4h4.065A3.75 3.75 0 0 1 20 7.75v8.75a.75.75 0 0 1-1.5 0V7.75a2.25 2.25 0 0 0-2.25-2.25h-4.064l1.22 1.22a.75.75 0 0 1-1.061 1.06l-2.5-2.5a.75.75 0 0 1 0-1.06l2.5-2.5a.75.75 0 0 1 1.06 0ZM4.75 7.25A.75.75 0 0 1 5.5 8v8A.75.75 0 0 1 4 16V8a.75.75 0 0 1 .75-.75Z"
+// primer/octicons bell-24 (MIT): the outline and clapper ring knock out even-odd.
+let bellPath = "M12 1c3.681 0 7 2.565 7 6v4.539c0 .642.189 1.269.545 1.803l2.2 3.298A1.517 1.517 0 0 1 20.482 19H15.5a3.5 3.5 0 1 1-7 0H3.519a1.518 1.518 0 0 1-1.265-2.359l2.2-3.299A3.25 3.25 0 0 0 5 11.539V7c0-3.435 3.318-6 7-6ZM6.5 7v4.539a4.75 4.75 0 0 1-.797 2.635l-2.2 3.298-.003.01.001.007.004.006.006.004.007.001h16.964l.007-.001.006-.004.004-.006.001-.006a.017.017 0 0 0-.003-.01l-2.199-3.299a4.753 4.753 0 0 1-.798-2.635V7c0-2.364-2.383-4.5-5.5-4.5S6.5 4.636 6.5 7ZM14 19h-4a2 2 0 1 0 4 0Z"
 let copilotMouthPath = "M28.998 28.516c1.104 0 1.999.895 1.999 1.999v3.998a2 2 0 1 1-3.998 0v-3.998c0-1.104.895-1.999 1.999-1.999Zm-9.996 0c1.104 0 1.999.895 1.999 1.999v3.998a2 2 0 1 1-3.998 0v-3.998c0-1.104.895-1.999 1.999-1.999Z"
 
 // MARK: - Render
@@ -140,6 +144,7 @@ let copilotMouthPath = "M28.998 28.516c1.104 0 1.999.895 1.999 1.999v3.998a2 2 0
 let S = 1024.0
 let arguments = CommandLine.arguments.dropFirst()
 let pullRequests = arguments.contains("--pull-requests")
+let notifications = arguments.contains("--notifications")
 let out = arguments.first { !$0.hasPrefix("--") } ?? "icon-1024.png"
 let cs = CGColorSpaceCreateDeviceRGB()
 func col(_ r: Double, _ g: Double, _ b: Double, _ a: Double = 1) -> CGColor {
@@ -188,7 +193,11 @@ func placed(_ data: [String], viewBox: Double, size: Double) -> CGPath {
 ctx.saveGState()
 ctx.setShadow(offset: CGSize(width: 0, height: -10), blur: 38, color: col(4, 47, 46, 0.5))
 ctx.setFillColor(col(255, 255, 255))
-if pullRequests {
+if notifications {
+    // Sized like the pull request glyph, its 24pt sibling.
+    ctx.addPath(placed([bellPath], viewBox: 24, size: 600))
+    ctx.fillPath(using: .evenOdd)
+} else if pullRequests {
     // The 24pt glyph has thinner strokes than the 48pt mascot, so it sits a
     // little smaller to keep the same visual weight. Rings knock out even-odd;
     // the branch line and arrow fill on their own so their overlap stays solid.

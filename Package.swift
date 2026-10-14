@@ -14,6 +14,7 @@ let package = Package(
         .executable(name: "copilot-projects", targets: ["copilot-projects"]),
         .executable(name: "copilot-projects-link", targets: ["copilot-projects-link"]),
         .executable(name: "copilot-pull-requests", targets: ["copilot-pull-requests"]),
+        .executable(name: "copilot-notifications", targets: ["copilot-notifications"]),
         .library(name: "CopilotProjectsUI", targets: ["CopilotProjectsUI"]),
         .library(
             name: "CopilotProjectsProtocol",
@@ -77,7 +78,8 @@ let package = Package(
             ],
             path: "Sources/CopilotProjectsHost"
         ),
-        // Shared PR engine and helper UI. The host uses only its read-only provider.
+        // Shared PR and notifications engines and the helper apps' UI. The host
+        // uses only the read-only PR provider.
         .target(
             name: "CopilotProjectsPullRequests",
             dependencies: [
@@ -102,6 +104,11 @@ let package = Package(
             name: "copilot-pull-requests",
             dependencies: ["CopilotProjectsPullRequests"],
             path: "Sources/copilot-pull-requests"
+        ),
+        .executableTarget(
+            name: "copilot-notifications",
+            dependencies: ["CopilotProjectsPullRequests"],
+            path: "Sources/copilot-notifications"
         ),
         .testTarget(
             name: "CopilotProjectsTests",
