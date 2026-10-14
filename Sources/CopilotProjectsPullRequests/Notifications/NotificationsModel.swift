@@ -327,7 +327,8 @@ final class NotificationsModel: ObservableObject {
 
     /// The window opened or came forward: refresh unless GitHub was just read.
     func refreshIfStale() {
-        if lastFullRefresh.map({ clock().timeIntervalSince($0) >= Self.reopenFreshness }) ?? true { refresh() }
+        let freshness = max(Self.reopenFreshness, pollIntervals.values.max() ?? 0)
+        if lastFullRefresh.map({ clock().timeIntervalSince($0) >= freshness }) ?? true { refresh() }
     }
 
     private func accountsForRefresh() async throws -> [GitHubAccount] {
@@ -400,9 +401,10 @@ final class NotificationsModel: ObservableObject {
         lastUpdated = clock()
         if phase != .loaded { loadedAt = loadedAt ?? clock() }
         phase = .loaded
-        // Sessions Pull Requests started for a PR link at once; branch matches follow the details.
-        await matchSessions()
         readingDetails = true
+        // Sessions Pull Requests started for a PR link at once; transcript matches
+        // follow each PR's branch as its details arrive.
+        await matchSessions()
         await readDetails(accounts: accounts)
         readingDetails = false
         await matchSessions()
@@ -546,7 +548,10 @@ final class NotificationsModel: ObservableObject {
         if !sources.isEmpty {
             // As Pull Requests does: only a distinctive branch name is worth finding in a transcript.
             let evidence = await transcripts.evidence(for: sources, branches: Set(heads.values.filter(PullRequestLinker.isDistinctiveBranch)))
-            let unmatched = heads.filter { matched[$0.key] == nil }.map { (key: $0.key, headRefName: $0.value) }
+            // A PR whose branch isn't known yet isn't inferred at all: on its URL
+            // alone, a session that only reviews it could win over the one building it.
+            let unmatched = heads.filter { matched[$0.key] == nil && !$0.value.isEmpty }
+                .map { (key: $0.key, headRefName: $0.value) }
             matched.merge(PullRequestLinker.links(heads: unmatched, evidence: evidence)) { current, _ in current }
         }
         if links != matched { links = matched }
@@ -831,6 +836,8 @@ final class NotificationsModel: ObservableObject {
                 try await api.markRead(account: account, threadId: key.id)
             } catch {
                 self.readLocally[key] = nil
+                // A refresh may have loaded it, read, in the meantime.
+                self.update([key]) { $0.unread = true }
                 self.warning = "Couldn’t mark a notification as read. \(error.localizedDescription)"
             }
         }

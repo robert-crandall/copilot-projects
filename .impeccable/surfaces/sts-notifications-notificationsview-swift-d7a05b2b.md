@@ -58,8 +58,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
 ## Unresolved
 
-- Companion clients (iOS, web/PWA) follow in later PRs through a host provider
-  and protocol types; this surface is the Mac app.
+- Mac only for now, by the user's choice; iOS and web/PWA companions are not planned.
 - Team mentions do not name the team (the API does not say which).
 
 ## Evidence and coverage boundary

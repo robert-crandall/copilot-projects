@@ -59,6 +59,7 @@ struct NotificationsView: View {
         .background(TitlebarSeparatorRemover())
         .onChange(of: filter) {
             selection = order.first?.id
+            userSelected = true
             lanesFocused = true
         }
         .onChange(of: order.map(\.id)) { _, keys in
@@ -359,6 +360,7 @@ struct NotificationsView: View {
             .onKeyPress(.escape) {
                 guard selection != nil else { return .ignored }
                 selection = nil
+                userSelected = true
                 return .handled
             }
             .onAppear {
@@ -385,6 +387,7 @@ struct NotificationsView: View {
         guard let selection, keys.contains(selection), let index = order.firstIndex(where: { $0.id == selection }) else { return }
         let next = order[(index + 1)...].first { !keys.contains($0.id) } ?? order[..<index].last { !keys.contains($0.id) }
         self.selection = next?.id
+        userSelected = true
         if let next { proxy.scrollTo(next.id) }
     }
 
