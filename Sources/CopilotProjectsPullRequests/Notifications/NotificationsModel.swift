@@ -614,12 +614,28 @@ final class NotificationsModel: ObservableObject {
         }
         let pid = snapshot.hostProcessIdentifier
         Task {
-            if case .done = await source.revealSession(projectId: session.projectId, sessionId: session.id) {
+            if await reveal(session) {
                 host.activate(pid)
                 if let item, item.thread.unread { markRead([item]) }
-            } else {
-                await pollWorkspace()
             }
+        }
+    }
+
+    private func reveal(_ session: PullRequestSession) async -> Bool {
+        switch await source.revealSession(projectId: session.projectId, sessionId: session.id) {
+        case .done:
+            return true
+        case .refused(code: "conflict", _):
+            // It moved to another project since the last snapshot; show it there.
+            await pollWorkspace()
+            if case .connected = workspace, let moved = liveSessions[session.id], moved.projectId != session.projectId,
+               case .done = await source.revealSession(projectId: moved.projectId, sessionId: session.id) {
+                return true
+            }
+            return false
+        case .refused, .unreachable:
+            await pollWorkspace()
+            return false
         }
     }
 

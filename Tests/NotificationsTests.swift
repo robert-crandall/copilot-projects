@@ -633,6 +633,32 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(model.threads.first?.unread, false)
     }
 
+    func testGoingToASessionThatMovedProjectsShowsItWhereItIsNow() async throws {
+        func snapshot(in project: String) -> WorkspaceSnapshot {
+            WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: project, projects: [
+                .init(id: project, name: "Workspace", sessions: [
+                    .init(id: "s1", title: "Ship lanes", status: .waiting, pullRequestKeys: ["octo/app#1"]),
+                ]),
+            ])
+        }
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "author", updated: now)]])
+        let workspace = FakeWorkspace(snapshot: snapshot(in: "p"))
+        let model = makeModel(github, clock: TestClock(now), workspace: workspace)
+        await model.pollWorkspace()
+        await model.refreshNow()
+        let item = try XCTUnwrap(model.items.first)
+        let session = try XCTUnwrap(item.session)
+        workspace.answer(
+            fetches: [.snapshot(snapshot(in: "q"))],
+            reveals: [.refused(code: "conflict", message: "moved"), .done(code: "revealed", text: nil)]
+        )
+        model.goToSession(session, for: item)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") }
+        XCTAssertEqual(workspace.revealCalls.map(\.projectId), ["p", "q"])
+        XCTAssertEqual(model.threads.first?.unread, false)
+    }
+
     func testABannerForAThreadNotLoadedStillMarksItRead() async throws {
         let github = FakeGitHub()
         var opened: [URL] = []
