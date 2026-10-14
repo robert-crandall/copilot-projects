@@ -717,8 +717,7 @@ final class NotificationsModel: ObservableObject {
         let answered = items.filter { $0.isAnswered && detailVersions[$0.id] == $0.thread.updatedAt }.map(\.thread)
         guard !answered.isEmpty else { return }
         let keys = Set(answered.map(\.key))
-        clearedAnswered = Array((answered.sorted { $0.updatedAt > $1.updatedAt }
-            + clearedAnswered.filter { !keys.contains($0.key) }).prefix(100))
+        clearedAnswered = answered.sorted { $0.updatedAt > $1.updatedAt } + clearedAnswered.filter { !keys.contains($0.key) }
         let judged = Dictionary(answered.map { ($0.key.id, $0.updatedAt) }, uniquingKeysWith: { first, _ in first })
         remove(answered, verb: "clear", coversUntilNow: false) { api, account, id in
             // Something new since it was judged may ask again: leave it for the next look.
@@ -729,8 +728,13 @@ final class NotificationsModel: ObservableObject {
             guard let self else { return }
             let keys = Set(failed.map(\.key))
             self.clearedAnswered.removeAll { keys.contains($0.key) }
-            // Whatever stopped it, the judgment no longer stands: it needs the user until read again.
-            for key in keys { self.detailVersions[key] = nil }
+            // Whatever stopped it, what was known no longer stands, a closed
+            // state included: it needs the user until read again.
+            for key in keys {
+                self.detailVersions[key] = nil
+                self.details[key] = nil
+                self.settled.remove(key)
+            }
             self.publish()
         }
     }

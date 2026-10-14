@@ -569,7 +569,8 @@ struct NotificationDetailsFetcher: Sendable {
                 }
                 read(review.body, by: review.author, at: review.submittedAt, edited: review.lastEditedAt)
                 for comment in (review.comments?.nodes ?? []).compactMap({ $0 }) {
-                    read(comment.body, by: comment.author, at: comment.createdAt, edited: comment.lastEditedAt)
+                    // A comment drafted in a pending review asks only once the review is sent.
+                    read(comment.body, by: comment.author, at: latest(comment.createdAt, review.submittedAt), edited: comment.lastEditedAt)
                 }
                 // Comments this review holds beyond those read may mention the user.
                 if review.comments?.pageInfo?.hasPreviousPage == true { targetViewer(review.submittedAt) }

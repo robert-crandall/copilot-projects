@@ -880,6 +880,10 @@ final class NotificationsTests: XCTestCase {
         {"submittedAt":"2026-10-14T12:00:00Z","state":"COMMENTED","body":"","author":{"login":"hubot"},
          "comments":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"createdAt":"2026-10-14T12:00:00Z","body":"what do you think, @octocat?","author":{"login":"hubot"}}]}}
         """)), "mentioned in an inline reply")
+        XCTAssertFalse(answered(try subject(before, reviews: """
+        {"submittedAt":"2026-10-14T12:00:00Z","state":"COMMENTED","body":"","author":{"login":"hubot"},
+         "comments":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"createdAt":"2026-10-14T10:30:00Z","body":"what do you think, @octocat?","author":{"login":"hubot"}}]}}
+        """)), "drafted before you answered, but sent after")
         XCTAssertFalse(answered(try subject("""
         {"__typename":"MentionedEvent","createdAt":"2026-10-14T10:00:00Z","actor":{"login":"octocat"}},
         {"__typename":"IssueComment","createdAt":"2026-10-14T09:30:00Z","lastEditedAt":"2026-10-14T12:00:00Z","body":"cc @octocat","author":{"login":"hubot"}},
@@ -1085,6 +1089,32 @@ final class NotificationsTests: XCTestCase {
         XCTAssertNil(model.warning, "a thread that moved on isn't a failure")
         XCTAssertEqual(model.counts.needsYou, 1, "it may ask again, so it needs you until read again")
         XCTAssertEqual(published.last?.needsYou, 1, "and the badge says so")
+    }
+
+    func testAReopenedRequestThatStoppedAClearNeedsYouAgain() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now.addingTimeInterval(-60))]])
+        // Closed when judged; reopened and asked again before the clear.
+        github.setCurrent(FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now))
+        var closed = answeredDetail
+        closed.state = .closed
+        let model = answeringModel(github, details: DetailBox(["1": closed]), clears: true, clock: TestClock(now))
+        await model.refreshNow()
+        try await waitUntil { model.threads.contains { $0.key.id == "1" } && model.clearedAnswered.isEmpty }
+        XCTAssertFalse(github.actions.contains { $0.hasPrefix("DELETE") })
+        XCTAssertEqual(model.counts.needsYou, 1, "the closed state it was judged on no longer stands")
+        XCTAssertEqual(model.counts.settled, 0)
+    }
+
+    func testEveryClearedThreadIsCountedHoweverMany() async throws {
+        let github = FakeGitHub()
+        let ids = (1...150).map(String.init)
+        github.answer("participating", pages: [ids.map { FakeGitHub.thread($0, reason: "mention", number: Int($0)!, updated: now.addingTimeInterval(-60)) }])
+        let box = DetailBox(Dictionary(uniqueKeysWithValues: ids.map { ($0, answeredDetail) }))
+        let model = answeringModel(github, details: box, clears: true, clock: TestClock(now))
+        await model.refreshNow()
+        try await waitUntil { github.actions.filter { $0.hasPrefix("DELETE") }.count == 150 }
+        XCTAssertEqual(model.clearedAnswered.count, 150)
     }
 
     func testAStaleAnswerNeverHidesANewerCopy() async throws {
