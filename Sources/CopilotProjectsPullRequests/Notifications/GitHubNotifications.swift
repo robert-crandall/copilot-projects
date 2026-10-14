@@ -286,10 +286,11 @@ struct NotificationSubjectDetail: Equatable, Sendable {
     var requestHistoryComplete = true
     /// The asked team the user belongs to, when known.
     var viewerTeam: String?
-    /// The latest time the user was mentioned, assigned, or asked to review by name.
+    /// The latest time the user was mentioned, assigned, or asked to review by
+    /// name, or the oldest point a truncated history still shows, whichever is later.
     var viewerTargetedAt: Date?
-    /// The latest time each team (`org/slug`, lowercased) was asked to review.
-    var teamRequestedAt: [String: Date] = [:]
+    /// The latest time each team (`org/slug`, lowercased) was asked to review or mentioned.
+    var teamTargetedAt: [String: Date] = [:]
     /// The latest time the user reviewed, commented, merged, or closed it.
     var viewerActedAt: Date?
     /// The user acted after the last time anything asked for them.
@@ -299,12 +300,12 @@ struct NotificationSubjectDetail: Equatable, Sendable {
     var teamToName: String? { viewerTeam ?? requestedTeams.first }
 
     /// Whether the user's last action came after the last thing aimed at them:
-    /// a mention, assignment, or review request to them, or a review request to
-    /// a team they're on. `onTeam` answers nil when membership isn't known; such
-    /// a team counts as theirs, so an unknown never hides a request. With nothing
-    /// aimed at them in the history, nothing is answered.
+    /// a mention, assignment, or review request to them, or a mention of or
+    /// review request to a team they're on. `onTeam` answers nil when membership
+    /// isn't known; such a team counts as theirs, so an unknown never hides a
+    /// request. With nothing aimed at them in the history, nothing is answered.
     func isAnswered(onTeam: (String) -> Bool?) -> Bool {
-        let teamTargets = teamRequestedAt.filter { onTeam($0.key) != false }.map(\.value)
+        let teamTargets = teamTargetedAt.filter { onTeam($0.key) != false }.map(\.value)
         guard let target = ([viewerTargetedAt].compactMap { $0 } + teamTargets).max(),
               let acted = viewerActedAt else { return false }
         return acted > target

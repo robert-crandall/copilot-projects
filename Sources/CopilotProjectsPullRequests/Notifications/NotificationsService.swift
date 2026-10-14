@@ -64,6 +64,20 @@ struct GitHubNotificationsAPI: Sendable {
         ))
     }
 
+    /// The thread as GitHub has it now.
+    func thread(account: GitHubAccount, threadId: String) async throws -> NotificationThread {
+        var request = request(base.appendingPathComponent("notifications/threads/\(threadId)"), account: account, method: "GET")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await send(request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw Self.failure(status: status, data: data) }
+        let array = Data("[".utf8) + data + Data("]".utf8)
+        guard let thread = try Self.decode(array, account: account.login).first else {
+            throw Failure(status: status, message: "GitHub returned no thread \(threadId).")
+        }
+        return thread
+    }
+
     /// Marks the thread read on GitHub, as opening it there would.
     func markRead(account: GitHubAccount, threadId: String) async throws {
         try await act(account: account, path: "notifications/threads/\(threadId)", method: "PATCH")
@@ -270,23 +284,35 @@ struct NotificationDetailsFetcher: Sendable {
     }
     """
 
+    /// Who was asked and when, what the user did, and the text since: GitHub
+    /// records no event for a mention inside a review, a review comment, or of
+    /// a team, so the text itself is read for those.
     static let engagedFragment = """
     fragment Engaged on IssueOrPullRequest {
       ... on PullRequest {
-        state isDraft headRefName
+        state isDraft headRefName createdAt body lastEditedAt author { login }
         timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 100) {
           pageInfo { hasPreviousPage }
           nodes { ... on ReviewRequestedEvent { requestedReviewer {
             __typename ... on User { login } ... on Team { slug organization { login } }
           } } }
         }
-        prActivity: timelineItems(itemTypes: [MENTIONED_EVENT, ASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, PULL_REQUEST_REVIEW, ISSUE_COMMENT, MERGED_EVENT, CLOSED_EVENT], last: 100) {
+        prActivity: timelineItems(itemTypes: [MENTIONED_EVENT, ASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, ISSUE_COMMENT, MERGED_EVENT, CLOSED_EVENT], last: 60) {
+          pageInfo { hasPreviousPage }
           nodes { __typename ...Activity }
+        }
+        reviews(last: 20) {
+          pageInfo { hasPreviousPage }
+          nodes {
+            submittedAt state body lastEditedAt author { login }
+            comments(last: 20) { pageInfo { hasPreviousPage } nodes { createdAt body lastEditedAt author { login } } }
+          }
         }
       }
       ... on Issue {
-        state stateReason
-        issueActivity: timelineItems(itemTypes: [MENTIONED_EVENT, ASSIGNED_EVENT, ISSUE_COMMENT, CLOSED_EVENT], last: 100) {
+        state stateReason createdAt body lastEditedAt author { login }
+        issueActivity: timelineItems(itemTypes: [MENTIONED_EVENT, ASSIGNED_EVENT, ISSUE_COMMENT, CLOSED_EVENT], last: 60) {
+          pageInfo { hasPreviousPage }
           nodes { __typename ...Activity }
         }
       }
@@ -295,8 +321,7 @@ struct NotificationDetailsFetcher: Sendable {
       ... on MentionedEvent { createdAt actor { login } }
       ... on AssignedEvent { createdAt assignee { ... on User { login } } }
       ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } ... on Team { slug organization { login } } } }
-      ... on PullRequestReview { submittedAt state author { login } }
-      ... on IssueComment { createdAt author { login } }
+      ... on IssueComment { createdAt body lastEditedAt author { login } }
       ... on MergedEvent { createdAt actor { login } }
       ... on ClosedEvent { createdAt actor { login } }
     }
@@ -315,26 +340,57 @@ struct NotificationDetailsFetcher: Sendable {
         let pageInfo: PageInfo?
         let nodes: [Event?]?
     }
+    struct PageInfo: Decodable { let hasPreviousPage: Bool? }
     /// Something that asked for the user, or that they did.
     struct ActivityEvent: Decodable {
         let __typename: String?
         let createdAt: Date?
-        let submittedAt: Date?
-        let state: String?
         let actor: Login?
         let author: Login?
         let assignee: Login?
         let requestedReviewer: Reviewer?
+        var body: String? = nil
+        var lastEditedAt: Date? = nil
     }
-    struct Activity: Decodable { let nodes: [ActivityEvent?]? }
+    struct Activity: Decodable {
+        var pageInfo: PageInfo? = nil
+        let nodes: [ActivityEvent?]?
+    }
+    struct ReviewComment: Decodable {
+        let createdAt: Date?
+        let body: String?
+        var lastEditedAt: Date? = nil
+        let author: Login?
+    }
+    struct ReviewComments: Decodable {
+        var pageInfo: PageInfo? = nil
+        let nodes: [ReviewComment?]?
+    }
+    struct Review: Decodable {
+        let submittedAt: Date?
+        let state: String?
+        var body: String? = nil
+        var lastEditedAt: Date? = nil
+        let author: Login?
+        var comments: ReviewComments? = nil
+    }
+    struct Reviews: Decodable {
+        var pageInfo: PageInfo? = nil
+        let nodes: [Review?]?
+    }
     struct Subject: Decodable {
         let state: String?
         let isDraft: Bool?
         let headRefName: String?
         let stateReason: String?
         let timelineItems: Timeline?
+        var createdAt: Date? = nil
+        var body: String? = nil
+        var lastEditedAt: Date? = nil
+        var author: Login? = nil
         var prActivity: Activity? = nil
         var issueActivity: Activity? = nil
+        var reviews: Reviews? = nil
     }
     /// Each alias: a repository holding the subject, or the viewer.
     struct Node: Decodable {
@@ -440,45 +496,102 @@ struct NotificationDetailsFetcher: Sendable {
         if !detail.viewerRequested, subject.timelineItems?.pageInfo?.hasPreviousPage == true {
             detail.requestHistoryComplete = false
         }
-        // The newest events: anything older that asked for the user was answered
-        // or asked again by something here.
-        let events = (subject.prActivity?.nodes ?? []) + (subject.issueActivity?.nodes ?? [])
+        guard let viewer else { return detail }
         func latest(_ current: Date?, _ candidate: Date?) -> Date? {
             guard let candidate else { return current }
             return current.map { max($0, candidate) } ?? candidate
         }
-        for case let event? in events {
-            func isViewer(_ login: Login?) -> Bool { login?.login?.lowercased() == viewer && viewer != nil }
-            switch event.__typename {
-            case "MentionedEvent" where isViewer(event.actor),
-                 "AssignedEvent" where isViewer(event.assignee):
-                detail.viewerTargetedAt = latest(detail.viewerTargetedAt, event.createdAt)
-            case "ReviewRequestedEvent":
-                guard let reviewer = event.requestedReviewer, let at = event.createdAt else { continue }
-                if reviewer.__typename == "User", reviewer.login?.lowercased() == viewer {
-                    detail.viewerTargetedAt = latest(detail.viewerTargetedAt, at)
-                } else if reviewer.__typename == "Team", let slug = reviewer.slug, let org = reviewer.organization?.login {
-                    let team = "\(org)/\(slug)".lowercased()
-                    detail.teamRequestedAt[team] = latest(detail.teamRequestedAt[team], at)
+        func isViewer(_ login: Login?) -> Bool { login?.login?.lowercased() == viewer }
+        func targetViewer(_ at: Date?) { detail.viewerTargetedAt = latest(detail.viewerTargetedAt, at) }
+        func targetTeam(_ team: String, _ at: Date?) { detail.teamTargetedAt[team] = latest(detail.teamTargetedAt[team], at) }
+        func acted(_ at: Date?) { detail.viewerActedAt = latest(detail.viewerActedAt, at) }
+        /// Someone else's text: a mention of the user or a team, as of its last edit.
+        func read(_ body: String?, by author: Login?, at: Date?, edited: Date?) {
+            guard let body, !isViewer(author) else { return }
+            let when = latest(at, edited)
+            let found = mentions(in: body)
+            if found.users.contains(viewer) { targetViewer(when) }
+            for team in found.teams { targetTeam(team, when) }
+        }
+        read(subject.body, by: subject.author, at: subject.createdAt, edited: subject.lastEditedAt)
+        // Each history is its newest stretch. Where it was cut short, nothing
+        // before its oldest entry is known, so that point counts as an ask.
+        for activity in [subject.prActivity, subject.issueActivity].compactMap({ $0 }) {
+            let events = (activity.nodes ?? []).compactMap { $0 }
+            if activity.pageInfo?.hasPreviousPage == true { targetViewer(events.compactMap(\.createdAt).min()) }
+            for event in events {
+                switch event.__typename {
+                case "MentionedEvent" where isViewer(event.actor),
+                     "AssignedEvent" where isViewer(event.assignee):
+                    targetViewer(event.createdAt)
+                case "ReviewRequestedEvent":
+                    guard let reviewer = event.requestedReviewer else { continue }
+                    if reviewer.__typename == "User", reviewer.login?.lowercased() == viewer {
+                        targetViewer(event.createdAt)
+                    } else if reviewer.__typename == "Team", let slug = reviewer.slug, let org = reviewer.organization?.login {
+                        targetTeam("\(org)/\(slug)".lowercased(), event.createdAt)
+                    }
+                case "IssueComment":
+                    if isViewer(event.author) { acted(event.createdAt) }
+                    read(event.body, by: event.author, at: event.createdAt, edited: event.lastEditedAt)
+                case "MergedEvent" where isViewer(event.actor),
+                     "ClosedEvent" where isViewer(event.actor):
+                    acted(event.createdAt)
+                default:
+                    continue
                 }
-            case "PullRequestReview" where isViewer(event.author) && event.state != "PENDING":
-                detail.viewerActedAt = latest(detail.viewerActedAt, event.submittedAt)
-            case "IssueComment" where isViewer(event.author),
-                 "MergedEvent" where isViewer(event.actor),
-                 "ClosedEvent" where isViewer(event.actor):
-                detail.viewerActedAt = latest(detail.viewerActedAt, event.createdAt)
-            default:
-                continue
+            }
+        }
+        // Reviews, read directly: the timeline leaves out replies made inline.
+        if let reviews = subject.reviews {
+            let nodes = (reviews.nodes ?? []).compactMap { $0 }
+            if reviews.pageInfo?.hasPreviousPage == true { targetViewer(nodes.compactMap(\.submittedAt).min()) }
+            for review in nodes where review.state != "PENDING" {
+                if isViewer(review.author) {
+                    acted(review.submittedAt)
+                    continue
+                }
+                read(review.body, by: review.author, at: review.submittedAt, edited: review.lastEditedAt)
+                for comment in (review.comments?.nodes ?? []).compactMap({ $0 }) {
+                    read(comment.body, by: comment.author, at: comment.createdAt, edited: comment.lastEditedAt)
+                }
+                // Comments this review holds beyond those read may mention the user.
+                if review.comments?.pageInfo?.hasPreviousPage == true { targetViewer(review.submittedAt) }
             }
         }
         return detail
     }
 
-    /// The teams in `organization` the viewer is on, to name the right one.
-    func viewerTeams(organization: String, account: GitHubAccount, login: String) async -> Set<String>? {
+    private static let mentionPattern = try! NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9_`/.-])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)(?:/([A-Za-z0-9][A-Za-z0-9_.-]*[A-Za-z0-9_]|[A-Za-z0-9]))?(?![A-Za-z0-9_-])"#
+    )
+
+    /// The logins and `org/team` names `@`-mentioned in `text`, lowercased.
+    static func mentions(in text: String) -> (users: Set<String>, teams: Set<String>) {
+        var users: Set<String> = []
+        var teams: Set<String> = []
+        let range = NSRange(text.startIndex..., in: text)
+        for match in mentionPattern.matches(in: text, range: range) {
+            guard let login = Range(match.range(at: 1), in: text).map({ String(text[$0]).lowercased() }) else { continue }
+            if let slug = Range(match.range(at: 2), in: text).map({ String(text[$0]).lowercased() }) {
+                teams.insert("\(login)/\(slug)")
+            } else {
+                users.insert(login)
+            }
+        }
+        return (users, teams)
+    }
+
+    /// The teams in `organization` the viewer is on, and whether that list is
+    /// the whole of it; only a whole list can say they're not on a team.
+    func viewerTeams(organization: String, account: GitHubAccount, login: String) async -> (teams: Set<String>, complete: Bool)? {
         struct Teams: Decodable {
             struct Organization: Decodable {
-                struct Connection: Decodable { let nodes: [Login?]? }
+                struct Connection: Decodable {
+                    struct PageInfo: Decodable { let hasNextPage: Bool? }
+                    let pageInfo: PageInfo?
+                    let nodes: [Login?]?
+                }
                 let teams: Connection?
             }
             let organization: Organization?
@@ -486,12 +599,13 @@ struct NotificationDetailsFetcher: Sendable {
         // Each team's slug arrives as `login` so it decodes like the other names.
         let text = """
         query($org: String!, $login: String!) {
-          organization(login: $org) { teams(first: 100, userLogins: [$login]) { nodes { login: slug } } }
+          organization(login: $org) { teams(first: 100, userLogins: [$login]) { pageInfo { hasNextPage } nodes { login: slug } } }
         }
         """
         guard let answer = try? await graphQL.run(
             text, variables: ["org": organization, "login": login], token: account.token, as: Teams.self
-        ).data, let nodes = answer.organization?.teams?.nodes else { return nil }
-        return Set(nodes.compactMap { $0?.login.map { "\(organization)/\($0)".lowercased() } })
+        ).data, let connection = answer.organization?.teams, let nodes = connection.nodes else { return nil }
+        let teams = Set(nodes.compactMap { $0?.login.map { "\(organization)/\($0)".lowercased() } })
+        return (teams, connection.pageInfo?.hasNextPage == false)
     }
 }

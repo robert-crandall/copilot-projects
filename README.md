@@ -268,10 +268,14 @@ five threads, unread and newest first; **Show more** reveals the rest.
   request changes, or comment), comment, merge, or close on it came after the last
   time you or a team you're on was mentioned, asked to review, or assigned. Others
   approving or replying afterward doesn't bring it back; being mentioned, asked, or
-  assigned again does. It's judged from each pull request or issue's newest 100
-  events, and a thread with nothing aimed at you there is left alone. The filter row
-  counts what was cleared this run, and its tooltip lists them; GitHub's Done view
-  keeps them all.
+  assigned again does, including an @mention in a description, comment, review, or
+  inline review comment (an edit counts from when it was made). It's judged from
+  each pull request or issue's newest 60 timeline events and 20 reviews (20 comments
+  each); when that history is cut short, it assumes you might have been asked at its
+  oldest point, and a thread with nothing aimed at you is left alone. Each thread is
+  checked again just before it's cleared, so one that changed meanwhile waits for
+  the next read. The filter row counts what was cleared this run, and its tooltip
+  lists them; GitHub's Done view keeps them all.
 - **Badge and banners.** The Dock badge and Copilot Notifications' own menu bar
   item (a bell with the count; **Banners** turns it off) count unread threads that
   need you: To you, Via your teams, and Watching. A review request whose pull
