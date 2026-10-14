@@ -25,8 +25,8 @@ struct GitHubNotificationsAPI: Sendable {
 
     enum Listing: Sendable {
         case page(Page)
-        /// Nothing changed since `If-Modified-Since`.
-        case notModified
+        /// Nothing changed since `If-Modified-Since`; GitHub may still ask for a longer gap.
+        case notModified(pollInterval: TimeInterval?)
     }
 
     func list(
@@ -45,7 +45,9 @@ struct GitHubNotificationsAPI: Sendable {
         let (data, response) = try await send(request)
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 0
-        if status == 304 { return .notModified }
+        if status == 304 {
+            return .notModified(pollInterval: http?.value(forHTTPHeaderField: "X-Poll-Interval").flatMap(TimeInterval.init))
+        }
         guard status == 200 else { throw Self.failure(status: status, data: data) }
         let link = http?.value(forHTTPHeaderField: "Link")
         return .page(Page(
@@ -67,13 +69,20 @@ struct GitHubNotificationsAPI: Sendable {
         try await act(account: account, path: "notifications/threads/\(threadId)", method: "DELETE")
     }
 
-    /// Stops notifications for the thread unless the user is mentioned or asked again.
+    /// Ignores the thread: no more notifications from it, even in a watched
+    /// repository, unless the user is mentioned or asked again.
     func unsubscribe(account: GitHubAccount, threadId: String) async throws {
-        try await act(account: account, path: "notifications/threads/\(threadId)/subscription", method: "DELETE")
+        try await act(account: account, path: "notifications/threads/\(threadId)/subscription", method: "PUT",
+                      body: Data(#"{"ignored":true}"#.utf8))
     }
 
-    private func act(account: GitHubAccount, path: String, method: String) async throws {
-        let (data, response) = try await send(request(base.appendingPathComponent(path), account: account, method: method))
+    private func act(account: GitHubAccount, path: String, method: String, body: Data? = nil) async throws {
+        var request = request(base.appendingPathComponent(path), account: account, method: method)
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        let (data, response) = try await send(request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else { throw Self.failure(status: status, data: data) }
     }
@@ -163,7 +172,7 @@ struct GitHubNotificationsAPI: Sendable {
 /// threads a day, mostly CI, so the passes favor what reached the user.
 struct NotificationsFetchPlan: Equatable, Sendable {
     /// Unread threads the user takes part in: reviews, mentions, their own work.
-    var participatingPages = 10
+    var participatingPages = 20
     /// The newest unread threads of every kind, for watched repositories and CI.
     var unreadPages = 4
     /// Recently read threads that aren't done, so All shows what was opened.
@@ -257,7 +266,8 @@ struct NotificationDetailsFetcher: Sendable {
     fragment Requests on IssueOrPullRequest {
       ... on PullRequest {
         state isDraft headRefName
-        timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 25) {
+        timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 100) {
+          pageInfo { hasPreviousPage }
           nodes { ... on ReviewRequestedEvent { requestedReviewer {
             __typename ... on User { login } ... on Team { slug organization { login } }
           } } }
@@ -275,7 +285,11 @@ struct NotificationDetailsFetcher: Sendable {
         let organization: Login?
     }
     struct Event: Decodable { let requestedReviewer: Reviewer? }
-    struct Timeline: Decodable { let nodes: [Event?]? }
+    struct Timeline: Decodable {
+        struct PageInfo: Decodable { let hasPreviousPage: Bool? }
+        let pageInfo: PageInfo?
+        let nodes: [Event?]?
+    }
     struct Subject: Decodable {
         let state: String?
         let isDraft: Bool?
@@ -378,6 +392,10 @@ struct NotificationDetailsFetcher: Sendable {
             }
         }
         detail.requestedTeams = teams
+        // Older requests weren't read: a direct one may be among them.
+        if !detail.viewerRequested, subject.timelineItems?.pageInfo?.hasPreviousPage == true {
+            detail.requestHistoryComplete = false
+        }
         return detail
     }
 

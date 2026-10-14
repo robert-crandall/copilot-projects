@@ -341,17 +341,18 @@ the one hidden-title-bar window (1200x760pt default, 880x480pt minimum) on
 `chrome` of Copilot Notifications, a separate app nested in Copilot Projects
 beside Copilot Pull Requests, with its own Dock icon, Dock badge, and Command-Tab
 entry. Window ▸ Notifications (Shift-Command-N) opens it or brings it forward and
-names the needs-you count in its title; while Copilot Projects keeps running, its
-menu bar item shows that count beside the terminal glyph. Closing the window does
+names the needs-you count in its title. The app's own menu bar item, a template
+bell (bell.badge when something needs you) with the count in monospaced digits,
+opens the window from its menu and can be turned off in the Banners popover. Closing the window does
 not quit, so the badge and banners stay live, and the app menu's Start
 Notifications with Copilot Projects toggle (on after the first open) launches it
 windowless with `--background`. Its icon is the Copilot Projects teal squircle
 with the white primer/octicons `bell-24` glyph (MIT) at the pull-request glyph's
 size, drawn by `scripts/make-icon.swift --notifications` and built into
 `Resources/NotificationsIcon.icns` by `scripts/make-icns.sh`. Needs you means
-unread in To you, Via your teams, or Watching and not already merged or closed;
-the Dock badge (none at zero, 999+ above 999), menu title, menu bar item, header,
-bands, and lanes all count exactly that.
+unread in To you, Via your teams, or Watching, except a review request whose pull
+request is already merged or closed; the Dock badge (none at zero, 999+ above
+999), menu title, menu bar item, header, bands, and lanes all count exactly that.
 
 It reuses the Pull Requests window's drag strip and 56pt header: a title3 semibold
 "N need you" headline over a caption secondary summary (to you · via your teams ·
@@ -390,7 +391,7 @@ caption session line: its indicator and state, plus the project only when the
 whole line fits, never cut short, and a click to that session while Copilot
 Projects answers (otherwise a terminal glyph and "Status unknown"). The inner 1pt
 edge is native orange (85%) for unread needs-you threads, secondary ink (45%, 80%
-on hover) for unread quiet threads and unread threads already merged or closed,
+on hover) for unread quiet threads and unread review requests already merged or closed,
 and absent once read (80% on hover only). Double-click opens the thread on GitHub
 and marks it read; the context menu opens, goes to the session, marks read or
 done, unsubscribes, or copies the link.

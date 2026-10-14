@@ -68,9 +68,13 @@ final class NotificationsModel: ObservableObject {
     static let minimumLook: TimeInterval = 1.5
     /// Individual banners per refresh; more become one summary banner.
     static let individualBannerLimit = 3
+    /// How long an open review request's state is trusted before it's read
+    /// again: merging doesn't always touch the notification.
+    static let openDetailLifetime: TimeInterval = 15 * 60
 
     static let lookedAtKey = "notifications.lookedAt"
-    static let bannerHighWaterKey = "notifications.bannerHighWater"
+    static let bannerHighWaterKey = "notifications.bannerHighWaters"
+    static let menuBarCountKey = "notifications.menuBarCount"
 
     @Published private(set) var threads: [NotificationThread] = []
     @Published private(set) var details: [NotificationThread.Key: NotificationSubjectDetail] = [:]
@@ -94,6 +98,9 @@ final class NotificationsModel: ObservableObject {
     @Published var bannersViaTeams: Bool { didSet { saveBannerSetting(.viaTeams, bannersViaTeams) } }
     @Published var bannersWatching: Bool { didSet { saveBannerSetting(.watching, bannersWatching) } }
     @Published var bannersAllowed: Bool?
+    @Published var showsMenuBarCount: Bool {
+        didSet { if writesState { defaults.set(showsMenuBarCount, forKey: Self.menuBarCountKey) } }
+    }
 
     enum Phase: Equatable {
         case idle, loading, loaded
@@ -119,9 +126,13 @@ final class NotificationsModel: ObservableObject {
     weak var banners: NotificationBannerPosting?
     /// The Dock badge; nil clears it.
     var setBadge: (String?) -> Void = { NSApp.dockTile.badgeLabel = $0 }
+    /// Every published count change, for the menu bar item.
+    var onCounts: ((NotificationCounts) -> Void)?
 
     private var cachedAccounts: (accounts: [GitHubAccount], loadedAt: Date)?
     private var lastModified: [String: String] = [:]
+    /// The longest wait between polls GitHub asked each account for.
+    private var pollIntervals: [String: TimeInterval] = [:]
     private var lastFullRefresh: Date?
     private var refreshTask: Task<Void, Never>?
     private var refreshAgain = false
@@ -137,9 +148,17 @@ final class NotificationsModel: ObservableObject {
     /// Threads marked read here, kept read across refreshes racing the request.
     private var readLocally: [NotificationThread.Key: Date] = [:]
     private var lookStarted: Date?
-    private var bannerHighWater: Date
+    /// When threads were first on screen; a look only counts from then.
+    private var loadedAt: Date?
+    /// Per account: the newest change already considered for a banner.
+    private var bannerHighWaters: [String: Date]
     private var announced: [NotificationThread.Key: Date] = [:]
     private var linkedSessions: [String] = []
+    /// When each subject's details were last read.
+    private var detailReadAt: [NotificationThread.Key: Date] = [:]
+    /// While subject details are being read, counts may still include requests
+    /// that turn out to be for a team or already merged; nothing is published.
+    private var readingDetails = false
 
     init(
         workspace: PullRequestsWorkspace = ControlWorkspaceBridge(),
@@ -185,9 +204,9 @@ final class NotificationsModel: ObservableObject {
         let looked = (defaults.object(forKey: Self.lookedAtKey) as? Double).map(Date.init(timeIntervalSince1970:))
         lookedAt = looked
         columnsLookedAt = looked
-        // A first run announces nothing already waiting; only what arrives after.
-        bannerHighWater = (defaults.object(forKey: Self.bannerHighWaterKey) as? Double)
-            .map(Date.init(timeIntervalSince1970:)) ?? clock()
+        bannerHighWaters = ((defaults.dictionary(forKey: Self.bannerHighWaterKey) as? [String: Double]) ?? [:])
+            .mapValues(Date.init(timeIntervalSince1970:))
+        showsMenuBarCount = defaults.object(forKey: Self.menuBarCountKey) as? Bool ?? true
         bannersToYou = defaults.object(forKey: Self.bannerKey(.toYou)) as? Bool ?? true
         bannersViaTeams = defaults.object(forKey: Self.bannerKey(.viaTeams)) as? Bool ?? true
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
@@ -252,7 +271,9 @@ final class NotificationsModel: ObservableObject {
     private func runLoop() async {
         await refreshNow()
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: UInt64(Self.pollInterval * 1_000_000_000))
+            // GitHub can ask for longer gaps under load; never poll sooner.
+            let wait = max(Self.pollInterval, pollIntervals.values.max() ?? 0)
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
             guard !Task.isCancelled else { return }
             let due = lastFullRefresh.map { clock().timeIntervalSince($0) >= Self.fullRefreshInterval } ?? true
             let changed = due ? false : await inboxChanged()
@@ -267,8 +288,13 @@ final class NotificationsModel: ObservableObject {
         for account in accounts {
             guard let since = lastModified[account.login] else { return true }
             switch try? await api.list(account: account, query: Self.probeQuery, ifModifiedSince: since) {
-            case .notModified: continue
-            case .page, nil: changed = true
+            case .notModified(let interval):
+                if let interval { pollIntervals[account.login] = interval }
+            case .page(let page):
+                if let interval = page.pollInterval { pollIntervals[account.login] = interval }
+                changed = true
+            case nil:
+                changed = true
             }
         }
         return changed
@@ -329,22 +355,26 @@ final class NotificationsModel: ObservableObject {
         self.accounts = accounts.map(\.login)
         var fetched: [String: NotificationsFetchPlan.Result] = [:]
         var failures: [String] = []
-        await withTaskGroup(of: (String, Result<NotificationsFetchPlan.Result, Error>, String?).self) { group in
+        let probe = Self.probeQuery
+        await withTaskGroup(of: (String, Result<NotificationsFetchPlan.Result, Error>, String?, TimeInterval?).self) { group in
             for account in accounts {
                 group.addTask { [api, plan] in
                     // The baseline for later "changed?" probes is taken before reading.
                     var stamp: String?
-                    if case .page(let page)? = try? await api.list(account: account, query: Self.probeQuery) {
+                    var interval: TimeInterval?
+                    if case .page(let page)? = try? await api.list(account: account, query: probe) {
                         stamp = page.lastModified
+                        interval = page.pollInterval
                     }
                     do {
-                        return (account.login, .success(try await plan.fetch(account: account, api: api, now: started)), stamp)
+                        return (account.login, .success(try await plan.fetch(account: account, api: api, now: started)), stamp, interval)
                     } catch {
-                        return (account.login, .failure(error), stamp)
+                        return (account.login, .failure(error), stamp, interval)
                     }
                 }
             }
-            for await (login, result, stamp) in group {
+            for await (login, result, stamp, interval) in group {
+                if let interval { pollIntervals[login] = interval }
                 switch result {
                 case .success(let value):
                     fetched[login] = value
@@ -368,10 +398,15 @@ final class NotificationsModel: ObservableObject {
         seedFirstLook()
         warning = failures.isEmpty ? nil : "Some accounts weren’t refreshed. " + failures.joined(separator: " ")
         lastUpdated = clock()
+        if phase != .loaded { loadedAt = loadedAt ?? clock() }
         phase = .loaded
-        await readDetails(accounts: accounts)
+        // Sessions Pull Requests started for a PR link at once; branch matches follow the details.
         await matchSessions()
-        announceNewThreads()
+        readingDetails = true
+        await readDetails(accounts: accounts)
+        readingDetails = false
+        await matchSessions()
+        announceNewThreads(fetchedAccounts: Set(fetched.keys))
         publish()
     }
 
@@ -401,17 +436,23 @@ final class NotificationsModel: ObservableObject {
             }
         }
         truncatedAccounts = Set(fetched.filter(\.value.truncated).map(\.key))
-        let present = Set(merged.map(\.key))
+        // A done still in flight keeps its details, in case it fails and comes back.
+        let present = Set(merged.map(\.key)).union(doneLocally.keys)
         details = details.filter { present.contains($0.key) }
         settled = settled.filter { present.contains($0) }
         detailVersions = detailVersions.filter { present.contains($0.key) }
+        detailReadAt = detailReadAt.filter { present.contains($0.key) }
         threads = merged
     }
 
     private func readDetails(accounts: [GitHubAccount]) async {
+        let now = clock()
         let stale = threads.filter { thread in
-            (thread.kind == .pullRequest || thread.kind == .issue) && thread.number != nil
-                && detailVersions[thread.key] != thread.updatedAt
+            guard (thread.kind == .pullRequest || thread.kind == .issue) && thread.number != nil else { return false }
+            if detailVersions[thread.key] != thread.updatedAt { return true }
+            // An unread request on a still-open PR is checked again now and then.
+            return thread.unread && thread.reason == .reviewRequested && details[thread.key]?.state?.isSettled != true
+                && now.timeIntervalSince(detailReadAt[thread.key] ?? .distantPast) >= Self.openDetailLifetime
         }
         guard !stale.isEmpty else { return }
         let byAccount = Dictionary(grouping: stale, by: \.account)
@@ -436,7 +477,10 @@ final class NotificationsModel: ObservableObject {
             let versions = Dictionary(uniqueKeysWithValues: threads.map { ($0.key, $0.updatedAt) })
             for key in result.settled {
                 // A subject GitHub didn't answer for is asked about again next time.
-                if answered[key] != nil { detailVersions[key] = versions[key] }
+                if answered[key] != nil {
+                    detailVersions[key] = versions[key]
+                    detailReadAt[key] = now
+                }
                 details[key] = answered[key]
             }
             settled.formUnion(result.settled)
@@ -456,8 +500,7 @@ final class NotificationsModel: ObservableObject {
 
     func pollWorkspace() async {
         apply(await source.snapshot())
-        let sessions = liveSessions.values.map { "\($0.id)|\($0.copilotSessionId ?? "")" }.sorted()
-        if sessions != linkedSessions { await matchSessions() }
+        if Self.signature(liveSessions) != linkedSessions { await matchSessions() }
     }
 
     func apply(_ fetch: WorkspaceFetch) {
@@ -474,9 +517,13 @@ final class NotificationsModel: ObservableObject {
 
     /// Ties each pull request thread to the live session working on it: the one
     /// Pull Requests started for it, or the one whose transcript names its branch.
+    private static func signature(_ sessions: [String: PullRequestSession]) -> [String] {
+        sessions.values.map { "\($0.id)|\($0.copilotSessionId ?? "")|\($0.pullRequestKeys.joined(separator: ","))" }.sorted()
+    }
+
     func matchSessions() async {
         let sessions = liveSessions
-        linkedSessions = sessions.values.map { "\($0.id)|\($0.copilotSessionId ?? "")" }.sorted()
+        linkedSessions = Self.signature(sessions)
         var heads: [PullRequestKey: String] = [:]
         for thread in threads {
             guard let key = thread.pullRequestKey else { continue }
@@ -497,7 +544,8 @@ final class NotificationsModel: ObservableObject {
             return PullRequestTranscriptIndex.Source(sessionId: session.id, path: path)
         }
         if !sources.isEmpty {
-            let evidence = await transcripts.evidence(for: sources, branches: Set(heads.values.filter { !$0.isEmpty }))
+            // As Pull Requests does: only a distinctive branch name is worth finding in a transcript.
+            let evidence = await transcripts.evidence(for: sources, branches: Set(heads.values.filter(PullRequestLinker.isDistinctiveBranch)))
             let unmatched = heads.filter { matched[$0.key] == nil }.map { (key: $0.key, headRefName: $0.value) }
             matched.merge(PullRequestLinker.links(heads: unmatched, evidence: evidence)) { current, _ in current }
         }
@@ -506,8 +554,10 @@ final class NotificationsModel: ObservableObject {
 
     // MARK: Looking
 
-    /// The window became key.
+    /// The window became key. Moving between the window and its own popovers
+    /// is one look.
     func beganLooking() {
+        guard lookStarted == nil else { return }
         lookStarted = clock()
         guard columnsLookedAt != lookedAt else { return }
         if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
@@ -517,12 +567,13 @@ final class NotificationsModel: ObservableObject {
         }
     }
 
-    /// The window stopped being key: what it showed has been seen.
+    /// The app went to the background, or the window closed: what it showed has
+    /// been seen, counting only from when there were threads to see.
     func finishedLooking() {
         guard let started = lookStarted else { return }
         lookStarted = nil
         let now = clock()
-        guard now.timeIntervalSince(started) >= Self.minimumLook else { return }
+        guard phase == .loaded, let loadedAt, now.timeIntervalSince(max(started, loadedAt)) >= Self.minimumLook else { return }
         lookedAt = now
         if writesState { defaults.set(now.timeIntervalSince1970, forKey: Self.lookedAtKey) }
     }
@@ -547,7 +598,9 @@ final class NotificationsModel: ObservableObject {
         if item.thread.unread { markRead([item]) }
     }
 
-    func goToSession(_ session: PullRequestSession) {
+    /// Shows the session working on `item`'s pull request; reaching it opens
+    /// the thread, so it's marked read as opening it on GitHub would.
+    func goToSession(_ session: PullRequestSession, for item: NotificationItem? = nil) {
         guard case .connected(let snapshot) = workspace else {
             host.open?()
             return
@@ -556,6 +609,7 @@ final class NotificationsModel: ObservableObject {
         Task {
             if case .done = await source.revealSession(projectId: session.projectId, sessionId: session.id) {
                 host.activate(pid)
+                if let item, item.thread.unread { markRead([item]) }
             } else {
                 await pollWorkspace()
             }
@@ -587,7 +641,8 @@ final class NotificationsModel: ObservableObject {
         }
     }
 
-    /// Unsubscribes and clears the thread, as GitHub's own Unsubscribe does.
+    /// Ignores the thread, even in a watched repository, and clears it, as
+    /// GitHub's own Unsubscribe does. A mention or a new request still notifies.
     func unsubscribe(_ item: NotificationItem) {
         remove([item.thread], verb: "unsubscribe from") { api, account, id in
             try await api.unsubscribe(account: account, threadId: id)
@@ -677,12 +732,15 @@ final class NotificationsModel: ObservableObject {
 
     /// Puts the needs-you count on the Dock and in the summary Copilot Projects reads.
     func publish() {
+        guard !readingDetails else { return }
         let counts = counts
         setBadge(counts.badgeLabel)
+        onCounts?(counts)
         guard writesState, let summaryURL, phase == .loaded else { return }
+        // Stamped now: a local read or done is fresh even when GitHub was read long ago.
         let summary = NotificationsSummary(
             needsYou: counts.needsYou, toYou: counts.toYou, viaTeams: counts.viaTeams,
-            watching: counts.watching, updatedAt: lastUpdated ?? clock()
+            watching: counts.watching, updatedAt: clock()
         )
         do { try summary.write(to: summaryURL) } catch {
             NSLog("copilot-notifications: could not write its summary: \(error)")
@@ -691,14 +749,24 @@ final class NotificationsModel: ObservableObject {
 
     /// Banners for unread threads that need the user and changed since the
     /// last announcement, never the backlog and never while they're looking.
-    func announceNewThreads() {
+    /// Each account keeps its own high-water mark, moved only by its own
+    /// successful reads, so one account's failed refresh can't lose another's
+    /// banners. An account seen for the first time announces nothing.
+    func announceNewThreads(fetchedAccounts: Set<String>) {
         let fresh = items.filter { item in
-            item.needsYou && bannersEnabled(for: item.lane.band) && item.thread.updatedAt > bannerHighWater
+            guard fetchedAccounts.contains(item.thread.account),
+                  let highWater = bannerHighWaters[item.thread.account] else { return false }
+            return item.needsYou && bannersEnabled(for: item.lane.band) && item.thread.updatedAt > highWater
                 && announced[item.id].map { $0 < item.thread.updatedAt } ?? true
         }
-        if let newest = threads.map(\.updatedAt).max(), newest > bannerHighWater {
-            bannerHighWater = newest
-            if writesState { defaults.set(newest.timeIntervalSince1970, forKey: Self.bannerHighWaterKey) }
+        let now = clock()
+        for account in fetchedAccounts {
+            let newest = threads.filter { $0.account == account }.map(\.updatedAt).max()
+            let current = bannerHighWaters[account]
+            bannerHighWaters[account] = [current ?? now, newest ?? .distantPast].max()
+        }
+        if writesState {
+            defaults.set(bannerHighWaters.mapValues(\.timeIntervalSince1970), forKey: Self.bannerHighWaterKey)
         }
         guard !fresh.isEmpty, !isLooking else { return }
         for item in fresh { announced[item.id] = item.thread.updatedAt }
@@ -739,12 +807,32 @@ final class NotificationsModel: ObservableObject {
         )
     }
 
-    /// A banner was clicked: open its thread and mark it read.
+    /// A banner was clicked: open its thread and mark it read, even when the
+    /// thread isn't loaded here (yet, or any more).
     func openBanner(thread key: NotificationThread.Key?, url: URL?) {
         if let key, let item = items.first(where: { $0.id == key }) {
             open(item)
-        } else if let url {
-            openURL(url)
+            return
+        }
+        if let url { openURL(url) }
+        if let key { markRead(key: key) }
+    }
+
+    private func markRead(key: NotificationThread.Key) {
+        readLocally[key] = clock()
+        let api = api
+        Task { [weak self] in
+            guard let self else { return }
+            guard let account = (try? await self.accountsForRefresh())?.first(where: { $0.login == key.account }) else {
+                self.readLocally[key] = nil
+                return
+            }
+            do {
+                try await api.markRead(account: account, threadId: key.id)
+            } catch {
+                self.readLocally[key] = nil
+                self.warning = "Couldn’t mark a notification as read. \(error.localizedDescription)"
+            }
         }
     }
 
@@ -773,6 +861,7 @@ final class NotificationsModel: ObservableObject {
         lastUpdated = updated
         truncatedAccounts = truncated
         self.warning = warning
+        loadedAt = loadedAt ?? clock()
         phase = .loaded
     }
 }

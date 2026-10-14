@@ -282,6 +282,8 @@ struct NotificationSubjectDetail: Equatable, Sendable {
     var viewerRequested = false
     /// `org/slug` of every team asked to review, most recent first.
     var requestedTeams: [String] = []
+    /// Every review request was read; false when older ones were left out.
+    var requestHistoryComplete = true
     /// The asked team the user belongs to, when known.
     var viewerTeam: String?
 
@@ -299,8 +301,13 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     var session: PullRequestSession?
 
     var id: NotificationThread.Key { thread.key }
-    /// Its pull request or issue is already merged or closed.
-    var isSettled: Bool { detail?.state?.isSettled == true }
+    /// A review request whose pull request is already merged or closed: there's
+    /// nothing left to review. Mentions and other activity on a closed thread
+    /// can still need an answer, so they're never settled this way.
+    var isSettled: Bool {
+        (lane == .reviewRequested || lane == .teamReviewRequested) && thread.reason == .reviewRequested
+            && detail?.state?.isSettled == true
+    }
     /// Unread, in a band that needs the user, and still open to act on.
     var needsYou: Bool { thread.unread && lane.band.needsYou && !isSettled }
 
@@ -310,7 +317,8 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     static func lane(for reason: NotificationReason, detail: NotificationSubjectDetail?) -> NotificationLane {
         switch reason {
         case .reviewRequested:
-            guard let detail, !detail.viewerRequested, !detail.requestedTeams.isEmpty else { return .reviewRequested }
+            guard let detail, !detail.viewerRequested, detail.requestHistoryComplete,
+                  !detail.requestedTeams.isEmpty else { return .reviewRequested }
             return .teamReviewRequested
         case .approvalRequested: return .reviewRequested
         case .mention: return .mentioned

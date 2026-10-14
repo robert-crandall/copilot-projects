@@ -21,10 +21,8 @@ struct CopilotProjectsApp: App {
                               keepRunning: $keepRunning, startsNotifications: $startsNotifications,
                               showsProjects: $showsProjects)
         }
-        MenuBarExtra(isInserted: $keepRunning) {
+        MenuBarExtra("Copilot Projects", systemImage: "terminal", isInserted: $keepRunning) {
             HostStatusMenu(keepRunning: $keepRunning)
-        } label: {
-            HostStatusLabel()
         }
     }
 }

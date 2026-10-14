@@ -18,6 +18,8 @@ struct NotificationsView: View {
     /// Cells showing every chip rather than the first few.
     @State private var expanded: Set<String> = []
     @State private var selectedInitialItem = false
+    /// The user picked a thread, so a finished refresh doesn't move the selection.
+    @State private var userSelected = false
     @State private var editingBanners = false
     /// Legacy scrollers take width from the lanes; rebuild them when the style changes.
     @State private var scrollerStyle = NSScroller.preferredScrollerStyle
@@ -63,6 +65,12 @@ struct NotificationsView: View {
             // A thread that left on refresh takes the selection with it, so the
             // next Return never lands on something else.
             if let selection, !keys.contains(selection) { self.selection = nil }
+        }
+        .onChange(of: model.isRefreshing) { _, refreshing in
+            // The first read places review requests only once their history is
+            // known; until the user picks, the most urgent thread stays selected.
+            guard !refreshing, selectedInitialItem, !userSelected else { return }
+            selection = order.first?.id
         }
     }
 
@@ -117,6 +125,8 @@ struct NotificationsView: View {
 
     func headline(_ counts: NotificationCounts, total: Int) -> String {
         if model.phase != .loaded && total == 0 { return "Notifications" }
+        // Only the newest threads were read, so nothing here is not the same as nothing at all.
+        if counts.needsYou == 0, !model.truncatedAccounts.isEmpty { return "Nothing needs you in the newest threads" }
         switch counts.needsYou {
         case 0: return total == 0 ? "Inbox clear" : "Nothing needs you"
         case 1: return "1 needs you"
@@ -324,7 +334,7 @@ struct NotificationsView: View {
             .onKeyPress(.return, phases: .down) { press in
                 guard let item = order.first(where: { $0.id == selection }) else { return .ignored }
                 if let session = item.session, model.isConnected, !press.modifiers.contains(.command) {
-                    model.goToSession(session)
+                    model.goToSession(session, for: item)
                 } else {
                     model.open(item)
                 }
@@ -383,6 +393,7 @@ struct NotificationsView: View {
         let current = order.firstIndex { $0.id == selection } ?? (delta > 0 ? -1 : order.count)
         let next = order[min(max(current + delta, 0), order.count - 1)]
         selection = next.id
+        userSelected = true
         proxy.scrollTo(next.id)
         AccessibilityNotification.Announcement(
             "\(next.thread.shortName), \(next.thread.title). \(NotificationChip.statusText(next, primaryAccount: model.primaryAccount))"
@@ -569,9 +580,9 @@ struct NotificationsView: View {
             item: item,
             primaryAccount: model.primaryAccount,
             isSelected: item.id == selection,
-            onSelect: { selection = item.id; lanesFocused = true },
+            onSelect: { selection = item.id; userSelected = true; lanesFocused = true },
             onOpen: { model.open(item) },
-            onGoToSession: model.isConnected ? { session in model.goToSession(session) } : nil
+            onGoToSession: model.isConnected ? { session in model.goToSession(session, for: item) } : nil
         )
         .contextMenu { menu(item) }
         .id(item.id)
@@ -586,7 +597,7 @@ struct NotificationsView: View {
     private func menu(_ item: NotificationItem) -> some View {
         Button("Open on GitHub") { model.open(item) }
         if let session = item.session, model.isConnected {
-            Button("Go to Session") { model.goToSession(session) }
+            Button("Go to Session") { model.goToSession(session, for: item) }
         }
         Divider()
         if item.thread.unread {
@@ -637,6 +648,8 @@ private struct BannersEditor: View {
             Toggle(NotificationBand.toYou.title, isOn: $model.bannersToYou)
             Toggle(NotificationBand.viaTeams.title, isOn: $model.bannersViaTeams)
             Toggle(NotificationBand.watching.title, isOn: $model.bannersWatching)
+            Divider()
+            Toggle("Show the count in the menu bar", isOn: $model.showsMenuBarCount)
             if model.bannersAllowed == false {
                 Label {
                     Text("Banners are turned off for Copilot Notifications in System Settings.")

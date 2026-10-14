@@ -258,25 +258,31 @@ five threads, unread and newest first; **Show more** reveals the rest.
 - **Act from it.** Double-click a thread, or press `⌘Return`, to open it on
   GitHub; that marks it read there too. Return goes to the Copilot session working
   on a pull request when there is one (the same match Pull Requests uses), else opens
-  it. `E` marks the selected thread done and moves to the next, `⇧I` marks it read,
-  and `⇧M` unsubscribes. Each lane's menu marks the whole lane read or done.
-  Read and done are written to GitHub, so your inbox matches everywhere.
-- **Badge and banners.** The Dock badge and the menu bar extra count unread
-  threads that need you: To you, Via your teams, and Watching, unless the pull
-  request or issue is already merged or closed. Those stay listed, quietly, and the
-  header counts them separately. **Banners** chooses
-  which of those raise a banner when something new arrives; more than three at
-  once become one summary banner, and nothing already waiting when it first runs is
-  announced.
+  it; going to the session marks it read too. `E` marks the selected thread done and
+  moves to the next, `⇧I` marks it read, and `⇧M` unsubscribes (it ignores the
+  thread, even in a repository you watch, until you're mentioned or asked again).
+  Each lane's menu marks the whole lane read or done. Read and done are written to
+  GitHub, so your inbox matches everywhere.
+- **Badge and banners.** The Dock badge and Copilot Notifications' own menu bar
+  item (a bell with the count; **Banners** turns it off) count unread threads that
+  need you: To you, Via your teams, and Watching. A review request whose pull
+  request is already merged or closed has nothing left to review, so it stays
+  listed, quietly, and the header counts it separately; a mention or reply on a
+  closed thread still counts. **Banners** chooses which of those raise a banner when
+  something new arrives; more than three at once become one summary banner, and
+  nothing already waiting when an account is first read is announced. When only the
+  newest threads were read and none needs you, the header says so rather than
+  claiming nothing does.
 
-It reads each account's unread threads you take part in (up to 500), the newest
+It reads each account's unread threads you take part in (up to 1,000), the newest
 200 unread threads of every kind, and up to 200 threads read in the last three days. When
 an inbox holds more, the footer says so and links to your inbox on GitHub. It
-asks GitHub once a minute whether anything changed (an unchanged answer is free)
-and reads the inbox again when it did, or every five minutes. Pull request and
-issue states, and who was asked to review, come from batched GraphQL queries,
-each subject read again only when it changes. Its last look, banner choices,
-and the summary the menu bar extra reads are kept under
+asks GitHub whether anything changed once a minute, or less often when GitHub asks
+(an unchanged answer is free), and reads the inbox again when it did, or every five
+minutes. Pull request and issue states, and who was asked to review, come from
+batched GraphQL queries, each subject read again when it changes; an unread review
+request on an open pull request is checked again every fifteen minutes. Its last
+look, banner choices, and the count Copilot Projects' Window menu shows are kept under
 `~/.local/state/copilot-projects/notifications/`. Only one copy writes there;
 opening another brings the first forward.
 

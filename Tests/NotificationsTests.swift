@@ -20,6 +20,9 @@ final class FakeGitHub: @unchecked Sendable {
     func reportUnchanged(_ value: Bool) { lock.withLock { unchanged = value } }
     /// Answers 401 to reads made with `token`.
     func revoke(_ token: String) { lock.withLock { _ = revoked.insert(token) } }
+    func restore(_ token: String) { lock.withLock { _ = revoked.remove(token) } }
+    private var _bodies: [String: String] = [:]
+    var bodies: [String: String] { lock.withLock { _bodies } }
     var actions: [String] { lock.withLock { _actions } }
 
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
@@ -35,6 +38,7 @@ final class FakeGitHub: @unchecked Sendable {
         if method != "GET" {
             return lock.withLock {
                 _actions.append("\(method) \(url.path)")
+                if let body = request.httpBody { _bodies["\(method) \(url.path)"] = String(decoding: body, as: UTF8.self) }
                 if failing.contains(method) { return reply(500, Data(#"{"message":"boom"}"#.utf8)) }
                 return reply(method == "PATCH" ? 205 : 204, Data())
             }
@@ -188,6 +192,35 @@ final class NotificationsTests: XCTestCase {
         let item = NotificationItem(thread: thread("2", "review_requested", account: "hubot"), detail: team, detailsSettled: true)
         XCTAssertEqual(item.lane.band, .viaTeams)
         XCTAssertEqual(item.detailParts(showsAccount: true), ["@octo/owners", "Merged", "as hubot"])
+    }
+
+    func testOnlyReviewRequestsSettleWhenTheirPullRequestCloses() {
+        var merged = NotificationSubjectDetail()
+        merged.state = .merged
+        let mention = NotificationItem(thread: thread("m", "mention"), detail: merged, detailsSettled: true)
+        XCTAssertTrue(mention.needsYou, "a new mention on a merged pull request can still need an answer")
+        let assigned = NotificationItem(thread: thread("a", "assign", kind: .issue), detail: merged, detailsSettled: true)
+        XCTAssertTrue(assigned.needsYou)
+        let review = NotificationItem(thread: thread("r", "review_requested"), detail: merged, detailsSettled: true)
+        XCTAssertFalse(review.needsYou)
+    }
+
+    func testAnIncompleteRequestHistoryIsNotProofOfATeamRequest() throws {
+        let json = """
+        {"state":"OPEN","timelineItems":{"pageInfo":{"hasPreviousPage":true},"nodes":[
+          {"requestedReviewer":{"__typename":"Team","slug":"reviewers","organization":{"login":"octo"}}}
+        ]}}
+        """
+        let subject = try JSONDecoder().decode(NotificationDetailsFetcher.Subject.self, from: Data(json.utf8))
+        let detail = NotificationDetailsFetcher.detail(subject, viewer: "octocat")
+        XCTAssertFalse(detail.requestHistoryComplete)
+        XCTAssertEqual(NotificationItem.lane(for: .reviewRequested, detail: detail), .reviewRequested,
+                       "a direct request may be among the older events")
+        let complete = try JSONDecoder().decode(
+            NotificationDetailsFetcher.Subject.self, from: Data(json.replacingOccurrences(of: "true", with: "false").utf8)
+        )
+        XCTAssertEqual(NotificationItem.lane(for: .reviewRequested, detail: NotificationDetailsFetcher.detail(complete, viewer: "octocat")),
+                       .teamReviewRequested)
     }
 
     func testEveryReasonHasALaneAndBand() {
@@ -414,12 +447,21 @@ final class NotificationsTests: XCTestCase {
         let model = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
         XCTAssertNil(model.lookedAt)
         model.beganLooking()
+        clock.now += 5
+        model.finishedLooking()
+        XCTAssertNil(model.lookedAt, "staring at the loading placeholder isn't a look")
+
+        model.show([thread("1", "mention")], accounts: ["octocat"])
+        model.beganLooking()
         clock.now += 1
         model.finishedLooking()
         XCTAssertNil(model.lookedAt, "a glance isn't a look")
 
         model.beganLooking()
-        clock.now += 10
+        clock.now += 5
+        model.beganLooking()
+        XCTAssertNil(model.lookedAt, "coming back from the window's own popover continues the look")
+        clock.now += 5
         model.finishedLooking()
         XCTAssertEqual(model.lookedAt, clock.now)
         XCTAssertNil(model.columnsLookedAt, "columns hold still while the user is away")
@@ -486,6 +528,75 @@ final class NotificationsTests: XCTestCase {
         github.answer("participating", pages: [[FakeGitHub.thread("later", reason: "mention", type: "Issue", updated: now.addingTimeInterval(200))]])
         await model.refreshNow()
         XCTAssertEqual(banners.posted.count, 1, "To you banners are off")
+    }
+
+    func testOneAccountsFailedRefreshDoesNotLoseItsBanners() async {
+        let github = FakeGitHub()
+        let clock = TestClock(now)
+        let model = NotificationsModel(
+            workspace: FakeWorkspace(), defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            api: GitHubNotificationsAPI(send: github.send),
+            detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "good"), GitHubAccount(login: "hubot", token: "flaky")] },
+            transcriptPath: { _ in nil }, clock: { clock.now }
+        )
+        model.setBadge = { _ in }
+        let banners = FakeBanners()
+        model.banners = banners
+        await model.refreshNow()
+
+        // hubot fails while octocat reads a newer thread; then hubot recovers
+        // with an older mention that arrived while it was failing.
+        clock.now += 300
+        github.revoke("flaky")
+        github.answer("unread", pages: [[FakeGitHub.thread("ci", reason: "ci_activity", type: "CheckSuite", number: nil, updated: now.addingTimeInterval(200))]])
+        await model.refreshNow()
+        github.restore("flaky")
+        github.answer("unread", pages: [])
+        github.answer("participating", pages: [[FakeGitHub.thread("m", reason: "mention", type: "Issue", updated: now.addingTimeInterval(100))]])
+        clock.now += 300
+        await model.refreshNow()
+        let titles = banners.posted.flatMap { $0 }.map(\.title)
+        XCTAssertTrue(titles.contains("You were mentioned"), "\(titles)")
+    }
+
+    func testGoingToTheLinkedSessionMarksTheThreadRead() async throws {
+        let snapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Ship lanes", status: .waiting, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "author", updated: now)]])
+        let model = makeModel(github, clock: TestClock(now), workspace: FakeWorkspace(snapshot: snapshot))
+        await model.pollWorkspace()
+        await model.refreshNow()
+        let item = try XCTUnwrap(model.items.first)
+        let session = try XCTUnwrap(item.session)
+        model.goToSession(session, for: item)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") }
+        XCTAssertEqual(model.threads.first?.unread, false)
+    }
+
+    func testABannerForAThreadNotLoadedStillMarksItRead() async throws {
+        let github = FakeGitHub()
+        var opened: [URL] = []
+        let model = makeModel(github, clock: TestClock(now), opened: { opened.append($0) })
+        let url = URL(string: "https://github.com/octo/app/issues/9")!
+        model.openBanner(thread: .init(account: "octocat", id: "99"), url: url)
+        XCTAssertEqual(opened, [url])
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/99") }
+    }
+
+    func testUnsubscribeIgnoresTheThreadAndClearsIt() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "subscribed", type: "Issue", updated: now)]])
+        let model = makeModel(github, clock: TestClock(now))
+        await model.refreshNow()
+        model.unsubscribe(try XCTUnwrap(model.items.first))
+        try await waitUntil { github.actions.count == 2 }
+        XCTAssertEqual(github.actions, ["PUT /notifications/threads/1/subscription", "DELETE /notifications/threads/1"])
+        XCTAssertEqual(github.bodies["PUT /notifications/threads/1/subscription"], #"{"ignored":true}"#)
     }
 
     func testManyNewThreadsBecomeOneSummaryBanner() {
@@ -656,7 +767,7 @@ final class NotificationsLiveTests: XCTestCase {
             print("live lane \(lane.lane.band.title) / \(lane.lane.title): \(lane.items.count) threads, \(lane.unreadCount) unread")
         }
         let reviews = model.items.filter { $0.thread.reason == .reviewRequested }
-        print("live review requests: \(reviews.filter { $0.lane == .reviewRequested }.count) to you, \(reviews.filter { $0.lane == .teamReviewRequested }.count) via teams, \(reviews.filter(\.isClassifying).count) unclassified")
+        print("live review requests: \(reviews.filter { $0.lane == .reviewRequested }.count) to you, \(reviews.filter { $0.lane == .teamReviewRequested }.count) via teams, \(reviews.filter(\.isClassifying).count) unclassified, \(reviews.filter { $0.detail?.requestHistoryComplete == false }.count) with incomplete history")
         print("live counts: \(model.counts), accounts: \(model.accounts), truncated: \(model.truncatedAccounts)")
         XCTAssertTrue(reviews.allSatisfy { !$0.isClassifying }, "every review request is classified")
     }

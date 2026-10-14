@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Darwin
 import SwiftUI
 import UserNotifications
@@ -49,6 +50,8 @@ final class NotificationsAppDelegate: NSObject, NSApplicationDelegate, NSWindowD
     private var window: NSWindow?
     private var eventMonitor: Any?
     private let banners = NotificationsBannerCenter()
+    private let statusItem = NotificationsStatusItem()
+    private var menuBarSetting: AnyCancellable?
 
     override init() {
         let primary = NotificationsApplication.isPrimary
@@ -99,12 +102,20 @@ final class NotificationsAppDelegate: NSObject, NSApplicationDelegate, NSWindowD
         }
         banners.onAuthorization = { [weak self] allowed in self?.model.bannersAllowed = allowed }
         banners.requestAuthorization()
+        // The count lives in this app's own menu bar item, so it shows whatever
+        // Copilot Projects' settings are, and leaves with this app.
+        statusItem.onOpen = { [weak self] in self?.showWindow() }
+        model.onCounts = { [weak self] counts in self?.statusItem.show(counts) }
+        menuBarSetting = model.$showsMenuBarCount.sink { [weak self] shows in self?.statusItem.isEnabled = shows }
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(windowRequested(_:)), name: NotificationsAppBundle.showWindowNotification,
             object: NotificationsAppBundle.windowRequestObject(), suspensionBehavior: .deliverImmediately
         )
         model.start()
-        if !NotificationsApplication.startsInBackground { showWindow() }
+        // A click on a delivered banner can launch this app; that opens the
+        // thread in the browser, not this window.
+        let defaultLaunch = notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
+        if !NotificationsApplication.startsInBackground, defaultLaunch { showWindow() }
     }
 
     /// Copilot Projects, or a second copy handing off, asked for the window.
@@ -131,8 +142,13 @@ final class NotificationsAppDelegate: NSObject, NSApplicationDelegate, NSWindowD
         banners.refreshAuthorization()
     }
 
+    /// Leaving the app ends a look; moving to the window's own popover doesn't.
+    func applicationDidResignActive(_ notification: Notification) { model.finishedLooking() }
+
     func applicationWillTerminate(_ notification: Notification) {
         model.finishedLooking()
+        // Nothing is watching any more, so Copilot Projects shouldn't show a count.
+        if NotificationsApplication.isPrimary { try? FileManager.default.removeItem(at: Paths.notificationsSummaryURL) }
         NotificationsApplication.lock?.release()
     }
 
@@ -174,11 +190,12 @@ final class NotificationsAppDelegate: NSObject, NSApplicationDelegate, NSWindowD
     func windowDidBecomeKey(_ notification: Notification) {
         model.beganLooking()
         model.refreshIfStale()
+        Task { await model.pollWorkspace() }
     }
 
-    func windowDidResignKey(_ notification: Notification) { model.finishedLooking() }
-
     func windowWillClose(_ notification: Notification) { model.finishedLooking() }
+
+    func windowDidMiniaturize(_ notification: Notification) { model.finishedLooking() }
 
     /// The app, Edit, and Window menus; the window has no File or View menus to offer.
     private static func mainMenu() -> NSMenu {
@@ -316,4 +333,64 @@ final class NotificationsBannerCenter: NSObject, UNUserNotificationCenterDelegat
             completionHandler(looking ? [] : [.banner, .sound, .list])
         }
     }
+}
+
+/// The bell in the menu bar with the needs-you count beside it.
+@MainActor
+final class NotificationsStatusItem: NSObject {
+    var onOpen: (() -> Void)?
+    var isEnabled = false {
+        didSet {
+            guard isEnabled != oldValue else { return }
+            if isEnabled { install() } else { remove() }
+        }
+    }
+    private var item: NSStatusItem?
+    private var counts: NotificationCounts?
+    private let summary = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+
+    func show(_ counts: NotificationCounts) {
+        self.counts = counts
+        render()
+    }
+
+    private func install() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let menu = NSMenu()
+        summary.isEnabled = false
+        menu.addItem(summary)
+        menu.addItem(.separator())
+        let open = menu.addItem(withTitle: "Open Notifications", action: #selector(openWindow), keyEquivalent: "")
+        open.target = self
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit \(NotificationsAppBundle.name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        item.menu = menu
+        self.item = item
+        render()
+    }
+
+    private func remove() {
+        if let item { NSStatusBar.system.removeStatusItem(item) }
+        item = nil
+    }
+
+    private func render() {
+        guard let button = item?.button else { return }
+        let needsYou = counts?.needsYou ?? 0
+        button.image = NSImage(systemSymbolName: needsYou > 0 ? "bell.badge" : "bell", accessibilityDescription: nil)
+        button.image?.isTemplate = true
+        button.imagePosition = .imageLeading
+        button.title = counts?.badgeLabel.map { " \($0)" } ?? ""
+        button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let label = needsYou == 0 ? "Nothing needs you" : needsYou == 1 ? "1 notification needs you" : "\(needsYou) notifications need you"
+        button.setAccessibilityLabel("\(NotificationsAppBundle.name), \(label)")
+        button.toolTip = label
+        if let counts {
+            summary.title = "\(counts.toYou) to you · \(counts.viaTeams) via your teams · \(counts.watching) watching"
+        } else {
+            summary.title = "Reading your notifications…"
+        }
+    }
+
+    @objc private func openWindow() { onOpen?() }
 }

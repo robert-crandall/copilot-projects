@@ -30,9 +30,9 @@ repo-sorted inbox and the one-at-a-time triage deck.
 OWN-WORLD: Studio Console unchanged, sibling to Goal Lanes: chrome ground,
 sidebar-recessed 240pt reason column, raised thread chips on the 6pt session
 corner, steel selection with a 1pt edge ring 2pt outside, native orange 1pt edge
-for unread needs-you, quiet secondary edge for unread CI and unread threads
-already merged or closed; read chips are edgeless until hovered, like Goal Lanes'
-chips with no reason. System type, no new tokens.
+for unread needs-you, quiet secondary edge for unread CI and unread review
+requests already merged or closed; read chips are edgeless until hovered, like
+Goal Lanes' chips with no reason. System type, no new tokens.
 
 STORY: Open on All, read how many unread threads need you split To you / Via
 your teams / Watching, scan the To you band first, open or clear each chip, bulk
@@ -66,13 +66,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
 - Source: `Notifications/NotificationsView.swift` (window, header, filter row,
   bands, lanes, chips, footer, states); `GitHubNotifications.swift` (reasons to
-  lanes and bands, freshness columns, settled as merged or closed, and
+  lanes and bands, freshness columns, review requests settled as merged or closed, and
   `NotificationCounts` with the badge label); `NotificationsModel.swift` (looks,
   banners, badge, summary); `NotificationsApplication.swift` (the AppKit window
   that survives close, Dock badge, banners, `--background`);
   `Sources/CopilotProjectsHost/NotificationsAppLauncher.swift` and `AppEntry.swift`
-  (Window ▸ Notifications ⇧⌘N, menu bar count, Start Notifications with Copilot
-  Projects); shared `Sources/CopilotProjectsStyle/StudioStyle.swift`.
+  (Window ▸ Notifications ⇧⌘N with its count, Start Notifications with Copilot
+  Projects); the menu bar bell and count belong to `NotificationsApplication.swift`; shared `Sources/CopilotProjectsStyle/StudioStyle.swift`.
 - Shipping raster: `Resources/NotificationsIcon.icns`, rendered by
   `scripts/make-icon.swift --notifications` from primer/octicons `bell-24` (MIT,
   path data and license named in the script) on the existing teal squircle, and

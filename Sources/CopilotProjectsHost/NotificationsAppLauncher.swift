@@ -58,7 +58,13 @@ enum NotificationsAppLauncher {
         configuration.environment = launch.environment
         if inBackground { configuration.arguments = [NotificationsAppBundle.backgroundArgument] }
         NSWorkspace.shared.openApplication(at: helperURL, configuration: configuration) { _, error in
-            if let error { NSLog("copilot-projects: could not open Copilot Notifications: \(error)") }
+            if let error {
+                NSLog("copilot-projects: could not open Copilot Notifications: \(error)")
+            } else if !inBackground {
+                // Already running, Launch Services only brought it forward; ask
+                // for the window once a just-launched copy is listening.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { NotificationsAppBundle.requestWindow() }
+            }
         }
     }
 
@@ -116,25 +122,5 @@ struct OpenNotificationsButton: View {
     private var title: String {
         guard let count = summary.needsYou, count > 0 else { return "Notifications" }
         return "Notifications — \(count.formatted()) need\(count == 1 ? "s" : "") you"
-    }
-}
-
-/// The menu bar item: the terminal glyph, with the needs-you count beside it.
-struct HostStatusLabel: View {
-    @ObservedObject var summary = NotificationsSummaryWatcher.shared
-
-    var body: some View {
-        if let count = summary.needsYou, count > 0 {
-            Label {
-                Text(count < 1000 ? "\(count)" : "999+")
-            } icon: {
-                Image(systemName: "terminal")
-            }
-            .labelStyle(.titleAndIcon)
-            .accessibilityLabel("Copilot Projects, \(count) notifications need you")
-        } else {
-            Image(systemName: "terminal")
-                .accessibilityLabel("Copilot Projects")
-        }
     }
 }
