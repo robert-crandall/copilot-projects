@@ -154,6 +154,8 @@ final class NotificationsModel: ObservableObject {
     private var bannerHighWaters: [String: Date]
     private var announced: [NotificationThread.Key: Date] = [:]
     private var linkedSessions: [String] = []
+    /// Bumped by each session match, so one finishing after a newer one drops its links.
+    private var matchGeneration = 0
     /// When each subject's details were last read.
     private var detailReadAt: [NotificationThread.Key: Date] = [:]
     /// While subject details are being read, counts may still include requests
@@ -526,6 +528,8 @@ final class NotificationsModel: ObservableObject {
     }
 
     func matchSessions() async {
+        matchGeneration += 1
+        let generation = matchGeneration
         let sessions = liveSessions
         linkedSessions = Self.signature(sessions)
         var heads: [PullRequestKey: String] = [:]
@@ -550,6 +554,8 @@ final class NotificationsModel: ObservableObject {
         if !sources.isEmpty {
             // As Pull Requests does: only a distinctive branch name is worth finding in a transcript.
             let evidence = await transcripts.evidence(for: sources, branches: Set(heads.values.filter(PullRequestLinker.isDistinctiveBranch)))
+            // A newer match started while this one read transcripts; its links stand.
+            guard generation == matchGeneration else { return }
             // A PR whose branch isn't known yet isn't inferred at all: on its URL
             // alone, a session that only reviews it could win over the one building it.
             let unmatched = heads.filter { matched[$0.key] == nil && !$0.value.isEmpty }
@@ -650,7 +656,8 @@ final class NotificationsModel: ObservableObject {
         let targets = items.filter(\.thread.unread).map(\.thread)
         guard !targets.isEmpty else { return }
         let now = clock()
-        for thread in targets { readLocally[thread.key] = now }
+        // A copy dated ahead of this clock is covered too, as for Done.
+        for thread in targets { readLocally[thread.key] = max(now, thread.updatedAt) }
         update(targets.map(\.key)) { $0.unread = false }
         perform(targets, verb: "mark as read", action: { api, account, id in try await api.markRead(account: account, threadId: id) }) { [weak self] failed in
             for thread in failed { self?.readLocally[thread.key] = nil }

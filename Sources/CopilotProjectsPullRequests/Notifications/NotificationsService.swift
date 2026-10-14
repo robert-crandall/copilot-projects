@@ -38,6 +38,11 @@ struct GitHubNotificationsAPI: Sendable {
     }
 
     func list(account: GitHubAccount, url: URL, ifModifiedSince: String? = nil) async throws -> Listing {
+        // Page links come from a response header; the token only goes to the API itself.
+        guard url.scheme?.lowercased() == base.scheme?.lowercased(), url.host?.lowercased() == base.host?.lowercased(),
+              url.port == base.port else {
+            throw Failure(status: nil, message: "GitHub returned a page link outside \(base.host ?? "its API"); it wasn’t followed.")
+        }
         var request = self.request(url, account: account, method: "GET")
         if let ifModifiedSince { request.setValue(ifModifiedSince, forHTTPHeaderField: "If-Modified-Since") }
         // A conditional poll must reach GitHub, never a local cache's answer.

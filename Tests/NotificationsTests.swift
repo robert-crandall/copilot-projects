@@ -335,6 +335,28 @@ final class NotificationsTests: XCTestCase {
         XCTAssertTrue(result.truncated)
     }
 
+    func testPageLinksOffTheAPIAreNotFollowedWithTheToken() async {
+        final class Sent: @unchecked Sendable {
+            var urls: [URL] = []
+        }
+        let sent = Sent()
+        let api = GitHubNotificationsAPI(send: { request in
+            sent.urls.append(request.url!)
+            return (Data("[]".utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        })
+        let account = GitHubAccount(login: "octocat", token: "secret")
+        for link in ["https://evil.example/notifications?page=2", "http://api.github.com/notifications?page=2",
+                     "https://api.github.com:8443/notifications?page=2"] {
+            do {
+                _ = try await api.list(account: account, url: URL(string: link)!)
+                XCTFail("followed \(link)")
+            } catch {}
+        }
+        XCTAssertTrue(sent.urls.isEmpty, "\(sent.urls)")
+        _ = try? await api.list(account: account, url: URL(string: "https://API.github.com/notifications?page=2")!)
+        XCTAssertEqual(sent.urls.count, 1, "the API's own links are still followed")
+    }
+
     func testRefreshShowsThreadsAndPublishesCounts() async {
         let github = FakeGitHub()
         github.answer("participating", pages: [[
@@ -414,6 +436,18 @@ final class NotificationsTests: XCTestCase {
         XCTAssertTrue(model.threads.isEmpty)
         try await waitUntil { !model.threads.isEmpty }
         XCTAssertTrue(model.warning?.contains("Couldn’t mark as done") == true, model.warning ?? "no warning")
+    }
+
+    func testReadCoversACopyDatedAheadOfThisClock() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(120))]])
+        let model = makeModel(github, clock: TestClock(now))
+        await model.refreshNow()
+        model.markRead(model.items)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") }
+        // A refresh that read GitHub before it saw the read keeps it read.
+        await model.refreshNow()
+        XCTAssertEqual(model.threads.first?.unread, false)
     }
 
     func testDoneCoversActivityUpToTheClickNotJustTheCopyOnScreen() async throws {
@@ -657,6 +691,57 @@ final class NotificationsTests: XCTestCase {
         try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") }
         XCTAssertEqual(workspace.revealCalls.map(\.projectId), ["p", "q"])
         XCTAssertEqual(model.threads.first?.unread, false)
+    }
+
+    func testAStaleSessionMatchDoesNotOverwriteANewerOne() async throws {
+        actor HeldTranscripts: PullRequestTranscriptReading {
+            private var first: CheckedContinuation<Void, Never>?
+            private var holding = true
+            private(set) var reads = 0
+            func evidence(
+                for sources: [PullRequestTranscriptIndex.Source], branches: Set<String>
+            ) async -> [String: TranscriptEvidence] {
+                reads += 1
+                if reads == 1, holding { await withCheckedContinuation { first = $0 } }
+                return [:]
+            }
+            func release() {
+                holding = false
+                first?.resume()
+                first = nil
+            }
+        }
+        func snapshot(linking session: String) -> WorkspaceSnapshot {
+            WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+                .init(id: "p", name: "Workspace", sessions: ["s1", "s2"].map {
+                    .init(id: $0, title: $0, status: .waiting, copilotSessionId: "copilot-\($0)",
+                          pullRequestKeys: $0 == session ? ["octo/app#1"] : [])
+                }),
+            ])
+        }
+        let transcripts = HeldTranscripts()
+        let workspace = FakeWorkspace(snapshot: snapshot(linking: "s1"))
+        let model = NotificationsModel(
+            workspace: workspace, defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            loadAccounts: { [] }, transcripts: transcripts, transcriptPath: { "/nonexistent/\($0).jsonl" }
+        )
+        model.setBadge = { _ in }
+        model.show([thread("1", "author")], accounts: ["octocat"])
+        let stale = Task { await model.pollWorkspace() }
+        var reads = 0
+        for _ in 0..<250 where reads == 0 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            reads = await transcripts.reads
+        }
+        XCTAssertEqual(reads, 1)
+
+        // The session working on it changes while the first match reads transcripts.
+        workspace.answer(fetches: [.snapshot(snapshot(linking: "s2"))])
+        await model.pollWorkspace()
+        XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s2")
+        await transcripts.release()
+        await stale.value
+        XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s2", "the older match's links were dropped")
     }
 
     func testABannerForAThreadNotLoadedStillMarksItRead() async throws {
