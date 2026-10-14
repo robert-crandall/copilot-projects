@@ -30,6 +30,7 @@ struct HostStatusMenu: View {
     var body: some View {
         Button("Open Copilot Projects") { showMainWindow() }
         OpenPullRequestsButton()
+        OpenNotificationsButton()
         Toggle("Keep Running When Window Closes", isOn: Binding(
             get: { keepRunning },
             set: { enabled in

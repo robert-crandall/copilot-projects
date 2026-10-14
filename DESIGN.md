@@ -336,11 +336,93 @@ older-pull-requests note. A refresh that moves a chip animates it to its new sta
 (matched geometry, 0.2s ease-out); the first load never animates, and Reduce
 Motion updates lanes in place.
 
+**Notifications window:** [Reason Lanes](.impeccable/surfaces/sts-notifications-notificationsview-swift-d7a05b2b.md),
+the one hidden-title-bar window (1200x760pt default, 880x480pt minimum) on
+`chrome` of Copilot Notifications, a separate app nested in Copilot Projects
+beside Copilot Pull Requests, with its own Dock icon, Dock badge, and Command-Tab
+entry. Window ▸ Notifications (Shift-Command-N) opens it or brings it forward and
+names the needs-you count in its title. The app's own menu bar item, a template
+bell (bell.badge when something needs you) with the count in monospaced digits,
+opens the window from its menu and can be turned off in the Banners popover. Closing the window does
+not quit, so the badge and banners stay live, and the app menu's Start
+Notifications with Copilot Projects toggle (on after the first open) launches it
+windowless with `--background`. Its icon is the Copilot Projects teal squircle
+with the white primer/octicons `bell-24` glyph (MIT) at the pull-request glyph's
+size, drawn by `scripts/make-icon.swift --notifications` and built into
+`Resources/NotificationsIcon.icns` by `scripts/make-icns.sh`. Needs you means
+unread in To you, Via your teams, or Watching, except a review request whose pull
+request is already merged or closed; the Dock badge (none at zero, 999+ above
+999), menu title, menu bar item, header, bands, and lanes all count exactly that.
+
+It reuses the Pull Requests window's drag strip and 56pt header: a title3 semibold
+"N need you" headline over a caption secondary summary (to you · via your teams ·
+watching · already merged or closed · quiet · accounts, monospaced digits), a
+Banners button (bell, or bell.slash when off) whose 300pt popover holds per-band
+checkboxes and, when System Settings denies banners, a note behind the native
+orange symbol with Open Notification Settings, then Refresh (Command-R). A caption
+secondary filter row follows: an Unread | All segmented picker (opening on All,
+disabled until loaded), "N of M threads", and trailing refresh progress, a "GitHub
+checked" relative time, or "Copilot Projects unavailable · sessions not linked".
+Later refresh or sync failures keep the lanes and add one selectable caption line
+under that row behind the outlined warning symbol in secondary ink. A sticky 28pt
+`chrome` stage row heads a 240pt Reasons column and four equal freshness columns
+(Since you looked, Today, This week, Older) split by native dividers, counts in
+monospaced digits. Since you looked holds unread threads that changed after the
+last look (the window key for at least 1.5s; before any look, the last read on
+GitHub stands in); the rest sit by day. Bands (To you, Via your teams, Watching,
+Quiet) head their lanes in a 24pt `chrome` row: caption semibold name, then a
+regular count of need-you and merged-or-closed threads (unread, for Quiet). The
+lane column sits on `sidebar` (14x10pt inset): a two-line body-medium reason with
+a borderless ellipsis menu (Mark All as Read, Mark All as Done), a caption
+secondary explanation, and a caption count. Only non-empty bands and lanes appear;
+chips lead unread, then newest. Cells pad 8pt, stack chips 6pt apart, and show
+five before a borderless caption Show N more (then Show fewer).
+
+Chips share Goal Lanes' `raised` body, 6pt session corner, 10x8pt padding,
+fill-free hover, and steel selection with the 1pt `selection-edge` ring 2pt
+outside on the 8pt corner. The identity line is a 6pt unread dot (orange when the
+thread needs you, secondary ink otherwise, so unread is a shape and not only a
+color), the subject kind's symbol and a caption semibold `repo#number` in
+secondary ink, and a caption2 narrow age that drops before the repository name
+truncates; then up to two callout title lines; a caption secondary detail line
+(@team, Deployment approval, Draft/Merged/Closed, "Checking who was asked…", or
+"as" a non-primary account); and, where a session works on the pull request, a
+caption session line: its indicator and state, plus the project only when the
+whole line fits, never cut short, and a click to that session while Copilot
+Projects answers (otherwise a terminal glyph and "Status unknown"). The inner 1pt
+edge is native orange (85%) for unread needs-you threads, secondary ink (45%, 80%
+on hover) for unread quiet threads and unread review requests already merged or closed,
+and absent once read (80% on hover only). Double-click opens the thread on GitHub
+and marks it read; the context menu opens, goes to the session, marks read or
+done, unsubscribes, or copies the link.
+
+The first load shows three redacted placeholder lanes under an unredacted stage
+row; a first-load failure (Try Again; terminal symbol when gh is missing), an
+empty inbox (Inbox Clear), and an Unread filter with nothing unread (Show All)
+use native `ContentUnavailableView`. The most urgent chip is preselected and the
+lanes take focus: arrows walk band, lane, and column order through shown chips and
+announce, Return goes to the session (or GitHub when there is none or the host is
+away), Command-Return opens GitHub, E marks done and Shift-M unsubscribes (both
+advancing selection), Shift-I marks read, and Escape clears selection. The footer
+lists only keys that can act now; its trailing note carries the storage warning
+and, when an account holds more unread than one read fetches, "Older unread
+threads aren't shown · Open GitHub Inbox" as a native link. Returning to the
+window slides chips already seen out of Since you looked into their day column,
+and Done or Unsubscribe removes a chip and ticks its counts down (matched
+geometry, 0.2s ease-out); Reduce Motion updates in place. Banners announce only
+unread needs-you threads in enabled bands that changed since the last
+announcement, never the backlog and never while the window is key; more than
+three at once become one summary banner.
+
 **Shared patterns:** the 32pt `sidebar` key-legend footer (caption secondary ink,
-semibold key glyphs, 14pt inset and spacing, trailing status note) is now shared
-by the session finder and the Pull Requests window. Both also carry failures in a
-trailing note behind the native orange warning symbol and use
-`ContentUnavailableView` for empty states.
+semibold key glyphs, 14pt inset and spacing, trailing status note) is shared by
+the session finder, the Pull Requests window, and the Notifications window. All
+three put persistent failures (Luna's, or a copy that can't lock its state
+folder) behind the native orange warning symbol in that trailing note and use
+`ContentUnavailableView` for empty states. The two lane windows also share the
+drag strip, 56pt header, `raised` chip body, selection ring, and redacted
+first-load lanes, and both start their filter row's native segmented picker, at
+its natural width, on the 14pt leading edge the headline and columns share.
 
 The [sidecar](.impeccable/design.json) contains schematic dark-appearance HTML/CSS
 previews of these roles, not replacements for native controls or pixel-certified

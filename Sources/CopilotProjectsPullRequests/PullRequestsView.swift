@@ -12,7 +12,7 @@ enum PullRequestsWindow {
 }
 
 /// Drops the title bar separator, as the workspace window does.
-private struct TitlebarSeparatorRemover: NSViewRepresentable {
+struct TitlebarSeparatorRemover: NSViewRepresentable {
     final class MarkerView: NSView {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -197,7 +197,8 @@ struct PullRequestsView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 180)
+            // Its natural width, starting on the 14pt edge the headline and columns share.
+            .fixedSize()
             .disabled(pullRequests.phase != .loaded)
             Text("\(visibleCount) of \(totalCount) goals")
                 .font(.caption)

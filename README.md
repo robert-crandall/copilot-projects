@@ -76,6 +76,10 @@ discards it. Closing the drawer or switching sessions dismisses that preview.
   app that lays out your open pull requests as goal lanes across Draft, Checks,
   Review, and Ready, flags the ones that need you, and takes you to the session
   working on them.
+- **Notifications by reason.** Press `⇧⌘N` to open Copilot Notifications, a
+  companion app that mirrors your GitHub inbox in lanes by why it reached you,
+  splits what was sent to you from what was sent to your teams, and keeps a Dock
+  badge and banners current even when its window is closed.
 - **Local pull-request reviews.** Choose **Review Pull Request…** from the split
   button's dropdown to open a Copilot CLI session with a local adversarial-review
   prompt for a GitHub pull request.
@@ -110,6 +114,7 @@ accessibility labels.
 | Next / previous session | `⌃Tab` / `⌃⇧Tab` |
 | Find a session | `⌘K` |
 | Show pull requests | `⇧⌘P` |
+| Show notifications | `⇧⌘N` |
 | Jump to a project | `⌘1`–`⌘9` |
 | Jump to a session | `⌃1`–`⌃9` |
 | Show / hide Projects | `⌘0` |
@@ -220,6 +225,66 @@ match counts and any goals you name are kept under
 `~/.local/state/copilot-projects/pull-requests/`. Only one copy of the app writes
 there; opening another brings the first forward. If that folder can't be locked,
 the window opens anyway and says that it saves nothing.
+
+### Notifications by reason
+
+**Notifications** (`⇧⌘N`, in the Window menu and the menu bar extra) opens
+**Copilot Notifications**, a separate app that ships inside Copilot Projects
+beside Copilot Pull Requests. Unlike Pull Requests it keeps running after you
+close its window, like Mail, so its Dock badge and banners stay current; quit it
+with `⌘Q`. Once you've opened it, Copilot Projects starts it in the background
+whenever it launches; turn that off with **Start Notifications with Copilot
+Projects** in the app menu.
+
+It mirrors the GitHub notifications inbox of every account signed in to `gh`.
+Each row is a reason, grouped by how it reached you:
+
+- **To you:** review requests, mentions, assignments, activity on pull requests
+  and issues you opened, and conversations you took part in.
+- **Via your teams:** review requests and mentions that reached you only because
+  you're on a team, named on each thread (for example `@github/reviewers`).
+  GitHub's `review_requested` reason doesn't say which, so each pull request's
+  review-request history decides: a request is yours if you were ever asked by
+  name, and stays with **To you** until that's known.
+- **Watching:** new threads in repositories you watch and threads you subscribed to.
+- **Quiet:** CI activity and everything else. Quiet threads are listed but never
+  badged or bannered.
+
+Its columns are **Since you looked** (unread threads that changed after you last
+had the window in front), **Today**, **This week**, and **Older**. When you come
+back, what you already saw moves out of **Since you looked**. Each cell shows
+five threads, unread and newest first; **Show more** reveals the rest.
+
+- **Act from it.** Double-click a thread, or press `⌘Return`, to open it on
+  GitHub; that marks it read there too. Return goes to the Copilot session working
+  on a pull request when there is one (the same match Pull Requests uses), else opens
+  it; going to the session marks it read too. `E` marks the selected thread done and
+  moves to the next, `⇧I` marks it read, and `⇧M` unsubscribes (it ignores the
+  thread, even in a repository you watch, until you're mentioned or asked again).
+  Each lane's menu marks the whole lane read or done. Read and done are written to
+  GitHub, so your inbox matches everywhere.
+- **Badge and banners.** The Dock badge and Copilot Notifications' own menu bar
+  item (a bell with the count; **Banners** turns it off) count unread threads that
+  need you: To you, Via your teams, and Watching. A review request whose pull
+  request is already merged or closed has nothing left to review, so it stays
+  listed, quietly, and the header counts it separately; a mention or reply on a
+  closed thread still counts. **Banners** chooses which of those raise a banner when
+  something new arrives; more than three at once become one summary banner, and
+  nothing already waiting when an account is first read is announced. When only the
+  newest threads were read and none needs you, the header says so rather than
+  claiming nothing does.
+
+It reads each account's unread threads you take part in (up to 1,000), the newest
+200 unread threads of every kind, and up to 200 threads read in the last three days. When
+an inbox holds more, the footer says so and links to your inbox on GitHub. It
+asks GitHub whether anything changed once a minute, or less often when GitHub asks
+(an unchanged answer is free), and reads the inbox again when it did, or every five
+minutes. Pull request and issue states, and who was asked to review, come from
+batched GraphQL queries, each subject read again when it changes; an unread review
+request on an open pull request is checked again every fifteen minutes. Its last
+look, banner choices, and the count Copilot Projects' Window menu shows are kept under
+`~/.local/state/copilot-projects/notifications/`. Only one copy writes there;
+opening another brings the first forward.
 
 VoiceOver exposes each session's selection and attention state, with separate
 select and end actions. The session-details drawer uses a fade instead of

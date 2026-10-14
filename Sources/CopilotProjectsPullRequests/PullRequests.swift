@@ -336,9 +336,16 @@ enum PullRequestLinker {
     static func links(
         pullRequests: [PullRequestSnapshot], evidence: [String: TranscriptEvidence]
     ) -> [PullRequestKey: String] {
+        links(heads: pullRequests.map { ($0.key, $0.headRefName) }, evidence: evidence)
+    }
+
+    /// The same links from only what identifies each pull request.
+    static func links(
+        heads: [(key: PullRequestKey, headRefName: String)], evidence: [String: TranscriptEvidence]
+    ) -> [PullRequestKey: String] {
         var links: [PullRequestKey: String] = [:]
         let sessions = evidence.sorted { $0.key < $1.key }
-        for pr in pullRequests {
+        for pr in heads {
             let distinctive = isDistinctiveBranch(pr.headRefName)
             var best: (sessionId: String, score: Int, modified: Date)?
             for (sessionId, evidence) in sessions {

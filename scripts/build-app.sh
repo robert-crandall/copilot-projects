@@ -150,15 +150,26 @@ PR_CONTENTS="$PR_APP/Contents"
 PR_MACOS="$PR_CONTENTS/MacOS"
 PR_RES="$PR_CONTENTS/Resources"
 PR_ICON="$ROOT/Resources/PullRequestsIcon.icns"
+# Copilot Notifications: the GitHub inbox as its own app, with its own Dock icon
+# and badge. It keeps running after its window closes.
+NOTIF_APP_NAME="Copilot Notifications"
+NOTIF_EXE_NAME="copilot-notifications"
+NOTIF_APP="$CONTENTS/Helpers/$NOTIF_APP_NAME.app"
+NOTIF_CONTENTS="$NOTIF_APP/Contents"
+NOTIF_MACOS="$NOTIF_CONTENTS/MacOS"
+NOTIF_RES="$NOTIF_CONTENTS/Resources"
+NOTIF_ICON="$ROOT/Resources/NotificationsIcon.icns"
 
-if [ ! -s "$PR_ICON" ]; then
-  echo "error: $PR_ICON is missing; run scripts/make-icns.sh" >&2
-  exit 1
-fi
+for icon in "$PR_ICON" "$NOTIF_ICON"; do
+  if [ ! -s "$icon" ]; then
+    echo "error: $icon is missing; run scripts/make-icns.sh" >&2
+    exit 1
+  fi
+done
 
 echo "==> assembling $APP_DIR"
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS" "$RES" "$HELPER_MACOS" "$PR_MACOS" "$PR_RES"
+mkdir -p "$MACOS" "$RES" "$HELPER_MACOS" "$PR_MACOS" "$PR_RES" "$NOTIF_MACOS" "$NOTIF_RES"
 
 cp "${OVERRIDE_BINARY:-$BUILD_DIR/$EXE_NAME}" "$MACOS/$EXE_NAME"
 cp "$BUILD_DIR/copilot-projects-link" "$HELPER_MACOS/copilot-projects-link"
@@ -166,6 +177,9 @@ cp "$BUILD_DIR/$PR_EXE_NAME" "$PR_MACOS/$PR_EXE_NAME"
 chmod 755 "$PR_MACOS/$PR_EXE_NAME"
 # The helper's own icon, in its own Resources, so the Dock and ⌘Tab show it.
 cp "$PR_ICON" "$PR_RES/PullRequestsIcon.icns"
+cp "$BUILD_DIR/$NOTIF_EXE_NAME" "$NOTIF_MACOS/$NOTIF_EXE_NAME"
+chmod 755 "$NOTIF_MACOS/$NOTIF_EXE_NAME"
+cp "$NOTIF_ICON" "$NOTIF_RES/NotificationsIcon.icns"
 
 # App icon
 if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
@@ -311,6 +325,27 @@ cat > "$PR_CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
+cat > "$NOTIF_CONTENTS/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>$NOTIF_APP_NAME</string>
+  <key>CFBundleDisplayName</key><string>$NOTIF_APP_NAME</string>
+  <key>CFBundleExecutable</key><string>$NOTIF_EXE_NAME</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID.notifications</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT_VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleIconFile</key><string>NotificationsIcon</string>
+  <key>CopilotProjectsHostBundleIdentifier</key><string>$BUNDLE_ID</string>
+</dict>
+</plist>
+PLIST
+
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
   echo "==> ad-hoc signing"
   SIGN_ARGS=(--force --sign -)
@@ -345,6 +380,7 @@ if [ -x "$CONTENTS/Helpers/dtach" ]; then
 fi
 codesign "${SIGN_ARGS[@]}" "$HELPER_APP"
 codesign "${SIGN_ARGS[@]}" "$PR_APP"
+codesign "${SIGN_ARGS[@]}" "$NOTIF_APP"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS" "$APP_DIR"
 rm -f "$ENTITLEMENTS"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
