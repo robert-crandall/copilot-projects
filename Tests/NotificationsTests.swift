@@ -797,6 +797,148 @@ final class NotificationsTests: XCTestCase {
         XCTAssertNil(model.items.first { $0.id.id == "2" }?.session)
     }
 
+    // MARK: Answered
+
+    private func subject(_ events: String) throws -> NotificationDetailsFetcher.Subject {
+        let json = #"{"state":"OPEN","prActivity":{"nodes":["# + events + "]}}"
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(NotificationDetailsFetcher.Subject.self, from: Data(json.utf8))
+    }
+
+    func testAThreadIsAnsweredWhenYouActedAfterTheLastAskOfYou() throws {
+        // entitlements#143685: asked and mentioned, then approved; others approving later don't ask again.
+        let asked = try subject("""
+        {"__typename":"ReviewRequestedEvent","createdAt":"2026-10-14T16:47:22Z","requestedReviewer":{"__typename":"User","login":"OctoCat"}},
+        {"__typename":"MentionedEvent","createdAt":"2026-10-14T16:47:30Z","actor":{"login":"octocat"}},
+        {"__typename":"MentionedEvent","createdAt":"2026-10-14T16:47:31Z","actor":{"login":"hubot"}},
+        {"__typename":"PullRequestReview","submittedAt":"2026-10-14T17:16:46Z","state":"APPROVED","author":{"login":"octocat"}},
+        {"__typename":"PullRequestReview","submittedAt":"2026-10-14T19:04:43Z","state":"APPROVED","author":{"login":"hubot"}},
+        {"__typename":"IssueComment","createdAt":"2026-10-14T19:05:04Z","author":{"login":"hubot"}}
+        """)
+        let detail = NotificationDetailsFetcher.detail(asked, viewer: "octocat")
+        XCTAssertNotNil(detail.viewerTargetedAt)
+        XCTAssertNotNil(detail.viewerActedAt)
+        XCTAssertTrue(detail.isAnswered { _ in nil })
+
+        let askedAgain = try subject("""
+        {"__typename":"MentionedEvent","createdAt":"2026-10-14T16:47:30Z","actor":{"login":"octocat"}},
+        {"__typename":"PullRequestReview","submittedAt":"2026-10-14T17:16:46Z","state":"APPROVED","author":{"login":"octocat"}},
+        {"__typename":"ReviewRequestedEvent","createdAt":"2026-10-14T18:00:00Z","requestedReviewer":{"__typename":"User","login":"octocat"}}
+        """)
+        XCTAssertFalse(NotificationDetailsFetcher.detail(askedAgain, viewer: "octocat").isAnswered { _ in nil }, "re-requested")
+
+        let mergedAndClosed = try subject("""
+        {"__typename":"AssignedEvent","createdAt":"2026-10-14T10:00:00Z","assignee":{"login":"octocat"}},
+        {"__typename":"ClosedEvent","createdAt":"2026-10-14T11:00:00Z","actor":{"login":"octocat"}}
+        """)
+        XCTAssertTrue(NotificationDetailsFetcher.detail(mergedAndClosed, viewer: "octocat").isAnswered { _ in nil })
+
+        let pending = try subject("""
+        {"__typename":"MentionedEvent","createdAt":"2026-10-14T10:00:00Z","actor":{"login":"octocat"}},
+        {"__typename":"PullRequestReview","submittedAt":"2026-10-14T11:00:00Z","state":"PENDING","author":{"login":"octocat"}}
+        """)
+        XCTAssertFalse(NotificationDetailsFetcher.detail(pending, viewer: "octocat").isAnswered { _ in nil }, "a draft review isn't an answer")
+
+        let nothingAsked = try subject("""
+        {"__typename":"IssueComment","createdAt":"2026-10-14T11:00:00Z","author":{"login":"octocat"}}
+        """)
+        XCTAssertFalse(NotificationDetailsFetcher.detail(nothingAsked, viewer: "octocat").isAnswered { _ in nil },
+                       "with nothing aimed at you in the history, it can't be called answered")
+    }
+
+    func testOnlyRequestsToYourTeamsAskAgain() throws {
+        let detail = NotificationDetailsFetcher.detail(try subject("""
+        {"__typename":"MentionedEvent","createdAt":"2026-10-14T10:00:00Z","actor":{"login":"octocat"}},
+        {"__typename":"IssueComment","createdAt":"2026-10-14T11:00:00Z","author":{"login":"octocat"}},
+        {"__typename":"ReviewRequestedEvent","createdAt":"2026-10-14T12:00:00Z","requestedReviewer":{"__typename":"Team","slug":"Reviewers","organization":{"login":"Octo"}}}
+        """), viewer: "octocat")
+        XCTAssertEqual(Array(detail.teamRequestedAt.keys), ["octo/reviewers"])
+        XCTAssertFalse(detail.isAnswered { _ in true }, "your team was asked after you replied")
+        XCTAssertTrue(detail.isAnswered { _ in false }, "another team's request doesn't ask you")
+        XCTAssertFalse(detail.isAnswered { _ in nil }, "unknown membership counts as yours")
+    }
+
+    private func answeringFetcher(_ details: [String: NotificationSubjectDetail]) -> NotificationDetailsFetcher {
+        var fetcher = NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2))
+        fetcher.answer = { threads, account in
+            var result = NotificationDetailsFetcher.Result(details: [:], settled: [], viewerLogin: account.login)
+            for thread in threads {
+                result.settled.insert(thread.key)
+                result.details[thread.key] = details[thread.key.id]
+            }
+            return result
+        }
+        return fetcher
+    }
+
+    private func answeringModel(
+        _ github: FakeGitHub, details: [String: NotificationSubjectDetail], clears: Bool, clock: TestClock
+    ) -> NotificationsModel {
+        let model = NotificationsModel(
+            workspace: FakeWorkspace(), defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            clearsAnswered: clears, api: GitHubNotificationsAPI(send: github.send),
+            detailsFetcher: answeringFetcher(details),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
+            transcriptPath: { _ in nil }, clock: { clock.now }, isVisible: { false }
+        )
+        model.setBadge = { _ in }
+        return model
+    }
+
+    func testAnsweredThreadsAreMarkedDoneUntilYoureAskedAgain() async throws {
+        let github = FakeGitHub()
+        var answered = NotificationSubjectDetail(state: .open)
+        answered.viewerTargetedAt = now.addingTimeInterval(-7200)
+        answered.viewerActedAt = now.addingTimeInterval(-3600)
+        var unanswered = answered
+        unanswered.viewerActedAt = nil
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", number: 1, updated: now.addingTimeInterval(-60)),
+            FakeGitHub.thread("2", reason: "mention", number: 2, updated: now.addingTimeInterval(-60)),
+            FakeGitHub.thread("3", reason: "author", number: 3, updated: now.addingTimeInterval(-60)),
+        ]])
+        let clock = TestClock(now)
+        let model = answeringModel(github, details: ["1": answered, "2": unanswered, "3": answered], clears: true, clock: clock)
+        let banners = FakeBanners()
+        model.banners = banners
+        await model.refreshNow()
+        try await waitUntil { github.actions.contains("DELETE /notifications/threads/1") }
+        XCTAssertEqual(github.actions, ["DELETE /notifications/threads/1"], "only the answered mention; your own PR's activity is never answered")
+        XCTAssertEqual(Set(model.threads.map(\.key.id)), ["2", "3"])
+        XCTAssertEqual(model.clearedAnswered.map(\.key.id), ["1"])
+        XCTAssertTrue(banners.posted.isEmpty)
+
+        // The same copy comes back from a refresh that raced the done: still cleared, not done twice.
+        await model.refreshNow()
+        XCTAssertFalse(model.threads.contains { $0.key.id == "1" })
+        XCTAssertEqual(github.actions.filter { $0.hasSuffix("/1") }.count, 1)
+
+        // Mentioned again after the answer: it needs you again and stays.
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", number: 1, updated: now.addingTimeInterval(120)),
+        ]])
+        let asked = answeringModel(github, details: ["1": unanswered], clears: true, clock: clock)
+        await asked.refreshNow()
+        XCTAssertTrue(asked.threads.contains { $0.key.id == "1" })
+        XCTAssertEqual(asked.counts.needsYou, 1)
+    }
+
+    func testReadOnlyCopiesNeverClearAnsweredThreads() async throws {
+        let github = FakeGitHub()
+        var answered = NotificationSubjectDetail(state: .open)
+        answered.viewerTargetedAt = now.addingTimeInterval(-7200)
+        answered.viewerActedAt = now.addingTimeInterval(-3600)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now)]])
+        let model = answeringModel(github, details: ["1": answered], clears: false, clock: TestClock(now))
+        await model.refreshNow()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(github.actions.isEmpty)
+        XCTAssertEqual(model.counts.needsYou, 0, "answered doesn't need you")
+        XCTAssertEqual(model.counts.answered, 1)
+        XCTAssertTrue(model.clearedAnswered.isEmpty)
+    }
+
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {
@@ -887,7 +1029,8 @@ final class NotificationsDesignCaptureTests: XCTestCase {
                 threads, details: details, accounts: ["octocat", "hubot"], links: [workspacePR: "s1"],
                 lookedAt: now.addingTimeInterval(-3600), updated: now.addingTimeInterval(-60),
                 truncated: offline ? ["octocat"] : [],
-                warning: offline ? "GitHub refresh failed. Showing the last successful results." : nil
+                warning: offline ? "GitHub refresh failed. Showing the last successful results." : nil,
+                cleared: Array(threads.prefix(3))
             )
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 800),
                                   styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
@@ -935,6 +1078,8 @@ final class NotificationsLiveTests: XCTestCase {
         let reviews = model.items.filter { $0.thread.reason == .reviewRequested }
         print("live review requests: \(reviews.filter { $0.lane == .reviewRequested }.count) to you, \(reviews.filter { $0.lane == .teamReviewRequested }.count) via teams, \(reviews.filter(\.isClassifying).count) unclassified, \(reviews.filter { $0.detail?.requestHistoryComplete == false }.count) with incomplete history")
         print("live counts: \(model.counts), accounts: \(model.accounts), truncated: \(model.truncatedAccounts)")
+        let answered = model.items.filter(\.isAnswered)
+        print("live answered (would clear): \(answered.count): " + answered.prefix(8).map(\.thread.shortName).joined(separator: ", "))
         XCTAssertTrue(reviews.allSatisfy { !$0.isClassifying }, "every review request is classified")
     }
 }

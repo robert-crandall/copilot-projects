@@ -251,6 +251,8 @@ struct NotificationDetailsFetcher: Sendable {
     var batchSize = 20
     /// Batches in flight at once for one account.
     var concurrency = 4
+    /// Answers in place of GitHub, for tests.
+    var answer: (@Sendable ([NotificationThread], GitHubAccount) async -> Result)? = nil
 
     struct Result: Sendable {
         var details: [NotificationThread.Key: NotificationSubjectDetail]
@@ -259,7 +261,8 @@ struct NotificationDetailsFetcher: Sendable {
         var viewerLogin: String?
     }
 
-    /// Only review requests need who was asked; everything else needs its state.
+    /// Threads that ask something of the user need who was asked and whether
+    /// they've answered since; everything else needs only its state.
     static let subjectFragment = """
     fragment Subject on IssueOrPullRequest {
       ... on PullRequest { state isDraft headRefName }
@@ -267,8 +270,8 @@ struct NotificationDetailsFetcher: Sendable {
     }
     """
 
-    static let requestsFragment = """
-    fragment Requests on IssueOrPullRequest {
+    static let engagedFragment = """
+    fragment Engaged on IssueOrPullRequest {
       ... on PullRequest {
         state isDraft headRefName
         timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 100) {
@@ -277,8 +280,25 @@ struct NotificationDetailsFetcher: Sendable {
             __typename ... on User { login } ... on Team { slug organization { login } }
           } } }
         }
+        prActivity: timelineItems(itemTypes: [MENTIONED_EVENT, ASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, PULL_REQUEST_REVIEW, ISSUE_COMMENT, MERGED_EVENT, CLOSED_EVENT], last: 100) {
+          nodes { __typename ...Activity }
+        }
       }
-      ... on Issue { state stateReason }
+      ... on Issue {
+        state stateReason
+        issueActivity: timelineItems(itemTypes: [MENTIONED_EVENT, ASSIGNED_EVENT, ISSUE_COMMENT, CLOSED_EVENT], last: 100) {
+          nodes { __typename ...Activity }
+        }
+      }
+    }
+    fragment Activity on Node {
+      ... on MentionedEvent { createdAt actor { login } }
+      ... on AssignedEvent { createdAt assignee { ... on User { login } } }
+      ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } ... on Team { slug organization { login } } } }
+      ... on PullRequestReview { submittedAt state author { login } }
+      ... on IssueComment { createdAt author { login } }
+      ... on MergedEvent { createdAt actor { login } }
+      ... on ClosedEvent { createdAt actor { login } }
     }
     """
 
@@ -295,12 +315,26 @@ struct NotificationDetailsFetcher: Sendable {
         let pageInfo: PageInfo?
         let nodes: [Event?]?
     }
+    /// Something that asked for the user, or that they did.
+    struct ActivityEvent: Decodable {
+        let __typename: String?
+        let createdAt: Date?
+        let submittedAt: Date?
+        let state: String?
+        let actor: Login?
+        let author: Login?
+        let assignee: Login?
+        let requestedReviewer: Reviewer?
+    }
+    struct Activity: Decodable { let nodes: [ActivityEvent?]? }
     struct Subject: Decodable {
         let state: String?
         let isDraft: Bool?
         let headRefName: String?
         let stateReason: String?
         let timelineItems: Timeline?
+        var prActivity: Activity? = nil
+        var issueActivity: Activity? = nil
     }
     /// Each alias: a repository holding the subject, or the viewer.
     struct Node: Decodable {
@@ -311,6 +345,7 @@ struct NotificationDetailsFetcher: Sendable {
     func details(
         for threads: [NotificationThread], account: GitHubAccount
     ) async -> Result {
+        if let answer { return await answer(threads, account) }
         let subjects = threads.filter { ($0.kind == .pullRequest || $0.kind == .issue) && $0.number != nil }
         let batches = stride(from: 0, to: subjects.count, by: batchSize).map {
             Array(subjects[$0..<min($0 + batchSize, subjects.count)])
@@ -357,7 +392,7 @@ struct NotificationDetailsFetcher: Sendable {
         for (index, thread) in batch.enumerated() {
             let parts = thread.repository.split(separator: "/", maxSplits: 1).map(String.init)
             guard parts.count == 2, let number = thread.number else { continue }
-            let fragment = thread.reason == .reviewRequested ? "Requests" : "Subject"
+            let fragment = NotificationItem.answerableReasons.contains(thread.reason) ? "Engaged" : "Subject"
             used.insert(fragment)
             declarations += ["$o\(index): String!", "$r\(index): String!", "$n\(index): Int!"]
             fields.append("t\(index): repository(owner: $o\(index), name: $r\(index)) { issueOrPullRequest(number: $n\(index)) { ...\(fragment) } }")
@@ -366,7 +401,7 @@ struct NotificationDetailsFetcher: Sendable {
             variables["n\(index)"] = number
         }
         let header = declarations.isEmpty ? "" : "(\(declarations.joined(separator: ", ")))"
-        let fragments = [used.contains("Subject") ? Self.subjectFragment : nil, used.contains("Requests") ? Self.requestsFragment : nil]
+        let fragments = [used.contains("Subject") ? Self.subjectFragment : nil, used.contains("Engaged") ? Self.engagedFragment : nil]
         let text = "query\(header) {\n\(fields.joined(separator: "\n"))\n}\n" + fragments.compactMap { $0 }.joined(separator: "\n")
         do {
             // Partial answers are kept: a subject GitHub won't show settles without detail.
@@ -404,6 +439,37 @@ struct NotificationDetailsFetcher: Sendable {
         // Older requests weren't read: a direct one may be among them.
         if !detail.viewerRequested, subject.timelineItems?.pageInfo?.hasPreviousPage == true {
             detail.requestHistoryComplete = false
+        }
+        // The newest events: anything older that asked for the user was answered
+        // or asked again by something here.
+        let events = (subject.prActivity?.nodes ?? []) + (subject.issueActivity?.nodes ?? [])
+        func latest(_ current: Date?, _ candidate: Date?) -> Date? {
+            guard let candidate else { return current }
+            return current.map { max($0, candidate) } ?? candidate
+        }
+        for case let event? in events {
+            func isViewer(_ login: Login?) -> Bool { login?.login?.lowercased() == viewer && viewer != nil }
+            switch event.__typename {
+            case "MentionedEvent" where isViewer(event.actor),
+                 "AssignedEvent" where isViewer(event.assignee):
+                detail.viewerTargetedAt = latest(detail.viewerTargetedAt, event.createdAt)
+            case "ReviewRequestedEvent":
+                guard let reviewer = event.requestedReviewer, let at = event.createdAt else { continue }
+                if reviewer.__typename == "User", reviewer.login?.lowercased() == viewer {
+                    detail.viewerTargetedAt = latest(detail.viewerTargetedAt, at)
+                } else if reviewer.__typename == "Team", let slug = reviewer.slug, let org = reviewer.organization?.login {
+                    let team = "\(org)/\(slug)".lowercased()
+                    detail.teamRequestedAt[team] = latest(detail.teamRequestedAt[team], at)
+                }
+            case "PullRequestReview" where isViewer(event.author) && event.state != "PENDING":
+                detail.viewerActedAt = latest(detail.viewerActedAt, event.submittedAt)
+            case "IssueComment" where isViewer(event.author),
+                 "MergedEvent" where isViewer(event.actor),
+                 "ClosedEvent" where isViewer(event.actor):
+                detail.viewerActedAt = latest(detail.viewerActedAt, event.createdAt)
+            default:
+                continue
+            }
         }
         return detail
     }

@@ -286,9 +286,29 @@ struct NotificationSubjectDetail: Equatable, Sendable {
     var requestHistoryComplete = true
     /// The asked team the user belongs to, when known.
     var viewerTeam: String?
+    /// The latest time the user was mentioned, assigned, or asked to review by name.
+    var viewerTargetedAt: Date?
+    /// The latest time each team (`org/slug`, lowercased) was asked to review.
+    var teamRequestedAt: [String: Date] = [:]
+    /// The latest time the user reviewed, commented, merged, or closed it.
+    var viewerActedAt: Date?
+    /// The user acted after the last time anything asked for them.
+    var answered = false
 
     /// The team to name on a team review request.
     var teamToName: String? { viewerTeam ?? requestedTeams.first }
+
+    /// Whether the user's last action came after the last thing aimed at them:
+    /// a mention, assignment, or review request to them, or a review request to
+    /// a team they're on. `onTeam` answers nil when membership isn't known; such
+    /// a team counts as theirs, so an unknown never hides a request. With nothing
+    /// aimed at them in the history, nothing is answered.
+    func isAnswered(onTeam: (String) -> Bool?) -> Bool {
+        let teamTargets = teamRequestedAt.filter { onTeam($0.key) != false }.map(\.value)
+        guard let target = ([viewerTargetedAt].compactMap { $0 } + teamTargets).max(),
+              let acted = viewerActedAt else { return false }
+        return acted > target
+    }
 }
 
 /// A thread placed in the window: its lane, column, and what its chip says.
@@ -301,6 +321,14 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     var session: PullRequestSession?
 
     var id: NotificationThread.Key { thread.key }
+
+    /// Threads that ask something of the user, and so can be answered.
+    static let answerableReasons: Set<NotificationReason> = [.reviewRequested, .mention, .teamMention, .assign]
+
+    /// The user already reviewed, replied, merged, or closed it since they were
+    /// last asked; later activity by others doesn't ask again.
+    var isAnswered: Bool { Self.answerableReasons.contains(thread.reason) && detail?.answered == true }
+
     /// A review request whose pull request is already merged or closed: there's
     /// nothing left to review. Mentions and other activity on a closed thread
     /// can still need an answer, so they're never settled this way.
@@ -308,8 +336,8 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
         (lane == .reviewRequested || lane == .teamReviewRequested) && thread.reason == .reviewRequested
             && detail?.state?.isSettled == true
     }
-    /// Unread, in a band that needs the user, and still open to act on.
-    var needsYou: Bool { thread.unread && lane.band.needsYou && !isSettled }
+    /// Unread, in a band that needs the user, still open to act on, and not answered.
+    var needsYou: Bool { thread.unread && lane.band.needsYou && !isSettled && !isAnswered }
 
     /// Where a thread belongs. Review requests are yours until GitHub's history
     /// shows they only ever reached a team: losing one to a team lane costs more
@@ -420,6 +448,8 @@ struct NotificationCounts: Equatable, Sendable {
     var quiet = 0
     /// Unread threads whose pull request or issue is already merged or closed.
     var settled = 0
+    /// Unread threads the user already answered.
+    var answered = 0
 
     var needsYou: Int { toYou + viaTeams + watching }
 
@@ -427,6 +457,10 @@ struct NotificationCounts: Equatable, Sendable {
         for item in items where item.thread.unread {
             if item.lane.band.needsYou, item.isSettled {
                 settled += 1
+                continue
+            }
+            if item.lane.band.needsYou, item.isAnswered {
+                answered += 1
                 continue
             }
             switch item.lane.band {

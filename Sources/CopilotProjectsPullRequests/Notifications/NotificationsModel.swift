@@ -98,6 +98,8 @@ final class NotificationsModel: ObservableObject {
     @Published var bannersViaTeams: Bool { didSet { saveBannerSetting(.viaTeams, bannersViaTeams) } }
     @Published var bannersWatching: Bool { didSet { saveBannerSetting(.watching, bannersWatching) } }
     @Published var bannersAllowed: Bool?
+    /// Threads cleared this run because the user had already answered them, newest first.
+    @Published private(set) var clearedAnswered: [NotificationThread] = []
     @Published var showsMenuBarCount: Bool {
         didSet { if writesState { defaults.set(showsMenuBarCount, forKey: Self.menuBarCountKey) } }
     }
@@ -119,6 +121,9 @@ final class NotificationsModel: ObservableObject {
     private let defaults: UserDefaults
     /// Only the copy holding the lock saves looks, settings, and the summary.
     private let writesState: Bool
+    /// Marks answered threads done on GitHub. Only the app's primary copy does;
+    /// everything else, the live test included, only reads.
+    private let clearsAnswered: Bool
     private let summaryURL: URL?
     private let clock: () -> Date
     private let openURL: (URL) -> Void
@@ -167,6 +172,7 @@ final class NotificationsModel: ObservableObject {
         host: PullRequestsHostApp = .none,
         defaults: UserDefaults = .standard,
         writesState: Bool = true,
+        clearsAnswered: Bool = false,
         storageNote: String? = nil,
         summaryURL: URL? = nil,
         stateDirectory: URL? = nil,
@@ -186,6 +192,7 @@ final class NotificationsModel: ObservableObject {
         self.host = host
         self.defaults = defaults
         self.writesState = writesState
+        self.clearsAnswered = clearsAnswered
         self.storageNote = storageNote
         self.summaryURL = summaryURL
         self.api = api
@@ -414,6 +421,7 @@ final class NotificationsModel: ObservableObject {
         await readDetails(accounts: accounts)
         readingDetails = false
         await matchSessions()
+        clearAnswered()
         announceNewThreads(fetchedAccounts: Set(fetched.keys))
         publish()
     }
@@ -471,7 +479,8 @@ final class NotificationsModel: ObservableObject {
             let result = await detailsFetcher.details(for: threads, account: account)
             var answered = result.details
             if let login = result.viewerLogin {
-                let organizations = Set(answered.values.flatMap(\.requestedTeams).compactMap { $0.split(separator: "/").first.map(String.init) })
+                let teamNames = answered.values.flatMap { $0.requestedTeams + $0.teamRequestedAt.keys }
+                let organizations = Set(teamNames.compactMap { $0.split(separator: "/").first.map { String($0).lowercased() } })
                 for organization in organizations where viewerTeams["\(account.login)|\(organization.lowercased())"] == nil {
                     if let teams = await detailsFetcher.viewerTeams(organization: organization, account: account, login: login) {
                         viewerTeams["\(account.login)|\(organization.lowercased())"] = teams
@@ -482,6 +491,12 @@ final class NotificationsModel: ObservableObject {
                         let organization = team.split(separator: "/").first.map(String.init)?.lowercased() ?? ""
                         return viewerTeams["\(account.login)|\(organization)"]?.contains(team.lowercased()) == true
                     }
+                }
+            }
+            for (key, detail) in answered {
+                answered[key]?.answered = detail.isAnswered { team in
+                    let organization = team.split(separator: "/").first.map(String.init) ?? ""
+                    return viewerTeams["\(account.login)|\(organization)"].map { $0.contains(team) }
                 }
             }
             let versions = Dictionary(uniqueKeysWithValues: threads.map { ($0.key, $0.updatedAt) })
@@ -684,16 +699,33 @@ final class NotificationsModel: ObservableObject {
         }
     }
 
+    /// Marks done every thread the user already answered, judged on details
+    /// read for the copy on hand. A thread that asks for them again comes back.
+    func clearAnswered() {
+        guard clearsAnswered else { return }
+        let answered = items.filter { $0.isAnswered && detailVersions[$0.id] == $0.thread.updatedAt }.map(\.thread)
+        guard !answered.isEmpty else { return }
+        clearedAnswered = Array((answered.sorted { $0.updatedAt > $1.updatedAt } + clearedAnswered).prefix(100))
+        remove(answered, verb: "clear", coversUntilNow: false) { api, account, id in
+            try await api.markDone(account: account, threadId: id)
+        } failed: { [weak self] failed in
+            let keys = Set(failed.map(\.key))
+            self?.clearedAnswered.removeAll { keys.contains($0.key) }
+        }
+    }
+
     private func remove(
-        _ targets: [NotificationThread], verb: String,
-        action: @escaping @Sendable (GitHubNotificationsAPI, GitHubAccount, String) async throws -> Void
+        _ targets: [NotificationThread], verb: String, coversUntilNow: Bool = true,
+        action: @escaping @Sendable (GitHubNotificationsAPI, GitHubAccount, String) async throws -> Void,
+        failed onFailure: (([NotificationThread]) -> Void)? = nil
     ) {
         guard !targets.isEmpty else { return }
         let keys = Set(targets.map(\.key))
-        // The action covers activity up to now, even if this copy is older;
-        // a copy dated ahead of this clock is covered too.
+        // The user's action covers activity up to now, even if this copy is
+        // older; a copy dated ahead of this clock is covered too. Clearing an
+        // answered thread covers only the copy it was judged on.
         let now = clock()
-        for thread in targets { doneLocally[thread.key] = max(now, thread.updatedAt) }
+        for thread in targets { doneLocally[thread.key] = coversUntilNow ? max(now, thread.updatedAt) : thread.updatedAt }
         animate { self.threads.removeAll { keys.contains($0.key) } }
         publish()
         perform(targets, verb: verb, action: action) { [weak self] failed in
@@ -701,6 +733,7 @@ final class NotificationsModel: ObservableObject {
             for thread in failed { self.doneLocally[thread.key] = nil }
             let present = Set(self.threads.map(\.key))
             self.animate { self.threads += failed.filter { !present.contains($0.key) } }
+            onFailure?(failed)
         }
     }
 
@@ -888,8 +921,10 @@ final class NotificationsModel: ObservableObject {
     func show(
         _ threads: [NotificationThread], details: [NotificationThread.Key: NotificationSubjectDetail] = [:],
         settled: Set<NotificationThread.Key>? = nil, accounts: [String], links: [PullRequestKey: String] = [:],
-        lookedAt: Date? = nil, updated: Date = Date(), truncated: Set<String> = [], warning: String? = nil
+        lookedAt: Date? = nil, updated: Date = Date(), truncated: Set<String> = [], warning: String? = nil,
+        cleared: [NotificationThread] = []
     ) {
+        clearedAnswered = cleared
         self.threads = threads
         self.details = details
         self.settled = settled ?? Set(details.keys)

@@ -351,8 +351,13 @@ with the white primer/octicons `bell-24` glyph (MIT) at the pull-request glyph's
 size, drawn by `scripts/make-icon.swift --notifications` and built into
 `Resources/NotificationsIcon.icns` by `scripts/make-icns.sh`. Needs you means
 unread in To you, Via your teams, or Watching, except a review request whose pull
-request is already merged or closed; the Dock badge (none at zero, 999+ above
-999), menu title, menu bar item, header, bands, and lanes all count exactly that.
+request is already merged or closed, and a request, mention, or assignment the
+user already answered (reviewed, commented, merged, or closed after they were last
+asked); the Dock badge (none at zero, 999+ above 999), menu title, menu bar item,
+header, bands, and lanes all count exactly that. The primary copy marks answered
+threads done on GitHub, and the filter row reports them as a caption
+"Cleared N you'd answered" behind the checkmark.circle symbol, with the cleared
+threads in its tooltip.
 
 It reuses the Pull Requests window's drag strip and 56pt header: a title3 semibold
 "N need you" headline over a caption secondary summary (to you · via your teams ·

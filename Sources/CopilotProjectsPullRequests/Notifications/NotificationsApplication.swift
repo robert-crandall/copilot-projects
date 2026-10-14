@@ -59,6 +59,7 @@ final class NotificationsAppDelegate: NSObject, NSApplicationDelegate, NSWindowD
             workspace: ControlWorkspaceBridge(),
             host: .system(),
             writesState: primary,
+            clearsAnswered: primary,
             storageNote: NotificationsApplication.lockFailure,
             summaryURL: primary ? Paths.notificationsSummaryURL : nil,
             stateDirectory: Paths.notificationsStateDir,
