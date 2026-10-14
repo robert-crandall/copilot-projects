@@ -273,6 +273,8 @@ struct NotificationDetailsFetcher: Sendable {
         /// Threads GitHub answered for, with or without a subject it could show.
         var settled: Set<NotificationThread.Key>
         var viewerLogin: String?
+        /// Subjects GitHub reported an error inside, or may have; read them again.
+        var erred: Set<NotificationThread.Key> = []
     }
 
     /// Threads that ask something of the user need who was asked and whether
@@ -438,7 +440,10 @@ struct NotificationDetailsFetcher: Sendable {
                 guard let subject = answer.nodes["t\(index)"]??.issueOrPullRequest else { continue }
                 var detail = Self.detail(subject, viewer: result.viewerLogin)
                 // What GitHub failed to read may have asked again: it's never answered.
-                if answer.erred?.contains(index) != false { detail.viewerActedAt = nil }
+                if answer.erred?.contains(index) != false {
+                    detail.viewerActedAt = nil
+                    result.erred.insert(thread.key)
+                }
                 result.details[thread.key] = detail
             }
         }
