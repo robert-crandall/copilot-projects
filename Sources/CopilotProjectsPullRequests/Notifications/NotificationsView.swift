@@ -144,6 +144,7 @@ struct NotificationsView: View {
             "\(counts.watching.formatted()) watching",
         ]
         if counts.settled > 0 { parts.append("\(counts.settled.formatted()) already merged or closed") }
+        if counts.answered > 0 { parts.append("\(counts.answered.formatted()) you’ve answered") }
         if counts.quiet > 0 { parts.append("\(counts.quiet.formatted()) quiet") }
         if !model.accounts.isEmpty { parts.append(model.accounts.filter { !$0.isEmpty }.joined(separator: ", ")) }
         return parts.joined(separator: " · ")
@@ -180,6 +181,7 @@ struct NotificationsView: View {
             .disabled(model.phase != .loaded)
             Text("\(visibleCount.formatted()) of \(totalCount.formatted()) threads")
                 .monospacedDigit()
+            clearedNote
             Spacer(minLength: 8)
             refreshStatus
             switch model.workspace {
@@ -197,6 +199,34 @@ struct NotificationsView: View {
         .foregroundStyle(StudioStyle.secondaryText)
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
+    }
+
+    /// Threads marked done because the user had already answered them, so
+    /// nothing disappears without a trace.
+    @ViewBuilder
+    private var clearedNote: some View {
+        let cleared = model.clearedAnswered
+        if !cleared.isEmpty {
+            Label {
+                Text(cleared.count == 1 ? "Cleared 1 you’d answered" : "Cleared \(cleared.count.formatted()) you’d answered")
+                    .monospacedDigit()
+                    .lineLimit(1)
+            } icon: {
+                Image(systemName: "checkmark.circle")
+            }
+            .help(clearedHelp(cleared))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Cleared \(cleared.count) notifications you’d already answered")
+            .accessibilityHint(clearedHelp(cleared))
+        }
+    }
+
+    private func clearedHelp(_ cleared: [NotificationThread]) -> String {
+        var lines = ["Marked done on GitHub because you reviewed, replied, merged, or closed after you were last asked:"]
+        lines += cleared.prefix(10).map { "• \($0.shortName): \($0.title)" }
+        if cleared.count > 10 { lines.append("and \((cleared.count - 10).formatted()) more") }
+        lines.append("A new mention, request, or assignment brings a thread back. GitHub’s Done view keeps the rest.")
+        return lines.joined(separator: "\n")
     }
 
     @ViewBuilder
