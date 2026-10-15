@@ -273,11 +273,12 @@ struct NotificationsView: View {
         return lines.joined(separator: "\n")
     }
 
-    /// Which settled subjects stay out of the window, the badge, and banners.
+    /// What stays out of the window, the badge, and banners: CI, and settled subjects.
     private var hidingMenu: some View {
         let scope = model.scope
         return Menu {
             Section("Hide") {
+                Toggle("CI Activity", isOn: $model.hidesCIActivity)
                 Toggle("Merged Pull Requests", isOn: $model.hidesMergedPullRequests)
                 Toggle("Closed Pull Requests", isOn: $model.hidesClosedPullRequests)
                 Toggle("Closed Issues", isOn: $model.hidesClosedIssues)
@@ -288,16 +289,17 @@ struct NotificationsView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.visible)
         .fixedSize()
-        .help(scope.hidesAnyState
+        .help(scope.hidesAnything
               ? "Hidden threads stay in your GitHub inbox but don’t show here, count toward the badge, or raise banners."
-              : "Merged and closed pull requests and closed issues show here. Choose which to hide.")
-        .accessibilityLabel("Merged and closed threads")
+              : "CI, merged and closed pull requests, and closed issues show here. Choose which to hide.")
+        .accessibilityLabel("Hidden threads")
         .accessibilityValue(scope.hidingLabel)
     }
 
     /// What "N of M threads" leaves out, and why.
     static func countHelp(_ scoped: ScopedNotifications, owners: [String], unreadOnly: Bool) -> String {
         var parts: [String] = []
+        if scoped.hiddenCI > 0 { parts.append("\(scoped.hiddenCI.formatted()) CI") }
         if scoped.hiddenByState > 0 { parts.append("\(scoped.hiddenByState.formatted()) merged or closed") }
         if scoped.hiddenByOwner > 0 {
             parts.append("\(scoped.hiddenByOwner.formatted()) outside \(owners.joined(separator: ", "))")
@@ -417,6 +419,9 @@ struct NotificationsView: View {
                     } description: {
                         Text(Self.allHiddenDescription(scoped, owners: model.ownerList))
                     } actions: {
+                        if scoped.hiddenCI > 0 {
+                            Button("Show CI") { model.hidesCIActivity = false }
+                        }
                         if scoped.hiddenByState > 0 {
                             Button("Show Merged & Closed") {
                                 model.hidesMergedPullRequests = false
@@ -458,6 +463,9 @@ struct NotificationsView: View {
     /// Why nothing shows when everything loaded is out of scope.
     static func allHiddenDescription(_ scoped: ScopedNotifications, owners: [String]) -> String {
         var parts: [String] = []
+        if scoped.hiddenCI > 0 {
+            parts.append(scoped.hiddenCI == 1 ? "1 CI thread" : "\(scoped.hiddenCI.formatted()) CI threads")
+        }
         if scoped.hiddenByState > 0 {
             parts.append(scoped.hiddenByState == 1 ? "1 merged or closed thread" : "\(scoped.hiddenByState.formatted()) merged or closed threads")
         }
@@ -466,7 +474,7 @@ struct NotificationsView: View {
             parts.append("\(threads) outside \(owners.joined(separator: ", "))")
         }
         let verb = scoped.hidden == 1 ? "is" : "are"
-        return "\(parts.joined(separator: " and ")) \(verb) hidden. They stay in your GitHub inbox."
+        return "\(ListFormatter.localizedString(byJoining: parts)) \(verb) hidden. They stay in your GitHub inbox."
     }
 
     private func lanes(_ layout: NotificationLayout, order: [NotificationItem], now: Date, placeholder: Bool) -> some View {

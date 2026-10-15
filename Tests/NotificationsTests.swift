@@ -1595,13 +1595,18 @@ final class NotificationsTests: XCTestCase {
     }
 
     func testThePullDownAndNotesNameWhatIsHidden() {
-        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding merged & closed")
-        XCTAssertEqual(NotificationScope(hidesClosedIssues: false).hidingLabel, "Hiding merged & closed PRs")
-        XCTAssertEqual(NotificationScope(hidesClosedPullRequests: false).hidingLabel, "Hiding merged PRs & closed issues")
-        XCTAssertEqual(NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false).hidingLabel, "Hiding closed issues")
+        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding CI, merged & closed")
+        XCTAssertEqual(NotificationScope(hidesCIActivity: false).hidingLabel, "Hiding merged & closed")
+        XCTAssertEqual(NotificationScope(hidesClosedIssues: false, hidesCIActivity: false).hidingLabel, "Hiding merged & closed PRs")
+        XCTAssertEqual(NotificationScope(hidesClosedPullRequests: false, hidesCIActivity: false).hidingLabel, "Hiding merged PRs & closed issues")
+        XCTAssertEqual(NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false).hidingLabel, "Hiding CI, closed issues")
         XCTAssertEqual(
             NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false).hidingLabel,
-            "Showing merged & closed"
+            "Hiding CI"
+        )
+        XCTAssertEqual(
+            NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false, hidesCIActivity: false).hidingLabel,
+            "Showing everything"
         )
         let scoped = ScopedNotifications(
             [item("m", state: .merged), item("x", repo: "other/app", state: .open)], scope: NotificationScope(owners: ["octo"])
@@ -1612,6 +1617,25 @@ final class NotificationsTests: XCTestCase {
         )
         XCTAssertEqual(NotificationsView.countHelp(scoped, owners: ["octo"], unreadOnly: true),
                        "Hidden: 1 merged or closed · 1 outside octo\nRead threads are left out while Unread is on.")
+    }
+
+    func testCIIsHiddenByDefaultAndCanBeShown() {
+        let ci = NotificationItem(thread: thread("ci", "ci_activity", kind: .checkSuite, number: nil), detail: nil, detailsSettled: true)
+        let mention = item("m", state: .open)
+        var scope = NotificationScope()
+        var scoped = ScopedNotifications([ci, mention], scope: scope)
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["m"])
+        XCTAssertEqual(scoped.hiddenCI, 1)
+        XCTAssertEqual(scoped.total, 2)
+        XCTAssertEqual(NotificationsView.countHelp(scoped, owners: [], unreadOnly: false), "Hidden: 1 CI")
+        XCTAssertEqual(
+            NotificationsView.allHiddenDescription(ScopedNotifications([ci], scope: scope), owners: []),
+            "1 CI thread is hidden. They stay in your GitHub inbox."
+        )
+        scope.hidesCIActivity = false
+        scoped = ScopedNotifications([ci, mention], scope: scope)
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["ci", "m"])
+        XCTAssertEqual(scoped.hiddenCI, 0)
     }
 
     func testEmptyLanesSayNothingIsUnreadHiddenOrClearUntilEverySubjectIsPlaced() {
@@ -1670,11 +1694,14 @@ final class NotificationsTests: XCTestCase {
         model.owners = ""
         XCTAssertEqual(badge, "4")
         model.hidesClosedIssues = false
+        XCTAssertTrue(model.hidesCIActivity)
+        model.hidesCIActivity = false
 
         let relaunched = answeringModel(github, details: box, clears: false, clock: clock, defaults: defaults)
         XCTAssertFalse(relaunched.hidesMergedPullRequests)
         XCTAssertTrue(relaunched.hidesClosedPullRequests)
         XCTAssertFalse(relaunched.hidesClosedIssues)
+        XCTAssertFalse(relaunched.hidesCIActivity)
         XCTAssertEqual(relaunched.owners, "")
     }
 
@@ -1711,6 +1738,8 @@ final class NotificationsTests: XCTestCase {
             transcriptPath: { _ in nil }, clock: { clock.now }, isVisible: { false }
         )
         model.setBadge = { _ in }
+        // The CI thread is the control: something that never waits for a state.
+        model.hidesCIActivity = false
         probe.model = model
         await model.refreshNow()
         XCTAssertEqual(probe.seen, ["ci"], "the pull request waits while its state is read")

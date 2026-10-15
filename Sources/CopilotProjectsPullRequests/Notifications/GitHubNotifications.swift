@@ -514,17 +514,19 @@ struct NotificationCounts: Equatable, Sendable {
 }
 
 /// Which threads count at all: those in the chosen owners' repositories, less
-/// the merged and closed ones the user hides. What's out of scope stays in the
+/// CI and the merged and closed ones the user hides. What's out of scope stays in the
 /// GitHub inbox but never shows, badges, or raises a banner here.
 struct NotificationScope: Equatable, Sendable {
     var hidesMergedPullRequests = true
     var hidesClosedPullRequests = true
     var hidesClosedIssues = true
+    /// CI runs, which the Pull Requests window already covers.
+    var hidesCIActivity = true
     /// Organizations or users whose repositories count; empty means every owner.
     var owners: [String] = []
 
     enum Hidden: Equatable, Sendable {
-        case owner, mergedPullRequest, closedPullRequest, closedIssue
+        case owner, ciActivity, mergedPullRequest, closedPullRequest, closedIssue
     }
 
     /// Why a thread is out of scope; nil when it's in. A subject whose state
@@ -535,6 +537,7 @@ struct NotificationScope: Equatable, Sendable {
             let owner = item.thread.repository.split(separator: "/").first.map { $0.lowercased() } ?? ""
             if !owners.contains(where: { $0.lowercased() == owner }) { return .owner }
         }
+        if hidesCIActivity, item.lane == .ciActivity { return .ciActivity }
         guard let state = item.detail?.state, state.isSettled, item.stateIsCurrent || state == .merged else { return nil }
         switch item.thread.kind {
         case .pullRequest:
@@ -566,19 +569,22 @@ struct NotificationScope: Equatable, Sendable {
 
     /// The filter row's pull-down: what's hidden, in as few words as hold it.
     var hidingLabel: String {
+        let states: String?
         switch (hidesMergedPullRequests, hidesClosedPullRequests, hidesClosedIssues) {
-        case (true, true, true): return "Hiding merged & closed"
-        case (true, true, false): return "Hiding merged & closed PRs"
-        case (true, false, true): return "Hiding merged PRs & closed issues"
-        case (false, true, true): return "Hiding closed PRs & issues"
-        case (true, false, false): return "Hiding merged PRs"
-        case (false, true, false): return "Hiding closed PRs"
-        case (false, false, true): return "Hiding closed issues"
-        case (false, false, false): return "Showing merged & closed"
+        case (true, true, true): states = "merged & closed"
+        case (true, true, false): states = "merged & closed PRs"
+        case (true, false, true): states = "merged PRs & closed issues"
+        case (false, true, true): states = "closed PRs & issues"
+        case (true, false, false): states = "merged PRs"
+        case (false, true, false): states = "closed PRs"
+        case (false, false, true): states = "closed issues"
+        case (false, false, false): states = nil
         }
+        let hidden = [hidesCIActivity ? "CI" : nil, states].compactMap { $0 }
+        return hidden.isEmpty ? "Showing everything" : "Hiding " + hidden.joined(separator: ", ")
     }
 
-    var hidesAnyState: Bool { hidesMergedPullRequests || hidesClosedPullRequests || hidesClosedIssues }
+    var hidesAnything: Bool { hidesMergedPullRequests || hidesClosedPullRequests || hidesClosedIssues || hidesCIActivity }
 }
 
 /// Every loaded thread sorted by scope: what shows, what's hidden and why, and
@@ -587,17 +593,20 @@ struct ScopedNotifications: Equatable {
     var shown: [NotificationItem] = []
     /// Merged or closed subjects the user hides.
     var hiddenByState = 0
+    /// CI runs the user hides.
+    var hiddenCI = 0
     /// Threads in repositories outside the chosen owners.
     var hiddenByOwner = 0
     /// Subjects whose state is being read for the first time and might be hidden.
     var pending = 0
-    var total: Int { shown.count + hiddenByState + hiddenByOwner + pending }
-    var hidden: Int { hiddenByState + hiddenByOwner }
+    var total: Int { shown.count + hidden + pending }
+    var hidden: Int { hiddenByState + hiddenCI + hiddenByOwner }
 
     init(_ items: [NotificationItem], scope: NotificationScope, isPending: (NotificationItem) -> Bool = { _ in false }) {
         for item in items {
             switch scope.hidden(item) {
             case .owner: hiddenByOwner += 1
+            case .ciActivity: hiddenCI += 1
             case .mergedPullRequest, .closedPullRequest, .closedIssue: hiddenByState += 1
             case nil:
                 if scope.mightHide(item), isPending(item) {
