@@ -357,8 +357,9 @@ user already answered (reviewed, commented, merged, or closed after they were la
 asked); the Dock badge (none at zero, 999+ above 999), menu title, menu bar item,
 header, bands, and lanes all count exactly that, within the window's scope. The
 scope keeps threads from repositories in the chosen owners (empty means every
-owner) and, by default, drops CI activity (the Pull Requests window covers it) and
-merged and closed pull requests and closed issues;
+owner) and, by default, drops CI activity and activity on the user's own pull
+requests (the Pull Requests window covers both; a mention or review request on one
+still shows) and merged and closed pull requests and closed issues;
 what's out of scope stays in the GitHub inbox (unless already answered, which
 still clears it) but never shows, badges, banners, or counts here. A subject whose
 state isn't known is never hidden for it, nor is one last read closed for an
@@ -379,8 +380,8 @@ checkboxes and, when System Settings denies banners, a note behind the native
 orange symbol with Open Notification Settings, then Refresh (Command-R). A caption
 secondary filter row follows: an Unread | All segmented picker (opening on All,
 disabled until loaded), a native borderless pull-down at the picker's control size
-naming what it hides ("Hiding CI, merged & closed", down to "Showing everything")
-with a Hide section of CI Activity, Merged Pull Requests, Closed Pull Requests, and Closed Issues
+naming what it hides ("Hiding CI, your PRs, merged & closed", down to "Showing everything")
+with a Hide section of CI Activity, Your Pull Requests, Merged Pull Requests, Closed Pull Requests, and Closed Issues
 checkmarks (each kept in `notifications.hides…`), "N of M threads" (M counts every
 loaded thread; its tooltip names what's hidden and why), and trailing refresh progress, a "GitHub
 checked" relative time that never wraps, or "Copilot Projects unavailable · sessions not linked".

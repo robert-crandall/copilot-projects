@@ -89,6 +89,7 @@ final class NotificationsModel: ObservableObject {
     static let hidesClosedPullRequestsKey = "notifications.hidesClosedPullRequests"
     static let hidesClosedIssuesKey = "notifications.hidesClosedIssues"
     static let hidesCIActivityKey = "notifications.hidesCIActivity"
+    static let hidesYourPullRequestsKey = "notifications.hidesYourPullRequests"
 
     @Published private(set) var threads: [NotificationThread] = []
     @Published private(set) var details: [NotificationThread.Key: NotificationSubjectDetail] = [:]
@@ -132,6 +133,9 @@ final class NotificationsModel: ObservableObject {
     }
     @Published var hidesCIActivity: Bool {
         didSet { scopeChanged(hidesCIActivity, Self.hidesCIActivityKey) }
+    }
+    @Published var hidesYourPullRequests: Bool {
+        didSet { scopeChanged(hidesYourPullRequests, Self.hidesYourPullRequestsKey) }
     }
     /// While subject details are being read, counts may still include requests
     /// that turn out to be for a team or already merged; nothing is published.
@@ -257,6 +261,7 @@ final class NotificationsModel: ObservableObject {
         hidesClosedPullRequests = defaults.object(forKey: Self.hidesClosedPullRequestsKey) as? Bool ?? true
         hidesClosedIssues = defaults.object(forKey: Self.hidesClosedIssuesKey) as? Bool ?? true
         hidesCIActivity = defaults.object(forKey: Self.hidesCIActivityKey) as? Bool ?? true
+        hidesYourPullRequests = defaults.object(forKey: Self.hidesYourPullRequestsKey) as? Bool ?? true
         // Old actions are kept until threads are on hand to judge them by.
         for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
             let parts = name.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
@@ -306,7 +311,8 @@ final class NotificationsModel: ObservableObject {
     var scope: NotificationScope {
         NotificationScope(
             hidesMergedPullRequests: hidesMergedPullRequests, hidesClosedPullRequests: hidesClosedPullRequests,
-            hidesClosedIssues: hidesClosedIssues, hidesCIActivity: hidesCIActivity, owners: ownerList
+            hidesClosedIssues: hidesClosedIssues, hidesCIActivity: hidesCIActivity,
+            hidesYourPullRequests: hidesYourPullRequests, owners: ownerList
         )
     }
 

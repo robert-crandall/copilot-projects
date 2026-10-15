@@ -522,11 +522,13 @@ struct NotificationScope: Equatable, Sendable {
     var hidesClosedIssues = true
     /// CI runs, which the Pull Requests window already covers.
     var hidesCIActivity = true
+    /// Activity on the user's own pull requests, which the Pull Requests window covers too.
+    var hidesYourPullRequests = true
     /// Organizations or users whose repositories count; empty means every owner.
     var owners: [String] = []
 
     enum Hidden: Equatable, Sendable {
-        case owner, ciActivity, mergedPullRequest, closedPullRequest, closedIssue
+        case owner, ciActivity, yourPullRequest, mergedPullRequest, closedPullRequest, closedIssue
     }
 
     /// Why a thread is out of scope; nil when it's in. A subject whose state
@@ -538,6 +540,8 @@ struct NotificationScope: Equatable, Sendable {
             if !owners.contains(where: { $0.lowercased() == owner }) { return .owner }
         }
         if hidesCIActivity, item.lane == .ciActivity { return .ciActivity }
+        // A mention or review request on it still asks something of the user, so only its activity goes.
+        if hidesYourPullRequests, item.lane == .yourWork, item.thread.kind == .pullRequest { return .yourPullRequest }
         guard let state = item.detail?.state, state.isSettled, item.stateIsCurrent || state == .merged else { return nil }
         switch item.thread.kind {
         case .pullRequest:
@@ -580,11 +584,13 @@ struct NotificationScope: Equatable, Sendable {
         case (false, false, true): states = "closed issues"
         case (false, false, false): states = nil
         }
-        let hidden = [hidesCIActivity ? "CI" : nil, states].compactMap { $0 }
+        let hidden = [hidesCIActivity ? "CI" : nil, hidesYourPullRequests ? "your PRs" : nil, states].compactMap { $0 }
         return hidden.isEmpty ? "Showing everything" : "Hiding " + hidden.joined(separator: ", ")
     }
 
-    var hidesAnything: Bool { hidesMergedPullRequests || hidesClosedPullRequests || hidesClosedIssues || hidesCIActivity }
+    var hidesAnything: Bool {
+        hidesMergedPullRequests || hidesClosedPullRequests || hidesClosedIssues || hidesCIActivity || hidesYourPullRequests
+    }
 }
 
 /// Every loaded thread sorted by scope: what shows, what's hidden and why, and
@@ -595,18 +601,21 @@ struct ScopedNotifications: Equatable {
     var hiddenByState = 0
     /// CI runs the user hides.
     var hiddenCI = 0
+    /// Activity on the user's own pull requests they hide.
+    var hiddenYourPullRequests = 0
     /// Threads in repositories outside the chosen owners.
     var hiddenByOwner = 0
     /// Subjects whose state is being read for the first time and might be hidden.
     var pending = 0
     var total: Int { shown.count + hidden + pending }
-    var hidden: Int { hiddenByState + hiddenCI + hiddenByOwner }
+    var hidden: Int { hiddenByState + hiddenCI + hiddenYourPullRequests + hiddenByOwner }
 
     init(_ items: [NotificationItem], scope: NotificationScope, isPending: (NotificationItem) -> Bool = { _ in false }) {
         for item in items {
             switch scope.hidden(item) {
             case .owner: hiddenByOwner += 1
             case .ciActivity: hiddenCI += 1
+            case .yourPullRequest: hiddenYourPullRequests += 1
             case .mergedPullRequest, .closedPullRequest, .closedIssue: hiddenByState += 1
             case nil:
                 if scope.mightHide(item), isPending(item) {
