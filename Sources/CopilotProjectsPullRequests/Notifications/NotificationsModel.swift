@@ -187,7 +187,9 @@ final class NotificationsModel: ObservableObject {
     /// threads among read ones, so only this keeps them out of a fresh start.
     private var confirmedDone: [NotificationThread.Key: Date] = [:]
     /// Threads marked read here, kept read across refreshes racing the request.
-    private var readLocally: [NotificationThread.Key: Date] = [:]
+    /// Only the latest read of a thread may undo it, so a stale failure can't.
+    private var readLocally: [NotificationThread.Key: (covers: Date, by: Int)] = [:]
+    private var reads = 0
     /// Per thread, reads sent here that GitHub hasn't answered yet.
     private var readsInFlight: [NotificationThread.Key: Int] = [:]
     private var lookStarted: Date?
@@ -539,7 +541,7 @@ final class NotificationsModel: ObservableObject {
                     if confirmedDone.removeValue(forKey: thread.key) != nil { confirmedDoneChanged = true }
                 }
                 if let read = readLocally[thread.key] {
-                    if thread.updatedAt <= read { thread.unread = false } else { readLocally[thread.key] = nil }
+                    if thread.updatedAt <= read.covers { thread.unread = false } else { readLocally[thread.key] = nil }
                 }
                 merged.append(thread)
             }
@@ -851,9 +853,11 @@ final class NotificationsModel: ObservableObject {
         guard !targets.isEmpty else { return }
         noteActed(targets)
         let now = clock()
+        reads += 1
+        let read = reads
         // A copy dated ahead of this clock is covered too, as for Done.
         for thread in targets {
-            readLocally[thread.key] = max(now, thread.updatedAt)
+            readLocally[thread.key] = (max(now, thread.updatedAt), read)
             readSent(thread.key)
         }
         update(targets.map(\.key)) { $0.unread = false }
@@ -861,11 +865,11 @@ final class NotificationsModel: ObservableObject {
             self?.readTaken(thread.key, covers: max(now, thread.updatedAt))
         }) { [weak self] failed in
             guard let self else { return }
-            for thread in failed {
-                self.readLocally[thread.key] = nil
-                self.readAnswered(thread.key)
-            }
-            self.update(failed.map(\.key)) { $0.unread = true }
+            for thread in failed { self.readAnswered(thread.key) }
+            // A newer copy, or a later read of it, has moved on: leave that be.
+            let undone = failed.filter { self.readLocally[$0.key]?.by == read }
+            for thread in undone { self.readLocally[thread.key] = nil }
+            self.update(undone.map(\.key)) { $0.unread = true }
         }
     }
 
@@ -949,7 +953,13 @@ final class NotificationsModel: ObservableObject {
             let restored = failed.filter { self.doneLocally[$0.key]?.by == removal }
             for thread in restored { self.doneLocally[thread.key] = nil }
             let present = Set(self.threads.map(\.key))
-            self.animate { self.threads += restored.filter { !present.contains($0.key) } }
+            // A read GitHub may have taken meanwhile, from its banner, still covers the copy.
+            let returning = restored.filter { !present.contains($0.key) }.map { thread in
+                var thread = thread
+                if let read = self.readLocally[thread.key], thread.updatedAt <= read.covers { thread.unread = false }
+                return thread
+            }
+            self.animate { self.threads += returning }
             onFailure?(failed)
         }
     }
@@ -1130,14 +1140,16 @@ final class NotificationsModel: ObservableObject {
 
     private func markRead(key: NotificationThread.Key) {
         let now = clock()
-        readLocally[key] = now
+        reads += 1
+        let read = reads
+        readLocally[key] = (now, read)
         readSent(key)
         let api = api
         Task { [weak self] in
             guard let self else { return }
             guard let account = (try? await self.accountsForRefresh())?.first(where: { $0.login == key.account }) else {
-                self.readLocally[key] = nil
                 self.readAnswered(key)
+                if self.readLocally[key]?.by == read { self.readLocally[key] = nil }
                 return
             }
             do {
@@ -1145,9 +1157,12 @@ final class NotificationsModel: ObservableObject {
                 self.readTaken(key, covers: now)
             } catch {
                 self.readAnswered(key)
-                self.readLocally[key] = nil
-                // A refresh may have loaded it, read, in the meantime.
-                self.update([key]) { $0.unread = true }
+                // A newer copy, or a later read of it, has moved on: leave that be.
+                if self.readLocally[key]?.by == read {
+                    self.readLocally[key] = nil
+                    // A refresh may have loaded it, read, in the meantime.
+                    self.update([key]) { $0.unread = true }
+                }
                 self.warning = "Couldn’t mark a notification as read. \(error.localizedDescription)"
             }
         }

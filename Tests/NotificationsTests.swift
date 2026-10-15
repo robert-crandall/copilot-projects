@@ -850,6 +850,73 @@ final class NotificationsTests: XCTestCase {
         XCTAssertFalse(sinceYouLooked(model).contains("99"))
     }
 
+    func testAFailedDoneComesBackReadAfterABannerReadGitHubTook() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
+        let model = makeModel(github, clock: TestClock(now))
+        await model.refreshNow()
+        github.holdNextAction("1")
+        model.markDone(model.items)
+        try await waitUntil { github.isHolding("1") }
+
+        // Its banner, clicked while the Done is in flight, reads it on GitHub.
+        model.openBanner(thread: .init(account: "octocat", id: "1"), url: URL(string: "https://github.com/octo/app/issues/1")!)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") && model.actedAt.isEmpty }
+
+        github.fail("DELETE")
+        github.release("1")
+        try await waitUntil { !model.threads.isEmpty }
+        XCTAssertEqual(model.threads.map(\.unread), [false])
+        XCTAssertFalse(sinceYouLooked(model).contains("1"))
+    }
+
+    func testAnOlderReadFailingLeavesANewerReadGitHubTook() async throws {
+        let github = FakeGitHub()
+        let clock = TestClock(now)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
+        let model = makeModel(github, clock: clock)
+        await model.refreshNow()
+        github.holdNextAction("1")
+        model.markRead(model.items)
+        try await waitUntil { github.isHolding("1") }
+
+        // Something new lands, and that copy is read too, before the first read fails.
+        clock.now += 60
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: clock.now)]])
+        await model.refreshNow()
+        clock.now += 60
+        model.markRead(model.items)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") && model.actedAt.isEmpty }
+
+        github.fail("PATCH")
+        github.release("1")
+        try await waitUntil { model.warning != nil }
+        XCTAssertEqual(model.threads.map(\.unread), [false])
+        XCTAssertFalse(sinceYouLooked(model).contains("1"))
+    }
+
+    func testAnOlderBannerReadFailingLeavesANewerReadGitHubTook() async throws {
+        let github = FakeGitHub()
+        let clock = TestClock(now)
+        let model = makeModel(github, clock: clock)
+        github.holdNextAction("99")
+        model.openBanner(thread: .init(account: "octocat", id: "99"), url: URL(string: "https://github.com/octo/app/issues/9")!)
+        try await waitUntil { github.isHolding("99") }
+
+        // It loads with something newer than the banner read covers, and is read here.
+        clock.now += 60
+        github.answer("participating", pages: [[FakeGitHub.thread("99", reason: "mention", type: "Issue", number: 9, updated: clock.now)]])
+        await model.refreshNow()
+        model.markRead(model.items)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/99") && model.actedAt.isEmpty }
+
+        github.fail("PATCH")
+        github.release("99")
+        try await waitUntil { model.warning != nil }
+        XCTAssertEqual(model.threads.map(\.unread), [false])
+        XCTAssertFalse(sinceYouLooked(model).contains("99"))
+    }
+
     func testActionsAreRememberedForAnAccountWithoutALogin() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let baseline = now.addingTimeInterval(-3600)
