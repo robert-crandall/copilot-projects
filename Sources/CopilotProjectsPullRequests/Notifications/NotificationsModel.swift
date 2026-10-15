@@ -804,8 +804,8 @@ final class NotificationsModel: ObservableObject {
                 if thread.updatedAt <= at, thread.unread || readsInFlight[key] != nil { kept[key] = at }
             } else if confirmedDone[key] != nil {
                 continue
-            } else if doneLocally[key] != nil || at >= horizon {
-                // A Done still in flight brings the thread back if it fails.
+            } else if doneLocally[key] != nil || readsInFlight[key] != nil || at >= horizon {
+                // A Done or read still in flight brings the thread back if it fails.
                 kept[key] = at
             } else if truncatedAccounts.contains(key.account) {
                 outOfReach[key.account, default: []].append((key, at))

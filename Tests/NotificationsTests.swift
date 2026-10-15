@@ -817,6 +817,39 @@ final class NotificationsTests: XCTestCase {
         XCTAssertFalse(sinceYouLooked(model).contains("1"))
     }
 
+    func testABannerReadInFlightKeepsAnOldActionOutOfReachPastTheCap() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        // The oldest action out of reach, behind a full cap of newer ones.
+        var stored: [String: Double] = ["octocat|99": now.addingTimeInterval(-10 * 86_400).timeIntervalSince1970]
+        for index in 0..<NotificationsModel.actedOffHandLimit {
+            stored["octocat|gone\(index)"] = now.addingTimeInterval(-8 * 86_400 - Double(index + 1) * 60).timeIntervalSince1970
+        }
+        defaults.set(stored, forKey: NotificationsModel.actedAtKey)
+        github.answer("participating", pages: [
+            [FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-60))],
+            [FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-120))],
+        ])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults, plan: NotificationsFetchPlan(participatingPages: 1))
+        github.holdNextAction("99")
+        model.openBanner(thread: .init(account: "octocat", id: "99"), url: URL(string: "https://github.com/octo/app/issues/9")!)
+        try await waitUntil { github.isHolding("99") }
+        await model.refreshNow()
+        XCTAssertEqual(model.truncatedAccounts, ["octocat"])
+        XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "99")], "the read may yet fail")
+
+        // It fails, and the thread comes back into reach unchanged: not new to you.
+        github.fail("PATCH")
+        github.release("99")
+        try await waitUntil { model.warning != nil }
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("99", reason: "mention", type: "Issue", number: 9, updated: now.addingTimeInterval(-11 * 86_400)),
+        ]])
+        await model.refreshNow()
+        XCTAssertEqual(model.items.map(\.id.id), ["99"])
+        XCTAssertFalse(sinceYouLooked(model).contains("99"))
+    }
+
     func testActionsAreRememberedForAnAccountWithoutALogin() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let baseline = now.addingTimeInterval(-3600)
