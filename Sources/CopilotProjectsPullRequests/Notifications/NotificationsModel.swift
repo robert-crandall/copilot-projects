@@ -229,7 +229,7 @@ final class NotificationsModel: ObservableObject {
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
         // Old actions are kept until threads are on hand to judge them by.
         for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
-            let parts = name.split(separator: "|", maxSplits: 1).map(String.init)
+            let parts = name.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 2 else { continue }
             actedAt[NotificationThread.Key(account: parts[0], id: parts[1])] = Date(timeIntervalSince1970: at)
         }

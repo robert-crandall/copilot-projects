@@ -609,6 +609,20 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(sinceYouLooked(model), ["4"])
     }
 
+    func testActionsAreRememberedForAnAccountWithoutALogin() {
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let baseline = now.addingTimeInterval(-3600)
+        // An older gh names no account.
+        let acted = thread("1", "mention", account: "")
+        let first = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
+        first.show([acted], accounts: [""], lookedAt: baseline)
+        first.noteActed([acted])
+
+        let restarted = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
+        restarted.show([acted], accounts: [""], lookedAt: baseline)
+        XCTAssertEqual(sinceYouLooked(restarted), [])
+    }
+
     func testTheFirstLookStartsFromTheLastReadOnGitHub() async {
         let github = FakeGitHub()
         var read = FakeGitHub.thread("1", reason: "author", type: "Issue", unread: false, updated: now.addingTimeInterval(-7200))
