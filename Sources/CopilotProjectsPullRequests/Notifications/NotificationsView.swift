@@ -143,7 +143,7 @@ struct NotificationsView: View {
             "\(counts.viaTeams.formatted()) via your teams",
             "\(counts.watching.formatted()) watching",
         ]
-        if counts.settled > 0 { parts.append("\(counts.settled.formatted()) already merged or closed") }
+        if counts.settled > 0 { parts.append("\(counts.settled.formatted()) already merged, closed, or withdrawn") }
         if counts.answered > 0 { parts.append("\(counts.answered.formatted()) you’ve answered") }
         if counts.quiet > 0 { parts.append("\(counts.quiet.formatted()) quiet") }
         if !model.accounts.isEmpty { parts.append(model.accounts.filter { !$0.isEmpty }.joined(separator: ", ")) }
@@ -598,12 +598,12 @@ struct NotificationsView: View {
     }
 
     /// Bands and lanes count what the Dock badge counts; unread threads already
-    /// merged or closed are named apart, and quiet ones are only unread.
+    /// merged, closed, or withdrawn are named apart, and quiet ones are only unread.
     static func countText(needsYou: Int, settled: Int, unread: Int, needsYouBand: Bool) -> String? {
         guard needsYouBand else { return unread > 0 ? "\(unread.formatted()) unread" : nil }
         var parts: [String] = []
         if needsYou > 0 { parts.append(needsYou == 1 ? "1 needs you" : "\(needsYou.formatted()) need you") }
-        if settled > 0 { parts.append("\(settled.formatted()) merged or closed") }
+        if settled > 0 { parts.append("\(settled.formatted()) merged, closed, or withdrawn") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
@@ -729,7 +729,7 @@ struct NotificationChip: View {
     }
 
     /// Orange for unread threads that need you, quiet for unread CI and threads
-    /// already merged or closed, nothing once read. Hover only strengthens a quiet edge; selection
+    /// already merged, closed, or withdrawn, nothing once read. Hover only strengthens a quiet edge; selection
     /// adds its own ring outside, so the edge stays visible.
     private var edge: Color {
         if item.needsYou { return .orange.opacity(0.85) }

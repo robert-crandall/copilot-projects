@@ -295,9 +295,23 @@ struct NotificationSubjectDetail: Equatable, Sendable {
     var viewerActedAt: Date?
     /// The user acted after the last time anything asked for them.
     var answered = false
+    /// Review requests still open, as lowercased logins and `org/slug` teams;
+    /// nil when they weren't all read.
+    var pendingReviewers: Set<String>?
+    /// No open review request reaches the user or a team they might be on.
+    var withdrawn = false
 
     /// The team to name on a team review request.
     var teamToName: String? { viewerTeam ?? requestedTeams.first }
+
+    /// Whether every review request that could reach the user is gone: the open
+    /// requests were read whole and name neither them nor a team they're on.
+    /// `onTeam` answers nil when membership isn't known; such a team counts as
+    /// theirs, so an unknown never hides a request.
+    func isWithdrawn(viewer: String, onTeam: (String) -> Bool?) -> Bool {
+        guard !viewer.isEmpty, let pendingReviewers, !pendingReviewers.contains(viewer.lowercased()) else { return false }
+        return !pendingReviewers.contains { $0.contains("/") && onTeam($0) != false }
+    }
 
     /// Whether the user's last action came after the last thing aimed at them:
     /// a mention, assignment, or review request to them, or a mention of or
@@ -330,12 +344,13 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     /// last asked; later activity by others doesn't ask again.
     var isAnswered: Bool { Self.answerableReasons.contains(thread.reason) && detail?.answered == true }
 
-    /// A review request whose pull request is already merged or closed: there's
-    /// nothing left to review. Mentions and other activity on a closed thread
-    /// can still need an answer, so they're never settled this way.
+    /// A review request whose pull request is already merged or closed, or
+    /// whose request was withdrawn: there's nothing left to review. Mentions
+    /// and other activity on a closed thread can still need an answer, so
+    /// they're never settled this way.
     var isSettled: Bool {
         (lane == .reviewRequested || lane == .teamReviewRequested) && thread.reason == .reviewRequested
-            && detail?.state?.isSettled == true
+            && (detail?.state?.isSettled == true || detail?.withdrawn == true)
     }
     /// Unread, in a band that needs the user, still open to act on, and not answered.
     var needsYou: Bool { thread.unread && lane.band.needsYou && !isSettled && !isAnswered }
@@ -396,7 +411,7 @@ struct NotificationLayout: Equatable {
         var unreadCount: Int { items.filter(\.thread.unread).count }
         /// Counted as the Dock badge counts them.
         var needsYouCount: Int { items.filter(\.needsYou).count }
-        /// Unread, but its pull request or issue is already merged or closed.
+        /// Unread, but its pull request is already merged or closed, or the request withdrawn.
         var settledCount: Int { items.filter { $0.thread.unread && $0.isSettled && $0.lane.band.needsYou }.count }
 
         func items(in column: NotificationFreshness, lookedAt: Date?, now: Date) -> [NotificationItem] {
@@ -447,7 +462,7 @@ struct NotificationCounts: Equatable, Sendable {
     var viaTeams = 0
     var watching = 0
     var quiet = 0
-    /// Unread threads whose pull request or issue is already merged or closed.
+    /// Unread review requests whose pull request is already merged or closed, or whose request was withdrawn.
     var settled = 0
     /// Unread threads the user already answered.
     var answered = 0
