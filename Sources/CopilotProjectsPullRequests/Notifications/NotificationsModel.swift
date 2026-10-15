@@ -77,6 +77,8 @@ final class NotificationsModel: ObservableObject {
     static let lookedAtKey = "notifications.lookedAt"
     static let bannerHighWaterKey = "notifications.bannerHighWaters"
     static let menuBarCountKey = "notifications.menuBarCount"
+    /// `account|thread id` → the latest `updatedAt` a confirmed done covers.
+    static let doneThreadsKey = "notifications.doneThreads"
 
     @Published private(set) var threads: [NotificationThread] = []
     @Published private(set) var details: [NotificationThread.Key: NotificationSubjectDetail] = [:]
@@ -155,6 +157,9 @@ final class NotificationsModel: ObservableObject {
     /// removal of a thread may undo it, so a stale failure can't revive it.
     private var doneLocally: [NotificationThread.Key: (covers: Date, by: Int)] = [:]
     private var removals = 0
+    /// Dones GitHub accepted, kept across launches: GitHub keeps listing done
+    /// threads among read ones, so only this keeps them out of a fresh start.
+    private var confirmedDone: [NotificationThread.Key: Date] = [:]
     /// Threads marked read here, kept read across refreshes racing the request.
     private var readLocally: [NotificationThread.Key: Date] = [:]
     private var lookStarted: Date?
@@ -224,6 +229,16 @@ final class NotificationsModel: ObservableObject {
         bannersToYou = defaults.object(forKey: Self.bannerKey(.toYou)) as? Bool ?? true
         bannersViaTeams = defaults.object(forKey: Self.bannerKey(.viaTeams)) as? Bool ?? true
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
+        let horizon = clock().addingTimeInterval(-plan.readWindow)
+        for (name, covers) in (defaults.dictionary(forKey: Self.doneThreadsKey) as? [String: Double]) ?? [:] {
+            // An older gh's account has an empty login, so its keys start with "|".
+            let parts = name.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let date = Date(timeIntervalSince1970: covers)
+            guard parts.count == 2, date >= horizon else { continue }
+            let key = NotificationThread.Key(account: parts[0], id: parts[1])
+            confirmedDone[key] = date
+            doneLocally[key] = (date, 0)
+        }
     }
 
     deinit {
@@ -239,8 +254,12 @@ final class NotificationsModel: ObservableObject {
         return threads.map { thread in
             let session = thread.pullRequestKey.flatMap { links[$0] }.flatMap { sessions[$0] }
             var detail = details[thread.key]
-            // Answered holds only for the copy it was judged on; anything newer may ask again.
-            if detailVersions[thread.key] != thread.updatedAt { detail?.answered = false }
+            // Answered and withdrawn hold only for the copy they were judged on;
+            // anything newer may ask again.
+            if detailVersions[thread.key] != thread.updatedAt {
+                detail?.answered = false
+                detail?.withdrawn = false
+            }
             return NotificationItem(
                 thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), session: session
             )
@@ -447,11 +466,14 @@ final class NotificationsModel: ObservableObject {
     private func apply(_ fetched: [String: NotificationsFetchPlan.Result], accounts: [GitHubAccount], started: Date) {
         let known = Set(accounts.map(\.login))
         var merged = threads.filter { fetched[$0.account] == nil && known.contains($0.account) }
+        var confirmedDoneChanged = false
+        defer { if confirmedDoneChanged { saveConfirmedDone() } }
         for (_, result) in fetched {
             for var thread in result.threads {
                 if let done = doneLocally[thread.key] {
                     if thread.updatedAt <= done.covers { continue }
                     doneLocally[thread.key] = nil
+                    if confirmedDone.removeValue(forKey: thread.key) != nil { confirmedDoneChanged = true }
                 }
                 if let read = readLocally[thread.key] {
                     if thread.updatedAt <= read { thread.unread = false } else { readLocally[thread.key] = nil }
@@ -487,7 +509,9 @@ final class NotificationsModel: ObservableObject {
             let result = await detailsFetcher.details(for: threads, account: account)
             var answered = result.details
             if let login = result.viewerLogin {
-                let teamNames = answered.values.flatMap { $0.requestedTeams + $0.teamTargetedAt.keys }
+                let teamNames = answered.values.flatMap {
+                    $0.requestedTeams + $0.teamTargetedAt.keys + ($0.pendingReviewers ?? []).filter { $0.contains("/") }
+                }
                 let organizations = Set(teamNames.compactMap { $0.split(separator: "/").first.map { String($0).lowercased() } })
                 for organization in organizations {
                     let key = "\(account.login)|\(organization)"
@@ -503,13 +527,19 @@ final class NotificationsModel: ObservableObject {
                     }
                 }
             }
+            let onTeam: (String) -> Bool? = { team in
+                let organization = team.split(separator: "/").first.map(String.init) ?? ""
+                guard let known = self.viewerTeams["\(account.login)|\(organization)"] else { return nil }
+                if known.teams.contains(team) { return true }
+                // Not on the list says not on the team only if the list was whole and recent.
+                return known.complete && now.timeIntervalSince(known.readAt) < Self.teamsLifetime ? false : nil
+            }
             for (key, detail) in answered {
-                answered[key]?.answered = detail.isAnswered { team in
-                    let organization = team.split(separator: "/").first.map(String.init) ?? ""
-                    guard let known = viewerTeams["\(account.login)|\(organization)"] else { return nil }
-                    if known.teams.contains(team) { return true }
-                    // Not on the list says not on the team only if the list was whole and recent.
-                    return known.complete && now.timeIntervalSince(known.readAt) < Self.teamsLifetime ? false : nil
+                let isAnswered = detail.isAnswered(onTeam: onTeam)
+                answered[key]?.answered = isAnswered
+                // Reviewing also takes the user off the open requests; that's answered, not withdrawn.
+                if !isAnswered, let login = result.viewerLogin {
+                    answered[key]?.withdrawn = detail.isWithdrawn(viewer: login, onTeam: onTeam)
                 }
             }
             let versions = Dictionary(uniqueKeysWithValues: threads.map { ($0.key, $0.updatedAt) })
@@ -764,7 +794,13 @@ final class NotificationsModel: ObservableObject {
         }
         animate { self.threads.removeAll { keys.contains($0.key) } }
         publish()
-        perform(targets, verb: verb, action: action) { [weak self] failed in
+        perform(targets, verb: verb, action: action, succeeded: { [weak self] thread in
+            // Remembered across launches once GitHub has it, unless a newer copy
+            // or a later removal of it has moved on meanwhile.
+            guard let self, let entry = self.doneLocally[thread.key], entry.by == removal else { return }
+            self.confirmedDone[thread.key] = entry.covers
+            self.saveConfirmedDone()
+        }) { [weak self] failed in
             guard let self else { return }
             // A newer copy, or a later removal of it, has moved on: leave that be.
             let restored = failed.filter { self.doneLocally[$0.key]?.by == removal }
@@ -775,9 +811,23 @@ final class NotificationsModel: ObservableObject {
         }
     }
 
+    /// Writes the confirmed dones, dropping those older than the read pass reaches:
+    /// a thread they cover can only come back newer, and then it's shown anyway.
+    private func saveConfirmedDone() {
+        let horizon = clock().addingTimeInterval(-plan.readWindow)
+        confirmedDone = confirmedDone.filter { $0.value >= horizon }
+        guard writesState else { return }
+        let stored = Dictionary(
+            confirmedDone.map { ("\($0.key.account)|\($0.key.id)", $0.value.timeIntervalSince1970) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        defaults.set(stored, forKey: Self.doneThreadsKey)
+    }
+
     private func perform(
         _ targets: [NotificationThread], verb: String,
         action: @escaping @Sendable (GitHubNotificationsAPI, GitHubAccount, String) async throws -> Void,
+        succeeded onSuccess: ((NotificationThread) -> Void)? = nil,
         rollback: @escaping ([NotificationThread]) -> Void
     ) {
         let api = api
@@ -809,7 +859,11 @@ final class NotificationsModel: ObservableObject {
                         }
                     }
                     var results: [(NotificationThread, String?)] = []
-                    for await result in group { results.append(result) }
+                    for await result in group {
+                        // Each success lands as it comes, so one that stalls holds none back.
+                        if result.1 == nil { onSuccess?(result.0) }
+                        results.append(result)
+                    }
                     return results
                 }
                 for (thread, error) in results where error != nil {
