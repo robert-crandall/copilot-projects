@@ -1004,17 +1004,23 @@ final class AppModel: ObservableObject {
         alert.informativeText = message
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.stringValue = transform?(initialText) ?? initialText
-        let observer = transform.map { transform in
+        var previousValue = field.stringValue
+        let observer = transform.map { _ in
             NotificationCenter.default.addObserver(
                 forName: NSControl.textDidChangeNotification,
                 object: field,
                 queue: .main
             ) { _ in
                 MainActor.assumeIsolated {
-                    let updated = transform(field.stringValue)
-                    if updated != field.stringValue {
+                    let current = field.stringValue
+                    let updated = PullRequestReviewTarget.trimmingPastedFragment(
+                        from: previousValue,
+                        to: current
+                    )
+                    if updated != current {
                         field.stringValue = updated
                     }
+                    previousValue = field.stringValue
                 }
             }
         }
