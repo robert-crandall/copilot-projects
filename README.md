@@ -280,6 +280,16 @@ five threads, unread and newest first; **Show more** reveals the rest.
   checked again just before it's cleared, so one that changed meanwhile waits for
   the next read. The filter row counts what was cleared this run, and its tooltip
   lists them; GitHub's Done view keeps them all.
+- **Hide what's settled, or other owners.** Merged pull requests, closed pull
+  requests, and closed issues are hidden by default; the filter row's **Hiding
+  merged & closed** menu turns each back on. **Owners** in the header (like the
+  Pull Requests window's, but its own list) keeps only threads from repositories in
+  the organizations or users you name. Hidden threads stay in your GitHub inbox
+  (threads you'd already answered are still cleared) but don't show, count toward
+  the badge, or raise banners; "N of M threads" counts them, and its tooltip says
+  what's hidden and why. A thread whose state couldn't be read is never hidden,
+  and neither is one that's changed since it was last seen closed, until it's
+  read again.
 - **Badge and banners.** The Dock badge and Copilot Notifications' own menu bar
   item (a bell with the count; **Banners** turns it off) count unread threads that
   need you: To you, Via your teams, and Watching. A review request whose pull

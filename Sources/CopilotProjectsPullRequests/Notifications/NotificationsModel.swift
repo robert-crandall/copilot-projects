@@ -81,6 +81,11 @@ final class NotificationsModel: ObservableObject {
     static let actedLifetime: TimeInterval = 7 * 86_400
     /// `account|thread id` → the latest `updatedAt` a confirmed done covers.
     static let doneThreadsKey = "notifications.doneThreads"
+    /// Comma- or space-separated owners whose repositories count; empty means every owner.
+    static let ownersKey = "notifications.owners"
+    static let hidesMergedPullRequestsKey = "notifications.hidesMergedPullRequests"
+    static let hidesClosedPullRequestsKey = "notifications.hidesClosedPullRequests"
+    static let hidesClosedIssuesKey = "notifications.hidesClosedIssues"
 
     @Published private(set) var threads: [NotificationThread] = []
     @Published private(set) var details: [NotificationThread.Key: NotificationSubjectDetail] = [:]
@@ -109,6 +114,22 @@ final class NotificationsModel: ObservableObject {
     @Published var showsMenuBarCount: Bool {
         didSet { if writesState { defaults.set(showsMenuBarCount, forKey: Self.menuBarCountKey) } }
     }
+    /// Owners whose repositories count, as typed; see `ownerList`.
+    @Published var owners: String {
+        didSet { scopeChanged(owners, Self.ownersKey) }
+    }
+    @Published var hidesMergedPullRequests: Bool {
+        didSet { scopeChanged(hidesMergedPullRequests, Self.hidesMergedPullRequestsKey) }
+    }
+    @Published var hidesClosedPullRequests: Bool {
+        didSet { scopeChanged(hidesClosedPullRequests, Self.hidesClosedPullRequestsKey) }
+    }
+    @Published var hidesClosedIssues: Bool {
+        didSet { scopeChanged(hidesClosedIssues, Self.hidesClosedIssuesKey) }
+    }
+    /// While subject details are being read, counts may still include requests
+    /// that turn out to be for a team or already merged; nothing is published.
+    @Published private(set) var readingDetails = false
 
     enum Phase: Equatable {
         case idle, loading, loaded
@@ -173,9 +194,6 @@ final class NotificationsModel: ObservableObject {
     private var matchGeneration = 0
     /// When each subject's details were last read.
     private var detailReadAt: [NotificationThread.Key: Date] = [:]
-    /// While subject details are being read, counts may still include requests
-    /// that turn out to be for a team or already merged; nothing is published.
-    private var readingDetails = false
 
     init(
         workspace: PullRequestsWorkspace = ControlWorkspaceBridge(),
@@ -228,6 +246,10 @@ final class NotificationsModel: ObservableObject {
         bannersToYou = defaults.object(forKey: Self.bannerKey(.toYou)) as? Bool ?? true
         bannersViaTeams = defaults.object(forKey: Self.bannerKey(.viaTeams)) as? Bool ?? true
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
+        owners = defaults.string(forKey: Self.ownersKey) ?? ""
+        hidesMergedPullRequests = defaults.object(forKey: Self.hidesMergedPullRequestsKey) as? Bool ?? true
+        hidesClosedPullRequests = defaults.object(forKey: Self.hidesClosedPullRequestsKey) as? Bool ?? true
+        hidesClosedIssues = defaults.object(forKey: Self.hidesClosedIssuesKey) as? Bool ?? true
         // Old actions are kept until threads are on hand to judge them by.
         for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
             let parts = name.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
@@ -254,23 +276,47 @@ final class NotificationsModel: ObservableObject {
 
     // MARK: Derived
 
-    var items: [NotificationItem] {
+    /// Every loaded thread, in scope or not.
+    var allItems: [NotificationItem] {
         let sessions = liveSessions
         return threads.map { thread in
             let session = thread.pullRequestKey.flatMap { links[$0] }.flatMap { sessions[$0] }
             var detail = details[thread.key]
+            let current = detailVersions[thread.key] == thread.updatedAt
             // Answered and withdrawn hold only for the copy they were judged on;
             // anything newer may ask again.
-            if detailVersions[thread.key] != thread.updatedAt {
+            if !current {
                 detail?.answered = false
                 detail?.withdrawn = false
             }
             return NotificationItem(
-                thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), session: session,
-                actedAt: actedAt[thread.key]
+                thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), stateIsCurrent: current,
+                session: session, actedAt: actedAt[thread.key]
             )
         }
     }
+
+    var scope: NotificationScope {
+        NotificationScope(
+            hidesMergedPullRequests: hidesMergedPullRequests, hidesClosedPullRequests: hidesClosedPullRequests,
+            hidesClosedIssues: hidesClosedIssues, owners: ownerList
+        )
+    }
+
+    var ownerList: [String] { PullRequestsModel.ownerList(owners) }
+
+    /// Loaded threads by scope. A subject that might be hidden waits while its
+    /// state is read rather than showing and then vanishing; one GitHub didn't
+    /// answer for shows once the read is over.
+    var scoped: ScopedNotifications {
+        ScopedNotifications(allItems, scope: scope) { [readingDetails, settled] item in
+            // A subject GitHub answered for without showing it is never read into a state.
+            readingDetails && (item.detail != nil || !settled.contains(item.id))
+        }
+    }
+
+    /// The threads in scope: what the window, badge, banners, and counts consider.
+    var items: [NotificationItem] { scoped.shown }
 
     var counts: NotificationCounts { NotificationCounts(items: items) }
 
@@ -299,6 +345,12 @@ final class NotificationsModel: ObservableObject {
         case .watching: return bannersWatching
         case .quiet: return false
         }
+    }
+
+    /// A scope setting changed: keep it, and let the badge and summary follow at once.
+    private func scopeChanged(_ value: Any, _ key: String) {
+        if writesState { defaults.set(value, forKey: key) }
+        publish()
     }
 
     // MARK: Running
@@ -781,7 +833,7 @@ final class NotificationsModel: ObservableObject {
     /// read for the copy on hand. A thread that asks for them again comes back.
     func clearAnswered() {
         guard clearsAnswered else { return }
-        let answered = items.filter { $0.isAnswered && detailVersions[$0.id] == $0.thread.updatedAt }.map(\.thread)
+        let answered = allItems.filter { $0.isAnswered && detailVersions[$0.id] == $0.thread.updatedAt }.map(\.thread)
         guard !answered.isEmpty else { return }
         let keys = Set(answered.map(\.key))
         clearedAnswered = answered.sorted { $0.updatedAt > $1.updatedAt } + clearedAnswered.filter { !keys.contains($0.key) }
@@ -1009,7 +1061,7 @@ final class NotificationsModel: ObservableObject {
     /// A banner was clicked: open its thread and mark it read, even when the
     /// thread isn't loaded here (yet, or any more).
     func openBanner(thread key: NotificationThread.Key?, url: URL?) {
-        if let key, let item = items.first(where: { $0.id == key }) {
+        if let key, let item = allItems.first(where: { $0.id == key }) {
             open(item)
             return
         }
@@ -1056,6 +1108,10 @@ final class NotificationsModel: ObservableObject {
         clearedAnswered = cleared
         self.threads = threads
         self.details = details
+        // Supplied details describe the copies supplied with them.
+        detailVersions = Dictionary(
+            threads.filter { details[$0.key] != nil }.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: { first, _ in first }
+        )
         self.settled = settled ?? Set(details.keys)
         self.accounts = accounts
         self.links = links
