@@ -351,7 +351,8 @@ with the white primer/octicons `bell-24` glyph (MIT) at the pull-request glyph's
 size, drawn by `scripts/make-icon.swift --notifications` and built into
 `Resources/NotificationsIcon.icns` by `scripts/make-icns.sh`. Needs you means
 unread in To you, Via your teams, or Watching, except a review request whose pull
-request is already merged or closed, and a request, mention, or assignment the
+request is already merged or closed or whose open requests no longer reach the
+user or a team they might be on, and a request, mention, or assignment the
 user already answered (reviewed, commented, merged, or closed after they were last
 asked); the Dock badge (none at zero, 999+ above 999), menu title, menu bar item,
 header, bands, and lanes all count exactly that. The primary copy marks answered
@@ -361,7 +362,7 @@ threads in its tooltip.
 
 It reuses the Pull Requests window's drag strip and 56pt header: a title3 semibold
 "N need you" headline over a caption secondary summary (to you · via your teams ·
-watching · already merged or closed · quiet · accounts, monospaced digits), a
+watching · already merged, closed, or withdrawn · quiet · accounts, monospaced digits), a
 Banners button (bell, or bell.slash when off) whose 300pt popover holds per-band
 checkboxes and, when System Settings denies banners, a note behind the native
 orange symbol with Open Notification Settings, then Refresh (Command-R). A caption
@@ -397,7 +398,7 @@ caption session line: its indicator and state, plus the project only when the
 whole line fits, never cut short, and a click to that session while Copilot
 Projects answers (otherwise a terminal glyph and "Status unknown"). The inner 1pt
 edge is native orange (85%) for unread needs-you threads, secondary ink (45%, 80%
-on hover) for unread quiet threads and unread review requests already merged or closed,
+on hover) for unread quiet threads and unread review requests already merged, closed, or withdrawn,
 and absent once read (80% on hover only). Double-click opens the thread on GitHub
 and marks it read; the context menu opens, goes to the session, marks read or
 done, unsubscribes, or copies the link.

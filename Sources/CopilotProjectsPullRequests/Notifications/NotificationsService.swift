@@ -194,7 +194,9 @@ struct NotificationsFetchPlan: Equatable, Sendable {
     var participatingPages = 20
     /// The newest unread threads of every kind, for watched repositories and CI.
     var unreadPages = 4
-    /// Recently read threads that aren't done, so All shows what was opened.
+    /// Recently read threads, so All shows what was opened. GitHub lists done
+    /// threads here too, with nothing to tell them apart; the model hides the
+    /// ones it marked done.
     var readPages = 4
     var readWindow: TimeInterval = 3 * 86_400
     var perPage = 50
@@ -310,6 +312,12 @@ struct NotificationDetailsFetcher: Sendable {
             comments(last: 20) { pageInfo { hasPreviousPage } nodes { createdAt body lastEditedAt author { login } } }
           }
         }
+        pending: reviewRequests(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { requestedReviewer {
+            __typename ... on User { login } ... on Team { slug organization { login } }
+          } }
+        }
       }
       ... on Issue {
         state stateReason createdAt body lastEditedAt author { login }
@@ -380,6 +388,12 @@ struct NotificationDetailsFetcher: Sendable {
         var pageInfo: PageInfo? = nil
         let nodes: [Review?]?
     }
+    /// The review requests still open; GitHub drops one once it's reviewed or withdrawn.
+    struct PendingRequests: Decodable {
+        struct PageInfo: Decodable { let hasNextPage: Bool? }
+        let pageInfo: PageInfo?
+        let nodes: [Event?]?
+    }
     struct Subject: Decodable {
         let state: String?
         let isDraft: Bool?
@@ -393,6 +407,7 @@ struct NotificationDetailsFetcher: Sendable {
         var prActivity: Activity? = nil
         var issueActivity: Activity? = nil
         var reviews: Reviews? = nil
+        var pending: PendingRequests? = nil
     }
     /// Each alias: a repository holding the subject, or the viewer.
     struct Node: Decodable {
@@ -439,9 +454,11 @@ struct NotificationDetailsFetcher: Sendable {
                 result.settled.insert(thread.key)
                 guard let subject = answer.nodes["t\(index)"]??.issueOrPullRequest else { continue }
                 var detail = Self.detail(subject, viewer: result.viewerLogin)
-                // What GitHub failed to read may have asked again: it's never answered.
+                // What GitHub failed to read may have asked again: it's never
+                // answered, and a request it may have left out isn't withdrawn.
                 if answer.erred?.contains(index) != false {
                     detail.viewerActedAt = nil
+                    detail.pendingReviewers = nil
                     result.erred.insert(thread.key)
                 }
                 result.details[thread.key] = detail
@@ -489,6 +506,31 @@ struct NotificationDetailsFetcher: Sendable {
         }
     }
 
+    /// Every pending review request, as lowercased logins and `org/slug` teams;
+    /// nil unless the whole list was read and every reviewer named. Bots can't
+    /// be the user or a team of theirs, so they don't count; anything else that
+    /// can't be named (an enterprise team, say) might be theirs.
+    static func pendingReviewers(_ pending: PendingRequests?) -> Set<String>? {
+        guard let pending, pending.pageInfo?.hasNextPage == false else { return nil }
+        var names: Set<String> = []
+        for node in pending.nodes ?? [] {
+            guard let reviewer = node?.requestedReviewer else { return nil }
+            switch reviewer.__typename {
+            case "User":
+                guard let login = reviewer.login else { return nil }
+                names.insert(login.lowercased())
+            case "Team":
+                guard let slug = reviewer.slug, let org = reviewer.organization?.login else { return nil }
+                names.insert("\(org)/\(slug)".lowercased())
+            case "Bot":
+                continue
+            default:
+                return nil
+            }
+        }
+        return names
+    }
+
     static func detail(_ subject: Subject, viewer: String?) -> NotificationSubjectDetail {
         var detail = NotificationSubjectDetail()
         switch (subject.state, subject.isDraft, subject.stateReason) {
@@ -517,6 +559,7 @@ struct NotificationDetailsFetcher: Sendable {
         if !detail.viewerRequested, subject.timelineItems?.pageInfo?.hasPreviousPage == true {
             detail.requestHistoryComplete = false
         }
+        detail.pendingReviewers = pendingReviewers(subject.pending)
         guard let viewer else { return detail }
         func latest(_ current: Date?, _ candidate: Date?) -> Date? {
             guard let candidate else { return current }

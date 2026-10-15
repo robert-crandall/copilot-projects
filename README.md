@@ -264,7 +264,9 @@ five threads, unread and newest first; **Show more** reveals the rest.
   moves to the next, `⇧I` marks it read, and `⇧M` unsubscribes (it ignores the
   thread, even in a repository you watch, until you're mentioned or asked again).
   Each lane's menu marks the whole lane read or done. Read and done are written to
-  GitHub, so your inbox matches everywhere.
+  GitHub, so your inbox matches everywhere. GitHub keeps listing done threads among
+  read ones, so the app remembers what it marked done and keeps those out after a
+  restart too, until something new happens on them.
 - **Already answered threads clear themselves.** A review request, mention, team
   mention, or assignment is marked done on GitHub once your latest review (approve,
   request changes, or comment), comment, merge, or close on it came after the last
@@ -281,9 +283,9 @@ five threads, unread and newest first; **Show more** reveals the rest.
 - **Badge and banners.** The Dock badge and Copilot Notifications' own menu bar
   item (a bell with the count; **Banners** turns it off) count unread threads that
   need you: To you, Via your teams, and Watching. A review request whose pull
-  request is already merged or closed has nothing left to review, so it stays
-  listed, quietly, and the header counts it separately; a mention or reply on a
-  closed thread still counts. **Banners** chooses which of those raise a banner when
+  request is already merged or closed, or whose request to you and your teams was
+  withdrawn, has nothing left to review, so it stays listed, quietly, and the
+  header counts it separately; a mention or reply on a closed thread still counts. **Banners** chooses which of those raise a banner when
   something new arrives; more than three at once become one summary banner, and
   nothing already waiting when an account is first read is announced. When only the
   newest threads were read and none needs you, the header says so rather than

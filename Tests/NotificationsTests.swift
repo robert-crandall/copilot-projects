@@ -32,6 +32,9 @@ final class FakeGitHub: @unchecked Sendable {
     func holdNextRead(_ id: String) { lock.withLock { _ = holding.insert(id) } }
     func isHolding(_ id: String) -> Bool { lock.withLock { held[id] != nil } }
     func release(_ id: String) { lock.withLock { held.removeValue(forKey: id) }?.resume() }
+    private var holdingActions: Set<String> = []
+    /// Holds the next non-GET request to `/notifications/threads/{id}` until `release(id)`.
+    func holdNextAction(_ id: String) { lock.withLock { _ = holdingActions.insert(id) } }
     var actions: [String] { lock.withLock { _actions } }
 
     func send(_ request: URLRequest) async throws -> (Data, URLResponse) {
@@ -45,6 +48,10 @@ final class FakeGitHub: @unchecked Sendable {
             (body, HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: headers)!)
         }
         if method != "GET" {
+            let id = url.lastPathComponent
+            if lock.withLock({ holdingActions.remove(id) != nil }) {
+                await withCheckedContinuation { continuation in lock.withLock { held[id] = continuation } }
+            }
             return lock.withLock {
                 _actions.append("\(method) \(url.path)")
                 if let body = request.httpBody { _bodies["\(method) \(url.path)"] = String(decoding: body, as: UTF8.self) }
@@ -131,14 +138,14 @@ final class NotificationsTests: XCTestCase {
     private func makeModel(
         _ github: FakeGitHub, clock: TestClock, defaults: UserDefaults? = nil,
         workspace: PullRequestsWorkspace = FakeWorkspace(), opened: ((URL) -> Void)? = nil,
-        plan: NotificationsFetchPlan = NotificationsFetchPlan()
+        plan: NotificationsFetchPlan = NotificationsFetchPlan(), login: String = "octocat"
     ) -> NotificationsModel {
         let model = NotificationsModel(
             workspace: workspace, defaults: defaults ?? UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
             api: GitHubNotificationsAPI(send: github.send), plan: plan,
             // Nothing listens there: details fail fast without leaving the machine.
             detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
-            loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
+            loadAccounts: { [GitHubAccount(login: login, token: "token")] },
             transcriptPath: { _ in nil },
             clock: { clock.now },
             openURL: opened ?? { _ in },
@@ -1080,10 +1087,10 @@ final class NotificationsTests: XCTestCase {
     }
 
     private func answeringModel(
-        _ github: FakeGitHub, details box: DetailBox, clears: Bool, clock: TestClock
+        _ github: FakeGitHub, details box: DetailBox, clears: Bool, clock: TestClock, defaults: UserDefaults? = nil
     ) -> NotificationsModel {
         let model = NotificationsModel(
-            workspace: FakeWorkspace(), defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            workspace: FakeWorkspace(), defaults: defaults ?? UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
             clearsAnswered: clears, api: GitHubNotificationsAPI(send: github.send),
             detailsFetcher: answeringFetcher(box),
             loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
@@ -1278,6 +1285,188 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(model.counts.needsYou, 0, "answered doesn't need you")
         XCTAssertEqual(model.counts.answered, 1)
         XCTAssertTrue(model.clearedAnswered.isEmpty)
+    }
+
+    // MARK: Withdrawn requests
+
+    func testPendingReviewRequestsAreReadWholeOrNotAtAll() throws {
+        func pending(_ nodes: String, more: Bool = false) throws -> Set<String>? {
+            let json = #"{"pageInfo":{"hasNextPage":\#(more)},"nodes":[\#(nodes)]}"#
+            let decoded = try JSONDecoder().decode(NotificationDetailsFetcher.PendingRequests.self, from: Data(json.utf8))
+            return NotificationDetailsFetcher.pendingReviewers(decoded)
+        }
+        let user = #"{"requestedReviewer":{"__typename":"User","login":"OctoCat"}}"#
+        let team = #"{"requestedReviewer":{"__typename":"Team","slug":"Reviewers","organization":{"login":"Octo"}}}"#
+        let bot = #"{"requestedReviewer":{"__typename":"Bot"}}"#
+        XCTAssertEqual(try pending([user, team, bot].joined(separator: ",")), ["octocat", "octo/reviewers"], "a bot is never you")
+        XCTAssertEqual(try pending(""), [])
+        XCTAssertNil(try pending(user, more: true), "more than were read")
+        XCTAssertNil(try pending(#"{"requestedReviewer":{"__typename":"EnterpriseTeam"}}"#), "a team it can't name may be yours")
+        XCTAssertNil(try pending(#"{"requestedReviewer":null}"#))
+        XCTAssertNil(NotificationDetailsFetcher.pendingReviewers(nil))
+    }
+
+    func testARequestIsWithdrawnOnlyWhenNothingOpenCouldReachYou() {
+        func withdrawn(_ pending: Set<String>?, viewer: String = "OctoCat", onTeam: Bool? = nil) -> Bool {
+            var detail = NotificationSubjectDetail(state: .open)
+            detail.pendingReviewers = pending
+            return detail.isWithdrawn(viewer: viewer) { _ in onTeam }
+        }
+        XCTAssertTrue(withdrawn([]))
+        XCTAssertTrue(withdrawn(["hubot"]), "someone else still being asked isn't you")
+        XCTAssertFalse(withdrawn(["octocat"]))
+        XCTAssertFalse(withdrawn(["octo/reviewers"]), "a team you might be on")
+        XCTAssertFalse(withdrawn(["octo/reviewers"], onTeam: true))
+        XCTAssertTrue(withdrawn(["octo/reviewers"], onTeam: false))
+        XCTAssertFalse(withdrawn(nil))
+        XCTAssertFalse(withdrawn([], viewer: ""))
+    }
+
+    func testAWithdrawnRequestNoLongerNeedsYou() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now.addingTimeInterval(-60)),
+            FakeGitHub.thread("2", reason: "review_requested", number: 2, updated: now.addingTimeInterval(-60)),
+            FakeGitHub.thread("3", reason: "review_requested", number: 3, updated: now.addingTimeInterval(-60)),
+        ]])
+        var asked = NotificationSubjectDetail(state: .open)
+        asked.viewerTargetedAt = now.addingTimeInterval(-7200)
+        var withdrawn = asked
+        withdrawn.pendingReviewers = []
+        var teamStillAsked = asked
+        // Membership can't be read here, so the team may be yours.
+        teamStillAsked.pendingReviewers = ["octo/reviewers"]
+        var reviewed = answeredDetail
+        reviewed.pendingReviewers = []
+        let box = DetailBox(["1": withdrawn, "2": teamStillAsked, "3": reviewed])
+        let model = answeringModel(github, details: box, clears: false, clock: TestClock(now))
+        await model.refreshNow()
+        XCTAssertEqual(model.counts.needsYou, 1)
+        XCTAssertEqual(model.items.filter(\.needsYou).map(\.id.id), ["2"])
+        XCTAssertEqual(model.counts.settled, 1, "withdrawn is counted with merged and closed")
+        XCTAssertEqual(model.counts.answered, 1, "reviewing takes you off the list too; that's answered")
+
+        // Something new, and its details can't be read: the old judgment doesn't hold.
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now)]])
+        box.failing = true
+        await model.refreshNow()
+        XCTAssertEqual(model.counts.needsYou, 1)
+        XCTAssertEqual(model.counts.settled, 0)
+    }
+
+    // MARK: Remembered dones
+
+    private func doneThreads(_ defaults: UserDefaults) -> [String: Double] {
+        (defaults.dictionary(forKey: NotificationsModel.doneThreadsKey) as? [String: Double]) ?? [:]
+    }
+
+    func testDoneThreadsStayDoneAfterARestart() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        // GitHub keeps listing a done thread among read ones.
+        github.answer("read", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: now.addingTimeInterval(-60))]])
+        let first = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await first.refreshNow()
+        first.markDone(first.items)
+        try await waitUntil { self.doneThreads(defaults)["octocat|1"] != nil }
+
+        let second = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await second.refreshNow()
+        XCTAssertTrue(second.threads.isEmpty)
+
+        github.answer("read", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: now.addingTimeInterval(60))]])
+        await second.refreshNow()
+        XCTAssertEqual(second.threads.map(\.key.id), ["1"], "activity after the done brings it back")
+        XCTAssertNil(doneThreads(defaults)["octocat|1"])
+    }
+
+    func testOnlyADoneGitHubAcceptedIsRemembered() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now)]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        github.holdNextAction("1")
+        model.markDone(model.items)
+        try await waitUntil { github.isHolding("1") }
+        XCTAssertTrue(doneThreads(defaults).isEmpty, "not while it's in flight")
+        let restarted = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await restarted.refreshNow()
+        XCTAssertEqual(restarted.threads.map(\.key.id), ["1"])
+        github.release("1")
+        try await waitUntil { self.doneThreads(defaults)["octocat|1"] != nil }
+
+        github.answer("participating", pages: [[FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now)]])
+        await model.refreshNow()
+        github.fail("DELETE")
+        model.markDone(model.items.filter { $0.id.id == "2" })
+        try await waitUntil { model.warning != nil }
+        XCTAssertNil(doneThreads(defaults)["octocat|2"], "nor one that failed")
+    }
+
+    func testEachAcceptedDoneIsRememberedWithoutWaitingForTheRest() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("read", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", number: 1, unread: false, updated: now.addingTimeInterval(-60)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, unread: false, updated: now.addingTimeInterval(-60)),
+        ]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        github.holdNextAction("2")
+        model.markDone(model.items)
+        try await waitUntil { github.isHolding("2") && self.doneThreads(defaults)["octocat|1"] != nil }
+
+        // Quit while the other is still in flight.
+        let restarted = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await restarted.refreshNow()
+        XCTAssertEqual(restarted.threads.map(\.key.id), ["2"])
+        github.release("2")
+        try await waitUntil { self.doneThreads(defaults)["octocat|2"] != nil }
+    }
+
+    func testDonesAreRememberedForAnAccountWithoutALogin() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("read", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: now.addingTimeInterval(-60))]])
+        // An older gh names no account.
+        let first = makeModel(github, clock: TestClock(now), defaults: defaults, login: "")
+        await first.refreshNow()
+        XCTAssertEqual(first.threads.map(\.key.id), ["1"])
+        first.markDone(first.items)
+        try await waitUntil { self.doneThreads(defaults)["|1"] != nil }
+
+        let second = makeModel(github, clock: TestClock(now), defaults: defaults, login: "")
+        await second.refreshNow()
+        XCTAssertTrue(second.threads.isEmpty)
+    }
+
+    func testClearedThreadsAreNotClearedAgainAfterARestart() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("read", pages: [[FakeGitHub.thread("1", reason: "mention", number: 1, unread: false, updated: now.addingTimeInterval(-60))]])
+        let box = DetailBox(["1": answeredDetail])
+        let first = answeringModel(github, details: box, clears: true, clock: TestClock(now), defaults: defaults)
+        await first.refreshNow()
+        try await waitUntil { self.doneThreads(defaults)["octocat|1"] != nil }
+
+        let second = answeringModel(github, details: box, clears: true, clock: TestClock(now), defaults: defaults)
+        await second.refreshNow()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(github.actions.filter { $0.hasPrefix("DELETE") }.count, 1)
+        XCTAssertTrue(second.clearedAnswered.isEmpty)
+        XCTAssertTrue(second.threads.isEmpty)
+    }
+
+    func testDonesOlderThanTheReadWindowAreForgotten() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let old = now.addingTimeInterval(-4 * 86_400)
+        defaults.set(["octocat|1": old.timeIntervalSince1970], forKey: NotificationsModel.doneThreadsKey)
+        github.answer("read", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: old.addingTimeInterval(-60))]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        XCTAssertEqual(model.threads.map(\.key.id), ["1"])
     }
 
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
