@@ -355,20 +355,33 @@ request is already merged or closed or whose open requests no longer reach the
 user or a team they might be on, and a request, mention, or assignment the
 user already answered (reviewed, commented, merged, or closed after they were last
 asked); the Dock badge (none at zero, 999+ above 999), menu title, menu bar item,
-header, bands, and lanes all count exactly that. The primary copy marks answered
+header, bands, and lanes all count exactly that, within the window's scope. The
+scope keeps threads from repositories in the chosen owners (empty means every
+owner) and, by default, drops merged and closed pull requests and closed issues;
+what's out of scope stays in the GitHub inbox but never shows, badges, banners, or
+counts here. A subject whose state isn't known is never hidden for it, and one
+read for the first time waits for its state rather than showing and then
+vanishing. The primary copy marks answered
 threads done on GitHub, and the filter row reports them as a caption
 "Cleared N you'd answered" behind the checkmark.circle symbol, with the cleared
-threads in its tooltip.
+threads in its tooltip; a narrow row keeps only the symbol and N.
 
 It reuses the Pull Requests window's drag strip and 56pt header: a title3 semibold
-"N need you" headline over a caption secondary summary (to you · via your teams ·
-watching · already merged, closed, or withdrawn · quiet · accounts, monospaced digits), a
+"N need you" headline ("Checking pull requests and issues…" while nothing needs you
+and states are still being read) over a caption secondary summary (to you · via your teams ·
+watching · already merged, closed, or withdrawn · quiet · accounts, monospaced digits),
+the Pull Requests window's Owners button and token-field popover (its own list, kept
+under `notifications.owners`, not shared with Pull Requests), a
 Banners button (bell, or bell.slash when off) whose 300pt popover holds per-band
 checkboxes and, when System Settings denies banners, a note behind the native
 orange symbol with Open Notification Settings, then Refresh (Command-R). A caption
 secondary filter row follows: an Unread | All segmented picker (opening on All,
-disabled until loaded), "N of M threads", and trailing refresh progress, a "GitHub
-checked" relative time, or "Copilot Projects unavailable · sessions not linked".
+disabled until loaded), a native borderless pull-down at the picker's control size
+naming what it hides ("Hiding merged & closed", down to "Showing merged & closed")
+with a Hide section of Merged Pull Requests, Closed Pull Requests, and Closed Issues
+checkmarks (each kept in `notifications.hides…`), "N of M threads" (M counts every
+loaded thread; its tooltip names what's hidden and why), and trailing refresh progress, a "GitHub
+checked" relative time that never wraps, or "Copilot Projects unavailable · sessions not linked".
 Later refresh or sync failures keep the lanes and add one selectable caption line
 under that row behind the outlined warning symbol in secondary ink. A sticky 28pt
 `chrome` stage row heads a 240pt Reasons column and four equal freshness columns
@@ -404,8 +417,10 @@ and marks it read; the context menu opens, goes to the session, marks read or
 done, unsubscribes, or copies the link.
 
 The first load shows three redacted placeholder lanes under an unredacted stage
-row; a first-load failure (Try Again; terminal symbol when gh is missing), an
-empty inbox (Inbox Clear), and an Unread filter with nothing unread (Show All)
+row, and keeps them while everything loaded waits for its state; a first-load failure (Try Again; terminal symbol when gh is missing), an
+empty inbox (Inbox Clear), an Unread filter with nothing unread (Show All), and
+everything out of scope (All Threads Hidden, naming what's hidden, with Show Merged
+& Closed and Show Every Owner as they apply)
 use native `ContentUnavailableView`. The most urgent chip is preselected and the
 lanes take focus: arrows walk band, lane, and column order through shown chips and
 announce, Return goes to the session (or GitHub when there is none or the host is
