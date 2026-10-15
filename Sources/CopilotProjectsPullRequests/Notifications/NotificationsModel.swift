@@ -95,7 +95,8 @@ final class NotificationsModel: ObservableObject {
     @Published private(set) var workspace: WorkspaceState = .connecting
     @Published private(set) var links: [PullRequestKey: String] = [:]
     /// Where Since you looked starts: unread changes after it stay there until
-    /// the user acts on the thread. Set once, from the last read on GitHub.
+    /// the user acts on the thread. Set once, on the first refresh, from the
+    /// last read on GitHub.
     @Published private(set) var lookedAt: Date?
     /// Per thread, the latest change the user acted on here.
     @Published private(set) var actedAt: [NotificationThread.Key: Date] = [:]
@@ -650,13 +651,15 @@ final class NotificationsModel: ObservableObject {
 
     var isLooking: Bool { lookStarted != nil }
 
-    /// Before the window was ever looked at, the last time the user read a
-    /// notification on GitHub stands in, so the first view spreads threads
-    /// across the days instead of calling everything unread new.
+    /// Set once, on the first refresh: the last time the user read a
+    /// notification on GitHub, so the first view spreads threads across the
+    /// days instead of calling everything unread new. With nothing read there
+    /// yet, every unread thread is new; a later read doesn't move the others.
     private func seedFirstLook() {
-        guard lookedAt == nil, let lastRead = threads.compactMap(\.lastReadAt).max() else { return }
-        lookedAt = lastRead
-        if writesState { defaults.set(lastRead.timeIntervalSince1970, forKey: Self.lookedAtKey) }
+        guard lookedAt == nil else { return }
+        let seed = threads.compactMap(\.lastReadAt).max() ?? .distantPast
+        lookedAt = seed
+        if writesState { defaults.set(seed.timeIntervalSince1970, forKey: Self.lookedAtKey) }
     }
 
     // MARK: Actions

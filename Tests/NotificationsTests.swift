@@ -650,6 +650,28 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(model.lookedAt, lastRead)
     }
 
+    func testTheFirstLookHoldsWhenNothingWasReadOnGitHubYet() async throws {
+        let github = FakeGitHub()
+        let clock = TestClock(now)
+        let older = FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-5400))
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-1800)), older,
+        ]])
+        let model = makeModel(github, clock: clock)
+        await model.refreshNow()
+        XCTAssertEqual(sinceYouLooked(model), ["1", "2"])
+
+        // Opening one reads it on GitHub; that read doesn't move the other.
+        model.open(try XCTUnwrap(model.items.first { $0.id.id == "1" }))
+        clock.now += 60
+        var read = FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: now.addingTimeInterval(-1800))
+        read["last_read_at"] = ISO8601DateFormatter().string(from: clock.now)
+        github.answer("participating", pages: [[older]])
+        github.answer("read", pages: [[read]])
+        await model.refreshNow()
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
+    }
+
     func testBannersAnnounceOnlyNewThreadsThatNeedYou() async {
         let github = FakeGitHub()
         let clock = TestClock(now)
