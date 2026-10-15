@@ -997,18 +997,37 @@ final class AppModel: ObservableObject {
 
     /// Shared single-field prompt. Returns trimmed text, or nil if empty/cancelled.
     private func promptForText(title: String, message: String,
-                               confirmTitle: String, initialText: String) -> String? {
+                               confirmTitle: String, initialText: String,
+                               transform: ((String) -> String)? = nil) -> String? {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = initialText
+        field.stringValue = transform?(initialText) ?? initialText
+        let observer = transform.map { transform in
+            NotificationCenter.default.addObserver(
+                forName: NSControl.textDidChangeNotification,
+                object: field,
+                queue: .main
+            ) { _ in
+                MainActor.assumeIsolated {
+                    let updated = transform(field.stringValue)
+                    if updated != field.stringValue {
+                        field.stringValue = updated
+                    }
+                }
+            }
+        }
+        defer {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+        }
         alert.accessoryView = field
         alert.addButton(withTitle: confirmTitle)
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard alertPresenter(alert) == .alertFirstButtonReturn else { return nil }
+        let raw = transform?(field.stringValue) ?? field.stringValue
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
     }
 
@@ -1150,7 +1169,8 @@ final class AppModel: ObservableObject {
             title: "Review Pull Request",
             message: "Paste a GitHub pull request URL. Copilot will start a local adversarial review.",
             confirmTitle: "Review",
-            initialText: initialText
+            initialText: initialText,
+            transform: PullRequestReviewTarget.withoutFragment
         ) {
             if addAdversarialReviewSession(
                 toProjectId: pid,

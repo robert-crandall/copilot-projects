@@ -70,8 +70,14 @@ public struct PullRequestReviewTarget: Equatable, Sendable {
         "Review \(owner)/\(repository)#\(number)"
     }
 
+    /// Trims `#` and everything after it from a pull request URL input.
+    public static func withoutFragment(_ input: String) -> String {
+        guard let hash = input.firstIndex(of: "#") else { return input }
+        return String(input[..<hash])
+    }
+
     public static func parse(_ input: String) -> Self? {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = withoutFragment(input).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.utf8.count <= maximumInputBytes,
               let components = URLComponents(string: trimmed),

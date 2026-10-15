@@ -7080,6 +7080,37 @@ final class AppLogicTests: XCTestCase {
             pullRequestURL: "https://example.com/not-a-pr"
         ))
         XCTAssertEqual(launches.count, 1)
+
+        var trimmedInDialog: String?
+        let interactive = AppModel(
+            stateRepository: StateRepository(path: root.appendingPathComponent("state.json")),
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
+            remoteReposDirectory: { nil },
+            remoteSessionBackendAvailable: { true },
+            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
+            sessionCreationLedger: ledger,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(
+                root: root.appendingPathComponent("interactive-images", isDirectory: true)
+            ),
+            alertPresenter: { alert in
+                guard let field = alert.accessoryView as? NSTextField else {
+                    return .alertSecondButtonReturn
+                }
+                field.stringValue = "https://github.com/github/github/pull/123#discussion_r99"
+                NotificationCenter.default.post(
+                    name: NSControl.textDidChangeNotification,
+                    object: field
+                )
+                trimmedInDialog = field.stringValue
+                return .alertFirstButtonReturn
+            }
+        )
+        interactive.addAdversarialReviewSessionInteractive(toProjectId: "p1")
+        XCTAssertEqual(trimmedInDialog, "https://github.com/github/github/pull/123")
+        XCTAssertEqual(launches.count, 2)
     }
 
     @MainActor
