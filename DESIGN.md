@@ -374,8 +374,9 @@ under that row behind the outlined warning symbol in secondary ink. A sticky 28p
 `chrome` stage row heads a 240pt Reasons column and four equal freshness columns
 (Since you looked, Today, This week, Older) split by native dividers, counts in
 monospaced digits. Since you looked holds unread threads that changed after the
-last look (the window key for at least 1.5s; before any look, the last read on
-GitHub stands in); the rest sit by day. Bands (To you, Via your teams, Watching,
+user last acted on them (opened, marked, unsubscribed, went to the session, or
+copied the link; kept while nothing new happens on it) and after a baseline set once, on the
+first refresh, from the last read on GitHub (if any); looking at the window moves nothing. The rest sit by day. Bands (To you, Via your teams, Watching,
 Quiet) head their lanes in a 24pt `chrome` row: caption semibold name, then a
 regular count of need-you and merged-or-closed threads (unread, for Quiet). The
 lane column sits on `sidebar` (14x10pt inset): a two-line body-medium reason with
@@ -412,10 +413,9 @@ away), Command-Return opens GitHub, E marks done and Shift-M unsubscribes (both
 advancing selection), Shift-I marks read, and Escape clears selection. The footer
 lists only keys that can act now; its trailing note carries the storage warning
 and, when an account holds more unread than one read fetches, "Older unread
-threads aren't shown · Open GitHub Inbox" as a native link. Returning to the
-window slides chips already seen out of Since you looked into their day column,
-and Done or Unsubscribe removes a chip and ticks its counts down (matched
-geometry, 0.2s ease-out); Reduce Motion updates in place. Banners announce only
+threads aren't shown · Open GitHub Inbox" as a native link. Done or Unsubscribe
+removes a chip and ticks its counts down (matched geometry, 0.2s ease-out);
+Reduce Motion updates in place. Banners announce only
 unread needs-you threads in enabled bands that changed since the last
 announcement, never the backlog and never while the window is key; more than
 three at once become one summary banner.
