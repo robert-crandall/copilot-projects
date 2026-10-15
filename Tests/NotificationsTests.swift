@@ -1492,6 +1492,41 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(model.counts.needsYou, 1)
     }
 
+    func testAReopenedReviewRequestNeedsYouWhenItsOldClosedStateCantBeReadAgain() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now.addingTimeInterval(-60)),
+        ]])
+        let box = DetailBox(["1": NotificationSubjectDetail(state: .closed)])
+        let model = answeringModel(github, details: box, clears: false, clock: TestClock(now))
+        var badge: String?
+        model.setBadge = { badge = $0 }
+        model.hidesClosedPullRequests = false
+        await model.refreshNow()
+        XCTAssertEqual(model.counts.settled, 1, "a closed pull request has nothing left to review")
+        XCTAssertEqual(model.counts.needsYou, 0)
+
+        // Reopened and asked again, but its details can't be read.
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "review_requested", number: 1, updated: now)]])
+        box.failing = true
+        await model.refreshNow()
+        XCTAssertEqual(model.items.map(\.id.id), ["1"])
+        XCTAssertEqual(model.counts.settled, 0, "the old close may have been undone")
+        XCTAssertEqual(model.counts.needsYou, 1)
+        XCTAssertEqual(badge, "1")
+
+        // Hiding closed pull requests doesn't hide it either.
+        model.hidesClosedPullRequests = true
+        XCTAssertEqual(model.counts.needsYou, 1)
+        XCTAssertEqual(badge, "1")
+
+        let merged = NotificationItem(
+            thread: thread("m", "review_requested"), detail: NotificationSubjectDetail(state: .merged), detailsSettled: true,
+            stateIsCurrent: false
+        )
+        XCTAssertTrue(merged.isSettled, "nothing undoes a merge")
+    }
+
     func testOwnersNarrowTheScopeWhateverTheirCase() {
         let items = [
             item("mine", repo: "Octo/app", state: .open),
@@ -1523,6 +1558,23 @@ final class NotificationsTests: XCTestCase {
         )
         XCTAssertEqual(NotificationsView.countHelp(scoped, owners: ["octo"], unreadOnly: true),
                        "Hidden: 1 merged or closed · 1 outside octo\nRead threads are left out while Unread is on.")
+    }
+
+    func testEmptyLanesSayNothingIsUnreadHiddenOrClearUntilEverySubjectIsPlaced() {
+        let read = NotificationItem(
+            thread: thread("read", "mention", unread: false), detail: NotificationSubjectDetail(state: .open), detailsSettled: true
+        )
+        let reading = NotificationItem(thread: thread("new", "mention", number: 2), detail: nil, detailsSettled: false)
+        let merged = item("merged", state: .merged)
+        let scope = NotificationScope()
+        XCTAssertEqual(
+            NotificationsView.emptyContent(ScopedNotifications([read, reading], scope: scope) { _ in true }), .checking,
+            "the unread subject still being read may yet show"
+        )
+        XCTAssertEqual(NotificationsView.emptyContent(ScopedNotifications([read, reading], scope: scope)), .noUnread)
+        XCTAssertEqual(NotificationsView.emptyContent(ScopedNotifications([merged, reading], scope: scope) { _ in true }), .checking)
+        XCTAssertEqual(NotificationsView.emptyContent(ScopedNotifications([merged], scope: scope)), .allHidden)
+        XCTAssertEqual(NotificationsView.emptyContent(ScopedNotifications([], scope: scope)), .inboxClear)
     }
 
     func testHiddenThreadsNeitherCountNorBannerAndTheChoiceIsKept() async throws {

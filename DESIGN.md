@@ -361,7 +361,7 @@ owner) and, by default, drops merged and closed pull requests and closed issues;
 what's out of scope stays in the GitHub inbox (unless already answered, which
 still clears it) but never shows, badges, banners, or counts here. A subject whose
 state isn't known is never hidden for it, nor is one last read closed for an
-older copy (it may have been reopened; merged stays merged), and one read for
+older copy hidden or counted as settled (it may have been reopened; merged stays merged), and one read for
 the first time waits for its state rather than showing and then vanishing. The primary copy marks answered
 threads done on GitHub, and the filter row reports them as a caption
 "Cleared N you'd answered" behind the checkmark.circle symbol, with the cleared
@@ -418,7 +418,7 @@ and marks it read; the context menu opens, goes to the session, marks read or
 done, unsubscribes, or copies the link.
 
 The first load shows three redacted placeholder lanes under an unredacted stage
-row, and keeps them while everything loaded waits for its state; a first-load failure (Try Again; terminal symbol when gh is missing), an
+row, and keeps them whenever no lanes show while anything waits for its state; a first-load failure (Try Again; terminal symbol when gh is missing), an
 empty inbox (Inbox Clear), an Unread filter with nothing unread (Show All), and
 everything out of scope (All Threads Hidden, naming what's hidden, with Show Merged
 & Closed and Show Every Owner as they apply)

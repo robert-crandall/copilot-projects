@@ -398,44 +398,61 @@ struct NotificationsView: View {
         case .idle, .loading where !hasThreads:
             lanes(Self.placeholderLayout, order: [], now: now, placeholder: true)
         default:
-            if layout.isEmpty, !scoped.shown.isEmpty {
-                ContentUnavailableView {
-                    Label("No Unread Notifications", systemImage: "checkmark.circle")
-                } description: {
-                    Text("Everything here has been read. Mark threads done to clear them from your inbox.")
-                } actions: {
-                    Button("Show All") { filter = .all }
-                }
-            } else if layout.isEmpty, scoped.pending > 0 {
-                // Everything left might yet be hidden: hold the first-load lanes until it's read.
-                lanes(Self.placeholderLayout, order: [], now: now, placeholder: true)
-            } else if layout.isEmpty, scoped.hidden > 0 {
-                ContentUnavailableView {
-                    Label("All Threads Hidden", systemImage: "line.3.horizontal.decrease.circle")
-                } description: {
-                    Text(Self.allHiddenDescription(scoped, owners: model.ownerList))
-                } actions: {
-                    if scoped.hiddenByState > 0 {
-                        Button("Show Merged & Closed") {
-                            model.hidesMergedPullRequests = false
-                            model.hidesClosedPullRequests = false
-                            model.hidesClosedIssues = false
+            if layout.isEmpty {
+                switch Self.emptyContent(scoped) {
+                case .checking:
+                    // What's left might yet show or be hidden: hold the first-load lanes until it's read.
+                    lanes(Self.placeholderLayout, order: [], now: now, placeholder: true)
+                case .noUnread:
+                    ContentUnavailableView {
+                        Label("No Unread Notifications", systemImage: "checkmark.circle")
+                    } description: {
+                        Text("Everything here has been read. Mark threads done to clear them from your inbox.")
+                    } actions: {
+                        Button("Show All") { filter = .all }
+                    }
+                case .allHidden:
+                    ContentUnavailableView {
+                        Label("All Threads Hidden", systemImage: "line.3.horizontal.decrease.circle")
+                    } description: {
+                        Text(Self.allHiddenDescription(scoped, owners: model.ownerList))
+                    } actions: {
+                        if scoped.hiddenByState > 0 {
+                            Button("Show Merged & Closed") {
+                                model.hidesMergedPullRequests = false
+                                model.hidesClosedPullRequests = false
+                                model.hidesClosedIssues = false
+                            }
+                        }
+                        if scoped.hiddenByOwner > 0 {
+                            Button("Show Every Owner") { model.owners = "" }
                         }
                     }
-                    if scoped.hiddenByOwner > 0 {
-                        Button("Show Every Owner") { model.owners = "" }
+                case .inboxClear:
+                    ContentUnavailableView {
+                        Label("Inbox Clear", systemImage: "tray")
+                    } description: {
+                        Text("Review requests, mentions, and activity on your work land here, sorted by how they reached you.")
                     }
-                }
-            } else if layout.isEmpty {
-                ContentUnavailableView {
-                    Label("Inbox Clear", systemImage: "tray")
-                } description: {
-                    Text("Review requests, mentions, and activity on your work land here, sorted by how they reached you.")
                 }
             } else {
                 lanes(layout, order: order, now: now, placeholder: false)
             }
         }
+    }
+
+    /// What stands in for lanes that show nothing.
+    enum EmptyContent: Equatable {
+        case checking, noUnread, allHidden, inboxClear
+    }
+
+    /// A subject still being read may yet need the user, so nothing is called
+    /// read, hidden, or clear until it's placed.
+    static func emptyContent(_ scoped: ScopedNotifications) -> EmptyContent {
+        if scoped.pending > 0 { return .checking }
+        if !scoped.shown.isEmpty { return .noUnread }
+        if scoped.hidden > 0 { return .allHidden }
+        return .inboxClear
     }
 
     /// Why nothing shows when everything loaded is out of scope.

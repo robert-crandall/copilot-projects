@@ -353,10 +353,12 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     /// A review request whose pull request is already merged or closed, or
     /// whose request was withdrawn: there's nothing left to review. Mentions
     /// and other activity on a closed thread can still need an answer, so
-    /// they're never settled this way.
+    /// they're never settled this way. A close read for an older copy may have
+    /// been undone since, as `NotificationScope` judges it; a merge can't be.
     var isSettled: Bool {
-        (lane == .reviewRequested || lane == .teamReviewRequested) && thread.reason == .reviewRequested
-            && (detail?.state?.isSettled == true || detail?.withdrawn == true)
+        guard (lane == .reviewRequested || lane == .teamReviewRequested) && thread.reason == .reviewRequested else { return false }
+        if let state = detail?.state, state.isSettled, stateIsCurrent || state == .merged { return true }
+        return detail?.withdrawn == true
     }
     /// Unread, in a band that needs the user, still open to act on, and not answered.
     var needsYou: Bool { thread.unread && lane.band.needsYou && !isSettled && !isAnswered }
