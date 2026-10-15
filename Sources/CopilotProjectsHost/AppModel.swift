@@ -452,6 +452,20 @@ final class AppModel: ObservableObject {
     private let agentActivityCooldownScheduler:
         (_ delay: TimeInterval, _ action: @escaping @MainActor () -> Void) -> Void
     private let agentActivityScanObserver: (() -> Void)?
+    // Watcher and backstop scans read snapshot files on this queue and apply the
+    // results on the main actor: one read in flight, one follow-up queued behind it.
+    private let agentActivityReader: AgentActivityReader.Read
+    private let agentActivityReadQueue = DispatchQueue(
+        label: "copilot-projects.agent-activity-reads", qos: .userInitiated
+    )
+    private var agentActivityReadInFlight = false
+    private var agentActivityReadQueued = false
+    // Counts each session's main-actor observations of its snapshot file (applied
+    // scan reads and single-session loads, whatever they found) and the status
+    // hooks that change its scheduling, so a background read applies only to
+    // sessions nothing observed or changed after it began. The cached signature
+    // can't tell: a later scan that finds the file gone leaves an empty cache empty.
+    private var agentActivityObservations: [String: Int] = [:]
     // Per-session decoded-snapshot cache keyed by a file signature (inode+size+
     // mtime). Every live session heartbeats a write to its
     // `<id>.agent-activity.json` roughly every 5s, and both the directory watcher
@@ -627,6 +641,7 @@ final class AppModel: ObservableObject {
             }
         },
         agentActivityScanObserver: (() -> Void)? = nil,
+        agentActivityReader: @escaping AgentActivityReader.Read = AgentActivityReader.read,
         kittyImageDiskStore: RemoteKittyImageDiskStore = .shared,
         gracefulSessionDestroyer: @escaping GracefulSessionDestroyer = {
             sessionIds, store in
@@ -664,6 +679,7 @@ final class AppModel: ObservableObject {
         self.agentActivityRefreshThrottle = agentActivityRefreshThrottle
         self.agentActivityCooldownScheduler = agentActivityCooldownScheduler
         self.agentActivityScanObserver = agentActivityScanObserver
+        self.agentActivityReader = agentActivityReader
         self.kittyImageDiskStore = kittyImageDiskStore
         self.gracefulSessionDestroyer = gracefulSessionDestroyer
         self.forcedSessionDestroyer = forcedSessionDestroyer
@@ -3502,6 +3518,10 @@ final class AppModel: ObservableObject {
             projects[loc.p].sessions[loc.s].scheduledTurnActive = false
             scheduledSnapshotsSuppressed.insert(sessionId)
         }
+        if startsScheduledTurn || endsScheduledTurn {
+            // A scan read that began before this hook would undo it.
+            agentActivityObservations[sessionId, default: 0] += 1
+        }
         let clearsBackgroundAgents = status == .idle && source == "session-idle"
         let hasCompletionSignal = SessionSemantics.isCompletionSignal(
             status: status,
@@ -3532,6 +3552,7 @@ final class AppModel: ObservableObject {
         if status == .running || status == .waiting {
             if status == .running {
                 projects[loc.p].sessions[loc.s].scheduledTurnActive = false
+                agentActivityObservations[sessionId, default: 0] += 1
                 foregroundIdleGenerationBaselines[sessionId] =
                     projects[loc.p].sessions[loc.s].agentActivity?.idleGeneration ?? -1
             }
@@ -4087,7 +4108,7 @@ final class AppModel: ObservableObject {
         }
 
         let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshAgentActivitySnapshots() }
+            Task { @MainActor [weak self] in self?.scanAgentActivityInBackground() }
         }
         RunLoop.main.add(timer, forMode: .common)
         agentActivityTimer = timer
@@ -4106,7 +4127,7 @@ final class AppModel: ObservableObject {
             return
         }
         agentActivityRefreshCoolingDown = true
-        refreshAgentActivitySnapshots()
+        scanAgentActivityInBackground()
         scheduleAgentActivityCooldown(generation: agentActivityRefreshGeneration)
     }
 
@@ -4115,7 +4136,7 @@ final class AppModel: ObservableObject {
             guard let self, generation == self.agentActivityRefreshGeneration else { return }
             if self.agentActivityRefreshPending {
                 self.agentActivityRefreshPending = false
-                self.refreshAgentActivitySnapshots()
+                self.scanAgentActivityInBackground()
                 self.scheduleAgentActivityCooldown(generation: generation)
             } else {
                 self.agentActivityRefreshCoolingDown = false
@@ -4123,29 +4144,111 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Scans every session's snapshot, reading the files off the main actor.
+    /// A scan asked for while one is reading runs once that one finishes.
+    func scanAgentActivityInBackground() {
+        agentActivityScanObserver?()
+        guard !agentActivityReadInFlight else {
+            agentActivityReadQueued = true
+            return
+        }
+        startAgentActivityRead()
+    }
+
+    private func startAgentActivityRead() {
+        guard !isTerminating else { return }
+        agentActivityReadInFlight = true
+        let generation = agentActivityRefreshGeneration
+        let sessionIds = projects.flatMap { $0.sessions.map(\.id) }
+        let cached = agentActivitySnapshotCache.mapValues(\.signature)
+        let observations = agentActivityObservations
+        let directory = agentActivityDirectory
+        let reader = agentActivityReader
+        agentActivityReadQueue.async { [weak self] in
+            let reads = reader(sessionIds, directory, cached, { Date() })
+            Task { @MainActor [weak self] in
+                self?.finishAgentActivityRead(reads, observations: observations, generation: generation)
+            }
+        }
+    }
+
+    private func finishAgentActivityRead(
+        _ reads: [String: AgentActivityRead],
+        observations: [String: Int],
+        generation: Int
+    ) {
+        agentActivityReadInFlight = false
+        var again = agentActivityReadQueued
+        agentActivityReadQueued = false
+        // Tracking restarted or stopped since this read began.
+        if generation == agentActivityRefreshGeneration,
+           !applyAgentActivityReads(reads, observations: observations, clock: { Date() }) {
+            again = true
+        }
+        if again { startAgentActivityRead() }
+    }
+
+    /// Scans every session's snapshot synchronously, reading files on the main
+    /// actor; tracking's first scan uses it, and tests assert right after.
     func refreshAgentActivitySnapshots(now: Date = Date()) {
         // Trackers keep publishing while the scan runs, so each snapshot is
-        // judged when its file was read rather than when the scan started.
+        // judged when it's applied, after its file was read, rather than when
+        // the scan started.
         let readTime = advancingClock(from: now)
         agentActivityScanObserver?()
-        let decoder = JSONDecoder()
+        let reads = agentActivityReader(
+            projects.flatMap { $0.sessions.map(\.id) }, agentActivityDirectory,
+            agentActivitySnapshotCache.mapValues(\.signature), readTime
+        )
+        applyAgentActivityReads(reads, observations: agentActivityObservations, clock: readTime)
+    }
+
+    /// Applies a scan's reads to the current sessions. A session the scan didn't
+    /// read, or that was observed or changed by a hook after the read began (a
+    /// later scan, a single-session load, or a scheduling hook), keeps its state;
+    /// returns false when any did, so the caller can scan again.
+    @discardableResult
+    private func applyAgentActivityReads(
+        _ reads: [String: AgentActivityRead],
+        observations: [String: Int],
+        clock readTime: () -> Date
+    ) -> Bool {
         let fm = FileManager.default
         var nextProjects = projects
         var activityChanged = false
+        var complete = true
         var seenSessionIds: Set<String> = []
         var budgetNotifications: [(projectId: String, sessionId: String)] = []
         for pi in nextProjects.indices {
             for si in nextProjects[pi].sessions.indices {
                 let sessionId = nextProjects[pi].sessions[si].id
                 seenSessionIds.insert(sessionId)
-                let path = agentActivityDirectory
-                    .appendingPathComponent("\(sessionId).agent-activity.json", isDirectory: false).path
-                let snapshot = loadAgentActivitySnapshot(
-                    sessionId: sessionId, path: path, decoder: decoder, fm: fm
-                )
-                let readAt = readTime()
-                let fresh = snapshot?.isFresh(at: readAt) == true ? snapshot : nil
-                if let workflow = fresh?.workflow, workflow.isFresh(at: readAt),
+                guard let read = reads[sessionId],
+                      agentActivityObservations[sessionId] == observations[sessionId] else {
+                    complete = false
+                    continue
+                }
+                agentActivityObservations[sessionId, default: 0] += 1
+                let snapshot: AgentActivitySnapshot?
+                switch read.outcome {
+                case .missing:
+                    agentActivitySnapshotCache.removeValue(forKey: sessionId)
+                    snapshot = nil
+                case .unchanged:
+                    snapshot = agentActivitySnapshotCache[sessionId]?.snapshot
+                case .unreadable:
+                    // Fail closed without advancing the cached signature, so the
+                    // next scan retries rather than serving a stale snapshot.
+                    snapshot = nil
+                case .read(let signature, let decoded):
+                    agentActivitySnapshotCache[sessionId] = (signature, decoded)
+                    snapshot = decoded
+                }
+                // A background read can wait on later files and the main actor, so
+                // judge freshness now rather than when the file was read.
+                let judgedAt = max(read.readAt, readTime())
+                let fresh = snapshot?.isFresh(at: judgedAt) == true ? snapshot : nil
+                if let workflow = fresh?.workflow, workflow.isFresh(at: judgedAt),
                    let request = workflow.budgetRequest,
                    let epoch = fresh?.conversationEpoch {
                     let key = "\(epoch):\(request.requestId)"
@@ -4202,6 +4305,7 @@ final class AppModel: ObservableObject {
         // isn't written yet) is opened, leaving the count unchanged but a stale entry.
         agentActivitySnapshotCache = agentActivitySnapshotCache
             .filter { seenSessionIds.contains($0.key) }
+        agentActivityObservations = agentActivityObservations.filter { seenSessionIds.contains($0.key) }
         runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
         budgetNotificationKeys = budgetNotificationKeys.filter { seenSessionIds.contains($0.key) }
         reconcileRuntimeActivity(now: readTime())
@@ -4212,21 +4316,22 @@ final class AppModel: ObservableObject {
                 body: "Open this session to add AI credits or stop the blocked request."
             )
         }
+        return complete
     }
 
-    /// Load a session's agent-activity snapshot, skipping the `Data(contentsOf:)`
-    /// read + JSON decode when the file's signature (inode+size+mtime) matches the
-    /// cached one — the common case, since only 1–2 of N session files change per
-    /// scan. The caller re-applies the freshness TTL, so skipping the read never
-    /// stalls a stale→nil transition. Kept synchronous on the main actor so scans
-    /// stay serialized and single-writer — no races against `setStatus` or the
-    /// reconcilers that also mutate/read this state on main.
+    /// Load one session's agent-activity snapshot on the main actor, skipping the
+    /// `Data(contentsOf:)` read + JSON decode when the file's signature
+    /// (inode+size+mtime) matches the cached one. The caller re-applies the
+    /// freshness TTL, so skipping the read never stalls a stale→nil transition.
+    /// Scans read through `AgentActivityReader` instead; a scan whose read began
+    /// before this load leaves that session for the next scan.
     private func loadAgentActivitySnapshot(
         sessionId: String,
         path: String,
         decoder: JSONDecoder,
         fm: FileManager
     ) -> AgentActivitySnapshot? {
+        agentActivityObservations[sessionId, default: 0] += 1
         let cached = agentActivitySnapshotCache[sessionId]
         guard let attributes = try? fm.attributesOfItem(atPath: path) else {
             if cached != nil { agentActivitySnapshotCache.removeValue(forKey: sessionId) }
