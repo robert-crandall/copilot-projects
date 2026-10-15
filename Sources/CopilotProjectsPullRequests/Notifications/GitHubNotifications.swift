@@ -103,8 +103,8 @@ enum NotificationLane: Int, CaseIterable, Identifiable, Comparable, Sendable {
     static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
-/// The window's columns: how recently a thread changed, measured from when
-/// the user last looked.
+/// The window's columns: how recently a thread changed. Unread changes stay
+/// new until the user acts on them.
 enum NotificationFreshness: Int, CaseIterable, Identifiable, Sendable {
     case sinceYouLooked, today, thisWeek, older
 
@@ -119,7 +119,8 @@ enum NotificationFreshness: Int, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Unread changes after the last look are new; everything else is placed by its day.
+    /// Unread changes after `lookedAt` (the baseline, or the user's last action
+    /// on the thread) are new; everything else is placed by its day.
     static func of(
         updatedAt: Date, unread: Bool, lookedAt: Date?, now: Date, calendar: Calendar = .current
     ) -> NotificationFreshness {
@@ -334,6 +335,9 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     /// Who asked for a review isn't known yet; it sits with To you until it is.
     let isClassifying: Bool
     var session: PullRequestSession?
+    /// The latest change the user has acted on here (opened, marked, unsubscribed,
+    /// went to its session, or copied its link); nothing newer has been seen.
+    let actedAt: Date?
 
     var id: NotificationThread.Key { thread.key }
 
@@ -377,12 +381,16 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
         }
     }
 
-    init(thread: NotificationThread, detail: NotificationSubjectDetail?, detailsSettled: Bool, session: PullRequestSession? = nil) {
+    init(
+        thread: NotificationThread, detail: NotificationSubjectDetail?, detailsSettled: Bool,
+        session: PullRequestSession? = nil, actedAt: Date? = nil
+    ) {
         self.thread = thread
         self.detail = detail
         lane = Self.lane(for: thread.reason, detail: detail)
         isClassifying = thread.reason == .reviewRequested && thread.kind == .pullRequest && detail == nil && !detailsSettled
         self.session = session
+        self.actedAt = actedAt
     }
 
     /// The facts a chip adds to what its lane already says, most useful first.
@@ -414,9 +422,11 @@ struct NotificationLayout: Equatable {
         /// Unread, but its pull request is already merged or closed, or the request withdrawn.
         var settledCount: Int { items.filter { $0.thread.unread && $0.isSettled && $0.lane.band.needsYou }.count }
 
+        /// A thread the user acted on is measured from that action rather than from `lookedAt`.
         func items(in column: NotificationFreshness, lookedAt: Date?, now: Date) -> [NotificationItem] {
             items.filter {
-                NotificationFreshness.of(updatedAt: $0.thread.updatedAt, unread: $0.thread.unread, lookedAt: lookedAt, now: now) == column
+                let seen = [lookedAt, $0.actedAt].compactMap { $0 }.max()
+                return NotificationFreshness.of(updatedAt: $0.thread.updatedAt, unread: $0.thread.unread, lookedAt: seen, now: now) == column
             }
         }
     }

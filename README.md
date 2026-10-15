@@ -250,9 +250,11 @@ Each row is a reason, grouped by how it reached you:
 - **Quiet:** CI activity and everything else. Quiet threads are listed but never
   badged or bannered.
 
-Its columns are **Since you looked** (unread threads that changed after you last
-had the window in front), **Today**, **This week**, and **Older**. When you come
-back, what you already saw moves out of **Since you looked**. Each cell shows
+Its columns are **Since you looked** (unread changes you haven't acted on yet),
+**Today**, **This week**, and **Older**. Looking at the window moves nothing: a
+thread leaves **Since you looked** once you open it, mark it read or done,
+unsubscribe, go to its session, or copy its link, and comes back when something
+new happens on it. Each cell shows
 five threads, unread and newest first; **Show more** reveals the rest.
 
 - **Act from it.** Double-click a thread, or press `⌘Return`, to open it on

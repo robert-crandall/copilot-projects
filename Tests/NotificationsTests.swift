@@ -527,33 +527,130 @@ final class NotificationsTests: XCTestCase {
 
     // MARK: Looking and banners
 
-    func testColumnsCatchUpWithTheLastLookWhenTheUserComesBack() {
+    private func sinceYouLooked(_ model: NotificationsModel) -> [String] {
+        NotificationLayout(items: model.items).lanes
+            .flatMap { $0.items(in: .sinceYouLooked, lookedAt: model.lookedAt, now: now) }
+            .map(\.id.id).sorted()
+    }
+
+    func testLookingAtTheWindowMovesNothing() {
         let clock = TestClock(now)
+        let model = makeModel(FakeGitHub(), clock: clock)
+        model.show([thread("1", "mention"), thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        model.beganLooking()
+        XCTAssertTrue(model.isLooking)
+        clock.now += 60
+        model.finishedLooking()
+        XCTAssertFalse(model.isLooking)
+        model.beganLooking()
+        XCTAssertEqual(model.lookedAt, now.addingTimeInterval(-3600))
+        XCTAssertEqual(sinceYouLooked(model), ["1", "2"], "only acting on a thread moves it")
+    }
+
+    func testActingOnAThreadMovesItOutOfSinceYouLookedUntilItChanges() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let clock = TestClock(now)
         let model = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
-        XCTAssertNil(model.lookedAt)
-        model.beganLooking()
-        clock.now += 5
-        model.finishedLooking()
-        XCTAssertNil(model.lookedAt, "staring at the loading placeholder isn't a look")
+        let first = thread("1", "mention", minutesAgo: 10)
+        model.show([first, thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        model.noteActed([first])
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
+        XCTAssertNotNil(NotificationLayout(items: model.items).lanes.flatMap { $0.items(in: .today, lookedAt: model.lookedAt, now: now) }.first { $0.id.id == "1" })
 
-        model.show([thread("1", "mention")], accounts: ["octocat"])
-        model.beganLooking()
-        clock.now += 1
-        model.finishedLooking()
-        XCTAssertNil(model.lookedAt, "a glance isn't a look")
+        // Remembered across launches.
+        let restarted = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
+        restarted.show([first, thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        XCTAssertEqual(sinceYouLooked(restarted), ["2"])
 
-        model.beganLooking()
-        clock.now += 5
-        model.beganLooking()
-        XCTAssertNil(model.lookedAt, "coming back from the window's own popover continues the look")
-        clock.now += 5
-        model.finishedLooking()
-        XCTAssertEqual(model.lookedAt, clock.now)
-        XCTAssertNil(model.columnsLookedAt, "columns hold still while the user is away")
-        model.beganLooking()
-        XCTAssertEqual(model.columnsLookedAt, clock.now)
-        XCTAssertEqual(defaults.double(forKey: NotificationsModel.lookedAtKey), clock.now.timeIntervalSince1970)
+        // Something new after the action brings it back.
+        clock.now += 60
+        restarted.show([thread("1", "mention", minutesAgo: -1), thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        XCTAssertEqual(sinceYouLooked(restarted), ["1", "2"])
+    }
+
+    func testAnActionHoldsPastAWeekWhileItsThreadHasNothingNew() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let clock = TestClock(now)
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-600)),
+        ]])
+        let model = makeModel(github, clock: clock, defaults: defaults)
+        await model.refreshNow()
+        // Copy Link leaves the thread unread.
+        model.noteActed([try XCTUnwrap(model.threads.first { $0.key.id == "1" })])
+        clock.now += 8 * 86_400
+
+        // A week on, the next read forgets old actions, but not one still in use.
+        await model.refreshNow()
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
+        let older = NotificationLayout(items: model.items).lanes.flatMap { $0.items(in: .older, lookedAt: model.lookedAt, now: clock.now) }
+        XCTAssertEqual(older.map(\.id.id), ["1"])
+
+        // Nor does a relaunch.
+        let restarted = makeModel(github, clock: clock, defaults: defaults)
+        await restarted.refreshNow()
+        XCTAssertEqual(sinceYouLooked(restarted), ["2"])
+    }
+
+    func testActionsOlderThanAWeekAreForgottenOnceNoThreadNeedsThem() async {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let old = now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970
+        defaults.set(["octocat|1": old, "octocat|3": old, "octocat|4": old], forKey: NotificationsModel.actedAtKey)
+        // 1 is gone; 3 hasn't changed since; 4 has.
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("3", reason: "mention", type: "Issue", number: 3, updated: now.addingTimeInterval(-9 * 86_400)),
+            FakeGitHub.thread("4", reason: "mention", type: "Issue", number: 4, updated: now.addingTimeInterval(-600)),
+        ]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        XCTAssertEqual(model.actedAt.keys.map(\.id), ["3"])
+        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).keys.sorted(), ["octocat|3"])
+        XCTAssertEqual(sinceYouLooked(model), ["4"])
+    }
+
+    func testAnAccountThatWasntReadKeepsItsOldActions() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let old = now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970
+        defaults.set(["octocat|1": old, "hubot|1": old], forKey: NotificationsModel.actedAtKey)
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-9 * 86_400)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-600)),
+        ]])
+        github.revoke("flaky")
+        let model = NotificationsModel(
+            workspace: FakeWorkspace(), defaults: defaults,
+            api: GitHubNotificationsAPI(send: github.send),
+            detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "good"), GitHubAccount(login: "hubot", token: "flaky")] },
+            transcriptPath: { _ in nil }, clock: { self.now }
+        )
+        model.setBadge = { _ in }
+        await model.refreshNow()
+        // Acting while hubot's inbox couldn't be read doesn't forget what was done there.
+        model.noteActed([try XCTUnwrap(model.threads.first { $0.key == .init(account: "octocat", id: "2") })])
+
+        github.restore("flaky")
+        await model.refreshNow()
+        XCTAssertEqual(model.threads.filter { $0.key.account == "hubot" }.count, 2)
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
+    }
+
+    func testActionsAreRememberedForAnAccountWithoutALogin() {
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let baseline = now.addingTimeInterval(-3600)
+        // An older gh names no account.
+        let acted = thread("1", "mention", account: "")
+        let first = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
+        first.show([acted], accounts: [""], lookedAt: baseline)
+        first.noteActed([acted])
+
+        let restarted = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
+        restarted.show([acted], accounts: [""], lookedAt: baseline)
+        XCTAssertEqual(sinceYouLooked(restarted), [])
     }
 
     func testTheFirstLookStartsFromTheLastReadOnGitHub() async {
@@ -570,10 +667,9 @@ final class NotificationsTests: XCTestCase {
         await model.refreshNow()
         let lastRead = now.addingTimeInterval(-3600)
         XCTAssertEqual(model.lookedAt, lastRead)
-        XCTAssertEqual(model.columnsLookedAt, lastRead)
         XCTAssertEqual(defaults.double(forKey: NotificationsModel.lookedAtKey), lastRead.timeIntervalSince1970)
         let columns = Dictionary(uniqueKeysWithValues: model.items.map {
-            ($0.id.id, NotificationFreshness.of(updatedAt: $0.thread.updatedAt, unread: $0.thread.unread, lookedAt: model.columnsLookedAt, now: now))
+            ($0.id.id, NotificationFreshness.of(updatedAt: $0.thread.updatedAt, unread: $0.thread.unread, lookedAt: model.lookedAt, now: now))
         })
         XCTAssertEqual(columns["2"], .sinceYouLooked)
         XCTAssertNotEqual(columns["3"], .sinceYouLooked, "unread before the last read on GitHub was already there to see")
@@ -582,6 +678,28 @@ final class NotificationsTests: XCTestCase {
         model.beganLooking()
         await model.refreshNow()
         XCTAssertEqual(model.lookedAt, lastRead)
+    }
+
+    func testTheFirstLookHoldsWhenNothingWasReadOnGitHubYet() async throws {
+        let github = FakeGitHub()
+        let clock = TestClock(now)
+        let older = FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-5400))
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-1800)), older,
+        ]])
+        let model = makeModel(github, clock: clock)
+        await model.refreshNow()
+        XCTAssertEqual(sinceYouLooked(model), ["1", "2"])
+
+        // Opening one reads it on GitHub; that read doesn't move the other.
+        model.open(try XCTUnwrap(model.items.first { $0.id.id == "1" }))
+        clock.now += 60
+        var read = FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: now.addingTimeInterval(-1800))
+        read["last_read_at"] = ISO8601DateFormatter().string(from: clock.now)
+        github.answer("participating", pages: [[older]])
+        github.answer("read", pages: [[read]])
+        await model.refreshNow()
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
     }
 
     func testBannersAnnounceOnlyNewThreadsThatNeedYou() async {

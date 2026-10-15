@@ -453,7 +453,7 @@ struct NotificationsView: View {
     }
 
     private func lanes(_ layout: NotificationLayout, order: [NotificationItem], now: Date, placeholder: Bool) -> some View {
-        let lookedAt = placeholder ? nil : model.columnsLookedAt
+        let lookedAt = placeholder ? nil : model.lookedAt
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
@@ -555,7 +555,7 @@ struct NotificationsView: View {
     private func readingOrder(_ layout: NotificationLayout, now: Date) -> [NotificationItem] {
         layout.lanes.flatMap { lane in
             NotificationFreshness.allCases.flatMap { column in
-                shown(lane.items(in: column, lookedAt: model.columnsLookedAt, now: now), lane: lane.lane, column: column)
+                shown(lane.items(in: column, lookedAt: model.lookedAt, now: now), lane: lane.lane, column: column)
             }
         }
     }
@@ -587,7 +587,7 @@ struct NotificationsView: View {
                 }
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .help(column == .sinceYouLooked ? sinceYouLookedHelp(lookedAt) : column.title)
+                .help(column == .sinceYouLooked ? Self.sinceYouLookedHelp : column.title)
                 .accessibilityElement(children: .combine)
             }
         }
@@ -600,10 +600,7 @@ struct NotificationsView: View {
         .accessibilityAddTraits(.isHeader)
     }
 
-    private func sinceYouLookedHelp(_ lookedAt: Date?) -> String {
-        guard let lookedAt else { return "Unread threads you haven’t seen here yet" }
-        return "Unread threads that changed after you last looked, \(lookedAt.formatted(.relative(presentation: .named)))"
-    }
+    private static let sinceYouLookedHelp = "Unread changes you haven’t acted on yet. Open, mark, or copy a thread to move it along."
 
     private func bandHeader(_ band: NotificationLayout.Band) -> some View {
         HStack(spacing: 6) {
