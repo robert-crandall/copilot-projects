@@ -79,8 +79,8 @@ final class NotificationsModel: ObservableObject {
     static let actedAtKey = "notifications.actedAt"
     /// How long an action is remembered once no thread on hand still needs it.
     static let actedLifetime: TimeInterval = 7 * 86_400
-    /// Per account, the most actions remembered for threads not on hand when
-    /// its inbox holds more unread than one read reaches; the newest are kept.
+    /// Per account, the most actions over a week old remembered for threads not
+    /// on hand when its inbox holds more unread than one read reaches; the newest are kept.
     static let actedOffHandLimit = 1_000
     /// `account|thread id` → the latest `updatedAt` a confirmed done covers.
     static let doneThreadsKey = "notifications.doneThreads"
@@ -779,12 +779,14 @@ final class NotificationsModel: ObservableObject {
 
     /// Forgets actions no thread can need again, in the accounts just read. An
     /// action matters only while its thread is unread with nothing newer, so
-    /// it's forgotten once GitHub shows the thread read, something newer
-    /// happened, or GitHub took its Done; otherwise that thread would come back
-    /// to Since you looked with nothing new. One whose thread isn't on hand is
-    /// kept for a week, or, where the inbox holds more unread than one read
-    /// reaches and the thread may only be out of reach, up to a limit per
-    /// account. An account that wasn't read keeps its own.
+    /// it's forgotten once GitHub shows the thread read or something newer
+    /// happened (a read or Done GitHub took forgets it as it lands). Otherwise that
+    /// thread would come back to Since you looked with nothing new. One whose
+    /// thread isn't on hand is kept for a week; past that, where the inbox holds
+    /// more unread than one read reaches and the thread may only be out of
+    /// reach, the newest are kept up to a limit per account, and a thread whose
+    /// action was let go comes back as new if it returns unchanged. An account
+    /// that wasn't read keeps its own.
     private func forgetOldActions(read accounts: Set<String>) {
         let horizon = clock().addingTimeInterval(-Self.actedLifetime)
         let onHand = Dictionary(threads.map { ($0.key, $0) }, uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 })
@@ -798,15 +800,13 @@ final class NotificationsModel: ObservableObject {
             if let thread = onHand[key] {
                 // Read here but not yet on GitHub stays covered in case the read fails.
                 if thread.updatedAt <= at, thread.unread || readLocally[key] != nil { kept[key] = at }
-            } else if doneLocally[key] != nil, confirmedDone[key] == nil {
-                // A Done still in flight brings the thread back if it fails.
-                kept[key] = at
             } else if confirmedDone[key] != nil {
                 continue
+            } else if doneLocally[key] != nil || at >= horizon {
+                // A Done still in flight brings the thread back if it fails.
+                kept[key] = at
             } else if truncatedAccounts.contains(key.account) {
                 outOfReach[key.account, default: []].append((key, at))
-            } else if at >= horizon {
-                kept[key] = at
             }
         }
         for markers in outOfReach.values {
@@ -827,14 +827,19 @@ final class NotificationsModel: ObservableObject {
     }
 
     func markRead(_ items: [NotificationItem]) {
-        noteActed(items.map(\.thread))
+        // Only unread threads can sit in Since you looked, so only they need the action noted.
         let targets = items.filter(\.thread.unread).map(\.thread)
         guard !targets.isEmpty else { return }
+        noteActed(targets)
         let now = clock()
         // A copy dated ahead of this clock is covered too, as for Done.
         for thread in targets { readLocally[thread.key] = max(now, thread.updatedAt) }
         update(targets.map(\.key)) { $0.unread = false }
-        perform(targets, verb: "mark as read", action: { api, account, id in try await api.markRead(account: account, threadId: id) }) { [weak self] failed in
+        perform(targets, verb: "mark as read", action: { api, account, id in try await api.markRead(account: account, threadId: id) }, succeeded: { [weak self] thread in
+            // Read on GitHub, it comes back only with something newer, which no action covers.
+            guard let self, self.actedAt.removeValue(forKey: thread.key) != nil else { return }
+            self.saveActedAt()
+        }) { [weak self] failed in
             for thread in failed { self?.readLocally[thread.key] = nil }
             self?.update(failed.map(\.key)) { $0.unread = true }
         }
@@ -912,6 +917,8 @@ final class NotificationsModel: ObservableObject {
             guard let self, let entry = self.doneLocally[thread.key], entry.by == removal else { return }
             self.confirmedDone[thread.key] = entry.covers
             self.saveConfirmedDone()
+            // It comes back only with something newer, which no action covers.
+            if self.actedAt.removeValue(forKey: thread.key) != nil { self.saveActedAt() }
         }) { [weak self] failed in
             guard let self else { return }
             // A newer copy, or a later removal of it, has moved on: leave that be.

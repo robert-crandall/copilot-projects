@@ -699,9 +699,9 @@ final class NotificationsTests: XCTestCase {
         let github = FakeGitHub()
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let limit = NotificationsModel.actedOffHandLimit
-        var stored: [String: Double] = [:]
+        var stored: [String: Double] = ["octocat|recent": now.addingTimeInterval(-3600).timeIntervalSince1970]
         for index in 0..<(limit + 2) {
-            stored["octocat|gone\(index)"] = now.addingTimeInterval(-Double(index + 1) * 3600).timeIntervalSince1970
+            stored["octocat|gone\(index)"] = now.addingTimeInterval(-8 * 86_400 - Double(index + 1) * 3600).timeIntervalSince1970
         }
         defaults.set(stored, forKey: NotificationsModel.actedAtKey)
         github.answer("participating", pages: [
@@ -710,10 +710,48 @@ final class NotificationsTests: XCTestCase {
         ])
         let model = makeModel(github, clock: TestClock(now), defaults: defaults, plan: NotificationsFetchPlan(participatingPages: 1))
         await model.refreshNow()
-        XCTAssertEqual(model.actedAt.count, limit)
+        XCTAssertEqual(model.actedAt.count, limit + 1)
+        XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "recent")], "a week's actions are never capped")
         XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "gone0")])
         XCTAssertNil(model.actedAt[.init(account: "octocat", id: "gone\(limit)")], "the oldest go first")
         XCTAssertNil(model.actedAt[.init(account: "octocat", id: "gone\(limit + 1)")])
+    }
+
+    func testAnActionIsForgottenWhenGitHubTakesItsDoneHoweverOld() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        // Copied a link to it days ago; it's older than the read window, so its
+        // automatic Done is never kept as confirmed.
+        let old = now.addingTimeInterval(-4 * 86_400)
+        defaults.set(["octocat|1": old.timeIntervalSince1970], forKey: NotificationsModel.actedAtKey)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", number: 1, updated: old)]])
+        let model = answeringModel(github, details: DetailBox(["1": answeredDetail]), clears: true, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        try await waitUntil { model.actedAt.isEmpty }
+        XCTAssertTrue(github.actions.contains("DELETE /notifications/threads/1"))
+        XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
+    }
+
+    func testAnActionIsForgottenWhenGitHubTakesItsReadButKeptWhileItMayFail() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, unread: false, updated: now.addingTimeInterval(-600)),
+        ]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        github.holdNextAction("1")
+        model.markRead(model.items)
+        try await waitUntil { github.isHolding("1") }
+        XCTAssertEqual(model.actedAt.keys.map(\.id), ["1"], "a read thread needs no action noted; one in flight may yet fail")
+        // A refresh while it's in flight keeps it.
+        await model.refreshNow()
+        XCTAssertEqual(model.actedAt.keys.map(\.id), ["1"])
+
+        github.release("1")
+        try await waitUntil { model.actedAt.isEmpty }
+        XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
     }
 
     func testActionsAreRememberedForAnAccountWithoutALogin() {
