@@ -568,45 +568,75 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(sinceYouLooked(restarted), ["1", "2"])
     }
 
-    func testAnActionHoldsPastAWeekWhileItsThreadHasNothingNew() {
+    func testAnActionHoldsPastAWeekWhileItsThreadHasNothingNew() async throws {
+        let github = FakeGitHub()
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let clock = TestClock(now)
-        let model = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
-        let first = thread("1", "mention")
-        let second = thread("2", "mention", number: 2)
-        let baseline = now.addingTimeInterval(-3600)
-        model.show([first, second], accounts: ["octocat"], lookedAt: baseline)
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-600)),
+        ]])
+        let model = makeModel(github, clock: clock, defaults: defaults)
+        await model.refreshNow()
         // Copy Link leaves the thread unread.
-        model.noteActed([first])
+        model.noteActed([try XCTUnwrap(model.threads.first { $0.key.id == "1" })])
         clock.now += 8 * 86_400
 
-        // Acting on another thread forgets old actions, but not one still in use.
-        model.noteActed([second])
-        XCTAssertEqual(sinceYouLooked(model), [])
+        // A week on, the next read forgets old actions, but not one still in use.
+        await model.refreshNow()
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
         let older = NotificationLayout(items: model.items).lanes.flatMap { $0.items(in: .older, lookedAt: model.lookedAt, now: clock.now) }
-        XCTAssertEqual(older.map(\.id.id).sorted(), ["1", "2"])
+        XCTAssertEqual(older.map(\.id.id), ["1"])
 
         // Nor does a relaunch.
-        let restarted = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
-        restarted.show([first, second], accounts: ["octocat"], lookedAt: baseline)
-        XCTAssertEqual(sinceYouLooked(restarted), [])
+        let restarted = makeModel(github, clock: clock, defaults: defaults)
+        await restarted.refreshNow()
+        XCTAssertEqual(sinceYouLooked(restarted), ["2"])
     }
 
-    func testActionsOlderThanAWeekAreForgottenOnceNoThreadNeedsThem() {
+    func testActionsOlderThanAWeekAreForgottenOnceNoThreadNeedsThem() async {
+        let github = FakeGitHub()
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let old = now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970
         defaults.set(["octocat|1": old, "octocat|3": old, "octocat|4": old], forKey: NotificationsModel.actedAtKey)
-        let model = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
-        let second = thread("2", "mention", number: 2)
         // 1 is gone; 3 hasn't changed since; 4 has.
-        model.show(
-            [second, thread("3", "mention", minutesAgo: 9 * 1440, number: 3), thread("4", "mention", number: 4)],
-            accounts: ["octocat"], lookedAt: now.addingTimeInterval(-10 * 86_400)
-        )
-        model.noteActed([second])
-        XCTAssertEqual(model.actedAt.keys.map(\.id).sorted(), ["2", "3"])
-        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).keys.sorted(), ["octocat|2", "octocat|3"])
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("3", reason: "mention", type: "Issue", number: 3, updated: now.addingTimeInterval(-9 * 86_400)),
+            FakeGitHub.thread("4", reason: "mention", type: "Issue", number: 4, updated: now.addingTimeInterval(-600)),
+        ]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        XCTAssertEqual(model.actedAt.keys.map(\.id), ["3"])
+        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).keys.sorted(), ["octocat|3"])
         XCTAssertEqual(sinceYouLooked(model), ["4"])
+    }
+
+    func testAnAccountThatWasntReadKeepsItsOldActions() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let old = now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970
+        defaults.set(["octocat|1": old, "hubot|1": old], forKey: NotificationsModel.actedAtKey)
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-9 * 86_400)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-600)),
+        ]])
+        github.revoke("flaky")
+        let model = NotificationsModel(
+            workspace: FakeWorkspace(), defaults: defaults,
+            api: GitHubNotificationsAPI(send: github.send),
+            detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "good"), GitHubAccount(login: "hubot", token: "flaky")] },
+            transcriptPath: { _ in nil }, clock: { self.now }
+        )
+        model.setBadge = { _ in }
+        await model.refreshNow()
+        // Acting while hubot's inbox couldn't be read doesn't forget what was done there.
+        model.noteActed([try XCTUnwrap(model.threads.first { $0.key == .init(account: "octocat", id: "2") })])
+
+        github.restore("flaky")
+        await model.refreshNow()
+        XCTAssertEqual(model.threads.filter { $0.key.account == "hubot" }.count, 2)
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
     }
 
     func testActionsAreRememberedForAnAccountWithoutALogin() {

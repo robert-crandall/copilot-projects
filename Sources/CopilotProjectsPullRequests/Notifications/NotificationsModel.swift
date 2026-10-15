@@ -442,6 +442,7 @@ final class NotificationsModel: ObservableObject {
             return
         }
         apply(fetched, accounts: accounts, started: started)
+        forgetOldActions(read: Set(fetched.keys))
         seedFirstLook()
         warning = failures.isEmpty ? nil : "Some accounts weren’t refreshed. " + failures.joined(separator: " ")
         lastUpdated = clock()
@@ -721,12 +722,22 @@ final class NotificationsModel: ObservableObject {
         saveActedAt()
     }
 
-    /// Forgets actions past their lifetime, but not one still covering a thread
-    /// on hand: that thread would come back to Since you looked with nothing new.
-    private func saveActedAt() {
+    /// Forgets actions past their lifetime in the accounts just read, but not
+    /// one still covering a thread on hand: that thread would come back to
+    /// Since you looked with nothing new. An account that wasn't read keeps
+    /// its own, as its threads may simply not be on hand yet.
+    private func forgetOldActions(read accounts: Set<String>) {
         let horizon = clock().addingTimeInterval(-Self.actedLifetime)
         let onHand = Dictionary(threads.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: max)
-        actedAt = actedAt.filter { key, at in at >= horizon || onHand[key].map { $0 <= at } == true }
+        let kept = actedAt.filter { key, at in
+            at >= horizon || !accounts.contains(key.account) || onHand[key].map { $0 <= at } == true
+        }
+        guard kept.count < actedAt.count else { return }
+        actedAt = kept
+        saveActedAt()
+    }
+
+    private func saveActedAt() {
         guard writesState else { return }
         let stored = Dictionary(
             actedAt.map { ("\($0.key.account)|\($0.key.id)", $0.value.timeIntervalSince1970) },
