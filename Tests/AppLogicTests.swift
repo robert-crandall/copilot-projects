@@ -7081,6 +7081,7 @@ final class AppLogicTests: XCTestCase {
         ))
         XCTAssertEqual(launches.count, 1)
 
+        var typedHashInDialog: String?
         var trimmedInDialog: String?
         let interactive = AppModel(
             stateRepository: StateRepository(path: root.appendingPathComponent("state.json")),
@@ -7099,6 +7100,17 @@ final class AppLogicTests: XCTestCase {
                 guard let field = alert.accessoryView as? NSTextField else {
                     return .alertSecondButtonReturn
                 }
+                field.stringValue = "https://github.com/github/github/pull/123"
+                NotificationCenter.default.post(
+                    name: NSControl.textDidChangeNotification,
+                    object: field
+                )
+                field.stringValue = "https://github.com/github/github/pull/123#"
+                NotificationCenter.default.post(
+                    name: NSControl.textDidChangeNotification,
+                    object: field
+                )
+                typedHashInDialog = field.stringValue
                 field.stringValue = "https://github.com/github/github/pull/123#discussion_r99"
                 NotificationCenter.default.post(
                     name: NSControl.textDidChangeNotification,
@@ -7109,6 +7121,7 @@ final class AppLogicTests: XCTestCase {
             }
         )
         interactive.addAdversarialReviewSessionInteractive(toProjectId: "p1")
+        XCTAssertEqual(typedHashInDialog, "https://github.com/github/github/pull/123#")
         XCTAssertEqual(trimmedInDialog, "https://github.com/github/github/pull/123")
         XCTAssertEqual(launches.count, 2)
     }

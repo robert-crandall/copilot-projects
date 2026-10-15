@@ -77,15 +77,25 @@ public struct PullRequestReviewTarget: Equatable, Sendable {
     }
 
     /// Trims `#` and everything after it when a URL with a fragment is pasted,
-    /// without eating a bare `#` typed one character at a time.
+    /// without eating `#` or fragment characters typed one character at a time.
     public static func trimmingPastedFragment(from oldValue: String, to newValue: String) -> String {
-        guard !oldValue.contains("#"), let hash = newValue.firstIndex(of: "#") else {
+        guard let hash = newValue.firstIndex(of: "#") else {
             return newValue
         }
-        if hash < newValue.index(before: newValue.endIndex) || newValue.count - oldValue.count > 1 {
-            return String(newValue[..<hash])
+        var oldSlice = oldValue[...]
+        var newSlice = newValue[...]
+        while let oldFirst = oldSlice.first, let newFirst = newSlice.first, oldFirst == newFirst {
+            oldSlice.removeFirst()
+            newSlice.removeFirst()
         }
-        return newValue
+        while let oldLast = oldSlice.last, let newLast = newSlice.last, oldLast == newLast {
+            oldSlice.removeLast()
+            newSlice.removeLast()
+        }
+        guard newSlice.count > 1 else {
+            return newValue
+        }
+        return String(newValue[..<hash])
     }
 
     public static func parse(_ input: String) -> Self? {
