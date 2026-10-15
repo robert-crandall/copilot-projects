@@ -461,10 +461,10 @@ final class AppModel: ObservableObject {
     private var agentActivityReadInFlight = false
     private var agentActivityReadQueued = false
     // Counts each session's main-actor observations of its snapshot file (applied
-    // scan reads and single-session loads, whatever they found), so a background
-    // read applies only to sessions nothing observed after it began. The cached
-    // signature can't tell: a later scan that finds the file gone leaves an empty
-    // cache empty.
+    // scan reads and single-session loads, whatever they found) and the status
+    // hooks that change its scheduling, so a background read applies only to
+    // sessions nothing observed or changed after it began. The cached signature
+    // can't tell: a later scan that finds the file gone leaves an empty cache empty.
     private var agentActivityObservations: [String: Int] = [:]
     // Per-session decoded-snapshot cache keyed by a file signature (inode+size+
     // mtime). Every live session heartbeats a write to its
@@ -3518,6 +3518,10 @@ final class AppModel: ObservableObject {
             projects[loc.p].sessions[loc.s].scheduledTurnActive = false
             scheduledSnapshotsSuppressed.insert(sessionId)
         }
+        if startsScheduledTurn || endsScheduledTurn {
+            // A scan read that began before this hook would undo it.
+            agentActivityObservations[sessionId, default: 0] += 1
+        }
         let clearsBackgroundAgents = status == .idle && source == "session-idle"
         let hasCompletionSignal = SessionSemantics.isCompletionSignal(
             status: status,
@@ -3548,6 +3552,7 @@ final class AppModel: ObservableObject {
         if status == .running || status == .waiting {
             if status == .running {
                 projects[loc.p].sessions[loc.s].scheduledTurnActive = false
+                agentActivityObservations[sessionId, default: 0] += 1
                 foregroundIdleGenerationBaselines[sessionId] =
                     projects[loc.p].sessions[loc.s].agentActivity?.idleGeneration ?? -1
             }
@@ -4199,9 +4204,9 @@ final class AppModel: ObservableObject {
     }
 
     /// Applies a scan's reads to the current sessions. A session the scan didn't
-    /// read, or that was observed after the read began (a later scan or a
-    /// single-session load), keeps its state; returns false when any did, so the
-    /// caller can scan again.
+    /// read, or that was observed or changed by a hook after the read began (a
+    /// later scan, a single-session load, or a scheduling hook), keeps its state;
+    /// returns false when any did, so the caller can scan again.
     @discardableResult
     private func applyAgentActivityReads(
         _ reads: [String: AgentActivityRead],

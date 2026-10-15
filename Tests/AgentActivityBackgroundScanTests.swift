@@ -171,6 +171,48 @@ final class AgentActivityBackgroundScanTests: XCTestCase {
         XCTAssertTrue(model.projects[0].sessions[0].scheduledTurnActive, "the marker is checked when applied")
     }
 
+    func testAForegroundTurnThatStartsDuringAReadIsNotMadeScheduled() async throws {
+        try publish(generation: 1, scheduled: true)
+        let model = try makeModel()
+        modelUnderTest = model
+        reader.holdNextRead()
+        model.scanAgentActivityInBackground()
+        reader.waitUntilHeld()
+        // The scheduled turn ends and a foreground turn starts while the read is out.
+        try publish(generation: 1)
+        model.setStatus(
+            sessionId: session.id, status: .running, text: nil,
+            timestamp: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        XCTAssertFalse(model.projects[0].sessions[0].scheduledTurnActive)
+        reader.release()
+        try await settle(afterReads: 1)
+        XCTAssertFalse(model.projects[0].sessions[0].scheduledTurnActive, "the held read saw the scheduled turn")
+    }
+
+    func testAScheduledTurnThatEndsDuringAReadStaysEnded() async throws {
+        try publish(generation: 1)
+        let model = try makeModel()
+        modelUnderTest = model
+        reader.holdNextRead()
+        model.scanAgentActivityInBackground()
+        reader.waitUntilHeld()
+        // A scheduled turn starts and ends while the read is out, and the tracker
+        // still reports it until session.idle.
+        try publish(generation: 1, scheduled: true)
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        model.setStatus(sessionId: session.id, status: .idle, text: nil, timestamp: now, source: "scheduled-start")
+        model.setStatus(sessionId: session.id, status: .idle, text: nil, timestamp: now + 1, source: "scheduled-idle")
+        XCTAssertFalse(model.projects[0].sessions[0].scheduledTurnActive)
+        reader.release()
+        try await settle(afterReads: 1)
+        model.refreshAgentActivitySnapshots()
+        XCTAssertFalse(
+            model.projects[0].sessions[0].scheduledTurnActive,
+            "the held read from before the turn must not lift the ended turn's suppression"
+        )
+    }
+
     func testAReadThatFinishesAfterTerminationIsDropped() async throws {
         try publish(generation: 1)
         let model = try makeModel()
