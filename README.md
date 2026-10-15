@@ -280,9 +280,10 @@ five threads, unread and newest first; **Show more** reveals the rest.
   checked again just before it's cleared, so one that changed meanwhile waits for
   the next read. The filter row counts what was cleared this run, and its tooltip
   lists them; GitHub's Done view keeps them all.
-- **Hide what's settled, or other owners.** Merged pull requests, closed pull
-  requests, and closed issues are hidden by default; the filter row's **Hiding
-  merged & closed** menu turns each back on. **Owners** in the header (like the
+- **Hide CI, what's settled, or other owners.** CI activity (the Pull Requests
+  window already covers it), merged pull requests, closed pull requests, and
+  closed issues are hidden by default; the filter row's **Hiding CI, merged &
+  closed** menu turns each back on. **Owners** in the header (like the
   Pull Requests window's, but its own list) keeps only threads from repositories in
   the organizations or users you name. Hidden threads stay in your GitHub inbox
   (threads you'd already answered are still cleared) but don't show, count toward
