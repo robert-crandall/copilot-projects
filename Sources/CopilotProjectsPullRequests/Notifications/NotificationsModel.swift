@@ -79,6 +79,9 @@ final class NotificationsModel: ObservableObject {
     static let actedAtKey = "notifications.actedAt"
     /// How long an action is remembered once no thread on hand still needs it.
     static let actedLifetime: TimeInterval = 7 * 86_400
+    /// Per account, the most actions remembered for threads not on hand when
+    /// its inbox holds more unread than one read reaches; the newest are kept.
+    static let actedOffHandLimit = 1_000
     /// `account|thread id` → the latest `updatedAt` a confirmed done covers.
     static let doneThreadsKey = "notifications.doneThreads"
     /// Comma- or space-separated owners whose repositories count; empty means every owner.
@@ -774,15 +777,40 @@ final class NotificationsModel: ObservableObject {
         saveActedAt()
     }
 
-    /// Forgets actions past their lifetime in the accounts just read, but not
-    /// one still covering a thread on hand: that thread would come back to
-    /// Since you looked with nothing new. An account that wasn't read keeps
-    /// its own, as its threads may simply not be on hand yet.
+    /// Forgets actions no thread can need again, in the accounts just read. An
+    /// action matters only while its thread is unread with nothing newer, so
+    /// it's forgotten once GitHub shows the thread read, something newer
+    /// happened, or GitHub took its Done; otherwise that thread would come back
+    /// to Since you looked with nothing new. One whose thread isn't on hand is
+    /// kept for a week, or, where the inbox holds more unread than one read
+    /// reaches and the thread may only be out of reach, up to a limit per
+    /// account. An account that wasn't read keeps its own.
     private func forgetOldActions(read accounts: Set<String>) {
         let horizon = clock().addingTimeInterval(-Self.actedLifetime)
-        let onHand = Dictionary(threads.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: max)
-        let kept = actedAt.filter { key, at in
-            at >= horizon || !accounts.contains(key.account) || onHand[key].map { $0 <= at } == true
+        let onHand = Dictionary(threads.map { ($0.key, $0) }, uniquingKeysWith: { $0.updatedAt >= $1.updatedAt ? $0 : $1 })
+        var kept: [NotificationThread.Key: Date] = [:]
+        var outOfReach: [String: [(key: NotificationThread.Key, at: Date)]] = [:]
+        for (key, at) in actedAt {
+            guard accounts.contains(key.account) else {
+                kept[key] = at
+                continue
+            }
+            if let thread = onHand[key] {
+                // Read here but not yet on GitHub stays covered in case the read fails.
+                if thread.updatedAt <= at, thread.unread || readLocally[key] != nil { kept[key] = at }
+            } else if doneLocally[key] != nil, confirmedDone[key] == nil {
+                // A Done still in flight brings the thread back if it fails.
+                kept[key] = at
+            } else if confirmedDone[key] != nil {
+                continue
+            } else if truncatedAccounts.contains(key.account) {
+                outOfReach[key.account, default: []].append((key, at))
+            } else if at >= horizon {
+                kept[key] = at
+            }
+        }
+        for markers in outOfReach.values {
+            for marker in markers.sorted(by: { $0.at > $1.at }).prefix(Self.actedOffHandLimit) { kept[marker.key] = marker.at }
         }
         guard kept.count < actedAt.count else { return }
         actedAt = kept
