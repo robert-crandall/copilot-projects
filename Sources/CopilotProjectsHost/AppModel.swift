@@ -460,6 +460,12 @@ final class AppModel: ObservableObject {
     )
     private var agentActivityReadInFlight = false
     private var agentActivityReadQueued = false
+    // Counts each session's main-actor observations of its snapshot file (applied
+    // scan reads and single-session loads, whatever they found), so a background
+    // read applies only to sessions nothing observed after it began. The cached
+    // signature can't tell: a later scan that finds the file gone leaves an empty
+    // cache empty.
+    private var agentActivityObservations: [String: Int] = [:]
     // Per-session decoded-snapshot cache keyed by a file signature (inode+size+
     // mtime). Every live session heartbeats a write to its
     // `<id>.agent-activity.json` roughly every 5s, and both the directory watcher
@@ -4150,19 +4156,20 @@ final class AppModel: ObservableObject {
         let generation = agentActivityRefreshGeneration
         let sessionIds = projects.flatMap { $0.sessions.map(\.id) }
         let cached = agentActivitySnapshotCache.mapValues(\.signature)
+        let observations = agentActivityObservations
         let directory = agentActivityDirectory
         let reader = agentActivityReader
         agentActivityReadQueue.async { [weak self] in
             let reads = reader(sessionIds, directory, cached, { Date() })
             Task { @MainActor [weak self] in
-                self?.finishAgentActivityRead(reads, cached: cached, generation: generation)
+                self?.finishAgentActivityRead(reads, observations: observations, generation: generation)
             }
         }
     }
 
     private func finishAgentActivityRead(
         _ reads: [String: AgentActivityRead],
-        cached: [String: FileSignature],
+        observations: [String: Int],
         generation: Int
     ) {
         agentActivityReadInFlight = false
@@ -4170,7 +4177,7 @@ final class AppModel: ObservableObject {
         agentActivityReadQueued = false
         // Tracking restarted or stopped since this read began.
         if generation == agentActivityRefreshGeneration,
-           !applyAgentActivityReads(reads, cached: cached, clock: { Date() }) {
+           !applyAgentActivityReads(reads, observations: observations, clock: { Date() }) {
             again = true
         }
         if again { startAgentActivityRead() }
@@ -4180,24 +4187,25 @@ final class AppModel: ObservableObject {
     /// actor; tracking's first scan uses it, and tests assert right after.
     func refreshAgentActivitySnapshots(now: Date = Date()) {
         // Trackers keep publishing while the scan runs, so each snapshot is
-        // judged when its file was read rather than when the scan started.
+        // judged when it's applied, after its file was read, rather than when
+        // the scan started.
         let readTime = advancingClock(from: now)
         agentActivityScanObserver?()
-        let cached = agentActivitySnapshotCache.mapValues(\.signature)
         let reads = agentActivityReader(
-            projects.flatMap { $0.sessions.map(\.id) }, agentActivityDirectory, cached, readTime
+            projects.flatMap { $0.sessions.map(\.id) }, agentActivityDirectory,
+            agentActivitySnapshotCache.mapValues(\.signature), readTime
         )
-        applyAgentActivityReads(reads, cached: cached, clock: readTime)
+        applyAgentActivityReads(reads, observations: agentActivityObservations, clock: readTime)
     }
 
     /// Applies a scan's reads to the current sessions. A session the scan didn't
-    /// read, or whose cached snapshot changed after the read began (a later scan
-    /// or a single-session load replaced it), keeps its state; returns false when
-    /// any did, so the caller can scan again.
+    /// read, or that was observed after the read began (a later scan or a
+    /// single-session load), keeps its state; returns false when any did, so the
+    /// caller can scan again.
     @discardableResult
     private func applyAgentActivityReads(
         _ reads: [String: AgentActivityRead],
-        cached: [String: FileSignature],
+        observations: [String: Int],
         clock readTime: () -> Date
     ) -> Bool {
         let fm = FileManager.default
@@ -4211,10 +4219,11 @@ final class AppModel: ObservableObject {
                 let sessionId = nextProjects[pi].sessions[si].id
                 seenSessionIds.insert(sessionId)
                 guard let read = reads[sessionId],
-                      agentActivitySnapshotCache[sessionId]?.signature == cached[sessionId] else {
+                      agentActivityObservations[sessionId] == observations[sessionId] else {
                     complete = false
                     continue
                 }
+                agentActivityObservations[sessionId, default: 0] += 1
                 let snapshot: AgentActivitySnapshot?
                 switch read.outcome {
                 case .missing:
@@ -4230,9 +4239,11 @@ final class AppModel: ObservableObject {
                     agentActivitySnapshotCache[sessionId] = (signature, decoded)
                     snapshot = decoded
                 }
-                let readAt = read.readAt
-                let fresh = snapshot?.isFresh(at: readAt) == true ? snapshot : nil
-                if let workflow = fresh?.workflow, workflow.isFresh(at: readAt),
+                // A background read can wait on later files and the main actor, so
+                // judge freshness now rather than when the file was read.
+                let judgedAt = max(read.readAt, readTime())
+                let fresh = snapshot?.isFresh(at: judgedAt) == true ? snapshot : nil
+                if let workflow = fresh?.workflow, workflow.isFresh(at: judgedAt),
                    let request = workflow.budgetRequest,
                    let epoch = fresh?.conversationEpoch {
                     let key = "\(epoch):\(request.requestId)"
@@ -4289,6 +4300,7 @@ final class AppModel: ObservableObject {
         // isn't written yet) is opened, leaving the count unchanged but a stale entry.
         agentActivitySnapshotCache = agentActivitySnapshotCache
             .filter { seenSessionIds.contains($0.key) }
+        agentActivityObservations = agentActivityObservations.filter { seenSessionIds.contains($0.key) }
         runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
         budgetNotificationKeys = budgetNotificationKeys.filter { seenSessionIds.contains($0.key) }
         reconcileRuntimeActivity(now: readTime())
@@ -4307,13 +4319,14 @@ final class AppModel: ObservableObject {
     /// (inode+size+mtime) matches the cached one. The caller re-applies the
     /// freshness TTL, so skipping the read never stalls a stale→nil transition.
     /// Scans read through `AgentActivityReader` instead; a scan whose read began
-    /// before this replaced the cached copy leaves that session for the next scan.
+    /// before this load leaves that session for the next scan.
     private func loadAgentActivitySnapshot(
         sessionId: String,
         path: String,
         decoder: JSONDecoder,
         fm: FileManager
     ) -> AgentActivitySnapshot? {
+        agentActivityObservations[sessionId, default: 0] += 1
         let cached = agentActivitySnapshotCache[sessionId]
         guard let attributes = try? fm.attributesOfItem(atPath: path) else {
             if cached != nil { agentActivitySnapshotCache.removeValue(forKey: sessionId) }

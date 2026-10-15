@@ -15,7 +15,7 @@ struct AgentActivityRead {
     }
 
     let outcome: Outcome
-    /// Taken after the read, so a snapshot is judged when it was read.
+    /// Taken after the read, so a snapshot is never judged before it was read.
     let readAt: Date
 }
 

@@ -70,16 +70,18 @@ final class AgentActivityBackgroundScanTests: XCTestCase {
         )
     }
 
-    private func publish(generation: Int, scheduled: Bool = false) throws {
-        let now = ISO8601DateFormatter().string(from: Date())
+    private var snapshotURL: URL { root.appendingPathComponent("\(session.id).agent-activity.json") }
+
+    private func publish(generation: Int, scheduled: Bool = false, age: TimeInterval = 0) throws {
+        let now = Date().addingTimeInterval(-age)
+            .formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true))
         let activity = AgentActivitySnapshot(
             schemaVersion: 1, updatedAt: now, foregroundTurnActive: false,
             foregroundTransitionAt: now, scheduledTurnActive: scheduled, activeSubagents: [],
             schedules: [], idleGeneration: generation, lastIdleAborted: false,
             lastIdleTurnKind: "foreground", error: nil
         )
-        try JSONEncoder().encode(activity)
-            .write(to: root.appendingPathComponent("\(session.id).agent-activity.json"), options: .atomic)
+        try JSONEncoder().encode(activity).write(to: snapshotURL, options: .atomic)
     }
 
     private var activity: AgentActivitySnapshot? { modelUnderTest?.projects[0].sessions[0].agentActivity }
@@ -120,6 +122,34 @@ final class AgentActivityBackgroundScanTests: XCTestCase {
         reader.release()
         try await settle(afterReads: 2)
         XCTAssertEqual(activity?.idleGeneration, 2, "the held read saw generation 1 before the later scan")
+    }
+
+    func testAStaleReadNeverRestoresASnapshotALaterScanFoundGone() async throws {
+        try publish(generation: 1)
+        let model = try makeModel()
+        modelUnderTest = model
+        reader.holdNextRead()
+        model.scanAgentActivityInBackground()
+        reader.waitUntilHeld()
+        try FileManager.default.removeItem(at: snapshotURL)
+        model.refreshAgentActivitySnapshots()
+        XCTAssertNil(activity)
+        reader.release()
+        try await settle(afterReads: 2)
+        XCTAssertNil(activity, "the held read saw the file before the later scan found it gone")
+    }
+
+    func testASnapshotThatExpiresBeforeItsReadIsAppliedIsDropped() async throws {
+        try publish(generation: 1, age: 14)
+        let model = try makeModel()
+        modelUnderTest = model
+        reader.holdNextRead()
+        model.scanAgentActivityInBackground()
+        reader.waitUntilHeld()
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        reader.release()
+        try await settle(afterReads: 1)
+        XCTAssertNil(activity, "fresh when read, past the 15s limit when applied")
     }
 
     func testAScheduledTurnThatStartsDuringAReadStaysScheduled() async throws {
