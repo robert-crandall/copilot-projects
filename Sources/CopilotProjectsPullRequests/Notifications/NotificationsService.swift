@@ -264,7 +264,10 @@ struct NotificationsFetchPlan: Equatable, Sendable {
 /// in batched GraphQL queries.
 struct NotificationDetailsFetcher: Sendable {
     var graphQL = GitHubGraphQL()
-    var batchSize = 20
+    /// Subjects per query. With more, GitHub silently returns some subjects'
+    /// timelines empty, without an error, which reads as nobody asked: 20
+    /// emptied 22 of 269 live review requests, 10 emptied 2, and 5 none.
+    var batchSize = 5
     /// Batches in flight at once for one account.
     var concurrency = 4
     /// Answers in place of GitHub, for tests.

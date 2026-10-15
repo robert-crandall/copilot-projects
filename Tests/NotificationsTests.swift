@@ -317,6 +317,12 @@ final class NotificationsTests: XCTestCase {
 
     // MARK: Details
 
+    func testDetailsAreReadAFewSubjectsAtATime() {
+        // Larger batches come back with some timelines silently empty, and an
+        // empty history files a team's review request under To you.
+        XCTAssertLessThanOrEqual(NotificationDetailsFetcher().batchSize, 5)
+    }
+
     func testDetailsReadDirectAndTeamRequestsFromHistory() throws {
         let json = """
         {"state":"OPEN","isDraft":true,"headRefName":"octo/lanes","timelineItems":{"nodes":[
