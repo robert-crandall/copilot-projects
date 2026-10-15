@@ -639,6 +639,54 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(sinceYouLooked(model), ["2"])
     }
 
+    func testAnActionOutOfReachInALargeInboxHoldsPastAWeek() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let clock = TestClock(now)
+        let acted = FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))
+        let other = FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-600))
+        github.answer("participating", pages: [[acted, other]])
+        // One page per read: anything on a second page is out of reach.
+        let model = makeModel(github, clock: clock, defaults: defaults, plan: NotificationsFetchPlan(participatingPages: 1))
+        await model.refreshNow()
+        // Copy Link leaves it unread.
+        model.noteActed([try XCTUnwrap(model.threads.first { $0.key.id == "1" })])
+
+        // Newer threads push it off the first page for over a week.
+        clock.now += 8 * 86_400
+        let newer = FakeGitHub.thread("3", reason: "mention", type: "Issue", number: 3, updated: clock.now.addingTimeInterval(-60))
+        github.answer("participating", pages: [[newer, other], [acted]])
+        await model.refreshNow()
+        XCTAssertEqual(model.truncatedAccounts, ["octocat"])
+
+        // Back in reach with nothing new: not new to you.
+        github.answer("participating", pages: [[acted, other]])
+        await model.refreshNow()
+        XCTAssertFalse(sinceYouLooked(model).contains("1"))
+    }
+
+    func testActionsOutOfReachAreCappedPerAccountKeepingTheNewest() async {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let limit = NotificationsModel.actedOutOfReachLimit
+        var stored: [String: Double] = ["octocat|recent": now.addingTimeInterval(-3600).timeIntervalSince1970]
+        for index in 0..<(limit + 2) {
+            stored["octocat|gone\(index)"] = now.addingTimeInterval(-8 * 86_400 - Double(index + 1) * 3600).timeIntervalSince1970
+        }
+        defaults.set(stored, forKey: NotificationsModel.actedAtKey)
+        github.answer("participating", pages: [
+            [FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-60))],
+            [FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-120))],
+        ])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults, plan: NotificationsFetchPlan(participatingPages: 1))
+        await model.refreshNow()
+        XCTAssertEqual(model.actedAt.count, limit + 1)
+        XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "recent")], "a week's actions are never capped")
+        XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "gone0")])
+        XCTAssertNil(model.actedAt[.init(account: "octocat", id: "gone\(limit)")], "the oldest go first")
+        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).count, limit + 1)
+    }
+
     func testActionsAreRememberedForAnAccountWithoutALogin() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let baseline = now.addingTimeInterval(-3600)
