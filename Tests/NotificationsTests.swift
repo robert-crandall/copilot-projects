@@ -754,6 +754,69 @@ final class NotificationsTests: XCTestCase {
         XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
     }
 
+    func testAnActionAfterAReadGitHubTookIsForgottenWhenARefreshShowsItRead() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let updated = now.addingTimeInterval(-600)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: updated)]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        model.markRead(model.items)
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") && model.actedAt.isEmpty }
+
+        // Copying its link from the read row notes an action it can't need.
+        model.noteActed(model.threads)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: updated)]])
+        await model.refreshNow()
+        XCTAssertTrue(model.actedAt.isEmpty, "the read is done, so nothing can bring the thread back unchanged")
+    }
+
+    func testABannerReadForgetsTheActionOnceGitHubTakesItButKeepsItInFlight() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let updated = now.addingTimeInterval(-600)
+        defaults.set(["octocat|99": now.addingTimeInterval(-300).timeIntervalSince1970], forKey: NotificationsModel.actedAtKey)
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        github.holdNextAction("99")
+        model.openBanner(thread: .init(account: "octocat", id: "99"), url: URL(string: "https://github.com/octo/app/issues/9")!)
+        try await waitUntil { github.isHolding("99") }
+
+        // A refresh loads it while the read is in flight: it may yet fail.
+        github.answer("participating", pages: [[FakeGitHub.thread("99", reason: "mention", type: "Issue", number: 9, updated: updated)]])
+        await model.refreshNow()
+        XCTAssertEqual(model.actedAt.keys.map(\.id), ["99"])
+
+        github.release("99")
+        try await waitUntil { model.actedAt.isEmpty }
+        XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
+    }
+
+    func testAReadGitHubTookLateKeepsAnActionOnNewerActivity() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let clock = TestClock(now)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
+        let model = makeModel(github, clock: clock, defaults: defaults)
+        await model.refreshNow()
+        github.holdNextAction("1")
+        model.markRead(model.items)
+        try await waitUntil { github.isHolding("1") }
+
+        // Something new lands before GitHub's answer, and the user acts on it.
+        clock.now += 60
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: clock.now)]])
+        await model.refreshNow()
+        clock.now += 60
+        model.noteActed(model.threads)
+        let acted = try XCTUnwrap(model.actedAt[.init(account: "octocat", id: "1")])
+
+        github.release("1")
+        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(model.actedAt[.init(account: "octocat", id: "1")], acted, "the read covered only the older copy")
+        XCTAssertFalse(sinceYouLooked(model).contains("1"))
+    }
+
     func testActionsAreRememberedForAnAccountWithoutALogin() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let baseline = now.addingTimeInterval(-3600)

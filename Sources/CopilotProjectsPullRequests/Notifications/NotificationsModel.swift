@@ -188,6 +188,8 @@ final class NotificationsModel: ObservableObject {
     private var confirmedDone: [NotificationThread.Key: Date] = [:]
     /// Threads marked read here, kept read across refreshes racing the request.
     private var readLocally: [NotificationThread.Key: Date] = [:]
+    /// Per thread, reads sent here that GitHub hasn't answered yet.
+    private var readsInFlight: [NotificationThread.Key: Int] = [:]
     private var lookStarted: Date?
     /// Per account: the newest change already considered for a banner.
     private var bannerHighWaters: [String: Date]
@@ -798,8 +800,8 @@ final class NotificationsModel: ObservableObject {
                 continue
             }
             if let thread = onHand[key] {
-                // Read here but not yet on GitHub stays covered in case the read fails.
-                if thread.updatedAt <= at, thread.unread || readLocally[key] != nil { kept[key] = at }
+                // A read GitHub hasn't answered yet keeps it, in case the read fails.
+                if thread.updatedAt <= at, thread.unread || readsInFlight[key] != nil { kept[key] = at }
             } else if confirmedDone[key] != nil {
                 continue
             } else if doneLocally[key] != nil || at >= horizon {
@@ -826,6 +828,23 @@ final class NotificationsModel: ObservableObject {
         defaults.set(stored, forKey: Self.actedAtKey)
     }
 
+    private func readSent(_ key: NotificationThread.Key) { readsInFlight[key, default: 0] += 1 }
+
+    private func readAnswered(_ key: NotificationThread.Key) {
+        let left = (readsInFlight[key] ?? 1) - 1
+        readsInFlight[key] = left > 0 ? left : nil
+    }
+
+    /// GitHub took a read covering the thread up to `covers`. It comes back only
+    /// with something newer, so an action up to then is forgotten; a later one,
+    /// on activity since, stays.
+    private func readTaken(_ key: NotificationThread.Key, covers: Date) {
+        readAnswered(key)
+        guard let at = actedAt[key], at <= covers else { return }
+        actedAt[key] = nil
+        saveActedAt()
+    }
+
     func markRead(_ items: [NotificationItem]) {
         // Only unread threads can sit in Since you looked, so only they need the action noted.
         let targets = items.filter(\.thread.unread).map(\.thread)
@@ -833,15 +852,20 @@ final class NotificationsModel: ObservableObject {
         noteActed(targets)
         let now = clock()
         // A copy dated ahead of this clock is covered too, as for Done.
-        for thread in targets { readLocally[thread.key] = max(now, thread.updatedAt) }
+        for thread in targets {
+            readLocally[thread.key] = max(now, thread.updatedAt)
+            readSent(thread.key)
+        }
         update(targets.map(\.key)) { $0.unread = false }
         perform(targets, verb: "mark as read", action: { api, account, id in try await api.markRead(account: account, threadId: id) }, succeeded: { [weak self] thread in
-            // Read on GitHub, it comes back only with something newer, which no action covers.
-            guard let self, self.actedAt.removeValue(forKey: thread.key) != nil else { return }
-            self.saveActedAt()
+            self?.readTaken(thread.key, covers: max(now, thread.updatedAt))
         }) { [weak self] failed in
-            for thread in failed { self?.readLocally[thread.key] = nil }
-            self?.update(failed.map(\.key)) { $0.unread = true }
+            guard let self else { return }
+            for thread in failed {
+                self.readLocally[thread.key] = nil
+                self.readAnswered(thread.key)
+            }
+            self.update(failed.map(\.key)) { $0.unread = true }
         }
     }
 
@@ -1105,17 +1129,22 @@ final class NotificationsModel: ObservableObject {
     }
 
     private func markRead(key: NotificationThread.Key) {
-        readLocally[key] = clock()
+        let now = clock()
+        readLocally[key] = now
+        readSent(key)
         let api = api
         Task { [weak self] in
             guard let self else { return }
             guard let account = (try? await self.accountsForRefresh())?.first(where: { $0.login == key.account }) else {
                 self.readLocally[key] = nil
+                self.readAnswered(key)
                 return
             }
             do {
                 try await api.markRead(account: account, threadId: key.id)
+                self.readTaken(key, covers: now)
             } catch {
+                self.readAnswered(key)
                 self.readLocally[key] = nil
                 // A refresh may have loaded it, read, in the meantime.
                 self.update([key]) { $0.unread = true }
