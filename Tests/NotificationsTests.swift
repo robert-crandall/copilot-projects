@@ -649,6 +649,7 @@ final class NotificationsTests: XCTestCase {
         // One page per read: anything on a second page is out of reach.
         let model = makeModel(github, clock: clock, defaults: defaults, plan: NotificationsFetchPlan(participatingPages: 1))
         await model.refreshNow()
+        // Copy Link leaves it unread.
         model.noteActed([try XCTUnwrap(model.threads.first { $0.key.id == "1" })])
 
         // Newer threads push it off the first page for over a week.
@@ -657,7 +658,6 @@ final class NotificationsTests: XCTestCase {
         github.answer("participating", pages: [[newer, other], [acted]])
         await model.refreshNow()
         XCTAssertEqual(model.truncatedAccounts, ["octocat"])
-        XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "1")], "it may only be out of reach")
 
         // Back in reach with nothing new: not new to you.
         github.answer("participating", pages: [[acted, other]])
@@ -665,40 +665,10 @@ final class NotificationsTests: XCTestCase {
         XCTAssertFalse(sinceYouLooked(model).contains("1"))
     }
 
-    func testAnActionIsForgottenOnceItsThreadIsReadChangedOrDone() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        let clock = TestClock(now)
-        let ids = ["1", "2", "3", "4", "5"]
-        github.answer("participating", pages: [ids.map {
-            FakeGitHub.thread($0, reason: "mention", type: "Issue", number: Int($0), updated: now.addingTimeInterval(-600))
-        }])
-        let model = makeModel(github, clock: clock, defaults: defaults)
-        await model.refreshNow()
-        model.noteActed(model.threads)
-        XCTAssertEqual(Set(model.actedAt.keys.map(\.id)), Set(ids))
-
-        clock.now += 60
-        github.holdNextAction("5")
-        model.markDone(model.items.filter { ["3", "5"].contains($0.id.id) })
-        try await waitUntil { github.isHolding("5") && self.doneThreads(defaults)["octocat|3"] != nil }
-        // 1 was read on GitHub; 2 has something new; 4 hasn't changed.
-        github.answer("participating", pages: [[
-            FakeGitHub.thread("1", reason: "mention", type: "Issue", number: 1, unread: false, updated: now.addingTimeInterval(-600)),
-            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: clock.now),
-            FakeGitHub.thread("4", reason: "mention", type: "Issue", number: 4, updated: now.addingTimeInterval(-600)),
-        ]])
-        await model.refreshNow()
-        XCTAssertEqual(model.actedAt.keys.map(\.id).sorted(), ["4", "5"], "a Done still in flight may yet bring its thread back")
-        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).keys.sorted(), ["octocat|4", "octocat|5"])
-        github.release("5")
-        try await waitUntil { self.doneThreads(defaults)["octocat|5"] != nil }
-    }
-
     func testActionsOutOfReachAreCappedPerAccountKeepingTheNewest() async {
         let github = FakeGitHub()
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        let limit = NotificationsModel.actedOffHandLimit
+        let limit = NotificationsModel.actedOutOfReachLimit
         var stored: [String: Double] = ["octocat|recent": now.addingTimeInterval(-3600).timeIntervalSince1970]
         for index in 0..<(limit + 2) {
             stored["octocat|gone\(index)"] = now.addingTimeInterval(-8 * 86_400 - Double(index + 1) * 3600).timeIntervalSince1970
@@ -714,207 +684,7 @@ final class NotificationsTests: XCTestCase {
         XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "recent")], "a week's actions are never capped")
         XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "gone0")])
         XCTAssertNil(model.actedAt[.init(account: "octocat", id: "gone\(limit)")], "the oldest go first")
-        XCTAssertNil(model.actedAt[.init(account: "octocat", id: "gone\(limit + 1)")])
-    }
-
-    func testAnActionIsForgottenWhenGitHubTakesItsDoneHoweverOld() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        // Copied a link to it days ago; it's older than the read window, so its
-        // automatic Done is never kept as confirmed.
-        let old = now.addingTimeInterval(-4 * 86_400)
-        defaults.set(["octocat|1": old.timeIntervalSince1970], forKey: NotificationsModel.actedAtKey)
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", number: 1, updated: old)]])
-        let model = answeringModel(github, details: DetailBox(["1": answeredDetail]), clears: true, clock: TestClock(now), defaults: defaults)
-        await model.refreshNow()
-        try await waitUntil { model.actedAt.isEmpty }
-        XCTAssertTrue(github.actions.contains("DELETE /notifications/threads/1"))
-        XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
-    }
-
-    func testAnActionIsForgottenWhenGitHubTakesItsReadButKeptWhileItMayFail() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        github.answer("participating", pages: [[
-            FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600)),
-            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, unread: false, updated: now.addingTimeInterval(-600)),
-        ]])
-        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
-        await model.refreshNow()
-        github.holdNextAction("1")
-        model.markRead(model.items)
-        try await waitUntil { github.isHolding("1") }
-        XCTAssertEqual(model.actedAt.keys.map(\.id), ["1"], "a read thread needs no action noted; one in flight may yet fail")
-        // A refresh while it's in flight keeps it.
-        await model.refreshNow()
-        XCTAssertEqual(model.actedAt.keys.map(\.id), ["1"])
-
-        github.release("1")
-        try await waitUntil { model.actedAt.isEmpty }
-        XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
-    }
-
-    func testAnActionAfterAReadGitHubTookIsForgottenWhenARefreshShowsItRead() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        let updated = now.addingTimeInterval(-600)
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: updated)]])
-        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
-        await model.refreshNow()
-        model.markRead(model.items)
-        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") && model.actedAt.isEmpty }
-
-        // Copying its link from the read row notes an action it can't need.
-        model.noteActed(model.threads)
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: updated)]])
-        await model.refreshNow()
-        XCTAssertTrue(model.actedAt.isEmpty, "the read is done, so nothing can bring the thread back unchanged")
-    }
-
-    func testABannerReadForgetsTheActionOnceGitHubTakesItButKeepsItInFlight() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        let updated = now.addingTimeInterval(-600)
-        defaults.set(["octocat|99": now.addingTimeInterval(-300).timeIntervalSince1970], forKey: NotificationsModel.actedAtKey)
-        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
-        github.holdNextAction("99")
-        model.openBanner(thread: .init(account: "octocat", id: "99"), url: URL(string: "https://github.com/octo/app/issues/9")!)
-        try await waitUntil { github.isHolding("99") }
-
-        // A refresh loads it while the read is in flight: it may yet fail.
-        github.answer("participating", pages: [[FakeGitHub.thread("99", reason: "mention", type: "Issue", number: 9, updated: updated)]])
-        await model.refreshNow()
-        XCTAssertEqual(model.actedAt.keys.map(\.id), ["99"])
-
-        github.release("99")
-        try await waitUntil { model.actedAt.isEmpty }
-        XCTAssertTrue((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).isEmpty)
-    }
-
-    func testAReadGitHubTookLateKeepsAnActionOnNewerActivity() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        let clock = TestClock(now)
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
-        let model = makeModel(github, clock: clock, defaults: defaults)
-        await model.refreshNow()
-        github.holdNextAction("1")
-        model.markRead(model.items)
-        try await waitUntil { github.isHolding("1") }
-
-        // Something new lands before GitHub's answer, and the user acts on it.
-        clock.now += 60
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: clock.now)]])
-        await model.refreshNow()
-        clock.now += 60
-        model.noteActed(model.threads)
-        let acted = try XCTUnwrap(model.actedAt[.init(account: "octocat", id: "1")])
-
-        github.release("1")
-        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertEqual(model.actedAt[.init(account: "octocat", id: "1")], acted, "the read covered only the older copy")
-        XCTAssertFalse(sinceYouLooked(model).contains("1"))
-    }
-
-    func testABannerReadInFlightKeepsAnOldActionOutOfReachPastTheCap() async throws {
-        let github = FakeGitHub()
-        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        // The oldest action out of reach, behind a full cap of newer ones.
-        var stored: [String: Double] = ["octocat|99": now.addingTimeInterval(-10 * 86_400).timeIntervalSince1970]
-        for index in 0..<NotificationsModel.actedOffHandLimit {
-            stored["octocat|gone\(index)"] = now.addingTimeInterval(-8 * 86_400 - Double(index + 1) * 60).timeIntervalSince1970
-        }
-        defaults.set(stored, forKey: NotificationsModel.actedAtKey)
-        github.answer("participating", pages: [
-            [FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-60))],
-            [FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, updated: now.addingTimeInterval(-120))],
-        ])
-        let model = makeModel(github, clock: TestClock(now), defaults: defaults, plan: NotificationsFetchPlan(participatingPages: 1))
-        github.holdNextAction("99")
-        model.openBanner(thread: .init(account: "octocat", id: "99"), url: URL(string: "https://github.com/octo/app/issues/9")!)
-        try await waitUntil { github.isHolding("99") }
-        await model.refreshNow()
-        XCTAssertEqual(model.truncatedAccounts, ["octocat"])
-        XCTAssertNotNil(model.actedAt[.init(account: "octocat", id: "99")], "the read may yet fail")
-
-        // It fails, and the thread comes back into reach unchanged: not new to you.
-        github.fail("PATCH")
-        github.release("99")
-        try await waitUntil { model.warning != nil }
-        github.answer("participating", pages: [[
-            FakeGitHub.thread("99", reason: "mention", type: "Issue", number: 9, updated: now.addingTimeInterval(-11 * 86_400)),
-        ]])
-        await model.refreshNow()
-        XCTAssertEqual(model.items.map(\.id.id), ["99"])
-        XCTAssertFalse(sinceYouLooked(model).contains("99"))
-    }
-
-    func testAFailedDoneComesBackReadAfterABannerReadGitHubTook() async throws {
-        let github = FakeGitHub()
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
-        let model = makeModel(github, clock: TestClock(now))
-        await model.refreshNow()
-        github.holdNextAction("1")
-        model.markDone(model.items)
-        try await waitUntil { github.isHolding("1") }
-
-        // Its banner, clicked while the Done is in flight, reads it on GitHub.
-        model.openBanner(thread: .init(account: "octocat", id: "1"), url: URL(string: "https://github.com/octo/app/issues/1")!)
-        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") && model.actedAt.isEmpty }
-
-        github.fail("DELETE")
-        github.release("1")
-        try await waitUntil { !model.threads.isEmpty }
-        XCTAssertEqual(model.threads.map(\.unread), [false])
-        XCTAssertFalse(sinceYouLooked(model).contains("1"))
-    }
-
-    func testAnOlderReadFailingLeavesANewerReadGitHubTook() async throws {
-        let github = FakeGitHub()
-        let clock = TestClock(now)
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: now.addingTimeInterval(-600))]])
-        let model = makeModel(github, clock: clock)
-        await model.refreshNow()
-        github.holdNextAction("1")
-        model.markRead(model.items)
-        try await waitUntil { github.isHolding("1") }
-
-        // Something new lands, and that copy is read too, before the first read fails.
-        clock.now += 60
-        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", updated: clock.now)]])
-        await model.refreshNow()
-        clock.now += 60
-        model.markRead(model.items)
-        try await waitUntil { github.actions.contains("PATCH /notifications/threads/1") && model.actedAt.isEmpty }
-
-        github.fail("PATCH")
-        github.release("1")
-        try await waitUntil { model.warning != nil }
-        XCTAssertEqual(model.threads.map(\.unread), [false])
-        XCTAssertFalse(sinceYouLooked(model).contains("1"))
-    }
-
-    func testAnOlderBannerReadFailingLeavesANewerReadGitHubTook() async throws {
-        let github = FakeGitHub()
-        let clock = TestClock(now)
-        let model = makeModel(github, clock: clock)
-        github.holdNextAction("99")
-        model.openBanner(thread: .init(account: "octocat", id: "99"), url: URL(string: "https://github.com/octo/app/issues/9")!)
-        try await waitUntil { github.isHolding("99") }
-
-        // It loads with something newer than the banner read covers, and is read here.
-        clock.now += 60
-        github.answer("participating", pages: [[FakeGitHub.thread("99", reason: "mention", type: "Issue", number: 9, updated: clock.now)]])
-        await model.refreshNow()
-        model.markRead(model.items)
-        try await waitUntil { github.actions.contains("PATCH /notifications/threads/99") && model.actedAt.isEmpty }
-
-        github.fail("PATCH")
-        github.release("99")
-        try await waitUntil { model.warning != nil }
-        XCTAssertEqual(model.threads.map(\.unread), [false])
-        XCTAssertFalse(sinceYouLooked(model).contains("99"))
+        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).count, limit + 1)
     }
 
     func testActionsAreRememberedForAnAccountWithoutALogin() {
