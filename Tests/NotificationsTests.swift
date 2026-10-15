@@ -138,14 +138,14 @@ final class NotificationsTests: XCTestCase {
     private func makeModel(
         _ github: FakeGitHub, clock: TestClock, defaults: UserDefaults? = nil,
         workspace: PullRequestsWorkspace = FakeWorkspace(), opened: ((URL) -> Void)? = nil,
-        plan: NotificationsFetchPlan = NotificationsFetchPlan()
+        plan: NotificationsFetchPlan = NotificationsFetchPlan(), login: String = "octocat"
     ) -> NotificationsModel {
         let model = NotificationsModel(
             workspace: workspace, defaults: defaults ?? UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
             api: GitHubNotificationsAPI(send: github.send), plan: plan,
             // Nothing listens there: details fail fast without leaving the machine.
             detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
-            loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
+            loadAccounts: { [GitHubAccount(login: login, token: "token")] },
             transcriptPath: { _ in nil },
             clock: { clock.now },
             openURL: opened ?? { _ in },
@@ -1350,6 +1350,43 @@ final class NotificationsTests: XCTestCase {
         model.markDone(model.items.filter { $0.id.id == "2" })
         try await waitUntil { model.warning != nil }
         XCTAssertNil(doneThreads(defaults)["octocat|2"], "nor one that failed")
+    }
+
+    func testEachAcceptedDoneIsRememberedWithoutWaitingForTheRest() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("read", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", number: 1, unread: false, updated: now.addingTimeInterval(-60)),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", number: 2, unread: false, updated: now.addingTimeInterval(-60)),
+        ]])
+        let model = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await model.refreshNow()
+        github.holdNextAction("2")
+        model.markDone(model.items)
+        try await waitUntil { github.isHolding("2") && self.doneThreads(defaults)["octocat|1"] != nil }
+
+        // Quit while the other is still in flight.
+        let restarted = makeModel(github, clock: TestClock(now), defaults: defaults)
+        await restarted.refreshNow()
+        XCTAssertEqual(restarted.threads.map(\.key.id), ["2"])
+        github.release("2")
+        try await waitUntil { self.doneThreads(defaults)["octocat|2"] != nil }
+    }
+
+    func testDonesAreRememberedForAnAccountWithoutALogin() async throws {
+        let github = FakeGitHub()
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        github.answer("read", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", unread: false, updated: now.addingTimeInterval(-60))]])
+        // An older gh names no account.
+        let first = makeModel(github, clock: TestClock(now), defaults: defaults, login: "")
+        await first.refreshNow()
+        XCTAssertEqual(first.threads.map(\.key.id), ["1"])
+        first.markDone(first.items)
+        try await waitUntil { self.doneThreads(defaults)["|1"] != nil }
+
+        let second = makeModel(github, clock: TestClock(now), defaults: defaults, login: "")
+        await second.refreshNow()
+        XCTAssertTrue(second.threads.isEmpty)
     }
 
     func testClearedThreadsAreNotClearedAgainAfterARestart() async throws {

@@ -231,7 +231,8 @@ final class NotificationsModel: ObservableObject {
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
         let horizon = clock().addingTimeInterval(-plan.readWindow)
         for (name, covers) in (defaults.dictionary(forKey: Self.doneThreadsKey) as? [String: Double]) ?? [:] {
-            let parts = name.split(separator: "|", maxSplits: 1).map(String.init)
+            // An older gh's account has an empty login, so its keys start with "|".
+            let parts = name.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             let date = Date(timeIntervalSince1970: covers)
             guard parts.count == 2, date >= horizon else { continue }
             let key = NotificationThread.Key(account: parts[0], id: parts[1])
@@ -793,14 +794,11 @@ final class NotificationsModel: ObservableObject {
         }
         animate { self.threads.removeAll { keys.contains($0.key) } }
         publish()
-        perform(targets, verb: verb, action: action, succeeded: { [weak self] done in
-            guard let self else { return }
+        perform(targets, verb: verb, action: action, succeeded: { [weak self] thread in
             // Remembered across launches once GitHub has it, unless a newer copy
             // or a later removal of it has moved on meanwhile.
-            for thread in done {
-                guard let entry = self.doneLocally[thread.key], entry.by == removal else { continue }
-                self.confirmedDone[thread.key] = entry.covers
-            }
+            guard let self, let entry = self.doneLocally[thread.key], entry.by == removal else { return }
+            self.confirmedDone[thread.key] = entry.covers
             self.saveConfirmedDone()
         }) { [weak self] failed in
             guard let self else { return }
@@ -829,7 +827,7 @@ final class NotificationsModel: ObservableObject {
     private func perform(
         _ targets: [NotificationThread], verb: String,
         action: @escaping @Sendable (GitHubNotificationsAPI, GitHubAccount, String) async throws -> Void,
-        succeeded onSuccess: (([NotificationThread]) -> Void)? = nil,
+        succeeded onSuccess: ((NotificationThread) -> Void)? = nil,
         rollback: @escaping ([NotificationThread]) -> Void
     ) {
         let api = api
@@ -837,7 +835,6 @@ final class NotificationsModel: ObservableObject {
             guard let self else { return }
             let accounts = Dictionary((cachedAccounts?.accounts ?? []).map { ($0.login, $0) }, uniquingKeysWith: { first, _ in first })
             var failed: [NotificationThread] = []
-            var done: [NotificationThread] = []
             var loud: [NotificationThread] = []
             var message: String?
             // A few at a time: a whole lane can be hundreds of threads.
@@ -862,19 +859,18 @@ final class NotificationsModel: ObservableObject {
                         }
                     }
                     var results: [(NotificationThread, String?)] = []
-                    for await result in group { results.append(result) }
+                    for await result in group {
+                        // Each success lands as it comes, so one that stalls holds none back.
+                        if result.1 == nil { onSuccess?(result.0) }
+                        results.append(result)
+                    }
                     return results
                 }
-                for (thread, error) in results {
-                    guard let error else {
-                        done.append(thread)
-                        continue
-                    }
+                for (thread, error) in results where error != nil {
                     failed.append(thread)
-                    if !error.isEmpty { message = error; loud.append(thread) }
+                    if error?.isEmpty == false { message = error; loud.append(thread) }
                 }
             }
-            if !done.isEmpty { onSuccess?(done) }
             guard !failed.isEmpty else { return }
             rollback(failed)
             // A thread that changed while being cleared just comes back; that's no failure.
