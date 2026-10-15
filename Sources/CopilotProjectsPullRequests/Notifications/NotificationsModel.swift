@@ -77,7 +77,7 @@ final class NotificationsModel: ObservableObject {
     static let menuBarCountKey = "notifications.menuBarCount"
     /// `account|thread id` → the latest change the user acted on.
     static let actedAtKey = "notifications.actedAt"
-    /// How long an action is remembered: past this, a thread sits by its day anyway.
+    /// How long an action is remembered once no thread on hand still needs it.
     static let actedLifetime: TimeInterval = 7 * 86_400
 
     @Published private(set) var threads: [NotificationThread] = []
@@ -222,12 +222,11 @@ final class NotificationsModel: ObservableObject {
         bannersToYou = defaults.object(forKey: Self.bannerKey(.toYou)) as? Bool ?? true
         bannersViaTeams = defaults.object(forKey: Self.bannerKey(.viaTeams)) as? Bool ?? true
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
-        let actedHorizon = clock().addingTimeInterval(-Self.actedLifetime)
+        // Old actions are kept until threads are on hand to judge them by.
         for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
             let parts = name.split(separator: "|", maxSplits: 1).map(String.init)
-            let date = Date(timeIntervalSince1970: at)
-            guard parts.count == 2, date >= actedHorizon else { continue }
-            actedAt[NotificationThread.Key(account: parts[0], id: parts[1])] = date
+            guard parts.count == 2 else { continue }
+            actedAt[NotificationThread.Key(account: parts[0], id: parts[1])] = Date(timeIntervalSince1970: at)
         }
     }
 
@@ -689,9 +688,12 @@ final class NotificationsModel: ObservableObject {
         saveActedAt()
     }
 
+    /// Forgets actions past their lifetime, but not one still covering a thread
+    /// on hand: that thread would come back to Since you looked with nothing new.
     private func saveActedAt() {
         let horizon = clock().addingTimeInterval(-Self.actedLifetime)
-        actedAt = actedAt.filter { $0.value >= horizon }
+        let onHand = Dictionary(threads.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: max)
+        actedAt = actedAt.filter { key, at in at >= horizon || onHand[key].map { $0 <= at } == true }
         guard writesState else { return }
         let stored = Dictionary(
             actedAt.map { ("\($0.key.account)|\($0.key.id)", $0.value.timeIntervalSince1970) },

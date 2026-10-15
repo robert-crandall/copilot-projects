@@ -561,11 +561,45 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(sinceYouLooked(restarted), ["1", "2"])
     }
 
-    func testActionsOlderThanAWeekAreForgotten() {
+    func testAnActionHoldsPastAWeekWhileItsThreadHasNothingNew() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
-        defaults.set(["octocat|1": now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970], forKey: NotificationsModel.actedAtKey)
+        let clock = TestClock(now)
+        let model = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
+        let first = thread("1", "mention")
+        let second = thread("2", "mention", number: 2)
+        let baseline = now.addingTimeInterval(-3600)
+        model.show([first, second], accounts: ["octocat"], lookedAt: baseline)
+        // Copy Link leaves the thread unread.
+        model.noteActed([first])
+        clock.now += 8 * 86_400
+
+        // Acting on another thread forgets old actions, but not one still in use.
+        model.noteActed([second])
+        XCTAssertEqual(sinceYouLooked(model), [])
+        let older = NotificationLayout(items: model.items).lanes.flatMap { $0.items(in: .older, lookedAt: model.lookedAt, now: clock.now) }
+        XCTAssertEqual(older.map(\.id.id).sorted(), ["1", "2"])
+
+        // Nor does a relaunch.
+        let restarted = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
+        restarted.show([first, second], accounts: ["octocat"], lookedAt: baseline)
+        XCTAssertEqual(sinceYouLooked(restarted), [])
+    }
+
+    func testActionsOlderThanAWeekAreForgottenOnceNoThreadNeedsThem() {
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let old = now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970
+        defaults.set(["octocat|1": old, "octocat|3": old, "octocat|4": old], forKey: NotificationsModel.actedAtKey)
         let model = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
-        XCTAssertTrue(model.actedAt.isEmpty)
+        let second = thread("2", "mention", number: 2)
+        // 1 is gone; 3 hasn't changed since; 4 has.
+        model.show(
+            [second, thread("3", "mention", minutesAgo: 9 * 1440, number: 3), thread("4", "mention", number: 4)],
+            accounts: ["octocat"], lookedAt: now.addingTimeInterval(-10 * 86_400)
+        )
+        model.noteActed([second])
+        XCTAssertEqual(model.actedAt.keys.map(\.id).sorted(), ["2", "3"])
+        XCTAssertEqual((defaults.dictionary(forKey: NotificationsModel.actedAtKey) ?? [:]).keys.sorted(), ["octocat|2", "octocat|3"])
+        XCTAssertEqual(sinceYouLooked(model), ["4"])
     }
 
     func testTheFirstLookStartsFromTheLastReadOnGitHub() async {

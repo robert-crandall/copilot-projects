@@ -374,7 +374,7 @@ under that row behind the outlined warning symbol in secondary ink. A sticky 28p
 (Since you looked, Today, This week, Older) split by native dividers, counts in
 monospaced digits. Since you looked holds unread threads that changed after the
 user last acted on them (opened, marked, unsubscribed, went to the session, or
-copied the link; remembered for a week) and after a baseline set once from the
+copied the link; kept while nothing new happens on it) and after a baseline set once from the
 last read on GitHub; looking at the window moves nothing. The rest sit by day. Bands (To you, Via your teams, Watching,
 Quiet) head their lanes in a 24pt `chrome` row: caption semibold name, then a
 regular count of need-you and merged-or-closed threads (unread, for Quiet). The
