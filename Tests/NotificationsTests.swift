@@ -520,33 +520,52 @@ final class NotificationsTests: XCTestCase {
 
     // MARK: Looking and banners
 
-    func testColumnsCatchUpWithTheLastLookWhenTheUserComesBack() {
+    private func sinceYouLooked(_ model: NotificationsModel) -> [String] {
+        NotificationLayout(items: model.items).lanes
+            .flatMap { $0.items(in: .sinceYouLooked, lookedAt: model.lookedAt, now: now) }
+            .map(\.id.id).sorted()
+    }
+
+    func testLookingAtTheWindowMovesNothing() {
         let clock = TestClock(now)
+        let model = makeModel(FakeGitHub(), clock: clock)
+        model.show([thread("1", "mention"), thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        model.beganLooking()
+        XCTAssertTrue(model.isLooking)
+        clock.now += 60
+        model.finishedLooking()
+        XCTAssertFalse(model.isLooking)
+        model.beganLooking()
+        XCTAssertEqual(model.lookedAt, now.addingTimeInterval(-3600))
+        XCTAssertEqual(sinceYouLooked(model), ["1", "2"], "only acting on a thread moves it")
+    }
+
+    func testActingOnAThreadMovesItOutOfSinceYouLookedUntilItChanges() {
         let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let clock = TestClock(now)
         let model = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
-        XCTAssertNil(model.lookedAt)
-        model.beganLooking()
-        clock.now += 5
-        model.finishedLooking()
-        XCTAssertNil(model.lookedAt, "staring at the loading placeholder isn't a look")
+        let first = thread("1", "mention", minutesAgo: 10)
+        model.show([first, thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        model.noteActed([first])
+        XCTAssertEqual(sinceYouLooked(model), ["2"])
+        XCTAssertNotNil(NotificationLayout(items: model.items).lanes.flatMap { $0.items(in: .today, lookedAt: model.lookedAt, now: now) }.first { $0.id.id == "1" })
 
-        model.show([thread("1", "mention")], accounts: ["octocat"])
-        model.beganLooking()
-        clock.now += 1
-        model.finishedLooking()
-        XCTAssertNil(model.lookedAt, "a glance isn't a look")
+        // Remembered across launches.
+        let restarted = makeModel(FakeGitHub(), clock: clock, defaults: defaults)
+        restarted.show([first, thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        XCTAssertEqual(sinceYouLooked(restarted), ["2"])
 
-        model.beganLooking()
-        clock.now += 5
-        model.beganLooking()
-        XCTAssertNil(model.lookedAt, "coming back from the window's own popover continues the look")
-        clock.now += 5
-        model.finishedLooking()
-        XCTAssertEqual(model.lookedAt, clock.now)
-        XCTAssertNil(model.columnsLookedAt, "columns hold still while the user is away")
-        model.beganLooking()
-        XCTAssertEqual(model.columnsLookedAt, clock.now)
-        XCTAssertEqual(defaults.double(forKey: NotificationsModel.lookedAtKey), clock.now.timeIntervalSince1970)
+        // Something new after the action brings it back.
+        clock.now += 60
+        restarted.show([thread("1", "mention", minutesAgo: -1), thread("2", "mention", number: 2)], accounts: ["octocat"], lookedAt: now.addingTimeInterval(-3600))
+        XCTAssertEqual(sinceYouLooked(restarted), ["1", "2"])
+    }
+
+    func testActionsOlderThanAWeekAreForgotten() {
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        defaults.set(["octocat|1": now.addingTimeInterval(-8 * 86_400).timeIntervalSince1970], forKey: NotificationsModel.actedAtKey)
+        let model = makeModel(FakeGitHub(), clock: TestClock(now), defaults: defaults)
+        XCTAssertTrue(model.actedAt.isEmpty)
     }
 
     func testTheFirstLookStartsFromTheLastReadOnGitHub() async {
@@ -563,10 +582,9 @@ final class NotificationsTests: XCTestCase {
         await model.refreshNow()
         let lastRead = now.addingTimeInterval(-3600)
         XCTAssertEqual(model.lookedAt, lastRead)
-        XCTAssertEqual(model.columnsLookedAt, lastRead)
         XCTAssertEqual(defaults.double(forKey: NotificationsModel.lookedAtKey), lastRead.timeIntervalSince1970)
         let columns = Dictionary(uniqueKeysWithValues: model.items.map {
-            ($0.id.id, NotificationFreshness.of(updatedAt: $0.thread.updatedAt, unread: $0.thread.unread, lookedAt: model.columnsLookedAt, now: now))
+            ($0.id.id, NotificationFreshness.of(updatedAt: $0.thread.updatedAt, unread: $0.thread.unread, lookedAt: model.lookedAt, now: now))
         })
         XCTAssertEqual(columns["2"], .sinceYouLooked)
         XCTAssertNotEqual(columns["3"], .sinceYouLooked, "unread before the last read on GitHub was already there to see")

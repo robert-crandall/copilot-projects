@@ -64,8 +64,6 @@ final class NotificationsModel: ObservableObject {
     static let reopenFreshness: TimeInterval = 60
     static let accountsLifetime: TimeInterval = 600
     static let workspacePollInterval: TimeInterval = 3
-    /// A look shorter than this was a glance through ⌘Tab, not a read.
-    static let minimumLook: TimeInterval = 1.5
     /// Individual banners per refresh; more become one summary banner.
     static let individualBannerLimit = 3
     /// How long an open review request's state is trusted before it's read
@@ -77,6 +75,10 @@ final class NotificationsModel: ObservableObject {
     static let lookedAtKey = "notifications.lookedAt"
     static let bannerHighWaterKey = "notifications.bannerHighWaters"
     static let menuBarCountKey = "notifications.menuBarCount"
+    /// `account|thread id` → the latest change the user acted on.
+    static let actedAtKey = "notifications.actedAt"
+    /// How long an action is remembered: past this, a thread sits by its day anyway.
+    static let actedLifetime: TimeInterval = 7 * 86_400
 
     @Published private(set) var threads: [NotificationThread] = []
     @Published private(set) var details: [NotificationThread.Key: NotificationSubjectDetail] = [:]
@@ -90,12 +92,11 @@ final class NotificationsModel: ObservableObject {
     @Published private(set) var truncatedAccounts: Set<String> = []
     @Published private(set) var workspace: WorkspaceState = .connecting
     @Published private(set) var links: [PullRequestKey: String] = [:]
-    /// When the user last finished looking at the window.
+    /// Where Since you looked starts: unread changes after it stay there until
+    /// the user acts on the thread. Set once, from the last read on GitHub.
     @Published private(set) var lookedAt: Date?
-    /// The look the columns are measured from. It catches up with `lookedAt`
-    /// when the user comes back, so what they saw moves out of Since you looked
-    /// in front of them rather than while they're away.
-    @Published private(set) var columnsLookedAt: Date?
+    /// Per thread, the latest change the user acted on here.
+    @Published private(set) var actedAt: [NotificationThread.Key: Date] = [:]
     @Published var bannersToYou: Bool { didSet { saveBannerSetting(.toYou, bannersToYou) } }
     @Published var bannersViaTeams: Bool { didSet { saveBannerSetting(.viaTeams, bannersViaTeams) } }
     @Published var bannersWatching: Bool { didSet { saveBannerSetting(.watching, bannersWatching) } }
@@ -158,8 +159,6 @@ final class NotificationsModel: ObservableObject {
     /// Threads marked read here, kept read across refreshes racing the request.
     private var readLocally: [NotificationThread.Key: Date] = [:]
     private var lookStarted: Date?
-    /// When threads were first on screen; a look only counts from then.
-    private var loadedAt: Date?
     /// Per account: the newest change already considered for a banner.
     private var bannerHighWaters: [String: Date]
     private var announced: [NotificationThread.Key: Date] = [:]
@@ -217,13 +216,19 @@ final class NotificationsModel: ObservableObject {
         self.isVisible = isVisible
         let looked = (defaults.object(forKey: Self.lookedAtKey) as? Double).map(Date.init(timeIntervalSince1970:))
         lookedAt = looked
-        columnsLookedAt = looked
         bannerHighWaters = ((defaults.dictionary(forKey: Self.bannerHighWaterKey) as? [String: Double]) ?? [:])
             .mapValues(Date.init(timeIntervalSince1970:))
         showsMenuBarCount = defaults.object(forKey: Self.menuBarCountKey) as? Bool ?? true
         bannersToYou = defaults.object(forKey: Self.bannerKey(.toYou)) as? Bool ?? true
         bannersViaTeams = defaults.object(forKey: Self.bannerKey(.viaTeams)) as? Bool ?? true
         bannersWatching = defaults.object(forKey: Self.bannerKey(.watching)) as? Bool ?? true
+        let actedHorizon = clock().addingTimeInterval(-Self.actedLifetime)
+        for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
+            let parts = name.split(separator: "|", maxSplits: 1).map(String.init)
+            let date = Date(timeIntervalSince1970: at)
+            guard parts.count == 2, date >= actedHorizon else { continue }
+            actedAt[NotificationThread.Key(account: parts[0], id: parts[1])] = date
+        }
     }
 
     deinit {
@@ -242,7 +247,8 @@ final class NotificationsModel: ObservableObject {
             // Answered holds only for the copy it was judged on; anything newer may ask again.
             if detailVersions[thread.key] != thread.updatedAt { detail?.answered = false }
             return NotificationItem(
-                thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), session: session
+                thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), session: session,
+                actedAt: actedAt[thread.key]
             )
         }
     }
@@ -420,7 +426,6 @@ final class NotificationsModel: ObservableObject {
         seedFirstLook()
         warning = failures.isEmpty ? nil : "Some accounts weren’t refreshed. " + failures.joined(separator: " ")
         lastUpdated = clock()
-        if phase != .loaded { loadedAt = loadedAt ?? clock() }
         phase = .loaded
         readingDetails = true
         // Sessions Pull Requests started for a PR link at once; transcript matches
@@ -602,28 +607,16 @@ final class NotificationsModel: ObservableObject {
 
     // MARK: Looking
 
-    /// The window became key. Moving between the window and its own popovers
-    /// is one look.
+    /// The window became key; banners hold off while the user is looking.
+    /// Looking moves nothing out of Since you looked: acting on a thread does.
     func beganLooking() {
         guard lookStarted == nil else { return }
         lookStarted = clock()
-        guard columnsLookedAt != lookedAt else { return }
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            columnsLookedAt = lookedAt
-        } else {
-            withAnimation(.easeOut(duration: 0.2)) { columnsLookedAt = lookedAt }
-        }
     }
 
-    /// The app went to the background, or the window closed: what it showed has
-    /// been seen, counting only from when there were threads to see.
+    /// The app went to the background, or the window closed.
     func finishedLooking() {
-        guard let started = lookStarted else { return }
         lookStarted = nil
-        let now = clock()
-        guard phase == .loaded, let loadedAt, now.timeIntervalSince(max(started, loadedAt)) >= Self.minimumLook else { return }
-        lookedAt = now
-        if writesState { defaults.set(now.timeIntervalSince1970, forKey: Self.lookedAtKey) }
     }
 
     var isLooking: Bool { lookStarted != nil }
@@ -634,7 +627,6 @@ final class NotificationsModel: ObservableObject {
     private func seedFirstLook() {
         guard lookedAt == nil, let lastRead = threads.compactMap(\.lastReadAt).max() else { return }
         lookedAt = lastRead
-        columnsLookedAt = lastRead
         if writesState { defaults.set(lastRead.timeIntervalSince1970, forKey: Self.lookedAtKey) }
     }
 
@@ -685,9 +677,31 @@ final class NotificationsModel: ObservableObject {
     func copyLink(_ item: NotificationItem) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(item.thread.webURL.absoluteString, forType: .string)
+        noteActed([item.thread])
+    }
+
+    /// The user acted on these threads: what they show now is no longer new to
+    /// them. A copy dated ahead of this clock is covered too.
+    func noteActed(_ threads: [NotificationThread]) {
+        guard !threads.isEmpty else { return }
+        let now = clock()
+        for thread in threads { actedAt[thread.key] = max(now, thread.updatedAt, actedAt[thread.key] ?? .distantPast) }
+        saveActedAt()
+    }
+
+    private func saveActedAt() {
+        let horizon = clock().addingTimeInterval(-Self.actedLifetime)
+        actedAt = actedAt.filter { $0.value >= horizon }
+        guard writesState else { return }
+        let stored = Dictionary(
+            actedAt.map { ("\($0.key.account)|\($0.key.id)", $0.value.timeIntervalSince1970) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        defaults.set(stored, forKey: Self.actedAtKey)
     }
 
     func markRead(_ items: [NotificationItem]) {
+        noteActed(items.map(\.thread))
         let targets = items.filter(\.thread.unread).map(\.thread)
         guard !targets.isEmpty else { return }
         let now = clock()
@@ -701,6 +715,7 @@ final class NotificationsModel: ObservableObject {
     }
 
     func markDone(_ items: [NotificationItem]) {
+        noteActed(items.map(\.thread))
         remove(items.map(\.thread), verb: "mark as done") { api, account, id in
             try await api.markDone(account: account, threadId: id)
         }
@@ -709,6 +724,7 @@ final class NotificationsModel: ObservableObject {
     /// Ignores the thread, even in a watched repository, and clears it, as
     /// GitHub's own Unsubscribe does. A mention or a new request still notifies.
     func unsubscribe(_ item: NotificationItem) {
+        noteActed([item.thread])
         remove([item.thread], verb: "unsubscribe from") { api, account, id in
             try await api.unsubscribe(account: account, threadId: id)
             try await api.markDone(account: account, threadId: id)
@@ -974,11 +990,9 @@ final class NotificationsModel: ObservableObject {
         self.accounts = accounts
         self.links = links
         self.lookedAt = lookedAt
-        columnsLookedAt = lookedAt
         lastUpdated = updated
         truncatedAccounts = truncated
         self.warning = warning
-        loadedAt = loadedAt ?? clock()
         phase = .loaded
     }
 }
