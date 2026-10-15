@@ -857,6 +857,8 @@ final class NotificationsTests: XCTestCase {
         let github = FakeGitHub()
         github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "author", updated: now)]])
         let model = makeModel(github, clock: TestClock(now), workspace: FakeWorkspace(snapshot: snapshot))
+        // Your own pull requests are where sessions most often work.
+        model.hidesYourPullRequests = false
         await model.pollWorkspace()
         await model.refreshNow()
         let item = try XCTUnwrap(model.items.first)
@@ -878,6 +880,8 @@ final class NotificationsTests: XCTestCase {
         github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "author", updated: now)]])
         let workspace = FakeWorkspace(snapshot: snapshot(in: "p"))
         let model = makeModel(github, clock: TestClock(now), workspace: workspace)
+        // Your own pull requests are where sessions most often work.
+        model.hidesYourPullRequests = false
         await model.pollWorkspace()
         await model.refreshNow()
         let item = try XCTUnwrap(model.items.first)
@@ -989,6 +993,8 @@ final class NotificationsTests: XCTestCase {
             ]),
         ])
         let model = makeModel(FakeGitHub(), clock: TestClock(now), workspace: FakeWorkspace(snapshot: snapshot))
+        // Your own pull requests are where sessions most often work.
+        model.hidesYourPullRequests = false
         model.show([thread("1", "author", number: 7), thread("2", "author", number: 8)], accounts: ["octocat"])
         await model.pollWorkspace()
         await model.matchSessions()
@@ -1595,17 +1601,30 @@ final class NotificationsTests: XCTestCase {
     }
 
     func testThePullDownAndNotesNameWhatIsHidden() {
-        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding CI, merged & closed")
-        XCTAssertEqual(NotificationScope(hidesCIActivity: false).hidingLabel, "Hiding merged & closed")
-        XCTAssertEqual(NotificationScope(hidesClosedIssues: false, hidesCIActivity: false).hidingLabel, "Hiding merged & closed PRs")
-        XCTAssertEqual(NotificationScope(hidesClosedPullRequests: false, hidesCIActivity: false).hidingLabel, "Hiding merged PRs & closed issues")
-        XCTAssertEqual(NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false).hidingLabel, "Hiding CI, closed issues")
+        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding CI, your PRs, merged & closed")
+        XCTAssertEqual(NotificationScope(hidesYourPullRequests: false).hidingLabel, "Hiding CI, merged & closed")
+        XCTAssertEqual(NotificationScope(hidesCIActivity: false, hidesYourPullRequests: false).hidingLabel, "Hiding merged & closed")
         XCTAssertEqual(
-            NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false).hidingLabel,
-            "Hiding CI"
+            NotificationScope(hidesClosedIssues: false, hidesCIActivity: false, hidesYourPullRequests: false).hidingLabel,
+            "Hiding merged & closed PRs"
+        )
+        XCTAssertEqual(
+            NotificationScope(hidesClosedPullRequests: false, hidesCIActivity: false, hidesYourPullRequests: false).hidingLabel,
+            "Hiding merged PRs & closed issues"
+        )
+        XCTAssertEqual(
+            NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesYourPullRequests: false).hidingLabel,
+            "Hiding CI, closed issues"
         )
         XCTAssertEqual(
             NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false, hidesCIActivity: false).hidingLabel,
+            "Hiding your PRs"
+        )
+        XCTAssertEqual(
+            NotificationScope(
+                hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false,
+                hidesCIActivity: false, hidesYourPullRequests: false
+            ).hidingLabel,
             "Showing everything"
         )
         let scoped = ScopedNotifications(
@@ -1636,6 +1655,25 @@ final class NotificationsTests: XCTestCase {
         scoped = ScopedNotifications([ci, mention], scope: scope)
         XCTAssertEqual(scoped.shown.map(\.id.id), ["ci", "m"])
         XCTAssertEqual(scoped.hiddenCI, 0)
+    }
+
+    func testActivityOnYourPullRequestsIsHiddenByDefaultButWhatAsksYouIsNot() {
+        func mine(_ id: String, _ reason: String, kind: NotificationSubjectKind = .pullRequest) -> NotificationItem {
+            NotificationItem(thread: thread(id, reason, kind: kind), detail: NotificationSubjectDetail(state: .open), detailsSettled: true)
+        }
+        let items = [mine("pr", "author"), mine("issue", "author", kind: .issue), mine("asked", "mention"), mine("review", "review_requested")]
+        var scope = NotificationScope()
+        var scoped = ScopedNotifications(items, scope: scope)
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["issue", "asked", "review"], "only activity on your pull requests goes")
+        XCTAssertEqual(scoped.hiddenYourPullRequests, 1)
+        XCTAssertEqual(NotificationsView.countHelp(scoped, owners: [], unreadOnly: false), "Hidden: 1 on your PRs")
+        XCTAssertEqual(
+            NotificationsView.allHiddenDescription(ScopedNotifications([items[0]], scope: scope), owners: []),
+            "1 thread on your PRs is hidden. They stay in your GitHub inbox."
+        )
+        scope.hidesYourPullRequests = false
+        scoped = ScopedNotifications(items, scope: scope)
+        XCTAssertEqual(scoped.shown.count, 4)
     }
 
     func testEmptyLanesSayNothingIsUnreadHiddenOrClearUntilEverySubjectIsPlaced() {
@@ -1696,12 +1734,15 @@ final class NotificationsTests: XCTestCase {
         model.hidesClosedIssues = false
         XCTAssertTrue(model.hidesCIActivity)
         model.hidesCIActivity = false
+        XCTAssertTrue(model.hidesYourPullRequests)
+        model.hidesYourPullRequests = false
 
         let relaunched = answeringModel(github, details: box, clears: false, clock: clock, defaults: defaults)
         XCTAssertFalse(relaunched.hidesMergedPullRequests)
         XCTAssertTrue(relaunched.hidesClosedPullRequests)
         XCTAssertFalse(relaunched.hidesClosedIssues)
         XCTAssertFalse(relaunched.hidesCIActivity)
+        XCTAssertFalse(relaunched.hidesYourPullRequests)
         XCTAssertEqual(relaunched.owners, "")
     }
 
@@ -1957,6 +1998,9 @@ final class NotificationsDesignCaptureTests: XCTestCase {
             )
             model.setBadge = { _ in }
             model.owners = owners
+            // The linked session sits on your own pull request; the compact
+            // capture keeps the defaults to measure the longest default label.
+            if name != "mac-compact" { model.hidesYourPullRequests = false }
             await model.pollWorkspace()
             if offline { workspace.answer(fetches: [.unreachable]); await model.pollWorkspace() }
             model.show(
