@@ -236,7 +236,11 @@ struct PullRequestsView: View {
               ? "Showing every owner. Choose organizations or users to narrow it."
               : "Showing pull requests in \(owners.joined(separator: ", "))")
         .popover(isPresented: $editingOwners, arrowEdge: .bottom) {
-            OwnersEditor(owners: $pullRequests.owners, note: pullRequests.settingsNote) {
+            OwnersEditor(
+                owners: $pullRequests.owners,
+                description: "Show only your pull requests in these organizations or users. Leave empty to include every owner.",
+                note: pullRequests.settingsNote
+            ) {
                 editingOwners = false
                 pullRequests.refresh()
             }
@@ -1010,8 +1014,10 @@ struct PullRequestChip: View {
     }
 }
 
-private struct OwnersEditor: View {
+struct OwnersEditor: View {
     @Binding var owners: String
+    /// What the owners narrow, for this window.
+    let description: String
     /// Why these owners stay in this app rather than Copilot Projects' settings.
     let note: String?
     let onDone: () -> Void
@@ -1021,7 +1027,7 @@ private struct OwnersEditor: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Owners")
                 .font(.headline)
-            Text("Show only your pull requests in these organizations or users. Leave empty to include every owner.")
+            Text(description)
                 .font(.callout)
                 .foregroundStyle(StudioStyle.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)

@@ -21,6 +21,7 @@ struct NotificationsView: View {
     /// The user picked a thread, so a finished refresh doesn't move the selection.
     @State private var userSelected = false
     @State private var editingBanners = false
+    @State private var editingOwners = false
     /// Legacy scrollers take width from the lanes; rebuild them when the style changes.
     @State private var scrollerStyle = NSScroller.preferredScrollerStyle
     @FocusState private var lanesFocused: Bool
@@ -30,15 +31,16 @@ struct NotificationsView: View {
     static let cellLimit = 5
 
     var body: some View {
-        let all = model.items
+        let scoped = model.scoped
+        let all = scoped.shown
         let visible = filter.items(all)
         let layout = NotificationLayout(items: visible)
         let now = Date()
         let order = readingOrder(layout, now: now)
         VStack(spacing: 0) {
             titleStrip
-            header(NotificationCounts(items: all), total: all.count)
-            filterBar(visibleCount: visible.count, totalCount: all.count)
+            header(NotificationCounts(items: all), scoped: scoped)
+            filterBar(visibleCount: visible.count, scoped: scoped)
             if let warning = model.warning {
                 Label(warning, systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -49,7 +51,7 @@ struct NotificationsView: View {
                     .textSelection(.enabled)
             }
             Divider()
-            content(layout, order: order, now: now, hasThreads: !all.isEmpty)
+            content(layout, order: order, now: now, scoped: scoped)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             footer(order)
@@ -58,6 +60,11 @@ struct NotificationsView: View {
         .background(StudioStyle.chrome)
         .background(TitlebarSeparatorRemover())
         .onChange(of: filter) {
+            selection = order.first?.id
+            userSelected = true
+            lanesFocused = true
+        }
+        .onChange(of: model.scope) {
             selection = order.first?.id
             userSelected = true
             lanesFocused = true
@@ -92,14 +99,14 @@ struct NotificationsView: View {
 
     // MARK: Header
 
-    private func header(_ counts: NotificationCounts, total: Int) -> some View {
+    private func header(_ counts: NotificationCounts, scoped: ScopedNotifications) -> some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(headline(counts, total: total))
+                Text(headline(counts, total: scoped.total, pending: scoped.pending))
                     .font(.title3.weight(.semibold))
                     .monospacedDigit()
                     .lineLimit(1)
-                Text(subtitle(counts, total: total))
+                Text(subtitle(counts, total: scoped.total))
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(StudioStyle.secondaryText)
@@ -109,6 +116,7 @@ struct NotificationsView: View {
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(.isHeader)
             Spacer(minLength: 12)
+            ownersButton
             bannersButton
             Button {
                 model.refresh()
@@ -124,8 +132,10 @@ struct NotificationsView: View {
         .frame(height: 56)
     }
 
-    func headline(_ counts: NotificationCounts, total: Int) -> String {
+    func headline(_ counts: NotificationCounts, total: Int, pending: Int = 0) -> String {
         if model.phase != .loaded && total == 0 { return "Notifications" }
+        // What's still being read may yet need the user.
+        if counts.needsYou == 0, pending > 0 { return "Checking pull requests and issues…" }
         // Only the newest threads were read, so nothing here is not the same as nothing at all.
         if counts.needsYou == 0, !model.truncatedAccounts.isEmpty { return "Nothing needs you in the newest threads" }
         switch counts.needsYou {
@@ -150,6 +160,28 @@ struct NotificationsView: View {
         return parts.joined(separator: " · ")
     }
 
+    private var ownersButton: some View {
+        let owners = model.ownerList
+        return Button {
+            editingOwners.toggle()
+        } label: {
+            Label(PullRequestsView.ownersLabel(owners), systemImage: "line.3.horizontal.decrease.circle")
+                .lineLimit(1)
+        }
+        .help(owners.isEmpty
+              ? "Showing every owner. Choose organizations or users to narrow it."
+              : "Showing notifications from repositories in \(owners.joined(separator: ", "))")
+        .popover(isPresented: $editingOwners, arrowEdge: .bottom) {
+            OwnersEditor(
+                owners: $model.owners,
+                description: "Show only notifications from repositories in these organizations or users. Others don’t count toward the badge or raise banners. Leave empty to include every owner.",
+                note: model.storageNote
+            ) {
+                editingOwners = false
+            }
+        }
+    }
+
     private var bannersButton: some View {
         let enabled = NotificationBand.allCases.filter(model.bannersEnabled(for:))
         return Button {
@@ -167,7 +199,7 @@ struct NotificationsView: View {
         }
     }
 
-    private func filterBar(visibleCount: Int, totalCount: Int) -> some View {
+    private func filterBar(visibleCount: Int, scoped: ScopedNotifications) -> some View {
         HStack(spacing: 12) {
             Picker("Show", selection: $filter) {
                 ForEach(NotificationsFilter.allCases) { choice in
@@ -179,8 +211,11 @@ struct NotificationsView: View {
             // Its natural width, starting on the 14pt edge the headline and columns share.
             .fixedSize()
             .disabled(model.phase != .loaded)
-            Text("\(visibleCount.formatted()) of \(totalCount.formatted()) threads")
+            hidingMenu
+            Text("\(visibleCount.formatted()) of \(scoped.total.formatted()) threads")
                 .monospacedDigit()
+                .fixedSize()
+                .help(Self.countHelp(scoped, owners: model.ownerList, unreadOnly: filter == .unread))
             clearedNote
             Spacer(minLength: 8)
             refreshStatus
@@ -207,12 +242,10 @@ struct NotificationsView: View {
     private var clearedNote: some View {
         let cleared = model.clearedAnswered
         if !cleared.isEmpty {
-            Label {
-                Text(cleared.count == 1 ? "Cleared 1 you’d answered" : "Cleared \(cleared.count.formatted()) you’d answered")
-                    .monospacedDigit()
-                    .lineLimit(1)
-            } icon: {
-                Image(systemName: "checkmark.circle")
+            // Narrow windows keep the count and symbol; the tooltip says the rest.
+            ViewThatFits(in: .horizontal) {
+                clearedLabel(cleared.count == 1 ? "Cleared 1 you’d answered" : "Cleared \(cleared.count.formatted()) you’d answered")
+                clearedLabel(cleared.count.formatted())
             }
             .help(clearedHelp(cleared))
             .accessibilityElement(children: .ignore)
@@ -221,12 +254,59 @@ struct NotificationsView: View {
         }
     }
 
+    private func clearedLabel(_ text: String) -> some View {
+        Label {
+            Text(text)
+                .monospacedDigit()
+                .lineLimit(1)
+        } icon: {
+            Image(systemName: "checkmark.circle")
+        }
+        .fixedSize()
+    }
+
     private func clearedHelp(_ cleared: [NotificationThread]) -> String {
         var lines = ["Marked done on GitHub because you reviewed, replied, merged, or closed after you were last asked:"]
         lines += cleared.prefix(10).map { "• \($0.shortName): \($0.title)" }
         if cleared.count > 10 { lines.append("and \((cleared.count - 10).formatted()) more") }
         lines.append("A new mention, request, or assignment brings a thread back. GitHub’s Done view keeps the rest.")
         return lines.joined(separator: "\n")
+    }
+
+    /// Which settled subjects stay out of the window, the badge, and banners.
+    private var hidingMenu: some View {
+        let scope = model.scope
+        return Menu {
+            Section("Hide") {
+                Toggle("Merged Pull Requests", isOn: $model.hidesMergedPullRequests)
+                Toggle("Closed Pull Requests", isOn: $model.hidesClosedPullRequests)
+                Toggle("Closed Issues", isOn: $model.hidesClosedIssues)
+            }
+        } label: {
+            Text(scope.hidingLabel)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.visible)
+        .fixedSize()
+        .help(scope.hidesAnyState
+              ? "Hidden threads stay in your GitHub inbox but don’t show here, count toward the badge, or raise banners."
+              : "Merged and closed pull requests and closed issues show here. Choose which to hide.")
+        .accessibilityLabel("Merged and closed threads")
+        .accessibilityValue(scope.hidingLabel)
+    }
+
+    /// What "N of M threads" leaves out, and why.
+    static func countHelp(_ scoped: ScopedNotifications, owners: [String], unreadOnly: Bool) -> String {
+        var parts: [String] = []
+        if scoped.hiddenByState > 0 { parts.append("\(scoped.hiddenByState.formatted()) merged or closed") }
+        if scoped.hiddenByOwner > 0 {
+            parts.append("\(scoped.hiddenByOwner.formatted()) outside \(owners.joined(separator: ", "))")
+        }
+        var lines: [String] = []
+        if !parts.isEmpty { lines.append("Hidden: " + parts.joined(separator: " · ")) }
+        if scoped.pending > 0 { lines.append("Checking \(scoped.pending.formatted()) pull requests and issues") }
+        if unreadOnly { lines.append("Read threads are left out while Unread is on.") }
+        return lines.isEmpty ? "Every loaded thread is shown." : lines.joined(separator: "\n")
     }
 
     @ViewBuilder
@@ -242,6 +322,7 @@ struct NotificationsView: View {
             TimelineView(.periodic(from: .now, by: 30)) { _ in
                 Text("GitHub checked \(updated, format: .relative(presentation: .named))")
                     .monospacedDigit()
+                    .fixedSize()
             }
         }
     }
@@ -303,7 +384,8 @@ struct NotificationsView: View {
     // MARK: Content
 
     @ViewBuilder
-    private func content(_ layout: NotificationLayout, order: [NotificationItem], now: Date, hasThreads: Bool) -> some View {
+    private func content(_ layout: NotificationLayout, order: [NotificationItem], now: Date, scoped: ScopedNotifications) -> some View {
+        let hasThreads = scoped.total > 0
         switch model.phase {
         case .failed(let error) where !hasThreads:
             ContentUnavailableView {
@@ -316,13 +398,33 @@ struct NotificationsView: View {
         case .idle, .loading where !hasThreads:
             lanes(Self.placeholderLayout, order: [], now: now, placeholder: true)
         default:
-            if layout.isEmpty, hasThreads {
+            if layout.isEmpty, !scoped.shown.isEmpty {
                 ContentUnavailableView {
                     Label("No Unread Notifications", systemImage: "checkmark.circle")
                 } description: {
                     Text("Everything here has been read. Mark threads done to clear them from your inbox.")
                 } actions: {
                     Button("Show All") { filter = .all }
+                }
+            } else if layout.isEmpty, scoped.pending > 0 {
+                // Everything left might yet be hidden: hold the first-load lanes until it's read.
+                lanes(Self.placeholderLayout, order: [], now: now, placeholder: true)
+            } else if layout.isEmpty, scoped.hidden > 0 {
+                ContentUnavailableView {
+                    Label("All Threads Hidden", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text(Self.allHiddenDescription(scoped, owners: model.ownerList))
+                } actions: {
+                    if scoped.hiddenByState > 0 {
+                        Button("Show Merged & Closed") {
+                            model.hidesMergedPullRequests = false
+                            model.hidesClosedPullRequests = false
+                            model.hidesClosedIssues = false
+                        }
+                    }
+                    if scoped.hiddenByOwner > 0 {
+                        Button("Show Every Owner") { model.owners = "" }
+                    }
                 }
             } else if layout.isEmpty {
                 ContentUnavailableView {
@@ -334,6 +436,20 @@ struct NotificationsView: View {
                 lanes(layout, order: order, now: now, placeholder: false)
             }
         }
+    }
+
+    /// Why nothing shows when everything loaded is out of scope.
+    static func allHiddenDescription(_ scoped: ScopedNotifications, owners: [String]) -> String {
+        var parts: [String] = []
+        if scoped.hiddenByState > 0 {
+            parts.append(scoped.hiddenByState == 1 ? "1 merged or closed thread" : "\(scoped.hiddenByState.formatted()) merged or closed threads")
+        }
+        if scoped.hiddenByOwner > 0 {
+            let threads = scoped.hiddenByOwner == 1 ? "1 thread" : "\(scoped.hiddenByOwner.formatted()) threads"
+            parts.append("\(threads) outside \(owners.joined(separator: ", "))")
+        }
+        let verb = scoped.hidden == 1 ? "is" : "are"
+        return "\(parts.joined(separator: " and ")) \(verb) hidden. They stay in your GitHub inbox."
     }
 
     private func lanes(_ layout: NotificationLayout, order: [NotificationItem], now: Date, placeholder: Bool) -> some View {

@@ -1302,6 +1302,170 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(model.counts.settled, 0)
     }
 
+    // MARK: Scope
+
+    private func item(
+        _ id: String, kind: NotificationSubjectKind = .pullRequest, repo: String = "octo/app",
+        state: NotificationSubjectDetail.State?
+    ) -> NotificationItem {
+        NotificationItem(
+            thread: thread(id, "mention", kind: kind, repo: repo),
+            detail: state.map { NotificationSubjectDetail(state: $0) }, detailsSettled: true
+        )
+    }
+
+    func testMergedAndClosedSubjectsAreHiddenByDefault() {
+        let items = [
+            item("open", state: .open), item("draft", state: .draft), item("merged", state: .merged),
+            item("closed", state: .closed), item("issue", kind: .issue, state: .open),
+            item("done", kind: .issue, state: .completed), item("dropped", kind: .issue, state: .notPlanned),
+            item("unknown", state: nil), item("ci", kind: .checkSuite, state: nil),
+        ]
+        var scope = NotificationScope()
+        var scoped = ScopedNotifications(items, scope: scope)
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["open", "draft", "issue", "unknown", "ci"], "an unknown state is never hidden")
+        XCTAssertEqual(scoped.hiddenByState, 4)
+        XCTAssertEqual(scoped.total, items.count)
+
+        scope.hidesMergedPullRequests = false
+        XCTAssertNil(scope.hidden(items[2]))
+        XCTAssertEqual(scope.hidden(items[3]), .closedPullRequest, "closed and merged are separate choices")
+        scope.hidesClosedPullRequests = false
+        XCTAssertEqual(ScopedNotifications(items, scope: scope).hiddenByState, 2, "closed issues stay hidden")
+        scope.hidesClosedIssues = false
+        scoped = ScopedNotifications(items, scope: scope)
+        XCTAssertEqual(scoped.shown.count, items.count)
+    }
+
+    func testOwnersNarrowTheScopeWhateverTheirCase() {
+        let items = [
+            item("mine", repo: "Octo/app", state: .open),
+            item("theirs", repo: "other/app", state: .open),
+            item("theirs-merged", repo: "other/app", state: .merged),
+        ]
+        let scoped = ScopedNotifications(items, scope: NotificationScope(owners: ["octo"]))
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["mine"])
+        XCTAssertEqual(scoped.hiddenByOwner, 2, "outside the owners is the reason, whatever the state")
+        XCTAssertEqual(scoped.hiddenByState, 0)
+        XCTAssertEqual(ScopedNotifications(items, scope: NotificationScope(owners: [])).hiddenByOwner, 0, "empty means every owner")
+    }
+
+    func testThePullDownAndNotesNameWhatIsHidden() {
+        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding merged & closed")
+        XCTAssertEqual(NotificationScope(hidesClosedIssues: false).hidingLabel, "Hiding merged & closed PRs")
+        XCTAssertEqual(NotificationScope(hidesClosedPullRequests: false).hidingLabel, "Hiding merged PRs & closed issues")
+        XCTAssertEqual(NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false).hidingLabel, "Hiding closed issues")
+        XCTAssertEqual(
+            NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false).hidingLabel,
+            "Showing merged & closed"
+        )
+        let scoped = ScopedNotifications(
+            [item("m", state: .merged), item("x", repo: "other/app", state: .open)], scope: NotificationScope(owners: ["octo"])
+        )
+        XCTAssertEqual(
+            NotificationsView.allHiddenDescription(scoped, owners: ["octo"]),
+            "1 merged or closed thread and 1 thread outside octo are hidden. They stay in your GitHub inbox."
+        )
+        XCTAssertEqual(NotificationsView.countHelp(scoped, owners: ["octo"], unreadOnly: true),
+                       "Hidden: 1 merged or closed · 1 outside octo\nRead threads are left out while Unread is on.")
+    }
+
+    func testHiddenThreadsNeitherCountNorBannerAndTheChoiceIsKept() async throws {
+        let github = FakeGitHub()
+        let clock = TestClock(now)
+        let old = FakeGitHub.thread("old", reason: "mention", type: "Issue", number: 9, updated: now.addingTimeInterval(-60))
+        github.answer("participating", pages: [[old]])
+        let defaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
+        let box = DetailBox([
+            "old": NotificationSubjectDetail(state: .open), "1": NotificationSubjectDetail(state: .merged),
+            "2": NotificationSubjectDetail(state: .open), "3": NotificationSubjectDetail(state: .open),
+        ])
+        let model = answeringModel(github, details: box, clears: false, clock: clock, defaults: defaults)
+        var badge: String?
+        model.setBadge = { badge = $0 }
+        let banners = FakeBanners()
+        model.banners = banners
+        await model.refreshNow()
+
+        clock.now += 120
+        github.answer("participating", pages: [[
+            old,
+            FakeGitHub.thread("1", reason: "mention", number: 1, updated: now.addingTimeInterval(60)),
+            FakeGitHub.thread("2", reason: "mention", repo: "other/app", number: 2, updated: now.addingTimeInterval(60)),
+            FakeGitHub.thread("3", reason: "mention", number: 3, updated: now.addingTimeInterval(60)),
+        ]])
+        model.owners = "@Octo"
+        XCTAssertEqual(defaults.string(forKey: NotificationsModel.ownersKey), "@Octo")
+        await model.refreshNow()
+        XCTAssertEqual(Set(model.items.map(\.id.id)), ["old", "3"])
+        XCTAssertEqual(model.scoped.hiddenByState, 1)
+        XCTAssertEqual(model.scoped.hiddenByOwner, 1)
+        XCTAssertEqual(model.counts.needsYou, 2)
+        XCTAssertEqual(badge, "2")
+        XCTAssertEqual(banners.posted.flatMap { $0 }.compactMap(\.thread?.id), ["3"], "hidden threads raise no banner")
+
+        model.hidesMergedPullRequests = false
+        XCTAssertEqual(badge, "3", "the badge follows the choice at once")
+        model.owners = ""
+        XCTAssertEqual(badge, "4")
+        model.hidesClosedIssues = false
+
+        let relaunched = answeringModel(github, details: box, clears: false, clock: clock, defaults: defaults)
+        XCTAssertFalse(relaunched.hidesMergedPullRequests)
+        XCTAssertTrue(relaunched.hidesClosedPullRequests)
+        XCTAssertFalse(relaunched.hidesClosedIssues)
+        XCTAssertEqual(relaunched.owners, "")
+    }
+
+    func testASubjectReadForTheFirstTimeWaitsForItsStateInsteadOfFlashingPast() async throws {
+        final class Probe: @unchecked Sendable {
+            weak var model: NotificationsModel?
+            var seen: [String]?
+            var pending = 0
+            var fails = false
+        }
+        let probe = Probe()
+        var fetcher = NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2))
+        fetcher.answer = { threads, account in
+            await MainActor.run {
+                probe.seen = probe.model?.items.map(\.id.id)
+                probe.pending = probe.model?.scoped.pending ?? -1
+            }
+            var result = NotificationDetailsFetcher.Result(details: [:], settled: [], viewerLogin: account.login)
+            guard !probe.fails else { return result }
+            for thread in threads {
+                result.settled.insert(thread.key)
+                result.details[thread.key] = NotificationSubjectDetail(state: .merged)
+            }
+            return result
+        }
+        let github = FakeGitHub()
+        let ci = FakeGitHub.thread("ci", reason: "ci_activity", type: "CheckSuite", number: nil, updated: now)
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", number: 1, updated: now), ci]])
+        let clock = TestClock(now)
+        let model = NotificationsModel(
+            workspace: FakeWorkspace(), defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            api: GitHubNotificationsAPI(send: github.send), detailsFetcher: fetcher,
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
+            transcriptPath: { _ in nil }, clock: { clock.now }, isVisible: { false }
+        )
+        model.setBadge = { _ in }
+        probe.model = model
+        await model.refreshNow()
+        XCTAssertEqual(probe.seen, ["ci"], "the pull request waits while its state is read")
+        XCTAssertEqual(probe.pending, 1)
+        XCTAssertEqual(model.items.map(\.id.id), ["ci"], "and then stays out: it's merged")
+        XCTAssertEqual(model.scoped.hiddenByState, 1)
+
+        // A subject GitHub doesn't answer for shows once the read is over.
+        probe.fails = true
+        github.answer("participating", pages: [[FakeGitHub.thread("2", reason: "mention", number: 2, updated: now), ci]])
+        await model.refreshNow()
+        XCTAssertEqual(probe.seen, ["ci"])
+        XCTAssertEqual(Set(model.items.map(\.id.id)), ["2", "ci"])
+        XCTAssertEqual(model.scoped.pending, 0)
+    }
+
     // MARK: Remembered dones
 
     private func doneThreads(_ defaults: UserDefaults) -> [String: Double] {
@@ -1488,11 +1652,12 @@ final class NotificationsDesignCaptureTests: XCTestCase {
             ]),
         ])
         let workspacePR = try XCTUnwrap(PullRequestKey("sample/workspace#205"))
-        for (name, appearance, width, offline) in [
-            ("mac-dark", NSAppearance.Name.darkAqua, 1280.0, false),
-            ("mac-light", .aqua, 1280.0, false),
-            ("mac-compact", .darkAqua, 880.0, false),
-            ("mac-offline", .aqua, 880.0, true),
+        for (name, appearance, width, offline, owners) in [
+            ("mac-dark", NSAppearance.Name.darkAqua, 1280.0, false, "sample"),
+            ("mac-light", .aqua, 1280.0, false, ""),
+            ("mac-compact", .darkAqua, 880.0, false, ""),
+            ("mac-offline", .aqua, 880.0, true, ""),
+            ("mac-all-hidden", .darkAqua, 880.0, false, "elsewhere"),
         ] {
             let workspace = FakeWorkspace(snapshot: snapshot)
             let model = NotificationsModel(
@@ -1501,6 +1666,7 @@ final class NotificationsDesignCaptureTests: XCTestCase {
                 transcriptPath: { _ in nil }, openURL: { _ in XCTFail("Capture must not open anything") }
             )
             model.setBadge = { _ in }
+            model.owners = owners
             await model.pollWorkspace()
             if offline { workspace.answer(fetches: [.unreachable]); await model.pollWorkspace() }
             model.show(

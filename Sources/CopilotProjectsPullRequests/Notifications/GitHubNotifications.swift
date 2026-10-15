@@ -497,3 +497,91 @@ struct NotificationCounts: Equatable, Sendable {
         }
     }
 }
+
+/// Which threads count at all: those in the chosen owners' repositories, less
+/// the merged and closed ones the user hides. What's out of scope stays in the
+/// GitHub inbox but never shows, badges, or raises a banner here.
+struct NotificationScope: Equatable, Sendable {
+    var hidesMergedPullRequests = true
+    var hidesClosedPullRequests = true
+    var hidesClosedIssues = true
+    /// Organizations or users whose repositories count; empty means every owner.
+    var owners: [String] = []
+
+    enum Hidden: Equatable, Sendable {
+        case owner, mergedPullRequest, closedPullRequest, closedIssue
+    }
+
+    /// Why a thread is out of scope; nil when it's in. A subject whose state
+    /// isn't known is never hidden for its state.
+    func hidden(_ item: NotificationItem) -> Hidden? {
+        if !owners.isEmpty {
+            let owner = item.thread.repository.split(separator: "/").first.map { $0.lowercased() } ?? ""
+            if !owners.contains(where: { $0.lowercased() == owner }) { return .owner }
+        }
+        guard let state = item.detail?.state, state.isSettled else { return nil }
+        switch item.thread.kind {
+        case .pullRequest:
+            if state == .merged { return hidesMergedPullRequests ? .mergedPullRequest : nil }
+            return hidesClosedPullRequests ? .closedPullRequest : nil
+        case .issue:
+            return hidesClosedIssues ? .closedIssue : nil
+        default:
+            return nil
+        }
+    }
+
+    /// Whether a subject of this kind could be hidden once its state is read.
+    func hidesSomeState(of kind: NotificationSubjectKind) -> Bool {
+        switch kind {
+        case .pullRequest: return hidesMergedPullRequests || hidesClosedPullRequests
+        case .issue: return hidesClosedIssues
+        default: return false
+        }
+    }
+
+    /// The filter row's pull-down: what's hidden, in as few words as hold it.
+    var hidingLabel: String {
+        switch (hidesMergedPullRequests, hidesClosedPullRequests, hidesClosedIssues) {
+        case (true, true, true): return "Hiding merged & closed"
+        case (true, true, false): return "Hiding merged & closed PRs"
+        case (true, false, true): return "Hiding merged PRs & closed issues"
+        case (false, true, true): return "Hiding closed PRs & issues"
+        case (true, false, false): return "Hiding merged PRs"
+        case (false, true, false): return "Hiding closed PRs"
+        case (false, false, true): return "Hiding closed issues"
+        case (false, false, false): return "Showing merged & closed"
+        }
+    }
+
+    var hidesAnyState: Bool { hidesMergedPullRequests || hidesClosedPullRequests || hidesClosedIssues }
+}
+
+/// Every loaded thread sorted by scope: what shows, what's hidden and why, and
+/// what waits for its state to be read before it can be placed.
+struct ScopedNotifications: Equatable {
+    var shown: [NotificationItem] = []
+    /// Merged or closed subjects the user hides.
+    var hiddenByState = 0
+    /// Threads in repositories outside the chosen owners.
+    var hiddenByOwner = 0
+    /// Subjects whose state is being read for the first time and might be hidden.
+    var pending = 0
+    var total: Int { shown.count + hiddenByState + hiddenByOwner + pending }
+    var hidden: Int { hiddenByState + hiddenByOwner }
+
+    init(_ items: [NotificationItem], scope: NotificationScope, isPending: (NotificationItem) -> Bool = { _ in false }) {
+        for item in items {
+            switch scope.hidden(item) {
+            case .owner: hiddenByOwner += 1
+            case .mergedPullRequest, .closedPullRequest, .closedIssue: hiddenByState += 1
+            case nil:
+                if item.detail?.state == nil, scope.hidesSomeState(of: item.thread.kind), isPending(item) {
+                    pending += 1
+                } else {
+                    shown.append(item)
+                }
+            }
+        }
+    }
+}
