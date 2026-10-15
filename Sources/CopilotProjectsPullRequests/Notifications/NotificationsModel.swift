@@ -282,15 +282,16 @@ final class NotificationsModel: ObservableObject {
         return threads.map { thread in
             let session = thread.pullRequestKey.flatMap { links[$0] }.flatMap { sessions[$0] }
             var detail = details[thread.key]
+            let current = detailVersions[thread.key] == thread.updatedAt
             // Answered and withdrawn hold only for the copy they were judged on;
             // anything newer may ask again.
-            if detailVersions[thread.key] != thread.updatedAt {
+            if !current {
                 detail?.answered = false
                 detail?.withdrawn = false
             }
             return NotificationItem(
-                thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), session: session,
-                actedAt: actedAt[thread.key]
+                thread: thread, detail: detail, detailsSettled: settled.contains(thread.key), stateIsCurrent: current,
+                session: session, actedAt: actedAt[thread.key]
             )
         }
     }
@@ -304,12 +305,13 @@ final class NotificationsModel: ObservableObject {
 
     var ownerList: [String] { PullRequestsModel.ownerList(owners) }
 
-    /// Loaded threads by scope. A subject read for the first time waits for its
-    /// state rather than showing and then vanishing; one GitHub didn't answer
-    /// for shows once the read is over.
+    /// Loaded threads by scope. A subject that might be hidden waits while its
+    /// state is read rather than showing and then vanishing; one GitHub didn't
+    /// answer for shows once the read is over.
     var scoped: ScopedNotifications {
         ScopedNotifications(allItems, scope: scope) { [readingDetails, settled] item in
-            readingDetails && !settled.contains(item.id)
+            // A subject GitHub answered for without showing it is never read into a state.
+            readingDetails && (item.detail != nil || !settled.contains(item.id))
         }
     }
 
@@ -1106,6 +1108,10 @@ final class NotificationsModel: ObservableObject {
         clearedAnswered = cleared
         self.threads = threads
         self.details = details
+        // Supplied details describe the copies supplied with them.
+        detailVersions = Dictionary(
+            threads.filter { details[$0.key] != nil }.map { ($0.key, $0.updatedAt) }, uniquingKeysWith: { first, _ in first }
+        )
         self.settled = settled ?? Set(details.keys)
         self.accounts = accounts
         self.links = links

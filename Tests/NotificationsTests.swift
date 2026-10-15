@@ -1455,6 +1455,43 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(scoped.shown.count, items.count)
     }
 
+    func testOnlyAStateReadForThisCopyHidesItExceptAMerge() {
+        func stale(_ id: String, kind: NotificationSubjectKind = .pullRequest, state: NotificationSubjectDetail.State) -> NotificationItem {
+            NotificationItem(thread: thread(id, "mention", kind: kind), detail: NotificationSubjectDetail(state: state),
+                             detailsSettled: true, stateIsCurrent: false)
+        }
+        let scope = NotificationScope()
+        XCTAssertNil(scope.hidden(stale("reopened", kind: .issue, state: .completed)), "it may have been reopened since")
+        XCTAssertNil(scope.hidden(stale("pr", state: .closed)))
+        XCTAssertEqual(scope.hidden(stale("merged", state: .merged)), .mergedPullRequest, "nothing undoes a merge")
+        XCTAssertTrue(scope.mightHide(stale("reopened", kind: .issue, state: .completed)))
+        XCTAssertFalse(scope.mightHide(stale("open", state: .open)), "an open subject stays put while it's read again")
+
+        let numberless = NotificationItem(thread: thread("x", "mention", number: nil), detail: nil, detailsSettled: false)
+        XCTAssertFalse(scope.mightHide(numberless), "a subject with no number is never read, so it never waits")
+        let scoped = ScopedNotifications([numberless, stale("reopened", kind: .issue, state: .closed)], scope: scope) { _ in true }
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["x"])
+        XCTAssertEqual(scoped.pending, 1)
+    }
+
+    func testAReopenedIssueIsNotHiddenByItsOldClosedStateWhenItCantBeReadAgain() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "mention", type: "Issue", number: 1, updated: now.addingTimeInterval(-60)),
+        ]])
+        let box = DetailBox(["1": NotificationSubjectDetail(state: .completed)])
+        let model = answeringModel(github, details: box, clears: false, clock: TestClock(now))
+        await model.refreshNow()
+        XCTAssertTrue(model.items.isEmpty, "closed issues are hidden")
+
+        // Reopened and mentioned again, but its details can't be read.
+        github.answer("participating", pages: [[FakeGitHub.thread("1", reason: "mention", type: "Issue", number: 1, updated: now)]])
+        box.failing = true
+        await model.refreshNow()
+        XCTAssertEqual(model.items.map(\.id.id), ["1"])
+        XCTAssertEqual(model.counts.needsYou, 1)
+    }
+
     func testOwnersNarrowTheScopeWhateverTheirCase() {
         let items = [
             item("mine", repo: "Octo/app", state: .open),

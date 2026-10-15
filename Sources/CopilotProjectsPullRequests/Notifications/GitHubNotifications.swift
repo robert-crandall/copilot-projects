@@ -334,6 +334,8 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
     let detail: NotificationSubjectDetail?
     /// Who asked for a review isn't known yet; it sits with To you until it is.
     let isClassifying: Bool
+    /// The detail was read for this copy of the thread, not an older one.
+    let stateIsCurrent: Bool
     var session: PullRequestSession?
     /// The latest change the user has acted on here (opened, marked, unsubscribed,
     /// went to its session, or copied its link); nothing newer has been seen.
@@ -383,12 +385,13 @@ struct NotificationItem: Identifiable, Equatable, Sendable {
 
     init(
         thread: NotificationThread, detail: NotificationSubjectDetail?, detailsSettled: Bool,
-        session: PullRequestSession? = nil, actedAt: Date? = nil
+        stateIsCurrent: Bool = true, session: PullRequestSession? = nil, actedAt: Date? = nil
     ) {
         self.thread = thread
         self.detail = detail
         lane = Self.lane(for: thread.reason, detail: detail)
         isClassifying = thread.reason == .reviewRequested && thread.kind == .pullRequest && detail == nil && !detailsSettled
+        self.stateIsCurrent = stateIsCurrent
         self.session = session
         self.actedAt = actedAt
     }
@@ -523,13 +526,14 @@ struct NotificationScope: Equatable, Sendable {
     }
 
     /// Why a thread is out of scope; nil when it's in. A subject whose state
-    /// isn't known is never hidden for its state.
+    /// isn't known is never hidden for its state, and neither is a closed one
+    /// read for an older copy: it may have been reopened since. Merged stays merged.
     func hidden(_ item: NotificationItem) -> Hidden? {
         if !owners.isEmpty {
             let owner = item.thread.repository.split(separator: "/").first.map { $0.lowercased() } ?? ""
             if !owners.contains(where: { $0.lowercased() == owner }) { return .owner }
         }
-        guard let state = item.detail?.state, state.isSettled else { return nil }
+        guard let state = item.detail?.state, state.isSettled, item.stateIsCurrent || state == .merged else { return nil }
         switch item.thread.kind {
         case .pullRequest:
             if state == .merged { return hidesMergedPullRequests ? .mergedPullRequest : nil }
@@ -539,6 +543,14 @@ struct NotificationScope: Equatable, Sendable {
         default:
             return nil
         }
+    }
+
+    /// Whether a subject could turn out hidden once its state is read: one never
+    /// read, or one last read closed for an older copy. Open ones stay put.
+    func mightHide(_ item: NotificationItem) -> Bool {
+        guard item.thread.number != nil, hidesSomeState(of: item.thread.kind) else { return false }
+        guard let state = item.detail?.state else { return true }
+        return state.isSettled && state != .merged && !item.stateIsCurrent
     }
 
     /// Whether a subject of this kind could be hidden once its state is read.
@@ -586,7 +598,7 @@ struct ScopedNotifications: Equatable {
             case .owner: hiddenByOwner += 1
             case .mergedPullRequest, .closedPullRequest, .closedIssue: hiddenByState += 1
             case nil:
-                if item.detail?.state == nil, scope.hidesSomeState(of: item.thread.kind), isPending(item) {
+                if scope.mightHide(item), isPending(item) {
                     pending += 1
                 } else {
                     shown.append(item)

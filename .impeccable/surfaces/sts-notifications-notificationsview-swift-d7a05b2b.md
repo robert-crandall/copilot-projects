@@ -118,8 +118,10 @@ borderless pull-down after Unread | All, labeled by what it hides ("Hiding merge
 closed" by default), with checkmarks for Merged Pull Requests, Closed Pull Requests,
 and Closed Issues. Out-of-scope threads leave the lanes, header, badge, banners, and
 summary; "N of M threads" counts every loaded thread and its tooltip names what's
-hidden. A subject read for the first time waits for its state (placeholder lanes if
-nothing else is left); an unknown state is never hidden. All Threads Hidden joins
+hidden. A subject read for the first time, or last read closed for an older copy,
+waits for its state (placeholder lanes if nothing else is left); an unknown state,
+or a closed one read for an older copy, is never hidden. Answered threads are still
+cleared on GitHub when hidden (the user's choice). All Threads Hidden joins
 the `ContentUnavailableView` states. At 880pt the cleared note drops to its symbol
 and count and "GitHub checked" never wraps. Evidence: `NotificationsTests` scope,
 owner, label, badge/banner/persistence, and first-read tests; native captures (now

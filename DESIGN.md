@@ -358,10 +358,11 @@ asked); the Dock badge (none at zero, 999+ above 999), menu title, menu bar item
 header, bands, and lanes all count exactly that, within the window's scope. The
 scope keeps threads from repositories in the chosen owners (empty means every
 owner) and, by default, drops merged and closed pull requests and closed issues;
-what's out of scope stays in the GitHub inbox but never shows, badges, banners, or
-counts here. A subject whose state isn't known is never hidden for it, and one
-read for the first time waits for its state rather than showing and then
-vanishing. The primary copy marks answered
+what's out of scope stays in the GitHub inbox (unless already answered, which
+still clears it) but never shows, badges, banners, or counts here. A subject whose
+state isn't known is never hidden for it, nor is one last read closed for an
+older copy (it may have been reopened; merged stays merged), and one read for
+the first time waits for its state rather than showing and then vanishing. The primary copy marks answered
 threads done on GitHub, and the filter row reports them as a caption
 "Cleared N you'd answered" behind the checkmark.circle symbol, with the cleared
 threads in its tooltip; a narrow row keeps only the symbol and N.
