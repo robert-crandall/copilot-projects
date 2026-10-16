@@ -70,8 +70,36 @@ public struct PullRequestReviewTarget: Equatable, Sendable {
         "Review \(owner)/\(repository)#\(number)"
     }
 
+    /// Trims `#` and everything after it from a pull request URL input.
+    public static func withoutFragment(_ input: String) -> String {
+        guard let hash = input.firstIndex(of: "#") else { return input }
+        return String(input[..<hash])
+    }
+
+    /// Trims `#` and everything after it when a URL with a fragment is pasted,
+    /// without eating `#` or fragment characters typed one character at a time.
+    public static func trimmingPastedFragment(from oldValue: String, to newValue: String) -> String {
+        guard let hash = newValue.firstIndex(of: "#") else {
+            return newValue
+        }
+        var oldSlice = oldValue[...]
+        var newSlice = newValue[...]
+        while let oldFirst = oldSlice.first, let newFirst = newSlice.first, oldFirst == newFirst {
+            oldSlice.removeFirst()
+            newSlice.removeFirst()
+        }
+        while let oldLast = oldSlice.last, let newLast = newSlice.last, oldLast == newLast {
+            oldSlice.removeLast()
+            newSlice.removeLast()
+        }
+        guard newSlice.count > 1 else {
+            return newValue
+        }
+        return String(newValue[..<hash])
+    }
+
     public static func parse(_ input: String) -> Self? {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = withoutFragment(input).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.utf8.count <= maximumInputBytes,
               let components = URLComponents(string: trimmed),

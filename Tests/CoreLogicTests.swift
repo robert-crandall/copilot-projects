@@ -4591,6 +4591,40 @@ final class CoreLogicTests: XCTestCase {
             "https://github.com/owner/repo-name/pull/7"
         )
         XCTAssertEqual(
+            PullRequestReviewTarget.withoutFragment(
+                "https://github.com/owner/repo/pull/42#issuecomment-123#extra"
+            ),
+            "https://github.com/owner/repo/pull/42"
+        )
+        XCTAssertEqual(
+            PullRequestReviewTarget.trimmingPastedFragment(
+                from: "https://github.com/owner/repo/pull/42",
+                to: "https://github.com/owner/repo/pull/42#"
+            ),
+            "https://github.com/owner/repo/pull/42#"
+        )
+        XCTAssertEqual(
+            PullRequestReviewTarget.trimmingPastedFragment(
+                from: "https://github.com/owner/repo/pull/42#",
+                to: "https://github.com/owner/repo/pull/42#discussion_r99"
+            ),
+            "https://github.com/owner/repo/pull/42"
+        )
+        XCTAssertEqual(
+            PullRequestReviewTarget.trimmingPastedFragment(
+                from: "https://github.com/very-long-owner/very-long-repo/pull/42#",
+                to: "https://github.com/o/r/pull/1#discussion_r99"
+            ),
+            "https://github.com/o/r/pull/1"
+        )
+        XCTAssertEqual(
+            PullRequestReviewTarget.parse(
+                "https://github.com/owner/repo/pull/42#"
+                    + String(repeating: "x", count: PullRequestReviewTarget.maximumInputBytes)
+            )?.url,
+            "https://github.com/owner/repo/pull/42"
+        )
+        XCTAssertEqual(
             PullRequestReviewTarget.parse(
                 "https://github.com/owner/repo_name/pull/42"
             )?.title,
