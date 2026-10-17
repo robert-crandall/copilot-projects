@@ -805,6 +805,10 @@ final class SessionFinderModelTests: XCTestCase {
                 id: "p-ios", name: "copilot-projects-ios", cwd: "/Users/me/Repos/copilot-projects-ios",
                 sessionCwds: []
             ),
+            SessionFinderProjectTarget(
+                id: "p-work", name: "Work", cwd: "/Users/me/Repos/widget",
+                sessionCwds: []
+            ),
         ]
 
         // Exact session cwd match (non-default startup dir).
@@ -826,6 +830,27 @@ final class SessionFinderModelTests: XCTestCase {
                 defaultStartupDir: "/Users/me/Repos"
             )?.id,
             "p-ios"
+        )
+        // Project cwd folder matches worktree prefix and repository name even when project.name differs
+        // and no live tabs remain at that directory.
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos/widget-fix",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-work"
+        )
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos",
+                repository: "owner/widget",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-work"
         )
         // Sibling worktree prefix prefers longest match (`copilot-projects-ios` over `copilot-projects`),
         // even when `copilot-projects` is selected.
@@ -889,6 +914,32 @@ final class SessionFinderModelTests: XCTestCase {
             {"type":"assistant.message","data":{"content":"cached the file signature on background queue"}}
             """
         )
+        let unindexedId = UUID().uuidString.lowercased()
+        let unindexedDir = home.root.appendingPathComponent("session-state/\(unindexedId)")
+        try FileManager.default.createDirectory(at: unindexedDir, withIntermediateDirectories: true)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let unindexedDate = Date(timeIntervalSince1970: 1_800_000_500)
+        try Data("""
+            id: \(unindexedId)
+            cwd: \(repoDir.path)
+            client_name: github/cli
+            name: Newer unindexed session
+            created_at: \(formatter.string(from: unindexedDate.addingTimeInterval(-60)))
+            updated_at: \(formatter.string(from: unindexedDate))
+            """.utf8).write(to: unindexedDir.appendingPathComponent("workspace.yaml"))
+        try Data(#"{"type":"user.message","data":{"content":"unindexed conversation"}}"#.utf8)
+            .write(to: unindexedDir.appendingPathComponent("events.jsonl"))
+
+        let missingWorkspaceCwdId = try home.addSession(
+            cwd: repoDir.path,
+            name: "Missing workspace cwd",
+            updated: Date(timeIntervalSince1970: 1_800_000_600),
+            transcript: #"{"type":"user.message","data":{"content":"has db cwd only"}}"#
+        )
+        try Data("id: \(missingWorkspaceCwdId)\nclient_name: github/cli\nname: Missing workspace cwd\n".utf8)
+            .write(to: home.root.appendingPathComponent("session-state/\(missingWorkspaceCwdId)/workspace.yaml"))
+
         let liveId = try home.addSession(
             cwd: repoDir.path,
             name: "Already live",
@@ -923,6 +974,17 @@ final class SessionFinderModelTests: XCTestCase {
             SessionFinderProjectTarget(id: "p1", name: "General", cwd: otherDir.path, sessionCwds: []),
             SessionFinderProjectTarget(id: "p2", name: "copilot-projects", cwd: otherDir.path, sessionCwds: [repoDir.path]),
         ]
+        // Even with limit = 1, the newer directory-only session outranks the older database entry.
+        let topOne = SessionFinderResumableLoader.load(
+            store: home.store,
+            projects: projects,
+            selectedProjectId: "p1",
+            liveCopilotSessionIds: [liveId],
+            defaultStartupDir: root.path,
+            limit: 1
+        )
+        XCTAssertEqual(topOne.map(\.source.resumableCopilotSessionId), [unindexedId])
+
         let loaded = SessionFinderResumableLoader.load(
             store: home.store,
             projects: projects,
@@ -931,8 +993,8 @@ final class SessionFinderModelTests: XCTestCase {
             defaultStartupDir: root.path
         )
 
-        XCTAssertEqual(loaded.count, 1)
-        let entry = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(loaded.map(\.source.resumableCopilotSessionId), [unindexedId, resumableId])
+        let entry = try XCTUnwrap(loaded.last)
         XCTAssertEqual(entry.source.resumableCopilotSessionId, resumableId)
         XCTAssertEqual(entry.source.projectId, "p2")
         XCTAssertEqual(entry.source.projectName, "copilot-projects")

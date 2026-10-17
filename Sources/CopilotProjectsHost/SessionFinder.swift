@@ -329,28 +329,29 @@ enum SessionFinderSearch {
             if let match = preferred(byProjectCwd) { return match }
         }
 
-        let folder: String = {
-            guard !normalizedCwd.isEmpty, normalizedCwd != "/", normalizedCwd != normalizedDefault else {
-                return ""
-            }
-            return (normalizedCwd as NSString).lastPathComponent
-        }()
-        let repoName = repository?.split(separator: "/").last.map(String.init) ?? ""
-        let tokens = [folder, repoName].map(fold).filter { !$0.isEmpty }
+        func folderToken(_ path: String) -> String? {
+            let norm = Paths.normalizedDirectory(path)
+            guard !norm.isEmpty, norm != "/", norm != normalizedDefault else { return nil }
+            let token = fold((norm as NSString).lastPathComponent)
+            return token.isEmpty ? nil : token
+        }
 
-        // Check exact project name or session folder matches across all tokens first.
+        let folder = folderToken(normalizedCwd) ?? ""
+        let repoName = repository?.split(separator: "/").last.map(String.init) ?? ""
+        let tokens = [folder, fold(repoName)].filter { !$0.isEmpty }
+
+        // Check exact project name, session folder, or project folder matches across all tokens first.
         for token in tokens {
             let byName = projects.filter { fold($0.name) == token }
             if let match = preferred(byName) { return match }
 
             let bySessionFolder = projects.filter { project in
-                project.sessionCwds.contains { sessionCwd in
-                    let norm = Paths.normalizedDirectory(sessionCwd)
-                    guard !norm.isEmpty, norm != "/", norm != normalizedDefault else { return false }
-                    return fold((norm as NSString).lastPathComponent) == token
-                }
+                project.sessionCwds.contains { folderToken($0) == token }
             }
             if let match = preferred(bySessionFolder) { return match }
+
+            let byProjectFolder = projects.filter { folderToken($0.cwd) == token }
+            if let match = preferred(byProjectFolder) { return match }
         }
 
         // Next check worktree-prefix matches (`<project>-*`), preferring the longest prefix.
@@ -358,18 +359,11 @@ enum SessionFinderSearch {
         var bestPrefixProjects: [SessionFinderProjectTarget] = []
         for project in projects {
             var longestForProject = 0
-            let projectName = fold(project.name)
+            let candidatePrefixes = [fold(project.name)]
+                + ([project.cwd] + project.sessionCwds).compactMap(folderToken)
             for token in tokens {
-                if projectName.count >= 3, token.hasPrefix(projectName + "-") {
-                    longestForProject = max(longestForProject, projectName.count)
-                }
-                for sessionCwd in project.sessionCwds {
-                    let norm = Paths.normalizedDirectory(sessionCwd)
-                    guard !norm.isEmpty, norm != "/", norm != normalizedDefault else { continue }
-                    let sessionFolder = fold((norm as NSString).lastPathComponent)
-                    if sessionFolder.count >= 3, token.hasPrefix(sessionFolder + "-") {
-                        longestForProject = max(longestForProject, sessionFolder.count)
-                    }
+                for prefix in candidatePrefixes where prefix.count >= 3 && token.hasPrefix(prefix + "-") {
+                    longestForProject = max(longestForProject, prefix.count)
                 }
             }
             guard longestForProject > 0 else { continue }
@@ -395,7 +389,6 @@ enum SessionFinderResumableLoader {
 
     private struct DatabaseCandidate {
         let id: String
-        let cwd: String?
         let repository: String?
         let summary: String?
         let updatedAt: Date?
@@ -425,39 +418,63 @@ enum SessionFinderResumableLoader {
 
         let dbOrdered = db.map { readDatabaseCandidates($0, limit: candidateScanLimit) } ?? []
         let dbById = Dictionary(dbOrdered.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        var candidateIds = dbOrdered.map(\.id)
-        if candidateIds.count < candidateScanLimit,
-           let dirNames = try? FileManager.default.contentsOfDirectory(atPath: store.sessionStateDirectory) {
-            var seen = Set(candidateIds)
+        var dirModifiedById: [String: Date] = [:]
+        var unindexedIds: [String] = []
+        if let dirNames = try? FileManager.default.contentsOfDirectory(atPath: store.sessionStateDirectory) {
+            var seen = Set(dbById.keys)
             var unindexed: [(id: String, modified: Date)] = []
             for name in dirNames {
                 let lowered = name.lowercased()
-                guard CopilotSessionStore.isValidSessionId(lowered), seen.insert(lowered).inserted,
+                guard CopilotSessionStore.isValidSessionId(lowered),
                       let dirPath = store.directory(for: lowered) else { continue }
                 let modified = (try? FileManager.default.attributesOfItem(atPath: dirPath)[.modificationDate] as? Date)
                     ?? .distantPast
-                unindexed.append((lowered, modified))
+                dirModifiedById[lowered] = modified
+                if seen.insert(lowered).inserted {
+                    unindexed.append((lowered, modified))
+                }
             }
             unindexed.sort { $0.modified != $1.modified ? $0.modified > $1.modified : $0.id < $1.id }
-            candidateIds.append(contentsOf: unindexed.prefix(candidateScanLimit - candidateIds.count).map(\.id))
+            unindexedIds = unindexed.prefix(candidateScanLimit).map(\.id)
         }
-        guard !candidateIds.isEmpty else { return [] }
+
+        let allCandidateIds = dbOrdered.map(\.id) + unindexedIds
+        guard !allCandidateIds.isEmpty else { return [] }
+
+        var recordsById: [String: CopilotSessionRecord] = [:]
+        var rankedCandidates: [(id: String, sortDate: Date, order: Int)] = []
+        rankedCandidates.reserveCapacity(allCandidateIds.count)
+        for (order, id) in allCandidateIds.enumerated() {
+            let record = store.record(for: id)
+            if let record { recordsById[id] = record }
+            let dbRow = dbById[id]
+            let sortDate = record?.updatedAt
+                ?? dbRow?.updatedAt
+                ?? record?.createdAt
+                ?? dirModifiedById[id]
+                ?? .distantPast
+            rankedCandidates.append((id: id, sortDate: sortDate, order: order))
+        }
+        rankedCandidates.sort { lhs, rhs in
+            if lhs.sortDate != rhs.sortDate { return lhs.sortDate > rhs.sortDate }
+            return lhs.order < rhs.order
+        }
 
         var entries: [SessionFinderEntry] = []
-        for id in candidateIds.prefix(candidateScanLimit) {
+        for candidate in rankedCandidates.prefix(candidateScanLimit) {
             if Task.isCancelled { return [] }
             guard entries.count < limit else { break }
+            let id = candidate.id
             guard CopilotSessionStore.isValidSessionId(id), !live.contains(id),
-                  let record = store.record(for: id),
+                  let record = recordsById[id],
                   record.clientName == nil || record.clientName == "github/cli",
                   !store.isInUse(id) else { continue }
             let dbRow = dbById[id]
-            let rawCwd = record.cwd ?? dbRow?.cwd ?? ""
-            let cwd = Paths.normalizedDirectory(rawCwd)
+            let cwd = Paths.normalizedDirectory(record.cwd ?? "")
             guard !cwd.isEmpty, isDirectory(cwd) else { continue }
             guard let (requests, replies) = loadConversation(for: id, db: db, store: store),
                   !requests.isEmpty || !replies.isEmpty else { continue }
-            let lastActive = record.updatedAt ?? dbRow?.updatedAt ?? record.createdAt
+            let lastActive = record.updatedAt ?? dbRow?.updatedAt ?? record.createdAt ?? dirModifiedById[id]
             let recordedTitle = record.displayName ?? firstLine(dbRow?.summary)
             guard let targetProject = SessionFinderSearch.targetProject(
                 forCwd: cwd,
@@ -488,7 +505,7 @@ enum SessionFinderResumableLoader {
     }
 
     private static func readDatabaseCandidates(_ db: OpaquePointer, limit: Int) -> [DatabaseCandidate] {
-        let sql = "SELECT id, cwd, repository, summary, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?1"
+        let sql = "SELECT id, repository, summary, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?1"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             sqlite3_finalize(statement)
@@ -502,13 +519,11 @@ enum SessionFinderResumableLoader {
             guard let idText = sqlite3_column_text(statement, 0) else { continue }
             let id = String(cString: idText).lowercased()
             guard seen.insert(id).inserted else { continue }
-            let cwd = sqlite3_column_text(statement, 1).map { String(cString: $0) }
-            let repo = sqlite3_column_text(statement, 2).map { String(cString: $0) }
-            let summary = sqlite3_column_text(statement, 3).map { String(cString: $0) }
-            let updatedText = sqlite3_column_text(statement, 4).map { String(cString: $0) }
+            let repo = sqlite3_column_text(statement, 1).map { String(cString: $0) }
+            let summary = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+            let updatedText = sqlite3_column_text(statement, 3).map { String(cString: $0) }
             result.append(DatabaseCandidate(
                 id: id,
-                cwd: cwd?.isEmpty == false ? cwd : nil,
                 repository: repo?.isEmpty == false ? repo : nil,
                 summary: summary?.isEmpty == false ? summary : nil,
                 updatedAt: updatedText.flatMap(parseDatabaseDate)

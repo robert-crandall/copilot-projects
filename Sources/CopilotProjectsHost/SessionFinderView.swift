@@ -129,6 +129,8 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             }
             guard !Task.isCancelled else { return }
             if !resumableIndexed.isEmpty {
+                self.lunaTask?.cancel()
+                self.lunaTask = nil
                 self.entries = liveIndexed + resumableIndexed
                 self.lunaCache.removeAll()
                 self.refreshLocalMatches()
@@ -219,6 +221,8 @@ final class SessionFinderModel: ObservableObject, Identifiable {
 
     /// Any query with a non-space character goes to Luna once typing pauses.
     private func scheduleLuna() {
+        lunaTask?.cancel()
+        lunaTask = nil
         let text = SessionFinderSearch.collapseWhitespace(query)
         let searchable = availableEntries
         guard !isIndexing, !text.isEmpty, !searchable.isEmpty else {
