@@ -44,6 +44,7 @@ final class WorkspaceInputController: ObservableObject {
         sessionFinder = SessionFinderModel(
             sources: model.sessionFinderSources,
             currentSessionId: model.globalSelectedSessionId,
+            activeCopilotSessionIds: liveCopilotIds,
             ranker: sessionRanker,
             loadResumableEntries: {
                 SessionFinderResumableLoader.load(

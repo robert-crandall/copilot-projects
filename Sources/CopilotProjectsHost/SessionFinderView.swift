@@ -91,6 +91,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     init(
         sources: [SessionFinderSource],
         currentSessionId: String? = nil,
+        activeCopilotSessionIds: Set<String> = [],
         ranker: SessionRanking = LunaSessionRanker(),
         lunaDelay: TimeInterval = 0.6,
         loadTranscript: @escaping @Sendable (String) -> TranscriptSnapshot? = {
@@ -100,6 +101,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
         onOpen: @escaping (String) -> Void
     ) {
         self.currentSessionId = currentSessionId
+        self.activeCopilotSessionIds = Set(activeCopilotSessionIds.map { $0.lowercased() })
         self.ranker = ranker
         self.lunaDelay = lunaDelay
         self.onOpen = onOpen
@@ -381,11 +383,15 @@ struct SessionFinderView: View {
         .defaultFocus($searchFocused, true)
         .onAppear {
             searchFocused = true
+            finder.retainSessions(Set(liveSessionIds), activeCopilotSessionIds: activeCopilotSessionIds)
             announce(finder.highlightedId, live: live)
         }
         .onDisappear { finder.cancel() }
         .onChange(of: liveSessionIds) { _, ids in
-            finder.retainSessions(Set(ids), activeCopilotSessionIds: model.activeAndResumingCopilotSessionIds())
+            finder.retainSessions(Set(ids), activeCopilotSessionIds: activeCopilotSessionIds)
+        }
+        .onChange(of: activeCopilotSessionIds) { _, copilotIds in
+            finder.retainSessions(Set(liveSessionIds), activeCopilotSessionIds: copilotIds)
         }
         .onChange(of: finder.highlight) { previous, highlight in
             if highlight.isWorthAnnouncing(after: previous) { announce(highlight.sessionId, live: live) }
@@ -394,6 +400,10 @@ struct SessionFinderView: View {
 
     private var liveSessionIds: [String] {
         model.projects.flatMap { $0.sessions.map(\.id) }
+    }
+
+    private var activeCopilotSessionIds: Set<String> {
+        model.activeAndResumingCopilotSessionIds()
     }
 
     private var liveSessions: [String: LiveSession] {
