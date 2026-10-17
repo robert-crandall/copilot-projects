@@ -22,6 +22,8 @@ final class PullRequestsHostCommandTests: XCTestCase {
 
     private final class Resuming {
         var tabs: [String: Set<String>] = [:]
+        var livePromptSessions: Set<String> = []
+        var deliveredPrompts: [(sessionId: String, prompt: String)] = []
     }
 
     private func withHost(
@@ -56,7 +58,14 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let model = AppModel(
                 stateRepository: repository, isAppActive: { false },
                 agentActivityDirectory: root, resumeMarkerDirectory: root,
+                remotePromptLiveSessions: { _ in resuming.livePromptSessions },
                 copilotResumeSessions: { resuming.tabs[$0] ?? [] },
+                remotePromptTarget: { sessionId in
+                    RemotePromptTarget(activity: .idle) { prompt in
+                        resuming.deliveredPrompts.append((sessionId, prompt))
+                        return true
+                    }
+                },
                 remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
                 remoteReposDirectory: { root.path },
                 remoteSessionBackendAvailable: { true },
@@ -113,6 +122,10 @@ final class PullRequestsHostCommandTests: XCTestCase {
                 dispatched.append("resume:\($0.copilotSessionId ?? "")")
                 return .success("t", code: "created")
             },
+            sendSessionPrompt: {
+                dispatched.append("prompt:\($0.sessionId ?? ""):\($0.requestId ?? "")")
+                return .success("s", code: "sent")
+            },
             screenshot: { _ in .success() }, diagnostics: { "" }, remote: { _ in .success() }
         ))
         let uuid = UUID().uuidString
@@ -131,6 +144,12 @@ final class PullRequestsHostCommandTests: XCTestCase {
             request("resume-copilot-session", project: "A", requestId: "not-a-uuid", copilot: uuid),
             request("resume-copilot-session", project: "A", requestId: uuid),
             request("resume-copilot-session", project: "A", requestId: uuid, copilot: "../../etc/passwd"),
+            request("send-session-prompt", requestId: uuid, prompt: "p"),
+            request("send-session-prompt", session: "", requestId: uuid, prompt: "p"),
+            request("send-session-prompt", project: "", session: "s", requestId: uuid, prompt: "p"),
+            request("send-session-prompt", session: "s", prompt: "p"),
+            request("send-session-prompt", session: "s", requestId: "not-a-uuid", prompt: "p"),
+            request("send-session-prompt", session: "s", requestId: uuid),
         ] {
             let response = router.handle(invalid)
             XCTAssertFalse(response.ok)
@@ -143,7 +162,11 @@ final class PullRequestsHostCommandTests: XCTestCase {
                        "created")
         XCTAssertEqual(router.handle(request("resume-copilot-session", project: "A", requestId: uuid, copilot: uuid)).code,
                        "created")
-        XCTAssertEqual(dispatched, ["list-sessions", "reveal-session:s", "start:\(uuid)", "resume:\(uuid)"])
+        XCTAssertEqual(router.handle(request("send-session-prompt", session: "s", requestId: uuid, prompt: "p")).code,
+                       "sent")
+        XCTAssertEqual(dispatched, [
+            "list-sessions", "reveal-session:s", "start:\(uuid)", "resume:\(uuid)", "prompt:s:\(uuid)",
+        ])
     }
 
     func testListSessionsReportsEveryProjectAndSessionAsJSON() throws {
@@ -516,6 +539,260 @@ final class PullRequestsHostCommandTests: XCTestCase {
                            "unknown-project")
             XCTAssertTrue(host.launches().isEmpty)
             XCTAssertEqual(model.project("A")?.sessions.map(\.id), ["a1", "a2"])
+        }
+    }
+
+    func testSendSessionPromptDeliversOncePerRequestIdAndRefusesWaitingOrMissingSessions() throws {
+        try withHost(projects: twoProjects) { host in
+            let model = host.model
+            host.resuming.livePromptSessions = ["a1", "b1"]
+
+            let requestId = UUID().uuidString
+            @MainActor func send(
+                _ id: String = requestId,
+                project: String? = "A",
+                session: String = "a1",
+                prompt: String = "Fix the failing checks\r\non this PR"
+            ) -> ControlResponse {
+                model.handle(request(
+                    "send-session-prompt", project: project, session: session, requestId: id, prompt: prompt
+                ))
+            }
+
+            let first = send()
+            XCTAssertTrue(first.ok, first.error ?? "")
+            XCTAssertEqual(first.code, "sent")
+            XCTAssertEqual(first.text, "a1")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts[0].sessionId, "a1")
+            XCTAssertEqual(host.resuming.deliveredPrompts[0].prompt, "Fix the failing checks\non this PR")
+
+            // Replaying the same requestId returns `existing` without delivering again.
+            let replay = send()
+            XCTAssertTrue(replay.ok)
+            XCTAssertEqual(replay.code, "existing")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Reusing the requestId for a different prompt or session is a conflict.
+            XCTAssertEqual(send(prompt: "different").code, "conflict")
+            XCTAssertEqual(send(project: "B", session: "b1").code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Retrying an older terminal request after more than 128 later dispatches
+            // or after a host restart still returns `existing` instead of resending.
+            for index in 0..<130 {
+                let extra = send(UUID().uuidString, prompt: "Follow-up \(index)")
+                XCTAssertEqual(extra.code, "sent")
+            }
+            let expectedDeliveredCount = host.resuming.deliveredPrompts.count
+            XCTAssertEqual(expectedDeliveredCount, 131)
+            let replayAfterManyDispatches = send()
+            XCTAssertTrue(replayAfterManyDispatches.ok)
+            XCTAssertEqual(replayAfterManyDispatches.code, "existing")
+            XCTAssertEqual(send(prompt: "different").code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            let restarted = host.restart()
+            let replayAfterRestart = restarted.handle(request(
+                "send-session-prompt", project: "A", session: "a1", requestId: requestId,
+                prompt: "Fix the failing checks\r\non this PR"
+            ))
+            XCTAssertTrue(replayAfterRestart.ok)
+            XCTAssertEqual(replayAfterRestart.code, "existing")
+            XCTAssertEqual(restarted.handle(request(
+                "send-session-prompt", project: "A", session: "a1", requestId: requestId, prompt: "different"
+            )).code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // An interrupted `.pending` terminal intent on disk recovers as `indeterminate`
+            // after restart rather than resending the prompt.
+            let interruptedId = UUID()
+            let interruptedAction = RemoteSessionAction(kind: .send, prompt: "Interrupted send", mode: .enqueue)
+            let interruptedFingerprint = try XCTUnwrap(CLIOperationAdapter.payloadFingerprint(
+                kind: .sessionSend,
+                payload: interruptedAction
+            ))
+            let ledger = SessionCreationLedger(url: host.root.appendingPathComponent("ledger.json"))
+            try ledger.rememberPrompt(PullRequestsPromptRecord(
+                requestId: interruptedId.uuidString,
+                sessionId: "a1",
+                payloadFingerprint: interruptedFingerprint,
+                route: .terminal,
+                conversationEpoch: nil,
+                state: .pending,
+                createdAt: Date()
+            ))
+            let interruptedReplay = host.restart().handle(request(
+                "send-session-prompt", project: "A", session: "a1", requestId: interruptedId.uuidString,
+                prompt: "Interrupted send"
+            ))
+            XCTAssertFalse(interruptedReplay.ok)
+            XCTAssertEqual(interruptedReplay.code, "indeterminate")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // Mismatched project, ended session, or waiting session are refused.
+            XCTAssertEqual(send(UUID().uuidString, project: "B", session: "a1").code, "conflict")
+            XCTAssertEqual(send(UUID().uuidString, project: "A", session: "gone").code, "gone")
+            var waiting = request("set-status", session: "b1")
+            waiting.status = "waiting"
+            XCTAssertTrue(model.handle(waiting).ok)
+            XCTAssertEqual(send(UUID().uuidString, project: "B", session: "b1").code, "busy")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // A fresh on-disk pending-input snapshot blocks sending even when the in-memory
+            // session status is still `.idle`.
+            let now = Date()
+            let copilotId = "0f1e2d3c-4b5a-4000-8000-000000000077"
+            try Data("\(copilotId)\n".utf8).write(to: host.root.appendingPathComponent("a1.copilot-session"))
+            let snapshotURL = host.root.appendingPathComponent("a1.agent-activity.json")
+            var snapshot = AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: now.ISO8601Format(.init(includingFractionalSeconds: true)),
+                foregroundTurnActive: false,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: 0,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil,
+                pendingPermissionRequestIds: ["pending-perm"],
+                copilotSessionId: copilotId,
+                conversationEpoch: "epoch-1",
+                operationReceiptVersion: 1,
+                operationReceipts: [],
+                workflow: RemoteSessionWorkflow(
+                    observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+                    capabilities: [RemoteSessionActionKind.send.rawValue],
+                    sendReady: true,
+                    limitsKnown: true
+                )
+            )
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            XCTAssertEqual(send(UUID().uuidString, project: "A", session: "a1").code, "busy")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // Native workflow `.send` writes `session-send.json` and returns `queued` without
+            // falling back to terminal injection.
+            snapshot.pendingPermissionRequestIds = []
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let nativeReqId = UUID().uuidString
+            let queued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertTrue(queued.ok, queued.error ?? "")
+            XCTAssertEqual(queued.code, "queued")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount, "native path does not use terminal fallback")
+            let handoffURL = host.root.appendingPathComponent("a1.session-send.json")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: handoffURL.path))
+            let replayQueued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertTrue(replayQueued.ok)
+            XCTAssertEqual(replayQueued.code, "queued")
+
+            // If workflow freshness expires or the epoch changes before a receipt confirms
+            // delivery, replaying the native request returns `indeterminate` and never
+            // reroutes to terminal injection or a new epoch.
+            let expiredReplay = model.sendPullRequestsSessionPrompt(
+                requestId: try XCTUnwrap(UUID(uuidString: nativeReqId)),
+                projectId: nil,
+                sessionId: "a1",
+                prompt: "Queue via SDK",
+                now: now.addingTimeInterval(60)
+            )
+            XCTAssertFalse(expiredReplay.ok)
+            XCTAssertEqual(expiredReplay.code, "indeterminate")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            try FileManager.default.removeItem(at: handoffURL)
+            let action = RemoteSessionAction(kind: .send, prompt: "Queue via SDK", mode: .enqueue)
+            let fingerprint = try XCTUnwrap(CLIOperationAdapter.payloadFingerprint(
+                kind: .sessionSend,
+                payload: action
+            ))
+            @MainActor func makeWorkflow(sendReady: Bool) -> RemoteSessionWorkflow {
+                RemoteSessionWorkflow(
+                    observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+                    capabilities: [RemoteSessionActionKind.send.rawValue],
+                    sendReady: sendReady,
+                    limitsKnown: true
+                )
+            }
+            snapshot.operationReceipts = [
+                TrackedOperationReceipt(
+                    operationId: nativeReqId,
+                    conversationEpoch: "epoch-1",
+                    kind: CLISDKOperationKind.sessionSend.rawValue,
+                    state: .applied,
+                    updatedAtMilliseconds: 10,
+                    errorCode: nil,
+                    payloadFingerprint: fingerprint
+                )
+            ]
+            snapshot.workflow = makeWorkflow(sendReady: false)
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let appliedReplay = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertTrue(appliedReplay.ok)
+            XCTAssertEqual(appliedReplay.code, "applied")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // Once `applied` has been confirmed and persisted, replaying after a conversation
+            // epoch reset and host restart still returns `applied` from the ledger.
+            snapshot.conversationEpoch = "epoch-2"
+            snapshot.operationReceipts = []
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let appliedAfterEpochResetAndRestart = host.restart().handle(request(
+                "send-session-prompt", project: nil, session: "a1", requestId: nativeReqId, prompt: "Queue via SDK"
+            ))
+            XCTAssertTrue(appliedAfterEpochResetAndRestart.ok)
+            XCTAssertEqual(appliedAfterEpochResetAndRestart.code, "applied")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+            snapshot.conversationEpoch = "epoch-1"
+
+            // Rejected and indeterminate receipts surface their outcomes on replay.
+            let rejectedReqId = UUID()
+            snapshot.workflow = makeWorkflow(sendReady: true)
+            snapshot.operationReceipts = [
+                TrackedOperationReceipt(
+                    operationId: rejectedReqId.uuidString,
+                    conversationEpoch: "epoch-1",
+                    kind: CLISDKOperationKind.sessionSend.rawValue,
+                    state: .rejected,
+                    updatedAtMilliseconds: 20,
+                    errorCode: "busy",
+                    payloadFingerprint: fingerprint
+                )
+            ]
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let rejected = send(rejectedReqId.uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertFalse(rejected.ok)
+            XCTAssertEqual(rejected.code, "rejected")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            let indeterminateReqId = UUID()
+            snapshot.operationReceipts = [
+                TrackedOperationReceipt(
+                    operationId: indeterminateReqId.uuidString,
+                    conversationEpoch: "epoch-1",
+                    kind: CLISDKOperationKind.sessionSend.rawValue,
+                    state: .indeterminate,
+                    updatedAtMilliseconds: 30,
+                    errorCode: nil,
+                    payloadFingerprint: fingerprint
+                )
+            ]
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let indeterminate = send(indeterminateReqId.uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertFalse(indeterminate.ok)
+            XCTAssertEqual(indeterminate.code, "indeterminate")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // Native validation failure (e.g. sendReady == false or missing marker) refuses
+            // the attempt instead of falling back to terminal injection.
+            snapshot.operationReceipts = []
+            snapshot.workflow = makeWorkflow(sendReady: false)
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let notReady = send(UUID().uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertFalse(notReady.ok)
+            XCTAssertEqual(notReady.code, "busy")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
         }
     }
 }

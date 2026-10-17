@@ -33,6 +33,10 @@ protocol PullRequestsWorkspace: Sendable {
     func startCopilotSession(projectId: String, requestId: UUID, prompt: String) async -> WorkspaceCommandResult
     /// Opens an ended Copilot session in a new tab; replaying `requestId` never opens a second one.
     func resumeCopilotSession(projectId: String, requestId: UUID, copilotSessionId: String) async -> WorkspaceCommandResult
+    /// Sends or queues `prompt` in an existing session; replaying `requestId` never sends it twice.
+    func sendSessionPrompt(
+        projectId: String?, sessionId: String, requestId: UUID, prompt: String
+    ) async -> WorkspaceCommandResult
 }
 
 /// Copilot Projects over its control socket. Each request runs on a dispatch
@@ -75,6 +79,17 @@ actor ControlWorkspaceBridge: PullRequestsWorkspace {
         request.projectId = projectId
         request.requestId = requestId.uuidString
         request.copilotSessionId = copilotSessionId
+        return Self.result(await send(request))
+    }
+
+    func sendSessionPrompt(
+        projectId: String?, sessionId: String, requestId: UUID, prompt: String
+    ) async -> WorkspaceCommandResult {
+        var request = ControlRequest(command: "send-session-prompt")
+        request.projectId = projectId
+        request.sessionId = sessionId
+        request.requestId = requestId.uuidString
+        request.prompt = prompt
         return Self.result(await send(request))
     }
 

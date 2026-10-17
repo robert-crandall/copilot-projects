@@ -18,6 +18,9 @@ struct ControlCommandRouter {
         let revealSession: (ControlRequest) -> ControlResponse
         let startCopilotSession: (ControlRequest) -> ControlResponse
         let resumeCopilotSession: (ControlRequest) -> ControlResponse
+        var sendSessionPrompt: (ControlRequest) -> ControlResponse = { _ in
+            .failure("send-session-prompt is not configured", code: "unavailable")
+        }
         let screenshot: (String?) -> ControlResponse
         let diagnostics: () -> String
         let remote: (String) -> ControlResponse
@@ -95,6 +98,16 @@ struct ControlCommandRouter {
                     code: "bad-request")
             }
             return actions.resumeCopilotSession(request)
+        case "send-session-prompt":
+            guard let sessionId = request.sessionId, !sessionId.isEmpty,
+                  request.projectId.map({ !$0.isEmpty }) ?? true,
+                  let requestId = request.requestId, UUID(uuidString: requestId) != nil,
+                  request.prompt != nil else {
+                return .failure(
+                    "send-session-prompt requires a session id, a UUID request id, and a prompt",
+                    code: "bad-request")
+            }
+            return actions.sendSessionPrompt(request)
         case "screenshot":
             return actions.screenshot(request.path)
         case "diagnostics":

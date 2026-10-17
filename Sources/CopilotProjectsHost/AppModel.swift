@@ -404,6 +404,23 @@ final class AppModel: ObservableObject {
                 requestId: requestId, projectId: projectId, copilotSessionId: copilotSessionId
             )
         },
+        sendSessionPrompt: { [unowned self] request in
+            guard let sessionId = request.sessionId, !sessionId.isEmpty,
+                  request.projectId.map({ !$0.isEmpty }) ?? true,
+                  let rawRequestId = request.requestId,
+                  let requestId = UUID(uuidString: rawRequestId),
+                  let prompt = request.prompt else {
+                return .failure(
+                    "send-session-prompt requires a session id, a UUID request id, and a prompt",
+                    code: "bad-request")
+            }
+            return self.sendPullRequestsSessionPrompt(
+                requestId: requestId,
+                projectId: request.projectId,
+                sessionId: sessionId,
+                prompt: prompt
+            )
+        },
         screenshot: { _ in
             .failure("screenshot must be handled by the control server")
         },
@@ -418,6 +435,18 @@ final class AppModel: ObservableObject {
     /// the command that resumes it, nothing else shows that it is coming back.
     private var pullRequestsResumeLaunches: [String: (sessionId: String, launchedAt: Date)] = [:]
     static let pullRequestsResumeStartupGrace: TimeInterval = 5
+    private enum PullRequestsPromptRoute: Equatable {
+        case terminal
+        case native(conversationEpoch: String)
+    }
+    private struct SentPullRequestsPrompt {
+        let sessionId: String
+        let payloadFingerprint: String
+        let route: PullRequestsPromptRoute
+        var state: PullRequestsPromptRecord.DeliveryState
+        let createdAt: Date
+    }
+    private var sentPullRequestsPrompts: [UUID: SentPullRequestsPrompt] = [:]
     /// The Copilot session each captured launch resumes, by tab. Launches are
     /// captured only when `remoteSessionLauncher` is set, in tests.
     private(set) var capturedResumeLaunches: [String: String] = [:]
@@ -5297,6 +5326,389 @@ final class AppModel: ObservableObject {
             return launch.sessionId
         }
         return nil
+    }
+
+    /// Sends or queues a prompt into an existing live session for Copilot Pull Requests.
+    /// Replaying the same `requestId` for the same session and prompt resolves its prior
+    /// terminal or native outcome without delivering the prompt twice.
+    func sendPullRequestsSessionPrompt(
+        requestId: UUID,
+        projectId: String?,
+        sessionId: String,
+        prompt: String,
+        now: Date = Date()
+    ) -> ControlResponse {
+        let clock = advancingClock(from: now)
+        guard SessionInputValidation.isValidPrompt(prompt) else {
+            return .failure(CopilotSessionStartError.invalidPrompt.localizedDescription, code: "bad-request")
+        }
+        guard !isTerminating else {
+            return .failure(CopilotSessionStartError.shuttingDown.localizedDescription, code: "unavailable")
+        }
+        let normalizedPrompt = prompt
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let action = RemoteSessionAction(kind: .send, prompt: normalizedPrompt, mode: .enqueue)
+        guard let payloadFingerprint = CLIOperationAdapter.payloadFingerprint(
+            kind: .sessionSend,
+            payload: action
+        ) else {
+            return .failure("Could not send the prompt to that session.", code: "invalid")
+        }
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        let previous: SentPullRequestsPrompt?
+        if let cached = sentPullRequestsPrompts[requestId] {
+            previous = cached
+        } else {
+            do {
+                if let persisted = try sessionCreationLedger.promptRecord(for: requestId, now: clock()) {
+                    let route: PullRequestsPromptRoute
+                    switch persisted.route {
+                    case .terminal:
+                        route = .terminal
+                    case .native:
+                        guard let epoch = persisted.conversationEpoch, !epoch.isEmpty else {
+                            return .failure(
+                                "Could not confirm whether Copilot received the prompt. Inspect the terminal before trying again.",
+                                code: "indeterminate"
+                            )
+                        }
+                        route = .native(conversationEpoch: epoch)
+                    }
+                    let restored = SentPullRequestsPrompt(
+                        sessionId: persisted.sessionId,
+                        payloadFingerprint: persisted.payloadFingerprint,
+                        route: route,
+                        state: persisted.state,
+                        createdAt: persisted.createdAt
+                    )
+                    sentPullRequestsPrompts[requestId] = restored
+                    previous = restored
+                } else {
+                    previous = nil
+                }
+            } catch {
+                return .failure(
+                    "Could not confirm whether Copilot received the prompt. Inspect the terminal before trying again.",
+                    code: "indeterminate"
+                )
+            }
+        }
+        if let previous {
+            guard previous.sessionId == sessionId,
+                  previous.payloadFingerprint == payloadFingerprint else {
+                return .failure("request id is bound to a different session or prompt", code: "conflict")
+            }
+            guard let loc = locateIndex(sessionId) else {
+                return .failure("The session has ended.", code: "gone")
+            }
+            if let projectId, projects[loc.p].id != projectId {
+                return .failure("The session moved to another project.", code: "conflict")
+            }
+            switch previous.route {
+            case .terminal:
+                switch previous.state {
+                case .delivered:
+                    return .success(sessionId, code: "existing")
+                case .pending, .queued:
+                    return .failure(
+                        "Could not confirm whether Copilot received the prompt. Inspect the terminal before trying again.",
+                        code: "indeterminate"
+                    )
+                case .rejected:
+                    return .failure("Copilot did not accept the prompt.", code: "rejected")
+                }
+            case .native(let epoch):
+                switch previous.state {
+                case .delivered:
+                    return .success(sessionId, code: "applied")
+                case .rejected:
+                    return .failure("Copilot did not accept the prompt.", code: "rejected")
+                case .pending, .queued:
+                    return resolveNativePullRequestsPrompt(
+                        sessionId: sessionId,
+                        requestId: requestId,
+                        conversationEpoch: epoch,
+                        payloadFingerprint: payloadFingerprint,
+                        createdAt: previous.createdAt,
+                        adapter: adapter,
+                        clock: clock
+                    )
+                }
+            }
+        }
+        guard let loc = locateIndex(sessionId) else {
+            return .failure("The session has ended.", code: "gone")
+        }
+        if let projectId, projects[loc.p].id != projectId {
+            return .failure("The session moved to another project.", code: "conflict")
+        }
+
+        let freshSnapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: clock)
+        if let snapshot = freshSnapshot,
+           let epoch = snapshot.remoteOperationProjection(at: clock()).conversationEpoch {
+            let operation = CLIOperationRequest(operationId: requestId.uuidString, conversationEpoch: epoch)
+            let existingOutcome = adapter.submittedOperationOutcome(
+                sessionId: sessionId,
+                kind: .sessionSend,
+                operation: operation,
+                payloadFingerprint: payloadFingerprint,
+                handoffSuffix: "\(CLISDKOperationKind.sessionSend.rawValue).json",
+                now: clock
+            )
+            if existingOutcome != .notFound {
+                return recordAndRespondToNativePullRequestsPrompt(
+                    outcome: existingOutcome,
+                    requestId: requestId,
+                    sessionId: sessionId,
+                    payloadFingerprint: payloadFingerprint,
+                    conversationEpoch: epoch,
+                    createdAt: clock()
+                )
+            }
+        }
+
+        let session = projects[loc.p].sessions[loc.s]
+        if session.displayStatus == .waiting || session.hasPendingInput {
+            return .failure("The session is waiting for your input in the terminal.", code: "busy")
+        }
+
+        // Authoritative fresh tracker snapshot: refuse if input is pending on disk even before
+        // the asynchronous activity watcher updates the in-memory session model.
+        if freshSnapshot?.hasPendingInput == true {
+            return .failure("The session is waiting for your input in the terminal.", code: "busy")
+        }
+
+        // Prefer native SDK queueing when the session has a fresh tracker workflow snapshot.
+        if let snapshot = freshSnapshot,
+           let epoch = snapshot.remoteOperationProjection(at: clock()).conversationEpoch,
+           let workflow = snapshot.workflow,
+           workflow.supports(.send, at: clock()) {
+            guard workflow.sendReady else {
+                return .failure("The session is busy or waiting for input in the terminal.", code: "busy")
+            }
+            let intentAt = clock()
+            guard rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: epoch),
+                state: .pending,
+                now: intentAt
+            ) else {
+                return .failure(
+                    "Copilot Projects couldn’t save the prompt request. Try again; it won’t send twice.",
+                    code: "indeterminate"
+                )
+            }
+            let operation = CLIOperationRequest(operationId: requestId.uuidString, conversationEpoch: epoch)
+            switch performSessionAction(sessionId: sessionId, action: action, operation: operation, now: clock()) {
+            case .accepted:
+                _ = rememberSentPullRequestsPrompt(
+                    requestId: requestId,
+                    sessionId: sessionId,
+                    payloadFingerprint: payloadFingerprint,
+                    route: .native(conversationEpoch: epoch),
+                    state: .queued,
+                    now: intentAt
+                )
+                return resolveNativePullRequestsPrompt(
+                    sessionId: sessionId,
+                    requestId: requestId,
+                    conversationEpoch: epoch,
+                    payloadFingerprint: payloadFingerprint,
+                    createdAt: intentAt,
+                    adapter: adapter,
+                    clock: clock
+                )
+            case .conflict:
+                forgetPendingPullRequestsPrompt(requestId: requestId, now: clock())
+                return .failure("Another session action is already awaiting Copilot.", code: "busy")
+            case .invalid:
+                forgetPendingPullRequestsPrompt(requestId: requestId, now: clock())
+                if let latest = adapter.loadFreshSnapshot(sessionId: sessionId, now: clock),
+                   latest.hasPendingInput || latest.workflow?.sendReady == false {
+                    return .failure(
+                        latest.hasPendingInput
+                            ? "The session is waiting for your input in the terminal."
+                            : "The session is busy or waiting for input in the terminal.",
+                        code: "busy"
+                    )
+                }
+                return .failure("Could not send the prompt to that session.", code: "invalid")
+            }
+        }
+
+        let intentAt = clock()
+        guard rememberSentPullRequestsPrompt(
+            requestId: requestId,
+            sessionId: sessionId,
+            payloadFingerprint: payloadFingerprint,
+            route: .terminal,
+            state: .pending,
+            now: intentAt
+        ) else {
+            return .failure(
+                "Copilot Projects couldn’t save the prompt request. Try again; it won’t send twice.",
+                code: "indeterminate"
+            )
+        }
+        switch sendRemotePrompt(sessionId: sessionId, value: normalizedPrompt) {
+        case .sent:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .terminal,
+                state: .delivered,
+                now: intentAt
+            )
+            return .success(sessionId, code: "sent")
+        case .busy:
+            forgetPendingPullRequestsPrompt(requestId: requestId, now: clock())
+            return .failure("The session is busy or waiting for input in the terminal.", code: "busy")
+        case .noLiveCopilot:
+            forgetPendingPullRequestsPrompt(requestId: requestId, now: clock())
+            return .failure("Copilot isn’t running in that session.", code: "no-copilot")
+        case .invalid, .forbidden:
+            forgetPendingPullRequestsPrompt(requestId: requestId, now: clock())
+            return .failure("Could not send the prompt to that session.", code: "invalid")
+        }
+    }
+
+    private func resolveNativePullRequestsPrompt(
+        sessionId: String,
+        requestId: UUID,
+        conversationEpoch: String,
+        payloadFingerprint: String,
+        createdAt: Date,
+        adapter: CLIOperationAdapter,
+        clock: () -> Date
+    ) -> ControlResponse {
+        let operation = CLIOperationRequest(
+            operationId: requestId.uuidString,
+            conversationEpoch: conversationEpoch
+        )
+        let outcome = adapter.submittedOperationOutcome(
+            sessionId: sessionId,
+            kind: .sessionSend,
+            operation: operation,
+            payloadFingerprint: payloadFingerprint,
+            handoffSuffix: "\(CLISDKOperationKind.sessionSend.rawValue).json",
+            now: clock
+        )
+        return recordAndRespondToNativePullRequestsPrompt(
+            outcome: outcome,
+            requestId: requestId,
+            sessionId: sessionId,
+            payloadFingerprint: payloadFingerprint,
+            conversationEpoch: conversationEpoch,
+            createdAt: createdAt
+        )
+    }
+
+    private func recordAndRespondToNativePullRequestsPrompt(
+        outcome: CLISubmittedOperationOutcome,
+        requestId: UUID,
+        sessionId: String,
+        payloadFingerprint: String,
+        conversationEpoch: String,
+        createdAt: Date
+    ) -> ControlResponse {
+        switch outcome {
+        case .pendingHandoff, .accepted:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: conversationEpoch),
+                state: .queued,
+                now: createdAt
+            )
+            return .success(sessionId, code: "queued")
+        case .applied:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: conversationEpoch),
+                state: .delivered,
+                now: createdAt
+            )
+            return .success(sessionId, code: "applied")
+        case .rejected:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: conversationEpoch),
+                state: .rejected,
+                now: createdAt
+            )
+            return .failure("Copilot did not accept the prompt.", code: "rejected")
+        case .indeterminate, .notFound:
+            return .failure(
+                "Could not confirm whether Copilot received the prompt. Inspect the terminal before trying again.",
+                code: "indeterminate"
+            )
+        case .conflict:
+            return .failure("request id is bound to a different session or prompt", code: "conflict")
+        }
+    }
+
+    @discardableResult
+    private func rememberSentPullRequestsPrompt(
+        requestId: UUID,
+        sessionId: String,
+        payloadFingerprint: String,
+        route: PullRequestsPromptRoute,
+        state: PullRequestsPromptRecord.DeliveryState,
+        now: Date
+    ) -> Bool {
+        let recordRoute: PullRequestsPromptRecord.Route
+        let conversationEpoch: String?
+        switch route {
+        case .terminal:
+            recordRoute = .terminal
+            conversationEpoch = nil
+        case .native(let epoch):
+            recordRoute = .native
+            conversationEpoch = epoch
+        }
+        let persisted = PullRequestsPromptRecord(
+            requestId: requestId.uuidString,
+            sessionId: sessionId,
+            payloadFingerprint: payloadFingerprint,
+            route: recordRoute,
+            conversationEpoch: conversationEpoch,
+            state: state,
+            createdAt: now
+        )
+        let entry = SentPullRequestsPrompt(
+            sessionId: sessionId,
+            payloadFingerprint: payloadFingerprint,
+            route: route,
+            state: state,
+            createdAt: now
+        )
+        if state != .pending {
+            sentPullRequestsPrompts[requestId] = entry
+        }
+        do {
+            try sessionCreationLedger.rememberPrompt(persisted, now: now)
+            sentPullRequestsPrompts[requestId] = entry
+            return true
+        } catch {
+            return state != .pending
+        }
+    }
+
+    private func forgetPendingPullRequestsPrompt(requestId: UUID, now: Date) {
+        sentPullRequestsPrompts[requestId] = nil
+        try? sessionCreationLedger.removePrompt(for: requestId, now: now)
     }
 
     /// Every project and live session with the state the workspace shows, for `list-sessions`.

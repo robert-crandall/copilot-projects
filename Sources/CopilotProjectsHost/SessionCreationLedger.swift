@@ -84,6 +84,31 @@ struct SessionCreationRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// One remembered Pull Requests prompt dispatch: records delivery intent before
+/// dispatch and final delivery state afterward so retries across host restarts
+/// never send the same prompt twice.
+struct PullRequestsPromptRecord: Codable, Equatable, Sendable {
+    enum Route: String, Codable, Equatable, Sendable {
+        case terminal
+        case native
+    }
+
+    enum DeliveryState: String, Codable, Equatable, Sendable {
+        case pending
+        case queued
+        case delivered
+        case rejected
+    }
+
+    let requestId: String
+    let sessionId: String
+    let payloadFingerprint: String
+    let route: Route
+    let conversationEpoch: String?
+    var state: DeliveryState
+    let createdAt: Date
+}
+
 /// Thread-safe, bounded, persisted ledger of remote session creations. Acts as the
 /// tombstone store behind idempotent creation: once a `requestId` is remembered the
 /// host will never create for it again, so a session the user later closes is not
@@ -93,12 +118,14 @@ final class SessionCreationLedger: @unchecked Sendable {
     /// Keep at most this many records — the most recently created win once the cap
     /// is exceeded. Real usage is a handful; the bound only guards against abuse.
     static let maxRecords = 512
+    static let maxPromptRecords = 1_024
     /// Records older than this are dropped on the next load/prune. A week is long
     /// enough to cover realistic client retries while bounding tombstone lifetime.
     static let ttl: TimeInterval = 7 * 24 * 60 * 60
 
     private struct LedgerFile: Codable {
         var records: [SessionCreationRecord]
+        var promptRecords: [PullRequestsPromptRecord]? = nil
     }
 
     private let url: URL
@@ -112,7 +139,7 @@ final class SessionCreationLedger: @unchecked Sendable {
     func record(for requestId: UUID, now: Date = Date()) throws -> SessionCreationRecord? {
         lock.lock()
         defer { lock.unlock() }
-        let pruned = Self.prune(try load(), now: now)
+        let pruned = Self.prune(try loadFile().records, now: now)
         return pruned.first { $0.requestId == requestId.uuidString }
     }
 
@@ -121,9 +148,49 @@ final class SessionCreationLedger: @unchecked Sendable {
     func remember(_ record: SessionCreationRecord, now: Date = Date()) throws {
         lock.lock()
         defer { lock.unlock() }
-        var records = try load().filter { $0.requestId != record.requestId }
+        var file = try loadFile()
+        var records = file.records.filter { $0.requestId != record.requestId }
         records.append(record)
-        try persist(Self.prune(records, now: now))
+        file.records = Self.prune(records, now: now)
+        if let promptRecords = file.promptRecords {
+            file.promptRecords = Self.prunePrompts(promptRecords, now: now)
+        }
+        try persistFile(file)
+    }
+
+    /// The remembered Pull Requests prompt record for `requestId`, if still live.
+    func promptRecord(for requestId: UUID, now: Date = Date()) throws -> PullRequestsPromptRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        let pruned = Self.prunePrompts(try loadFile().promptRecords ?? [], now: now)
+        return pruned.first { $0.requestId == requestId.uuidString }
+    }
+
+    /// Remember or update a Pull Requests prompt record atomically.
+    func rememberPrompt(_ record: PullRequestsPromptRecord, now: Date = Date()) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var file = try loadFile()
+        file.records = Self.prune(file.records, now: now)
+        var prompts = (file.promptRecords ?? []).filter { $0.requestId != record.requestId }
+        prompts.append(record)
+        file.promptRecords = Self.prunePrompts(prompts, now: now)
+        try persistFile(file)
+    }
+
+    /// Removes an unconfirmed pending prompt record when pre-dispatch validation
+    /// or synchronous rejection proved nothing was sent.
+    func removePrompt(for requestId: UUID, now: Date = Date()) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var file = try loadFile()
+        guard let existing = file.promptRecords else { return }
+        let filtered = Self.prunePrompts(
+            existing.filter { $0.requestId != requestId.uuidString },
+            now: now
+        )
+        file.promptRecords = filtered.isEmpty ? nil : filtered
+        try persistFile(file)
     }
 
     // MARK: - Pure pruning (TTL then bound), exposed for tests.
@@ -146,22 +213,40 @@ final class SessionCreationLedger: @unchecked Sendable {
         return live.filter { keep.contains($0.requestId) }
     }
 
+    static func prunePrompts(
+        _ records: [PullRequestsPromptRecord],
+        now: Date,
+        ttl: TimeInterval = SessionCreationLedger.ttl,
+        maxRecords: Int = SessionCreationLedger.maxPromptRecords
+    ) -> [PullRequestsPromptRecord] {
+        let live = records.filter { now.timeIntervalSince($0.createdAt) <= ttl }
+        guard live.count > maxRecords else { return live }
+        let keep = Set(
+            live.sorted { $0.createdAt > $1.createdAt }
+                .prefix(maxRecords)
+                .map(\.requestId)
+        )
+        return live.filter { keep.contains($0.requestId) }
+    }
+
     // MARK: - Persistence
 
-    private func load() throws -> [SessionCreationRecord] {
-        guard let data = try CreationLedgerFile.read(from: url) else { return [] }
+    private func loadFile() throws -> LedgerFile {
+        guard let data = try CreationLedgerFile.read(from: url) else {
+            return LedgerFile(records: [], promptRecords: nil)
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(LedgerFile.self, from: data).records
+        return try decoder.decode(LedgerFile.self, from: data)
     }
 
     /// Atomic 0600 persistence: the payload is written to a private temp file
     /// created with 0600, fsynced, then `rename(2)`'d over the destination so a
     /// reader never observes a partial or world-readable file.
-    private func persist(_ records: [SessionCreationRecord]) throws {
+    private func persistFile(_ file: LedgerFile) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(LedgerFile(records: records))
+        let data = try encoder.encode(file)
         try CreationLedgerFile.write(data, to: url)
     }
 }
