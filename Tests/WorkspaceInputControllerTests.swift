@@ -188,6 +188,53 @@ final class WorkspaceInputControllerTests: XCTestCase {
         }
     }
 
+    func testJumpToNextAttentionSessionAndFleetStatusBarPillsCycleAcrossProjectsByUrgency() throws {
+        let b1 = Session(id: "b1", title: "Ready 1", cwd: "/tmp")
+        let b2 = Session(id: "b2", title: "Waiting 1", cwd: "/tmp")
+        let b3 = Session(id: "b3", title: "Waiting 2", cwd: "/tmp")
+        let b4 = Session(id: "b4", title: "Ready 2", cwd: "/tmp")
+        try withWorkspace(otherSessions: [b1, b2, b3, b4]) { model, input, sessions in
+            // sessions[0] is current; sessions[1] is manually marked unread;
+            // b1 & b4 finished unseen ("ready"); b2 & b3 are waiting for input.
+            model.markSessionUnread(sessionId: sessions[1].id)
+            for ready in [b1, b4] {
+                model.setStatus(sessionId: ready.id, status: .running, text: nil, timestamp: 1, source: "test")
+                model.setStatus(sessionId: ready.id, status: .idle, text: nil, timestamp: 2, source: "test")
+            }
+            model.setStatus(sessionId: b2.id, status: .waiting, text: "approve 1?", timestamp: 3, source: "test")
+            model.setStatus(sessionId: b3.id, status: .waiting, text: "approve 2?", timestamp: 4, source: "test")
+
+            XCTAssertTrue(model.hasAttentionSessions)
+            XCTAssertEqual(model.totalWaiting, 2)
+            XCTAssertEqual(model.totalReady, 2)
+
+            // FleetStatusBar pill for `.ready` jumps directly to the first ready session (`b1`),
+            // clearing only `b1`'s `finishedUnseen` while leaving `b4`'s intact.
+            XCTAssertEqual(model.selectNextSession(matching: .ready)?.sessionId, "b1")
+            XCTAssertEqual(model.globalSelectedSessionId, "b1")
+            XCTAssertEqual(model.totalReady, 1)
+            let p2AfterB1 = try XCTUnwrap(model.projects.last)
+            XCTAssertEqual(p2AfterB1.sessions.first { $0.id == "b4" }?.finishedUnseen, true)
+
+            // Repeated ⇧⌘A cycles through ALL waiting sessions (`b2` -> `b3`), then lower-tier
+            // unread/ready sessions (`sessions[1]` -> `b4`) without getting stuck on `b2`/`b3`,
+            // and wraps back to `b2`.
+            let shiftCommandA = try key("A", code: 0, modifiers: [.command, .shift])
+            XCTAssertNil(input.handleKeyDown(shiftCommandA))
+            XCTAssertEqual(model.globalSelectedSessionId, "b2")
+            XCTAssertNil(input.handleKeyDown(shiftCommandA))
+            XCTAssertEqual(model.globalSelectedSessionId, "b3")
+            XCTAssertNil(input.handleKeyDown(shiftCommandA))
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id)
+            XCTAssertEqual(model.projects[0].sessions[1].markedUnread, false)
+            XCTAssertNil(input.handleKeyDown(shiftCommandA))
+            XCTAssertEqual(model.globalSelectedSessionId, "b4")
+            XCTAssertEqual(model.totalReady, 0)
+            XCTAssertNil(input.handleKeyDown(shiftCommandA))
+            XCTAssertEqual(model.globalSelectedSessionId, "b2", "wraps back to the first waiting session")
+        }
+    }
+
     func testOpeningAResumableSessionFromFinderResumesItInTheMatchedProject() async throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

@@ -462,6 +462,10 @@ final class AppModel: ObservableObject {
     private weak var notifications: (any NotificationPosting)?
     private var saveWork: DispatchWorkItem?
     private(set) var isTerminating = false
+    /// Remembers the `(tier, workspaceIndex)` of an `.unread` session whose unread
+    /// flag was cleared by `selectNextAttentionSession()`, so pressing `⇧⌘A` again
+    /// from that session continues advancing through the cycle instead of restarting.
+    private var lastClearedAttentionCursor: (sessionId: String, tier: SessionAttentionTier, workspaceIndex: Int)?
 
     private var livenessTimer: Timer?
     private var footerTimer: Timer?
@@ -2053,6 +2057,7 @@ final class AppModel: ObservableObject {
     /// Fleet roll-ups across every project, for the title-bar status line.
     var totalRunning: Int { projects.reduce(0) { $0 + $1.runningCount } }
     var totalWaiting: Int { projects.reduce(0) { $0 + $1.waitingCount } }
+    var totalFailed: Int { projects.reduce(0) { $0 + $1.failedCount } }
     var totalBackgroundWork: Int {
         projects.reduce(0) { $0 + $1.backgroundWorkCount }
     }
@@ -2061,6 +2066,10 @@ final class AppModel: ObservableObject {
     }
     var totalReady: Int {
         projects.reduce(0) { $0 + $1.sessions.filter { $0.finishedUnseen }.count }
+    }
+
+    var hasAttentionSessions: Bool {
+        projects.contains { $0.sessions.contains { $0.attentionTier != nil } }
     }
 
     func remoteWorkspaceSnapshot() -> RemoteWorkspaceSnapshot {
@@ -3462,6 +3471,67 @@ final class AppModel: ObservableObject {
         let current = sessions.firstIndex { $0.id == projects[pi].selectedSessionId } ?? 0
         let next = (current + delta + sessions.count) % sessions.count
         selectSession(projectId: pid, sessionId: sessions[next].id)
+    }
+
+    /// Jumps to the next session across all projects matching `kind`, starting
+    /// after the currently selected session in workspace order and wrapping around.
+    @discardableResult
+    func selectNextSession(matching kind: FleetActivityKind) -> (projectId: String, sessionId: String)? {
+        let all = projects.flatMap { project in
+            project.sessions.map { (projectId: project.id, session: $0) }
+        }
+        guard !all.isEmpty else { return nil }
+        let startIndex = all.firstIndex(where: { $0.session.id == globalSelectedSessionId })
+            .map { ($0 + 1) % all.count } ?? 0
+        for offset in 0..<all.count {
+            let candidate = all[(startIndex + offset) % all.count]
+            guard kind.matches(candidate.session) else { continue }
+            show(projectId: candidate.projectId, sessionId: candidate.session.id)
+            save()
+            focusActiveTerminal()
+            return (candidate.projectId, candidate.session.id)
+        }
+        return nil
+    }
+
+    /// Jumps to the next session across all projects that needs attention,
+    /// cycling through a stable `(urgency tier, workspace order)` list
+    /// (`waiting` → `failed` → `unread/finished`).
+    @discardableResult
+    func selectNextAttentionSession() -> (projectId: String, sessionId: String)? {
+        let all = projects.flatMap { project in
+            project.sessions.map { (projectId: project.id, session: $0) }
+        }
+        guard !all.isEmpty else { return nil }
+        let ordered = all.enumerated().compactMap { index, entry -> (tier: SessionAttentionTier, workspaceIndex: Int, projectId: String, sessionId: String)? in
+            guard let tier = entry.session.attentionTier else { return nil }
+            return (tier, index, entry.projectId, entry.session.id)
+        }.sorted { lhs, rhs in
+            lhs.tier != rhs.tier ? lhs.tier < rhs.tier : lhs.workspaceIndex < rhs.workspaceIndex
+        }
+        guard !ordered.isEmpty else { return nil }
+
+        let currentId = globalSelectedSessionId
+        let target: (tier: SessionAttentionTier, workspaceIndex: Int, projectId: String, sessionId: String)
+        if let currentIndex = ordered.firstIndex(where: { $0.sessionId == currentId }) {
+            target = ordered[(currentIndex + 1) % ordered.count]
+        } else if let cursor = lastClearedAttentionCursor, cursor.sessionId == currentId {
+            target = ordered.first {
+                ($0.tier, $0.workspaceIndex) > (cursor.tier, cursor.workspaceIndex)
+            } ?? ordered[0]
+        } else {
+            target = ordered[0]
+        }
+
+        if target.tier == .unread {
+            lastClearedAttentionCursor = (target.sessionId, target.tier, target.workspaceIndex)
+        } else {
+            lastClearedAttentionCursor = nil
+        }
+        show(projectId: target.projectId, sessionId: target.sessionId)
+        save()
+        focusActiveTerminal()
+        return (target.projectId, target.sessionId)
     }
 
     // MARK: - status / notifications (driven by the CLI)

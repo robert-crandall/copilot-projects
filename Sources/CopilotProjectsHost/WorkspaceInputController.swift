@@ -151,6 +151,11 @@ final class WorkspaceInputController: ObservableObject {
             presentSessionFinder()
             return nil
         }
+        if mods == [.command, .shift], event.charactersIgnoringModifiers?.lowercased() == "a" {
+            clearNumberHint()
+            model.selectNextAttentionSession()
+            return nil
+        }
         if event.keyCode == 48 {
             if mods == .control { model.selectAdjacentSession(1); return nil }
             if mods == [.control, .shift] { model.selectAdjacentSession(-1); return nil }

@@ -165,9 +165,9 @@ struct WindowConfigurator: NSViewRepresentable {
 
 /// Roll-up of what every agent is doing, drawn as a trailing title-bar accessory:
 /// the running count (green), background-work sessions (purple), queued schedules
-/// (indigo), then the waiting (orange) and ready (blue) counts; "all idle" when
-/// nothing is active. (No spinner here — an NSProgressIndicator breaks Auto Layout
-/// inside the title-bar accessory's hosting view.)
+/// (indigo), then the waiting (orange), failed (red), and ready (blue) counts;
+/// "all idle" when nothing is active. Clicking any active count jumps to the next
+/// session in that state across all projects.
 struct FleetStatusBar: View {
     @ObservedObject var model: AppModel
 
@@ -176,28 +176,96 @@ struct FleetStatusBar: View {
         let background = model.totalBackgroundWork
         let scheduled = model.totalScheduled
         let waiting = model.totalWaiting
+        let failed = model.totalFailed
         let ready = model.totalReady
         HStack(spacing: 10) {
-            if running > 0 { Text("\(running) running").foregroundStyle(.green) }
-            if background > 0 {
-                HStack(spacing: 4) {
-                    BackgroundWorkBadge()
-                    Text("\(background) background").foregroundStyle(.purple)
+            if running > 0 {
+                pill(.running, help: "Jump to next running session") {
+                    Text("\(running) running").foregroundStyle(.green)
                 }
             }
-            if scheduled > 0 { Text("\(scheduled) scheduled").foregroundStyle(.indigo) }
-            if waiting > 0 { Text("\(waiting) waiting").foregroundStyle(.orange) }
-            if ready > 0 { Text("\(ready) ready").foregroundStyle(.blue) }
-            if running == 0, background == 0, scheduled == 0, waiting == 0, ready == 0 {
-                Text("all idle").foregroundStyle(StudioStyle.secondaryText)
+            if background > 0 {
+                pill(.background, help: "Jump to next background-work session") {
+                    HStack(spacing: 4) {
+                        BackgroundWorkBadge()
+                        Text("\(background) background").foregroundStyle(.purple)
+                    }
+                }
+            }
+            if scheduled > 0 {
+                pill(.scheduled, help: "Jump to next scheduled session") {
+                    Text("\(scheduled) scheduled").foregroundStyle(.indigo)
+                }
+            }
+            if waiting > 0 {
+                pill(.waiting, help: "Jump to next session waiting for input (⇧⌘A)") {
+                    Text("\(waiting) waiting").foregroundStyle(.orange)
+                }
+            }
+            if failed > 0 {
+                pill(.failed, help: "Jump to next session with a failed request (⇧⌘A)") {
+                    Text("\(failed) failed").foregroundStyle(.red)
+                }
+            }
+            if ready > 0 {
+                pill(.ready, help: "Jump to next finished session (⇧⌘A)") {
+                    Text("\(ready) ready").foregroundStyle(.blue)
+                }
+            }
+            if running == 0, background == 0, scheduled == 0, waiting == 0, failed == 0, ready == 0 {
+                Text("all idle")
+                    .foregroundStyle(StudioStyle.secondaryText)
+                    .allowsHitTesting(false)
             }
         }
         .font(.system(size: 12))
         .monospacedDigit()
         .lineLimit(1)
         .fixedSize()
-        .allowsHitTesting(false)
+        .background(
+            Group {
+                if running > 0 || background > 0 || scheduled > 0 || waiting > 0 || failed > 0 || ready > 0 {
+                    FleetStatusBarHitArea()
+                }
+            }
+        )
     }
+
+    private func pill<Label: View>(
+        _ kind: FleetActivityKind,
+        help: String,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button {
+            model.selectNextSession(matching: kind)
+        } label: {
+            label()
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityIdentifier("fleet-status-\(kind.rawValue)")
+    }
+}
+
+/// Marks the interactive region of `FleetStatusBar` in the window's view tree so
+/// double-clicking a status pill never triggers the title-bar zoom gesture.
+final class FleetStatusBarMarkerView: NSView {
+    static func contains(_ locationInWindow: NSPoint, in view: NSView?) -> Bool {
+        guard let view, !view.isHidden else { return false }
+        if let marker = view as? FleetStatusBarMarkerView {
+            let local = marker.convert(locationInWindow, from: nil)
+            if marker.bounds.contains(local) { return true }
+        }
+        return view.subviews.contains { contains(locationInWindow, in: $0) }
+    }
+}
+
+private struct FleetStatusBarHitArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> FleetStatusBarMarkerView {
+        FleetStatusBarMarkerView()
+    }
+
+    func updateNSView(_ nsView: FleetStatusBarMarkerView, context: Context) {}
 }
 
 /// Gives the HSplitView's underlying NSSplitView an autosave name so it persists
