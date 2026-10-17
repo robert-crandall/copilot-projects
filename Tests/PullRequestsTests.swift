@@ -215,6 +215,50 @@ final class PullRequestTriageTests: XCTestCase {
         XCTAssertTrue(matching.reasons.isEmpty, "no session claim before transcripts are matched")
     }
 
+    func testDispatchActionsFollowAttentionReasonsAndCustomPromptsAddContext() {
+        let pr = makePR(
+            42,
+            repo: "github/github",
+            branch: "me/fix-everything",
+            mergeable: .conflicting,
+            mergeState: .dirty,
+            review: .changesRequested,
+            checks: .failure,
+            requiredFailing: ["ci/build"],
+            threads: 2,
+            copilotThreads: 1
+        )
+        let assessment = PullRequestTriage.assess(pr, session: session, now: now)
+        let item = PullRequestItem(pr: pr, assessment: assessment, session: session, isManuallyAssigned: false)
+        XCTAssertEqual(item.dispatchActions.map(\.kind), [.resolveConflicts, .fixChecks, .addressFeedback])
+        XCTAssertEqual(item.dispatchActions.map(\.title), [
+            "Ask Session to Resolve Conflicts",
+            "Ask Session to Fix Checks",
+            "Ask Session to Address Feedback",
+        ])
+        XCTAssertTrue(item.dispatchActions[1].prompt.contains("(ci/build)"))
+
+        // Clean PR still offers a status check fallback.
+        let cleanPR = makePR(43, mergeState: .clean, review: .approved)
+        let cleanItem = PullRequestItem(
+            pr: cleanPR,
+            assessment: PullRequestTriage.assess(cleanPR, session: session, now: now),
+            session: session,
+            isManuallyAssigned: false
+        )
+        XCTAssertEqual(cleanItem.dispatchActions.map(\.kind), [.checkStatus])
+
+        // Custom prompts add the PR URL only when the user didn't already name the PR.
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("fix the failing snapshot test", for: pr),
+            "For https://github.com/github/github/pull/42:\n\nfix the failing snapshot test"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("check #42 again", for: pr),
+            "check #42 again"
+        )
+    }
+
     func testDistinctiveBranchesAndLinkThresholds() {
         XCTAssertTrue(PullRequestLinker.isDistinctiveBranch("obvioussean/ccr-auto-review-effort"))
         for common in ["main", "patch-1", "fix-12", "dev", "feature"] {

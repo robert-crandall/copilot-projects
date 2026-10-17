@@ -50,7 +50,12 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   Sessions whose folder is gone, or that another Copilot CLI has open, aren't offered.
   It uses your `gh` accounts and the GitHub GraphQL API, and reads sessions from
   Copilot Projects over the control socket (`list-sessions`, `reveal-session`,
-  `start-copilot-session`, `resume-copilot-session`), so it never touches terminals itself.
+  `start-copilot-session`, `resume-copilot-session`, `send-session-prompt`), so it
+  never touches terminals itself. Pull requests linked to a live session also offer
+  reason-aware dispatch actions (**Ask Session to Fix Checks**, **Ask Session to Resolve
+  Conflicts**, **Ask Session to Address Feedback**, **Ask Session to Update Branch**,
+  **Ask Session to Check Status**) and **Send Prompt to Session…** (`P`, or `⇧P` for the
+  primary action) to queue or send a prompt directly into that session and focus it.
   Only one copy per state directory writes its goals; see the README for the rules.
 - **Notifications (`⇧⌘N`):** opens Copilot Notifications, a separate app nested beside
   Copilot Pull Requests, with its own Dock icon, Dock badge, and `⌘Tab` entry. It keeps

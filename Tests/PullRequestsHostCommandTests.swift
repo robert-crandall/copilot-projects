@@ -22,6 +22,8 @@ final class PullRequestsHostCommandTests: XCTestCase {
 
     private final class Resuming {
         var tabs: [String: Set<String>] = [:]
+        var livePromptSessions: Set<String> = []
+        var deliveredPrompts: [(sessionId: String, prompt: String)] = []
     }
 
     private func withHost(
@@ -56,7 +58,14 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let model = AppModel(
                 stateRepository: repository, isAppActive: { false },
                 agentActivityDirectory: root, resumeMarkerDirectory: root,
+                remotePromptLiveSessions: { _ in resuming.livePromptSessions },
                 copilotResumeSessions: { resuming.tabs[$0] ?? [] },
+                remotePromptTarget: { sessionId in
+                    RemotePromptTarget(activity: .idle) { prompt in
+                        resuming.deliveredPrompts.append((sessionId, prompt))
+                        return true
+                    }
+                },
                 remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
                 remoteReposDirectory: { root.path },
                 remoteSessionBackendAvailable: { true },
@@ -113,6 +122,10 @@ final class PullRequestsHostCommandTests: XCTestCase {
                 dispatched.append("resume:\($0.copilotSessionId ?? "")")
                 return .success("t", code: "created")
             },
+            sendSessionPrompt: {
+                dispatched.append("prompt:\($0.sessionId ?? ""):\($0.requestId ?? "")")
+                return .success("s", code: "sent")
+            },
             screenshot: { _ in .success() }, diagnostics: { "" }, remote: { _ in .success() }
         ))
         let uuid = UUID().uuidString
@@ -131,6 +144,12 @@ final class PullRequestsHostCommandTests: XCTestCase {
             request("resume-copilot-session", project: "A", requestId: "not-a-uuid", copilot: uuid),
             request("resume-copilot-session", project: "A", requestId: uuid),
             request("resume-copilot-session", project: "A", requestId: uuid, copilot: "../../etc/passwd"),
+            request("send-session-prompt", requestId: uuid, prompt: "p"),
+            request("send-session-prompt", session: "", requestId: uuid, prompt: "p"),
+            request("send-session-prompt", project: "", session: "s", requestId: uuid, prompt: "p"),
+            request("send-session-prompt", session: "s", prompt: "p"),
+            request("send-session-prompt", session: "s", requestId: "not-a-uuid", prompt: "p"),
+            request("send-session-prompt", session: "s", requestId: uuid),
         ] {
             let response = router.handle(invalid)
             XCTAssertFalse(response.ok)
@@ -143,7 +162,11 @@ final class PullRequestsHostCommandTests: XCTestCase {
                        "created")
         XCTAssertEqual(router.handle(request("resume-copilot-session", project: "A", requestId: uuid, copilot: uuid)).code,
                        "created")
-        XCTAssertEqual(dispatched, ["list-sessions", "reveal-session:s", "start:\(uuid)", "resume:\(uuid)"])
+        XCTAssertEqual(router.handle(request("send-session-prompt", session: "s", requestId: uuid, prompt: "p")).code,
+                       "sent")
+        XCTAssertEqual(dispatched, [
+            "list-sessions", "reveal-session:s", "start:\(uuid)", "resume:\(uuid)", "prompt:s:\(uuid)",
+        ])
     }
 
     func testListSessionsReportsEveryProjectAndSessionAsJSON() throws {
@@ -516,6 +539,102 @@ final class PullRequestsHostCommandTests: XCTestCase {
                            "unknown-project")
             XCTAssertTrue(host.launches().isEmpty)
             XCTAssertEqual(model.project("A")?.sessions.map(\.id), ["a1", "a2"])
+        }
+    }
+
+    func testSendSessionPromptDeliversOncePerRequestIdAndRefusesWaitingOrMissingSessions() throws {
+        try withHost(projects: twoProjects) { host in
+            let model = host.model
+            host.resuming.livePromptSessions = ["a1", "b1"]
+
+            let requestId = UUID().uuidString
+            @MainActor func send(
+                _ id: String = requestId,
+                project: String? = "A",
+                session: String = "a1",
+                prompt: String = "Fix the failing checks\r\non this PR"
+            ) -> ControlResponse {
+                model.handle(request(
+                    "send-session-prompt", project: project, session: session, requestId: id, prompt: prompt
+                ))
+            }
+
+            let first = send()
+            XCTAssertTrue(first.ok, first.error ?? "")
+            XCTAssertEqual(first.code, "sent")
+            XCTAssertEqual(first.text, "a1")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts[0].sessionId, "a1")
+            XCTAssertEqual(host.resuming.deliveredPrompts[0].prompt, "Fix the failing checks\non this PR")
+
+            // Replaying the same requestId returns `existing` without delivering again.
+            let replay = send()
+            XCTAssertTrue(replay.ok)
+            XCTAssertEqual(replay.code, "existing")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Reusing the requestId for a different prompt or session is a conflict.
+            XCTAssertEqual(send(prompt: "different").code, "conflict")
+            XCTAssertEqual(send(project: "B", session: "b1").code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Mismatched project, ended session, or waiting session are refused.
+            XCTAssertEqual(send(UUID().uuidString, project: "B", session: "a1").code, "conflict")
+            XCTAssertEqual(send(UUID().uuidString, project: "A", session: "gone").code, "gone")
+            var waiting = request("set-status", session: "b1")
+            waiting.status = "waiting"
+            XCTAssertTrue(model.handle(waiting).ok)
+            XCTAssertEqual(send(UUID().uuidString, project: "B", session: "b1").code, "busy")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // A fresh on-disk pending-input snapshot blocks sending even when the in-memory
+            // session status is still `.idle`.
+            let now = Date()
+            let copilotId = "0f1e2d3c-4b5a-4000-8000-000000000077"
+            try Data("\(copilotId)\n".utf8).write(to: host.root.appendingPathComponent("a1.copilot-session"))
+            let snapshotURL = host.root.appendingPathComponent("a1.agent-activity.json")
+            var snapshot = AgentActivitySnapshot(
+                schemaVersion: 1,
+                updatedAt: now.ISO8601Format(.init(includingFractionalSeconds: true)),
+                foregroundTurnActive: false,
+                scheduledTurnActive: false,
+                activeSubagents: [],
+                schedules: [],
+                idleGeneration: 0,
+                lastIdleAborted: false,
+                lastIdleTurnKind: nil,
+                error: nil,
+                pendingPermissionRequestIds: ["pending-perm"],
+                copilotSessionId: copilotId,
+                conversationEpoch: "epoch-1",
+                operationReceiptVersion: 1,
+                operationReceipts: [],
+                workflow: RemoteSessionWorkflow(
+                    observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+                    capabilities: [RemoteSessionActionKind.send.rawValue],
+                    sendReady: true,
+                    limitsKnown: true
+                )
+            )
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            XCTAssertEqual(send(UUID().uuidString, project: "A", session: "a1").code, "busy")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Native workflow `.send` writes `session-send.json` and returns `queued` without
+            // falling back to terminal injection.
+            snapshot.pendingPermissionRequestIds = []
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let nativeReqId = UUID().uuidString
+            let queued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertTrue(queued.ok, queued.error ?? "")
+            XCTAssertEqual(queued.code, "queued")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1, "native path does not use terminal fallback")
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: host.root.appendingPathComponent("a1.session-send.json").path
+            ))
+            let replayQueued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertTrue(replayQueued.ok)
+            XCTAssertEqual(replayQueued.code, "queued")
         }
     }
 }

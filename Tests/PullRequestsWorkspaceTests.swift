@@ -12,10 +12,12 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
     private var reveals: [WorkspaceCommandResult] = [.done(code: "revealed", text: nil)]
     private var starts: [WorkspaceCommandResult] = [.done(code: "created", text: "started")]
     private var resumes: [WorkspaceCommandResult] = [.done(code: "created", text: "resumed")]
+    private var prompts: [WorkspaceCommandResult] = [.done(code: "sent", text: "s1")]
     private var _snapshotCalls = 0
     private var _revealCalls: [(projectId: String?, sessionId: String)] = []
     private var _startCalls: [(projectId: String, requestId: UUID, prompt: String)] = []
     private var _resumeCalls: [(projectId: String, requestId: UUID, copilotSessionId: String)] = []
+    private var _promptCalls: [(projectId: String?, sessionId: String, requestId: UUID, prompt: String)] = []
 
     init(snapshot: WorkspaceSnapshot? = nil) {
         fetches = [snapshot.map(WorkspaceFetch.snapshot) ?? .unreachable]
@@ -25,13 +27,17 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
         self.fetches = fetches
     }
 
-    func answer(fetches: [WorkspaceFetch]? = nil, reveals: [WorkspaceCommandResult]? = nil,
-                starts: [WorkspaceCommandResult]? = nil, resumes: [WorkspaceCommandResult]? = nil) {
+    func answer(
+        fetches: [WorkspaceFetch]? = nil, reveals: [WorkspaceCommandResult]? = nil,
+        starts: [WorkspaceCommandResult]? = nil, resumes: [WorkspaceCommandResult]? = nil,
+        prompts: [WorkspaceCommandResult]? = nil
+    ) {
         lock.withLock {
             if let fetches { self.fetches = fetches }
             if let reveals { self.reveals = reveals }
             if let starts { self.starts = starts }
             if let resumes { self.resumes = resumes }
+            if let prompts { self.prompts = prompts }
         }
     }
 
@@ -40,6 +46,9 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
     var startCalls: [(projectId: String, requestId: UUID, prompt: String)] { lock.withLock { _startCalls } }
     var resumeCalls: [(projectId: String, requestId: UUID, copilotSessionId: String)] {
         lock.withLock { _resumeCalls }
+    }
+    var promptCalls: [(projectId: String?, sessionId: String, requestId: UUID, prompt: String)] {
+        lock.withLock { _promptCalls }
     }
 
     private static func next<T>(_ answers: inout [T]) -> T {
@@ -71,6 +80,15 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
         lock.withLock {
             _resumeCalls.append((projectId, requestId, copilotSessionId))
             return Self.next(&resumes)
+        }
+    }
+
+    func sendSessionPrompt(
+        projectId: String?, sessionId: String, requestId: UUID, prompt: String
+    ) async -> WorkspaceCommandResult {
+        lock.withLock {
+            _promptCalls.append((projectId, sessionId, requestId, prompt))
+            return Self.next(&prompts)
         }
     }
 }
@@ -190,6 +208,10 @@ final class PullRequestsWorkspaceBridgeTests: XCTestCase {
                 return request.requestId.flatMap(UUID.init(uuidString:)) != nil && request.projectId == "p"
                     && request.copilotSessionId == "0f1e2d3c-4b5a-4000-8000-000000000002"
                     ? .success("back", code: "created") : .failure("bad", code: "bad-request")
+            case "send-session-prompt":
+                return request.requestId.flatMap(UUID.init(uuidString:)) != nil && request.sessionId == "s1"
+                    && request.prompt == "fix it"
+                    ? .success("s1", code: "sent") : .failure("bad", code: "bad-request")
             default: return .failure("unknown command: \(request.command)")
             }
         }
@@ -206,6 +228,10 @@ final class PullRequestsWorkspaceBridgeTests: XCTestCase {
             projectId: "p", requestId: UUID(), copilotSessionId: "0f1e2d3c-4b5a-4000-8000-000000000002"
         )
         XCTAssertEqual(resumed, .done(code: "created", text: "back"))
+        let prompted = await bridge.sendSessionPrompt(
+            projectId: "p", sessionId: "s1", requestId: UUID(), prompt: "fix it"
+        )
+        XCTAssertEqual(prompted, .done(code: "sent", text: "s1"))
     }
 
     func testAnUnreadableOrMissingHostIsUnreachable() async throws {
@@ -559,6 +585,57 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         try await waitUntil { model.startingGoals.isEmpty }
         XCTAssertEqual(try savedLinks(), [first.key.description: "new", second.key.description: "newer"],
                        "links to ended sessions go once the sessions are known")
+    }
+
+    func testSendPromptDispatchesRetriesWithSameRequestIdAndRevealsSession() async throws {
+        var idleSnapshot = fixtureSnapshot
+        idleSnapshot.projects[0].sessions[0].status = .idle
+        let workspace = FakeWorkspace(fetches: [.snapshot(idleSnapshot)])
+        let recorder = HostRecorder()
+        let model = makeModel(workspace, recorder: recorder)
+        let pr = makePR(7, checks: .failure, requiredFailing: ["lint", "unit-tests"])
+        model.show([pr], links: [pr.key: "s1"])
+        await model.pollWorkspace()
+
+        let goal = try XCTUnwrap(model.goals(now: testNow).first)
+        let session = try XCTUnwrap(goal.session)
+        let action = try XCTUnwrap(goal.items.first?.dispatchActions.first)
+        XCTAssertEqual(action.kind, .fixChecks)
+        XCTAssertTrue(action.prompt.contains("lint, unit-tests"))
+
+        // First dispatch succeeds, reveals the session, and activates Copilot Projects.
+        model.sendPrompt(to: session, prompt: action.prompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(workspace.promptCalls.count, 1)
+        XCTAssertEqual(workspace.promptCalls[0].sessionId, "s1")
+        XCTAssertNil(workspace.promptCalls[0].projectId)
+        XCTAssertEqual(workspace.promptCalls[0].prompt, action.prompt)
+        XCTAssertEqual(workspace.revealCalls.last?.sessionId, "s1")
+        XCTAssertEqual(recorder.activations, [4242])
+
+        // Lost answer retries once with the identical requestId, and a subsequent user retry
+        // after the session moved projects still reuses that requestId.
+        var movedSnapshot = idleSnapshot
+        let movedSession = movedSnapshot.projects[0].sessions.removeFirst()
+        movedSnapshot.projects[1].sessions.append(movedSession)
+        workspace.answer(
+            fetches: [.snapshot(movedSnapshot)],
+            prompts: [.unreachable, .unreachable, .done(code: "existing", text: "s1")]
+        )
+        let customPrompt = "For https://github.com/github/github/pull/7:\n\nre-run lint"
+        model.sendPrompt(to: session, prompt: customPrompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(workspace.promptCalls.count, 3)
+        let firstRetryId = workspace.promptCalls[1].requestId
+        XCTAssertEqual(workspace.promptCalls[2].requestId, firstRetryId)
+        XCTAssertEqual(recorder.alerts.count, 1)
+
+        let movedGoalSession = try XCTUnwrap(model.goals(now: testNow).first?.session)
+        XCTAssertEqual(movedGoalSession.projectId, "q")
+        model.sendPrompt(to: movedGoalSession, prompt: customPrompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(workspace.promptCalls.count, 4)
+        XCTAssertEqual(workspace.promptCalls[3].requestId, firstRetryId, "retrying after a project move keeps the requestId")
     }
 
     func testRefreshAsksForTheWorkspaceFirstAndMatchesAgainWhenItArrives() async throws {

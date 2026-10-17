@@ -441,6 +441,22 @@ struct PullRequestSession: Equatable, Sendable {
     }
 }
 
+/// A reason-aware prompt action offered for a pull request whose session is live.
+struct PullRequestDispatchAction: Equatable, Identifiable, Sendable {
+    enum Kind: String, Equatable, Sendable {
+        case fixChecks
+        case resolveConflicts
+        case addressFeedback
+        case updateBranch
+        case checkStatus
+    }
+
+    let kind: Kind
+    let title: String
+    let prompt: String
+    var id: Kind { kind }
+}
+
 struct PullRequestItem: Identifiable, Equatable {
     let pr: PullRequestSnapshot
     let assessment: PullRequestAssessment
@@ -450,6 +466,84 @@ struct PullRequestItem: Identifiable, Equatable {
     let isManuallyAssigned: Bool
 
     var id: PullRequestKey { pr.key }
+
+    var dispatchActions: [PullRequestDispatchAction] {
+        Self.dispatchActions(for: pr, reasons: assessment.reasons)
+    }
+
+    static func dispatchActions(
+        for pr: PullRequestSnapshot, reasons: [PullRequestAttention]
+    ) -> [PullRequestDispatchAction] {
+        var actions: [PullRequestDispatchAction] = []
+        var seen = Set<PullRequestDispatchAction.Kind>()
+        for reason in reasons {
+            switch reason {
+            case .failingRequiredChecks, .failingChecks:
+                guard seen.insert(.fixChecks).inserted else { continue }
+                let checksDetail: String
+                if let failing = pr.failingRequiredChecks, !failing.isEmpty {
+                    checksDetail = " (\(failing.joined(separator: ", ")))"
+                } else {
+                    checksDetail = ""
+                }
+                actions.append(PullRequestDispatchAction(
+                    kind: .fixChecks,
+                    title: "Ask Session to Fix Checks",
+                    prompt: "Fix the failing checks on \(pr.url.absoluteString)\(checksDetail). Inspect the failing job logs, reproduce locally if needed, and push a fix."
+                ))
+            case .conflicts:
+                guard seen.insert(.resolveConflicts).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .resolveConflicts,
+                    title: "Ask Session to Resolve Conflicts",
+                    prompt: "Resolve the merge conflicts on \(pr.url.absoluteString) (branch `\(pr.headRefName)`), verify the build and tests pass, and push the updated branch."
+                ))
+            case .changesRequested, .unresolvedThreads:
+                guard seen.insert(.addressFeedback).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .addressFeedback,
+                    title: "Ask Session to Address Feedback",
+                    prompt: "Review and address the unresolved review feedback on \(pr.url.absoluteString), run the relevant tests, and push any needed updates."
+                ))
+            case .behindBase:
+                guard seen.insert(.updateBranch).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .updateBranch,
+                    title: "Ask Session to Update Branch",
+                    prompt: "Update \(pr.url.absoluteString) (branch `\(pr.headRefName)`) with its base branch, verify checks pass, and push."
+                ))
+            case .stale:
+                guard seen.insert(.checkStatus).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .checkStatus,
+                    title: "Ask Session to Check Status",
+                    prompt: PullRequestsModel.startingPrompt(urls: [pr.url.absoluteString])
+                ))
+            case .sessionWaiting, .readyToMerge, .noSession:
+                break
+            }
+        }
+        if actions.isEmpty {
+            actions.append(PullRequestDispatchAction(
+                kind: .checkStatus,
+                title: "Ask Session to Check Status",
+                prompt: PullRequestsModel.startingPrompt(urls: [pr.url.absoluteString])
+            ))
+        }
+        return actions
+    }
+
+    static func formattedCustomPrompt(_ text: String, for pr: PullRequestSnapshot) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let url = pr.url.absoluteString
+        if trimmed.localizedCaseInsensitiveContains(url)
+            || trimmed.localizedCaseInsensitiveContains(pr.shortName)
+            || trimmed.contains("#\(pr.key.number)") {
+            return trimmed
+        }
+        return "For \(url):\n\n\(trimmed)"
+    }
 }
 
 /// Pull requests working toward one outcome.

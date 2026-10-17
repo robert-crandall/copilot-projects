@@ -404,6 +404,23 @@ final class AppModel: ObservableObject {
                 requestId: requestId, projectId: projectId, copilotSessionId: copilotSessionId
             )
         },
+        sendSessionPrompt: { [unowned self] request in
+            guard let sessionId = request.sessionId, !sessionId.isEmpty,
+                  request.projectId.map({ !$0.isEmpty }) ?? true,
+                  let rawRequestId = request.requestId,
+                  let requestId = UUID(uuidString: rawRequestId),
+                  let prompt = request.prompt else {
+                return .failure(
+                    "send-session-prompt requires a session id, a UUID request id, and a prompt",
+                    code: "bad-request")
+            }
+            return self.sendPullRequestsSessionPrompt(
+                requestId: requestId,
+                projectId: request.projectId,
+                sessionId: sessionId,
+                prompt: prompt
+            )
+        },
         screenshot: { _ in
             .failure("screenshot must be handled by the control server")
         },
@@ -418,6 +435,13 @@ final class AppModel: ObservableObject {
     /// the command that resumes it, nothing else shows that it is coming back.
     private var pullRequestsResumeLaunches: [String: (sessionId: String, launchedAt: Date)] = [:]
     static let pullRequestsResumeStartupGrace: TimeInterval = 5
+    private struct SentPullRequestsPrompt {
+        let sessionId: String
+        let prompt: String
+    }
+    private var sentPullRequestsPrompts: [UUID: SentPullRequestsPrompt] = [:]
+    private var sentPullRequestsPromptOrder: [UUID] = []
+    private static let maximumSentPullRequestsPrompts = 128
     /// The Copilot session each captured launch resumes, by tab. Launches are
     /// captured only when `remoteSessionLauncher` is set, in tests.
     private(set) var capturedResumeLaunches: [String: String] = [:]
@@ -5297,6 +5321,103 @@ final class AppModel: ObservableObject {
             return launch.sessionId
         }
         return nil
+    }
+
+    /// Sends or queues a prompt into an existing live session for Copilot Pull Requests.
+    /// Replaying the same `requestId` for the same session and prompt returns `existing`
+    /// without delivering the prompt twice.
+    func sendPullRequestsSessionPrompt(
+        requestId: UUID,
+        projectId: String?,
+        sessionId: String,
+        prompt: String,
+        now: Date = Date()
+    ) -> ControlResponse {
+        guard SessionInputValidation.isValidPrompt(prompt) else {
+            return .failure(CopilotSessionStartError.invalidPrompt.localizedDescription, code: "bad-request")
+        }
+        guard !isTerminating else {
+            return .failure(CopilotSessionStartError.shuttingDown.localizedDescription, code: "unavailable")
+        }
+        let normalizedPrompt = prompt
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        if let previous = sentPullRequestsPrompts[requestId] {
+            guard previous.sessionId == sessionId, previous.prompt == normalizedPrompt else {
+                return .failure("request id is bound to a different session or prompt", code: "conflict")
+            }
+            guard let loc = locateIndex(sessionId) else {
+                return .failure("The session has ended.", code: "gone")
+            }
+            if let projectId, projects[loc.p].id != projectId {
+                return .failure("The session moved to another project.", code: "conflict")
+            }
+            return .success(sessionId, code: "existing")
+        }
+        guard let loc = locateIndex(sessionId) else {
+            return .failure("The session has ended.", code: "gone")
+        }
+        if let projectId, projects[loc.p].id != projectId {
+            return .failure("The session moved to another project.", code: "conflict")
+        }
+        let session = projects[loc.p].sessions[loc.s]
+        if session.displayStatus == .waiting || session.hasPendingInput {
+            return .failure("The session is waiting for your input in the terminal.", code: "busy")
+        }
+
+        // Authoritative fresh tracker snapshot: refuse if input is pending on disk even before
+        // the asynchronous activity watcher updates the in-memory session model.
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        let freshSnapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: { now })
+        if freshSnapshot?.hasPendingInput == true {
+            return .failure("The session is waiting for your input in the terminal.", code: "busy")
+        }
+
+        // Prefer native SDK queueing when the session has a fresh tracker workflow snapshot.
+        // CLIOperationAdapter deduplicates replays against the active handoff file and
+        // tracker operation receipts, so a rejected receipt is never cached as delivered.
+        if let snapshot = freshSnapshot,
+           let epoch = snapshot.remoteOperationProjection().conversationEpoch,
+           let workflow = snapshot.workflow,
+           workflow.supports(.send, at: now),
+           workflow.sendReady {
+            let action = RemoteSessionAction(kind: .send, prompt: normalizedPrompt, mode: .enqueue)
+            let operation = CLIOperationRequest(operationId: requestId.uuidString, conversationEpoch: epoch)
+            switch performSessionAction(sessionId: sessionId, action: action, operation: operation, now: now) {
+            case .accepted:
+                return .success(sessionId, code: "queued")
+            case .conflict:
+                return .failure("Another session action is already awaiting Copilot.", code: "busy")
+            case .invalid:
+                break
+            }
+        }
+
+        switch sendRemotePrompt(sessionId: sessionId, value: normalizedPrompt) {
+        case .sent:
+            rememberSentPullRequestsPrompt(requestId: requestId, sessionId: sessionId, prompt: normalizedPrompt)
+            return .success(sessionId, code: "sent")
+        case .busy:
+            return .failure("The session is busy or waiting for input in the terminal.", code: "busy")
+        case .noLiveCopilot:
+            return .failure("Copilot isn’t running in that session.", code: "no-copilot")
+        case .invalid, .forbidden:
+            return .failure("Could not send the prompt to that session.", code: "invalid")
+        }
+    }
+
+    private func rememberSentPullRequestsPrompt(requestId: UUID, sessionId: String, prompt: String) {
+        if sentPullRequestsPrompts[requestId] == nil {
+            sentPullRequestsPromptOrder.append(requestId)
+            while sentPullRequestsPromptOrder.count > Self.maximumSentPullRequestsPrompts {
+                let oldest = sentPullRequestsPromptOrder.removeFirst()
+                sentPullRequestsPrompts[oldest] = nil
+            }
+        }
+        sentPullRequestsPrompts[requestId] = SentPullRequestsPrompt(sessionId: sessionId, prompt: prompt)
     }
 
     /// Every project and live session with the state the workspace shows, for `list-sessions`.
