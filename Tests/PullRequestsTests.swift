@@ -168,6 +168,13 @@ final class PullRequestTriageTests: XCTestCase {
         XCTAssertTrue(queued.reasons.isEmpty, "already merging")
         let behind = PullRequestTriage.assess(makePR(mergeState: .behind, review: .approved), session: session, now: now)
         XCTAssertEqual(behind.reasons, [.behindBase])
+        let approvedConflicted = PullRequestTriage.assess(
+            makePR(mergeable: .conflicting, mergeState: .dirty, review: .approved, checks: .success),
+            session: session,
+            now: now
+        )
+        XCTAssertEqual(approvedConflicted.stage, .review, "an approved PR with merge conflicts is not in the Ready column")
+        XCTAssertEqual(approvedConflicted.reasons, [.conflicts])
     }
 
     func testBehindAndReadyOnlyWhenTheyAreYoursToAct() {
@@ -236,6 +243,16 @@ final class PullRequestTriageTests: XCTestCase {
             "Ask Session to Fix Checks",
             "Ask Session to Address Feedback",
         ])
+        XCTAssertEqual(item.startDispatchActions.map(\.startTitle), [
+            "Start Session to Resolve Conflicts",
+            "Start Session to Fix Checks",
+            "Start Session to Address Feedback",
+        ])
+        XCTAssertEqual(item.startDispatchActions.map(\.shortTitle), [
+            "Resolve Conflicts",
+            "Fix Checks",
+            "Address Feedback",
+        ])
         XCTAssertTrue(item.dispatchActions[1].prompt.contains("(ci/build)"))
 
         // Clean PR still offers a status check fallback.
@@ -247,6 +264,7 @@ final class PullRequestTriageTests: XCTestCase {
             isManuallyAssigned: false
         )
         XCTAssertEqual(cleanItem.dispatchActions.map(\.kind), [.checkStatus])
+        XCTAssertTrue(cleanItem.startDispatchActions.isEmpty, "clean PRs do not offer reason-specific start dispatch buttons")
 
         // Custom prompts add the PR URL only when the user didn't already name the PR.
         XCTAssertEqual(

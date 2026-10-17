@@ -278,7 +278,7 @@ enum PullRequestTriage {
         if pr.inMergeQueue || isReady(pr) { return .ready }
         let requiredFailing = pr.checksFailing && pr.failingRequiredChecks?.isEmpty != true
         if requiredFailing || pr.checksRunning { return .checks }
-        if pr.reviewDecision == .approved { return .ready }
+        if pr.reviewDecision == .approved, pr.mergeable != .conflicting, pr.mergeState != .dirty { return .ready }
         return .review
     }
 
@@ -441,7 +441,7 @@ struct PullRequestSession: Equatable, Sendable {
     }
 }
 
-/// A reason-aware prompt action offered for a pull request whose session is live.
+/// A reason-aware prompt action offered for a pull request.
 struct PullRequestDispatchAction: Equatable, Identifiable, Sendable {
     enum Kind: String, Equatable, Sendable {
         case fixChecks
@@ -455,6 +455,26 @@ struct PullRequestDispatchAction: Equatable, Identifiable, Sendable {
     let title: String
     let prompt: String
     var id: Kind { kind }
+
+    var startTitle: String {
+        switch kind {
+        case .fixChecks: return "Start Session to Fix Checks"
+        case .resolveConflicts: return "Start Session to Resolve Conflicts"
+        case .addressFeedback: return "Start Session to Address Feedback"
+        case .updateBranch: return "Start Session to Update Branch"
+        case .checkStatus: return "Start Session"
+        }
+    }
+
+    var shortTitle: String {
+        switch kind {
+        case .fixChecks: return "Fix Checks"
+        case .resolveConflicts: return "Resolve Conflicts"
+        case .addressFeedback: return "Address Feedback"
+        case .updateBranch: return "Update Branch"
+        case .checkStatus: return "Check Status"
+        }
+    }
 }
 
 struct PullRequestItem: Identifiable, Equatable {
@@ -471,6 +491,11 @@ struct PullRequestItem: Identifiable, Equatable {
 
     var dispatchActions: [PullRequestDispatchAction] {
         Self.dispatchActions(for: pr, reasons: assessment.reasons)
+    }
+
+    /// Reason-specific actions that can start a new session with a tailored prompt.
+    var startDispatchActions: [PullRequestDispatchAction] {
+        dispatchActions.filter { $0.kind != .checkStatus }
     }
 
     static func dispatchActions(
@@ -655,6 +680,10 @@ struct PullRequestGoal: Identifiable, Equatable {
     func primaryDispatchItem(for session: PullRequestSession) -> PullRequestItem? {
         items.first { $0.session?.id == session.id }
             ?? (self.session?.id == session.id ? items.first { $0.session == nil } : nil)
+    }
+
+    var primaryStartDispatchActions: [PullRequestDispatchAction] {
+        items.first?.startDispatchActions ?? []
     }
 
     var actionCount: Int { items.filter { $0.assessment.needsAction }.count }

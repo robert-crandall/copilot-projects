@@ -487,6 +487,49 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         try await waitUntil { model.startingGoals.isEmpty }
         XCTAssertEqual(workspace.startCalls.last?.requestId, unsaved)
         XCTAssertEqual(model.overrides.sessionLinks[pr.key.description], "s2")
+
+        // Starting a session with a conflict-resolution prompt dispatches that prompt directly.
+        let conflictedPR = makePR(
+            9,
+            branch: "me/conflicted-branch",
+            mergeable: .conflicting,
+            mergeState: .dirty,
+            review: .approved
+        )
+        model.show([conflictedPR], links: [:])
+        let conflictedGoal = try XCTUnwrap(model.goals(now: testNow).first)
+        let resolveAction = try XCTUnwrap(conflictedGoal.primaryStartDispatchActions.first)
+        XCTAssertEqual(resolveAction.kind, .resolveConflicts)
+        workspace.answer(starts: [.done(code: "created", text: "s-conflict")])
+        model.startSession(for: conflictedGoal, projectId: "p", prompt: resolveAction.prompt)
+        try await waitUntil { model.startingGoals.isEmpty }
+        // Starting a session for a single unlinked PR in a manual goal preserves sibling session links.
+        let unlinkedPR = makePR(
+            10,
+            branch: "me/unlinked-conflict",
+            mergeable: .conflicting,
+            mergeState: .dirty,
+            review: .approved
+        )
+        let siblingPR = makePR(11, branch: "me/sibling-branch", mergeState: .clean, review: .approved)
+        model.moveToNewGoal(unlinkedPR.key, named: "Mixed Goal")
+        let manualGoalId = try XCTUnwrap(model.overrides.goalId(for: unlinkedPR.key))
+        model.move(siblingPR.key, toGoal: manualGoalId)
+        model.show([unlinkedPR, siblingPR], links: [siblingPR.key: "s1"])
+        let mixedGoal = try XCTUnwrap(model.goals(now: testNow).first { $0.id == manualGoalId })
+        workspace.answer(starts: [.done(code: "created", text: "s-only-conflict")])
+        model.startSession(
+            for: mixedGoal,
+            projectId: "p",
+            prompt: resolveAction.prompt,
+            keys: [unlinkedPR.key]
+        )
+        try await waitUntil { model.startingGoals.isEmpty }
+        XCTAssertEqual(model.overrides.sessionLinks[unlinkedPR.key.description], "s-only-conflict")
+        XCTAssertNil(
+            model.overrides.sessionLinks[siblingPR.key.description],
+            "starting for one unlinked PR must not overwrite a sibling PR's live session"
+        )
     }
 
     func testResumeSessionShowsTheTabItOpenedAndItsPullRequestsFollowItOnceLive() async throws {

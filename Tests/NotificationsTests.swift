@@ -1921,10 +1921,11 @@ final class NotificationsTests: XCTestCase {
         let workspace = FakeWorkspace(fetches: [.snapshot(fixtureSnapshot)])
         let recorder = HostRecorder()
         let clock = TestClock(now)
+        let suiteDefaults = UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!
         let model = NotificationsModel(
             workspace: workspace,
             host: recorder.host,
-            defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            defaults: suiteDefaults,
             api: GitHubNotificationsAPI(send: github.send),
             detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
             loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
@@ -1976,6 +1977,42 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(linkedItem.session?.id, "reviewed")
         XCTAssertFalse(model.canReviewInCopilot(linkedItem), "once linked to a live session, Go to Session takes over")
         XCTAssertFalse(linkedItem.thread.unread, "starting a review marks the thread read")
+
+        // Choosing a project for review is remembered across threads and restarts, even when
+        // another thread's repository name doesn't match that project.
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("3", reason: "review_requested", repo: "other-org/unmatched-repo", number: 77, updated: now),
+        ]])
+        await model.refreshNow()
+        let unmatchedItem = try XCTUnwrap(model.items.first { $0.id.id == "3" })
+        XCTAssertEqual(
+            model.preferredProjectId(for: unmatchedItem.thread),
+            "q",
+            "remembers the last project used for Review in Copilot instead of falling back to the first project"
+        )
+        workspace.answer(
+            fetches: [.snapshot(updatedSnapshot)],
+            reviews: [.done(code: "created", text: "reviewed-2")]
+        )
+        model.reviewInCopilot(unmatchedItem, projectId: "p")
+        try await waitUntil { model.reviewingThreads.isEmpty }
+        XCTAssertEqual(model.lastReviewProjectId, "p")
+        XCTAssertEqual(model.preferredProjectId(for: prItem.thread), "p", "explicitly chosen project becomes the new default")
+
+        let restartedModel = NotificationsModel(
+            workspace: FakeWorkspace(fetches: [.snapshot(fixtureSnapshot)]),
+            host: recorder.host,
+            defaults: suiteDefaults,
+            api: GitHubNotificationsAPI(send: github.send),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
+            transcriptPath: { _ in nil },
+            clock: { clock.now },
+            isVisible: { true }
+        )
+        restartedModel.setBadge = { _ in }
+        await restartedModel.pollWorkspace()
+        XCTAssertEqual(restartedModel.lastReviewProjectId, "p")
+        XCTAssertEqual(restartedModel.preferredProjectId(for: prItem.thread), "p", "last chosen review project persists across launches")
     }
 
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {

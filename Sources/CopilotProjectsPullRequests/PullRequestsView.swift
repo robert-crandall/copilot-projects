@@ -268,13 +268,32 @@ struct PullRequestsView: View {
             && selectedSession?.status != .waiting
             && selectedSession?.hasPendingInput != true
             && pullRequests.isConnected
+        let isGoalBusy = selectedGoal.map { goal in
+            pullRequests.startingGoals.contains(goal.id)
+                || (goal.resumable.map { pullRequests.resumingSessions.contains($0.copilotSessionId) } ?? false)
+        } ?? true
+        let canStartDispatch = selectedSession == nil
+            && !isGoalBusy
+            && pullRequests.isConnected
+            && pullRequests.sessionsKnown
+            && !checkingStatus
+            && !pullRequests.projects.isEmpty
         return HStack(spacing: 14) {
             if lanesShown {
                 keyHint("↑↓", "Move")
                 if selected != nil {
                     keyHint("↩", canGoToSession ? "Go to Session" : "Open on GitHub")
                     if canGoToSession { keyHint("⌘↩", "Open on GitHub") }
-                    if canPromptSession { keyHint("P", "Prompt Session") }
+                    if canPromptSession {
+                        keyHint("P", "Prompt Session")
+                        if let session = selectedSession, pullRequests.retryablePromptSessions.contains(session.id) {
+                            keyHint("⇧P", "Retry Prompt")
+                        } else if let primaryAction = selected?.startDispatchActions.first {
+                            keyHint("⇧P", primaryAction.shortTitle)
+                        }
+                    } else if canStartDispatch, let primaryAction = selected?.startDispatchActions.first {
+                        keyHint("⇧P", primaryAction.shortTitle)
+                    }
                 }
             }
             keyHint("⌘R", "Refresh")
@@ -414,27 +433,40 @@ struct PullRequestsView: View {
                 guard press.modifiers.subtracting([.shift]).isDisjoint(with: [.command, .control, .option]),
                       press.characters.lowercased() == "p",
                       let item = order.first(where: { $0.id == selection }),
-                      let session = item.session ?? goals.first(where: { $0.items.contains { $0.id == item.id } })?.session,
-                      pullRequests.isConnected,
-                      session.status != .waiting,
-                      !session.hasPendingInput,
-                      !pullRequests.sendingSessions.contains(session.id) else { return .ignored }
-                if press.modifiers.contains(.shift) {
-                    if pullRequests.retryablePromptSessions.contains(session.id) {
-                        pullRequests.retryPendingPrompt(for: session)
-                    } else if let action = item.dispatchActions.first {
-                        pullRequests.sendPrompt(to: session, prompt: action.prompt, pullRequestKey: item.pr.key)
+                      pullRequests.isConnected else { return .ignored }
+                let goal = goals.first { $0.items.contains { $0.id == item.id } }
+                if let session = item.session ?? goal?.session {
+                    guard session.status != .waiting,
+                          !session.hasPendingInput,
+                          !pullRequests.sendingSessions.contains(session.id) else { return .ignored }
+                    if press.modifiers.contains(.shift) {
+                        if pullRequests.retryablePromptSessions.contains(session.id) {
+                            pullRequests.retryPendingPrompt(for: session)
+                        } else if let action = item.dispatchActions.first {
+                            pullRequests.sendPrompt(to: session, prompt: action.prompt, pullRequestKey: item.pr.key)
+                        }
+                    } else {
+                        Self.promptSession(
+                            session,
+                            for: item.pr,
+                            initialText: pullRequests.promptDraft(for: item.pr, session: session)
+                        ) { draft, _ in
+                            pullRequests.sendCustomPrompt(draft, for: item.pr, to: session)
+                        }
                     }
-                } else {
-                    Self.promptSession(
-                        session,
-                        for: item.pr,
-                        initialText: pullRequests.promptDraft(for: item.pr, session: session)
-                    ) { draft, _ in
-                        pullRequests.sendCustomPrompt(draft, for: item.pr, to: session)
-                    }
+                    return .handled
+                } else if press.modifiers.contains(.shift),
+                          let goal,
+                          pullRequests.sessionsKnown,
+                          !checkingStatus,
+                          !pullRequests.startingGoals.contains(goal.id),
+                          !(goal.resumable.map { pullRequests.resumingSessions.contains($0.copilotSessionId) } ?? false),
+                          let target = pullRequests.defaultProjectId ?? pullRequests.projects.first?.id,
+                          let action = item.startDispatchActions.first {
+                    pullRequests.startSession(for: goal, projectId: target, prompt: action.prompt, keys: [item.pr.key])
+                    return .handled
                 }
-                return .handled
+                return .ignored
             }
             .onKeyPress(.escape) {
                 guard selection != nil else { return .ignored }
@@ -526,7 +558,9 @@ struct PullRequestsView: View {
             openPullRequest: { pullRequests.openOnGitHub($0) },
             copyLink: { pullRequests.copyLink($0) },
             goToSession: { pullRequests.goToSession($0) },
-            sendPrompt: { session, prompt in pullRequests.sendPrompt(to: session, prompt: prompt) },
+            sendPrompt: { session, prompt, key in
+                pullRequests.sendPrompt(to: session, prompt: prompt, pullRequestKey: key)
+            },
             retryPrompt: { session in pullRequests.retryPendingPrompt(for: session) },
             promptSession: { session, pr in
                 Self.promptSession(
@@ -537,7 +571,9 @@ struct PullRequestsView: View {
                     pullRequests.sendCustomPrompt(draft, for: pr, to: session)
                 }
             },
-            startSession: { goal, projectId in pullRequests.startSession(for: goal, projectId: projectId) },
+            startSession: { goal, projectId, prompt, keys in
+                pullRequests.startSession(for: goal, projectId: projectId, prompt: prompt, keys: keys)
+            },
             resumeSession: { candidate, projectId in pullRequests.resume(candidate, projectId: projectId) },
             openHost: { pullRequests.openHost() },
             move: { key, goalId in pullRequests.move(key, toGoal: goalId) },
@@ -584,10 +620,10 @@ private struct GoalLane: View {
         let openPullRequest: (PullRequestSnapshot) -> Void
         let copyLink: (PullRequestSnapshot) -> Void
         let goToSession: (PullRequestSession) -> Void
-        let sendPrompt: (PullRequestSession, String) -> Void
+        let sendPrompt: (PullRequestSession, String, PullRequestKey?) -> Void
         let retryPrompt: (PullRequestSession) -> Void
         let promptSession: (PullRequestSession, PullRequestSnapshot) -> Void
-        let startSession: (PullRequestGoal, String) -> Void
+        let startSession: (PullRequestGoal, String, String?, [PullRequestKey]?) -> Void
         let resumeSession: (ResumableSession, String) -> Void
         let openHost: () -> Void
         let move: (PullRequestKey, String?) -> Void
@@ -665,6 +701,7 @@ private struct GoalLane: View {
 
     @ViewBuilder
     private func chip(_ item: PullRequestItem) -> some View {
+        let dispatch = chipDispatch(for: item)
         let chip = PullRequestChip(
             item: item,
             sessionStateInSummary: PullRequestsPresentation.sharesSessionState(goal) && (laneSession != nil || sessionsKnown),
@@ -673,7 +710,11 @@ private struct GoalLane: View {
             showsTitle: PullRequestGrouping.sentenceCase(item.pr.title) != goal.name,
             isSelected: item.id == selection,
             onSelect: { actions.select(item.id) },
-            onOpen: { actions.openPullRequest(item.pr) }
+            onOpen: { actions.openPullRequest(item.pr) },
+            dispatchTitle: dispatch?.title,
+            dispatchHelp: dispatch?.help,
+            isDispatchDisabled: dispatch?.disabled ?? false,
+            onDispatch: dispatch?.action
         )
         .contextMenu { menu(item) }
         .id(item.id)
@@ -682,6 +723,36 @@ private struct GoalLane: View {
         } else {
             chip.transition(.opacity)
         }
+    }
+
+    private var isResuming: Bool {
+        previousSession.map { resumingSessions.contains($0.copilotSessionId) } ?? false
+    }
+
+    private func chipDispatch(
+        for item: PullRequestItem
+    ) -> (title: String, help: String, disabled: Bool, action: () -> Void)? {
+        guard workspace == .connected,
+              let primaryAction = item.startDispatchActions.first else { return nil }
+        if let session = goal.session(for: item) {
+            guard session.status != .waiting, !session.hasPendingInput else { return nil }
+            let sending = sendingSessions.contains(session.id)
+            return (
+                title: sending ? "Sending…" : primaryAction.shortTitle,
+                help: "\(primaryAction.title) (⇧P)",
+                disabled: sending,
+                action: { actions.sendPrompt(session, primaryAction.prompt, item.pr.key) }
+            )
+        } else if sessionsKnown, !checkingStatus, let target = defaultProjectId ?? projects.first?.id {
+            let busy = isStarting || isResuming
+            return (
+                title: isStarting ? "Starting…" : primaryAction.shortTitle,
+                help: "\(primaryAction.startTitle) (⇧P)",
+                disabled: busy,
+                action: { actions.startSession(goal, target, primaryAction.prompt, [item.pr.key]) }
+            )
+        }
+        return nil
     }
 
     @ViewBuilder
@@ -696,12 +767,22 @@ private struct GoalLane: View {
                         .disabled(sendingSessions.contains(session.id))
                 }
                 ForEach(item.dispatchActions) { action in
-                    Button(action.title) { actions.sendPrompt(session, action.prompt) }
+                    Button(action.title) { actions.sendPrompt(session, action.prompt, item.pr.key) }
                         .disabled(sendingSessions.contains(session.id))
                 }
                 Button("Send Prompt to Session…") { actions.promptSession(session, item.pr) }
                     .disabled(sendingSessions.contains(session.id))
             }
+        } else if workspace == .connected, sessionsKnown, !checkingStatus, !projects.isEmpty {
+            let target = defaultProjectId ?? projects[0].id
+            let busy = isStarting || isResuming
+            Divider()
+            ForEach(item.startDispatchActions) { action in
+                Button(action.startTitle) { actions.startSession(goal, target, action.prompt, [item.pr.key]) }
+                    .disabled(busy)
+            }
+            Button("Start Session") { actions.startSession(goal, target, nil, [item.pr.key]) }
+                .disabled(busy)
         }
         Button("Copy Link") { actions.copyLink(item.pr) }
         Divider()
@@ -823,7 +904,7 @@ private struct GoalLane: View {
                             .disabled(sending)
                     }
                     ForEach(primaryItem.dispatchActions) { action in
-                        Button(action.title) { actions.sendPrompt(session, action.prompt) }
+                        Button(action.title) { actions.sendPrompt(session, action.prompt, primaryItem.pr.key) }
                             .disabled(sending)
                     }
                     Button("Send Prompt to Session…") { actions.promptSession(session, primaryItem.pr) }
@@ -856,9 +937,17 @@ private struct GoalLane: View {
                     }
                 }
                 Divider()
+                if let primaryItem = goal.items.first, !primaryItem.startDispatchActions.isEmpty {
+                    ForEach(primaryItem.startDispatchActions) { action in
+                        Button(action.startTitle) {
+                            actions.startSession(goal, target, action.prompt, [primaryItem.pr.key])
+                        }
+                    }
+                    Divider()
+                }
                 Section("Start New Session in") {
                     ForEach(projects, id: \.id) { project in
-                        Button(project.name) { actions.startSession(goal, project.id) }
+                        Button(project.name) { actions.startSession(goal, project.id, nil, nil) }
                     }
                 }
             } label: {
@@ -877,13 +966,21 @@ private struct GoalLane: View {
         } else if !projects.isEmpty {
             let target = defaultProjectId ?? projects[0].id
             Menu {
+                if let primaryItem = goal.items.first, !primaryItem.startDispatchActions.isEmpty {
+                    ForEach(primaryItem.startDispatchActions) { action in
+                        Button(action.startTitle) {
+                            actions.startSession(goal, target, action.prompt, [primaryItem.pr.key])
+                        }
+                    }
+                    Divider()
+                }
                 ForEach(projects, id: \.id) { project in
-                    Button(project.name) { actions.startSession(goal, project.id) }
+                    Button(project.name) { actions.startSession(goal, project.id, nil, nil) }
                 }
             } label: {
                 Text("Start Session")
             } primaryAction: {
-                actions.startSession(goal, target)
+                actions.startSession(goal, target, nil, nil)
             }
             .menuStyle(.button)
             .controlSize(.small)
@@ -948,6 +1045,10 @@ struct PullRequestChip: View {
     let isSelected: Bool
     let onSelect: () -> Void
     let onOpen: () -> Void
+    var dispatchTitle: String? = nil
+    var dispatchHelp: String? = nil
+    var isDispatchDisabled = false
+    var onDispatch: (() -> Void)? = nil
     @State private var isHovering = false
 
     private var displayedReasons: [PullRequestAttention] {
@@ -1008,6 +1109,17 @@ struct PullRequestChip: View {
                     .foregroundStyle(StudioStyle.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let dispatchTitle, let onDispatch {
+                Button(dispatchTitle) {
+                    onSelect()
+                    onDispatch()
+                }
+                .controlSize(.small)
+                .disabled(isDispatchDisabled)
+                .padding(.top, 2)
+                .help(dispatchHelp ?? dispatchTitle)
+                .accessibilityHidden(true)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -1036,6 +1148,11 @@ struct PullRequestChip: View {
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { onSelect() }
         .accessibilityAction(named: "Open on GitHub", onOpen)
+        .accessibilityActions {
+            if let dispatchTitle, let onDispatch, !isDispatchDisabled {
+                Button(dispatchTitle, action: onDispatch)
+            }
+        }
     }
 
     /// `repo#number`, then how long ago it changed when that fits too.
