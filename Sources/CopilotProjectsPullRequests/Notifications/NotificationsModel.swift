@@ -90,6 +90,7 @@ final class NotificationsModel: ObservableObject {
     static let hidesClosedIssuesKey = "notifications.hidesClosedIssues"
     static let hidesCIActivityKey = "notifications.hidesCIActivity"
     static let hidesYourPullRequestsKey = "notifications.hidesYourPullRequests"
+    static let lastReviewProjectIdKey = "notifications.lastReviewProjectId"
 
     @Published private(set) var threads: [NotificationThread] = []
     @Published private(set) var details: [NotificationThread.Key: NotificationSubjectDetail] = [:]
@@ -142,6 +143,8 @@ final class NotificationsModel: ObservableObject {
     @Published private(set) var readingDetails = false
     /// Pull request notification threads whose Review in Copilot request is in flight.
     @Published private(set) var reviewingThreads: Set<NotificationThread.Key> = []
+    /// Most recent project chosen for Review in Copilot.
+    @Published private(set) var lastReviewProjectId: String?
 
     enum Phase: Equatable {
         case idle, loading, loaded
@@ -277,6 +280,7 @@ final class NotificationsModel: ObservableObject {
         hidesClosedIssues = defaults.object(forKey: Self.hidesClosedIssuesKey) as? Bool ?? true
         hidesCIActivity = defaults.object(forKey: Self.hidesCIActivityKey) as? Bool ?? true
         hidesYourPullRequests = defaults.object(forKey: Self.hidesYourPullRequestsKey) as? Bool ?? true
+        lastReviewProjectId = defaults.string(forKey: Self.lastReviewProjectIdKey)
         // Old actions are kept until threads are on hand to judge them by.
         for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
             let parts = name.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
@@ -382,11 +386,16 @@ final class NotificationsModel: ObservableObject {
         return snapshot.projects.first?.id
     }
 
-    /// Picks the project whose name matches the notification's repository name,
+    /// Picks the last project chosen for Review in Copilot when still available,
+    /// otherwise a project whose name matches the notification's repository name,
     /// falling back to the workspace's selected project.
     func preferredProjectId(for thread: NotificationThread) -> String? {
         let currentProjects = projects
         guard !currentProjects.isEmpty else { return nil }
+        if let last = lastReviewProjectId,
+           currentProjects.contains(where: { $0.id == last }) {
+            return last
+        }
         let repoName = thread.repository.split(separator: "/").last.map(String.init) ?? thread.repository
         let matching = currentProjects.filter {
             $0.name.caseInsensitiveCompare(repoName) == .orderedSame
@@ -836,6 +845,12 @@ final class NotificationsModel: ObservableObject {
         }
         guard let targetProjectId = projectId ?? existingPending?.projectId ?? preferredProjectId(for: item.thread),
               projects.contains(where: { $0.id == targetProjectId }) else { return }
+        if lastReviewProjectId != targetProjectId {
+            lastReviewProjectId = targetProjectId
+        }
+        if writesState {
+            defaults.set(targetProjectId, forKey: Self.lastReviewProjectIdKey)
+        }
         let review = existingPending.flatMap {
             $0.projectId == targetProjectId ? $0 : nil
         } ?? PendingReview(requestId: UUID(), projectId: targetProjectId, pullRequestURL: target.url)

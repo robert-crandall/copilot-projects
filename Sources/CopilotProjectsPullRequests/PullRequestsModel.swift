@@ -754,16 +754,29 @@ final class PullRequestsModel: ObservableObject {
         """
     }
 
-    /// Starts a Copilot session for a goal no session is working on, links the
-    /// goal's pull requests to it, and shows it in Copilot Projects.
-    func startSession(for goal: PullRequestGoal, projectId: String) {
+    /// Starts a Copilot session for a goal or specific pull requests no session is
+    /// working on, links those pull requests to it, and shows it in Copilot Projects.
+    func startSession(
+        for goal: PullRequestGoal,
+        projectId: String,
+        prompt customPrompt: String? = nil,
+        keys targetKeys: [PullRequestKey]? = nil
+    ) {
         guard !hostedReadOnly, isConnected, !startingGoals.contains(goal.id) else { return }
-        let prompt = Self.startingPrompt(for: goal.items.map(\.pr))
-        let start = pendingStarts[goal.id].flatMap { $0.projectId == projectId && $0.prompt == prompt ? $0 : nil }
-            ?? PendingStart(requestId: UUID(), projectId: projectId, prompt: prompt)
+        if let resumableId = goal.resumable?.copilotSessionId, resumingSessions.contains(resumableId) {
+            return
+        }
+        let keys = targetKeys ?? goal.items.filter { $0.session == nil }.map(\.pr.key)
+        guard !keys.isEmpty else { return }
+        let targetPRs = goal.items.filter { keys.contains($0.pr.key) }.map(\.pr)
+        let trimmedCustom = customPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = (trimmedCustom?.isEmpty == false ? trimmedCustom : nil)
+            ?? Self.startingPrompt(for: targetPRs.isEmpty ? goal.items.map(\.pr) : targetPRs)
+        let start = pendingStarts[goal.id].flatMap {
+            $0.projectId == projectId && $0.prompt == prompt ? $0 : nil
+        } ?? PendingStart(requestId: UUID(), projectId: projectId, prompt: prompt)
         pendingStarts[goal.id] = start
         startingGoals.insert(goal.id)
-        let keys = goal.items.map(\.pr.key)
         Task {
             await performStart(start, goalId: goal.id, keys: keys)
             startingGoals.remove(goal.id)

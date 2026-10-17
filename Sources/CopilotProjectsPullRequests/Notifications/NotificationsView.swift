@@ -759,13 +759,18 @@ struct NotificationsView: View {
 
     @ViewBuilder
     private func chip(_ item: NotificationItem, placeholder: Bool) -> some View {
+        let canReview = !placeholder && model.canReviewInCopilot(item)
         let chip = NotificationChip(
             item: item,
             primaryAccount: model.primaryAccount,
             isSelected: item.id == selection,
             onSelect: { selection = item.id; userSelected = true; lanesFocused = true },
             onOpen: { model.open(item) },
-            onGoToSession: model.isConnected ? { session in model.goToSession(session, for: item) } : nil
+            onGoToSession: model.isConnected ? { session in model.goToSession(session, for: item) } : nil,
+            reviewProjects: canReview ? model.projects : [],
+            preferredReviewProjectId: canReview ? model.preferredProjectId(for: item.thread) : nil,
+            isReviewing: model.reviewingThreads.contains(item.id),
+            onReviewInCopilot: canReview ? { projectId in model.reviewInCopilot(item, projectId: projectId) } : nil
         )
         .contextMenu { menu(item) }
         .id(item.id)
@@ -882,6 +887,10 @@ struct NotificationChip: View {
     let onOpen: () -> Void
     /// Present while Copilot Projects answers, so the session line can take you there.
     var onGoToSession: ((PullRequestSession) -> Void)? = nil
+    var reviewProjects: [(id: String, name: String)] = []
+    var preferredReviewProjectId: String? = nil
+    var isReviewing = false
+    var onReviewInCopilot: ((String?) -> Void)? = nil
     @State private var isHovering = false
 
     private var showsAccount: Bool {
@@ -926,6 +935,9 @@ struct NotificationChip: View {
             }
             if let session = item.session {
                 sessionLine(session)
+            } else if onReviewInCopilot != nil {
+                reviewLine
+                    .padding(.top, 2)
             }
         }
         .padding(.horizontal, 10)
@@ -958,7 +970,49 @@ struct NotificationChip: View {
         .accessibilityActions {
             if let session = item.session, let onGoToSession {
                 Button("Go to Session") { onGoToSession(session) }
+            } else if let onReviewInCopilot, !isReviewing {
+                let preferredId = preferredReviewProjectId ?? reviewProjects.first?.id
+                let preferredName = reviewProjects.first { $0.id == preferredId }?.name ?? "Copilot"
+                Button("Review in \(preferredName)") { onReviewInCopilot(preferredId) }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var reviewLine: some View {
+        let preferredId = preferredReviewProjectId ?? reviewProjects.first?.id
+        let preferredName = reviewProjects.first { $0.id == preferredId }?.name ?? "Copilot"
+        let labelText = isReviewing ? "Starting Review…" : "Review in \(preferredName)"
+        if isReviewing || reviewProjects.count <= 1 {
+            Button(labelText) {
+                onSelect()
+                onReviewInCopilot?(preferredId)
+            }
+            .controlSize(.small)
+            .disabled(isReviewing)
+            .help("Start a Copilot review of \(item.thread.shortName) in \(preferredName) (R)")
+            .accessibilityHidden(true)
+        } else {
+            Menu {
+                ForEach(reviewProjects, id: \.id) { project in
+                    Button(project.name) {
+                        onSelect()
+                        onReviewInCopilot?(project.id)
+                    }
+                }
+            } label: {
+                Text(labelText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } primaryAction: {
+                onSelect()
+                onReviewInCopilot?(preferredId)
+            }
+            .menuStyle(.button)
+            .controlSize(.small)
+            .fixedSize(horizontal: false, vertical: true)
+            .help("Start a Copilot review of \(item.thread.shortName) in \(preferredName) (R), or choose another project from the menu")
+            .accessibilityHidden(true)
         }
     }
 
