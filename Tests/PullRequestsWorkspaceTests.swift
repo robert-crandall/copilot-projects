@@ -12,11 +12,13 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
     private var reveals: [WorkspaceCommandResult] = [.done(code: "revealed", text: nil)]
     private var starts: [WorkspaceCommandResult] = [.done(code: "created", text: "started")]
     private var resumes: [WorkspaceCommandResult] = [.done(code: "created", text: "resumed")]
+    private var reviews: [WorkspaceCommandResult] = [.done(code: "created", text: "reviewed")]
     private var prompts: [WorkspaceCommandResult] = [.done(code: "sent", text: "s1")]
     private var _snapshotCalls = 0
     private var _revealCalls: [(projectId: String?, sessionId: String)] = []
     private var _startCalls: [(projectId: String, requestId: UUID, prompt: String)] = []
     private var _resumeCalls: [(projectId: String, requestId: UUID, copilotSessionId: String)] = []
+    private var _reviewCalls: [(projectId: String, requestId: UUID, pullRequestURL: String)] = []
     private var _promptCalls: [(projectId: String?, sessionId: String, requestId: UUID, prompt: String)] = []
 
     init(snapshot: WorkspaceSnapshot? = nil) {
@@ -30,13 +32,14 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
     func answer(
         fetches: [WorkspaceFetch]? = nil, reveals: [WorkspaceCommandResult]? = nil,
         starts: [WorkspaceCommandResult]? = nil, resumes: [WorkspaceCommandResult]? = nil,
-        prompts: [WorkspaceCommandResult]? = nil
+        reviews: [WorkspaceCommandResult]? = nil, prompts: [WorkspaceCommandResult]? = nil
     ) {
         lock.withLock {
             if let fetches { self.fetches = fetches }
             if let reveals { self.reveals = reveals }
             if let starts { self.starts = starts }
             if let resumes { self.resumes = resumes }
+            if let reviews { self.reviews = reviews }
             if let prompts { self.prompts = prompts }
         }
     }
@@ -46,6 +49,9 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
     var startCalls: [(projectId: String, requestId: UUID, prompt: String)] { lock.withLock { _startCalls } }
     var resumeCalls: [(projectId: String, requestId: UUID, copilotSessionId: String)] {
         lock.withLock { _resumeCalls }
+    }
+    var reviewCalls: [(projectId: String, requestId: UUID, pullRequestURL: String)] {
+        lock.withLock { _reviewCalls }
     }
     var promptCalls: [(projectId: String?, sessionId: String, requestId: UUID, prompt: String)] {
         lock.withLock { _promptCalls }
@@ -80,6 +86,13 @@ final class FakeWorkspace: PullRequestsWorkspace, @unchecked Sendable {
         lock.withLock {
             _resumeCalls.append((projectId, requestId, copilotSessionId))
             return Self.next(&resumes)
+        }
+    }
+
+    func reviewPullRequest(projectId: String, requestId: UUID, pullRequestURL: String) async -> WorkspaceCommandResult {
+        lock.withLock {
+            _reviewCalls.append((projectId, requestId, pullRequestURL))
+            return Self.next(&reviews)
         }
     }
 
@@ -208,6 +221,10 @@ final class PullRequestsWorkspaceBridgeTests: XCTestCase {
                 return request.requestId.flatMap(UUID.init(uuidString:)) != nil && request.projectId == "p"
                     && request.copilotSessionId == "0f1e2d3c-4b5a-4000-8000-000000000002"
                     ? .success("back", code: "created") : .failure("bad", code: "bad-request")
+            case "review-pull-request":
+                return request.requestId.flatMap(UUID.init(uuidString:)) != nil && request.projectId == "p"
+                    && request.path == "https://github.com/o/r/pull/42"
+                    ? .success("rev", code: "created") : .failure("bad", code: "bad-request")
             case "send-session-prompt":
                 return request.requestId.flatMap(UUID.init(uuidString:)) != nil && request.sessionId == "s1"
                     && request.prompt == "fix it"
@@ -228,6 +245,10 @@ final class PullRequestsWorkspaceBridgeTests: XCTestCase {
             projectId: "p", requestId: UUID(), copilotSessionId: "0f1e2d3c-4b5a-4000-8000-000000000002"
         )
         XCTAssertEqual(resumed, .done(code: "created", text: "back"))
+        let reviewed = await bridge.reviewPullRequest(
+            projectId: "p", requestId: UUID(), pullRequestURL: "https://github.com/o/r/pull/42"
+        )
+        XCTAssertEqual(reviewed, .done(code: "created", text: "rev"))
         let prompted = await bridge.sendSessionPrompt(
             projectId: "p", sessionId: "s1", requestId: UUID(), prompt: "fix it"
         )

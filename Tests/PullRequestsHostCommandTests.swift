@@ -122,6 +122,10 @@ final class PullRequestsHostCommandTests: XCTestCase {
                 dispatched.append("resume:\($0.copilotSessionId ?? "")")
                 return .success("t", code: "created")
             },
+            reviewPullRequest: {
+                dispatched.append("review:\($0.projectId ?? ""):\($0.path ?? "")")
+                return .success("r", code: "created")
+            },
             sendSessionPrompt: {
                 dispatched.append("prompt:\($0.sessionId ?? ""):\($0.requestId ?? "")")
                 return .success("s", code: "sent")
@@ -144,6 +148,10 @@ final class PullRequestsHostCommandTests: XCTestCase {
             request("resume-copilot-session", project: "A", requestId: "not-a-uuid", copilot: uuid),
             request("resume-copilot-session", project: "A", requestId: uuid),
             request("resume-copilot-session", project: "A", requestId: uuid, copilot: "../../etc/passwd"),
+            request("review-pull-request", requestId: uuid),
+            request("review-pull-request", project: "", requestId: uuid),
+            request("review-pull-request", project: "A", requestId: "not-a-uuid"),
+            request("review-pull-request", project: "A", requestId: uuid),
             request("send-session-prompt", requestId: uuid, prompt: "p"),
             request("send-session-prompt", session: "", requestId: uuid, prompt: "p"),
             request("send-session-prompt", project: "", session: "s", requestId: uuid, prompt: "p"),
@@ -162,10 +170,14 @@ final class PullRequestsHostCommandTests: XCTestCase {
                        "created")
         XCTAssertEqual(router.handle(request("resume-copilot-session", project: "A", requestId: uuid, copilot: uuid)).code,
                        "created")
+        var validReview = request("review-pull-request", project: "A", requestId: uuid)
+        validReview.path = "https://github.com/o/r/pull/1"
+        XCTAssertEqual(router.handle(validReview).code, "created")
         XCTAssertEqual(router.handle(request("send-session-prompt", session: "s", requestId: uuid, prompt: "p")).code,
                        "sent")
         XCTAssertEqual(dispatched, [
-            "list-sessions", "reveal-session:s", "start:\(uuid)", "resume:\(uuid)", "prompt:s:\(uuid)",
+            "list-sessions", "reveal-session:s", "start:\(uuid)", "resume:\(uuid)",
+            "review:A:https://github.com/o/r/pull/1", "prompt:s:\(uuid)",
         ])
     }
 
@@ -539,6 +551,45 @@ final class PullRequestsHostCommandTests: XCTestCase {
                            "unknown-project")
             XCTAssertTrue(host.launches().isEmpty)
             XCTAssertEqual(model.project("A")?.sessions.map(\.id), ["a1", "a2"])
+        }
+    }
+
+    func testReviewPullRequestCommandCreatesLinkedAdversarialReviewSessionAndIsIdempotent() throws {
+        try withHost(projects: twoProjects, selectedProjectIndex: 1) { host in
+            let model = host.model
+            let requestId = UUID().uuidString
+            let prURL = "https://github.com/Octo/App/pull/42#discussion_r1"
+            @MainActor func review(
+                _ id: String = requestId, project: String = "A", url: String = prURL, on target: AppModel = model
+            ) -> ControlResponse {
+                var req = request("review-pull-request", project: project, requestId: id)
+                req.path = url
+                return target.handle(req)
+            }
+
+            let created = review()
+            XCTAssertTrue(created.ok, created.error ?? "")
+            XCTAssertEqual(created.code, "created")
+            let sessionId = try XCTUnwrap(created.text)
+            XCTAssertEqual(host.launches().count, 1)
+            XCTAssertEqual(host.launches()[0].id, sessionId)
+            let target = try XCTUnwrap(PullRequestReviewTarget.parse(prURL))
+            XCTAssertEqual(host.launches()[0].prompt, AppModel.adversarialReviewPrompt(for: target))
+
+            let project = try XCTUnwrap(model.project("A"))
+            let session = try XCTUnwrap(project.sessions.last)
+            XCTAssertEqual(session.id, sessionId)
+            XCTAssertEqual(session.title, "Review Octo/App#42")
+            XCTAssertEqual(session.pullRequestKeys, ["octo/app#42"])
+            XCTAssertEqual(project.selectedSessionId, sessionId)
+
+            let replay = review()
+            XCTAssertEqual(replay.code, "existing")
+            XCTAssertEqual(replay.text, sessionId)
+            XCTAssertEqual(review(project: "B").code, "conflict")
+            XCTAssertEqual(review(url: "https://github.com/Octo/App/pull/43").code, "conflict")
+            XCTAssertEqual(review(UUID().uuidString, url: "https://github.com/Octo/App/issues/42").code, "bad-request")
+            XCTAssertEqual(host.launches().count, 1)
         }
     }
 

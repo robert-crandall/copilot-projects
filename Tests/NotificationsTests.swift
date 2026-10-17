@@ -1912,6 +1912,72 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(model.threads.map(\.key.id), ["1"])
     }
 
+    func testReviewInCopilotMatchesProjectStartsReviewLinksSessionAndMarksRead() async throws {
+        let github = FakeGitHub()
+        github.answer("participating", pages: [[
+            FakeGitHub.thread("1", reason: "review_requested", repo: "octo/Ops", number: 19, updated: now),
+            FakeGitHub.thread("2", reason: "mention", type: "Issue", repo: "octo/Ops", number: 20, updated: now),
+        ]])
+        let workspace = FakeWorkspace(fetches: [.snapshot(fixtureSnapshot)])
+        let recorder = HostRecorder()
+        let clock = TestClock(now)
+        let model = NotificationsModel(
+            workspace: workspace,
+            host: recorder.host,
+            defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            api: GitHubNotificationsAPI(send: github.send),
+            detailsFetcher: NotificationDetailsFetcher(graphQL: GitHubGraphQL(endpoint: URL(string: "http://127.0.0.1:9/graphql")!, timeout: 2)),
+            loadAccounts: { [GitHubAccount(login: "octocat", token: "token")] },
+            transcriptPath: { _ in nil },
+            clock: { clock.now },
+            isVisible: { true },
+            presentError: { title, message in recorder.alerts.append("\(title): \(message)") }
+        )
+        model.setBadge = { _ in }
+        await model.pollWorkspace()
+        await model.refreshNow()
+
+        let prItem = try XCTUnwrap(model.items.first { $0.id.id == "1" })
+        let issueItem = try XCTUnwrap(model.items.first { $0.id.id == "2" })
+        XCTAssertTrue(model.canReviewInCopilot(prItem))
+        XCTAssertFalse(model.canReviewInCopilot(issueItem))
+        XCTAssertEqual(model.preferredProjectId(for: prItem.thread), "q", "matches the Ops project by repository name")
+
+        var updatedSnapshot = fixtureSnapshot
+        updatedSnapshot.projects[1].sessions.append(
+            .init(id: "reviewed", title: "Review octo/Ops#19", status: .running, pullRequestKeys: ["octo/ops#19"])
+        )
+        workspace.answer(
+            fetches: [.snapshot(fixtureSnapshot), .snapshot(updatedSnapshot)],
+            reviews: [.unreachable, .unreachable, .done(code: "created", text: "reviewed")]
+        )
+
+        // First user attempt hits two unreachable responses and surfaces an alert while keeping
+        // the pending requestId for retry.
+        model.reviewInCopilot(prItem)
+        try await waitUntil { model.reviewingThreads.isEmpty }
+        XCTAssertEqual(workspace.reviewCalls.count, 2, "a lost answer is retried once with the same request id")
+        let initialRequestId = workspace.reviewCalls[0].requestId
+        XCTAssertEqual(workspace.reviewCalls[1].requestId, initialRequestId)
+        XCTAssertEqual(recorder.alerts.count, 1)
+
+        // Second user attempt reuses the exact same requestId and links the session on success.
+        model.reviewInCopilot(prItem)
+        try await waitUntil { model.reviewingThreads.isEmpty }
+        XCTAssertEqual(workspace.reviewCalls.count, 3)
+        XCTAssertEqual(workspace.reviewCalls[2].requestId, initialRequestId)
+        XCTAssertEqual(workspace.reviewCalls[2].projectId, "q")
+        XCTAssertEqual(workspace.reviewCalls[2].pullRequestURL, "https://github.com/octo/Ops/pull/19")
+        XCTAssertEqual(workspace.revealCalls.last?.projectId, "q")
+        XCTAssertEqual(workspace.revealCalls.last?.sessionId, "reviewed")
+        XCTAssertEqual(recorder.activations, [4242])
+
+        let linkedItem = try XCTUnwrap(model.items.first { $0.id.id == "1" })
+        XCTAssertEqual(linkedItem.session?.id, "reviewed")
+        XCTAssertFalse(model.canReviewInCopilot(linkedItem), "once linked to a live session, Go to Session takes over")
+        XCTAssertFalse(linkedItem.thread.unread, "starting a review marks the thread read")
+    }
+
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {

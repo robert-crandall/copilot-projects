@@ -18,6 +18,9 @@ struct ControlCommandRouter {
         let revealSession: (ControlRequest) -> ControlResponse
         let startCopilotSession: (ControlRequest) -> ControlResponse
         let resumeCopilotSession: (ControlRequest) -> ControlResponse
+        var reviewPullRequest: (ControlRequest) -> ControlResponse = { _ in
+            .failure("review-pull-request is not configured", code: "unavailable")
+        }
         var sendSessionPrompt: (ControlRequest) -> ControlResponse = { _ in
             .failure("send-session-prompt is not configured", code: "unavailable")
         }
@@ -98,6 +101,15 @@ struct ControlCommandRouter {
                     code: "bad-request")
             }
             return actions.resumeCopilotSession(request)
+        case "review-pull-request":
+            guard let projectId = request.projectId, !projectId.isEmpty,
+                  let requestId = request.requestId, UUID(uuidString: requestId) != nil,
+                  let pullRequestURL = request.path ?? request.text, !pullRequestURL.isEmpty else {
+                return .failure(
+                    "review-pull-request requires a project, a UUID request id, and a pull request URL",
+                    code: "bad-request")
+            }
+            return actions.reviewPullRequest(request)
         case "send-session-prompt":
             guard let sessionId = request.sessionId, !sessionId.isEmpty,
                   request.projectId.map({ !$0.isEmpty }) ?? true,

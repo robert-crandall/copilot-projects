@@ -1,4 +1,5 @@
 import Foundation
+import CopilotProjectsProtocol
 
 /// Why GitHub sent a notification: its `reason` field.
 enum NotificationReason: Equatable, Hashable, Sendable {
@@ -210,6 +211,12 @@ struct NotificationThread: Identifiable, Equatable, Sendable {
     var pullRequestKey: PullRequestKey? {
         guard kind == .pullRequest, let number else { return nil }
         return PullRequestKey(repository: repository, number: number)
+    }
+
+    /// Validated pull request review target for starting a local adversarial review.
+    var reviewTarget: PullRequestReviewTarget? {
+        guard kind == .pullRequest, number != nil else { return nil }
+        return PullRequestReviewTarget.parse(webURL.absoluteString)
     }
 
     /// `repo#number`, or the repository's name when the subject has no number.

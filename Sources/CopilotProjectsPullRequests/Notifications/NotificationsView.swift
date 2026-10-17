@@ -337,12 +337,14 @@ struct NotificationsView: View {
     private func footer(_ order: [NotificationItem]) -> some View {
         let selected = order.first { $0.id == selection }
         let canGoToSession = selected?.session != nil && model.isConnected
+        let canReview = selected.map(model.canReviewInCopilot) == true
         return HStack(spacing: 14) {
             if !order.isEmpty {
                 keyHint("↑↓", "Move")
                 if let selected {
                     keyHint("↩", canGoToSession ? "Go to Session" : "Open on GitHub")
                     if canGoToSession { keyHint("⌘↩", "Open on GitHub") }
+                    if canReview { keyHint("R", "Review in Copilot") }
                     keyHint("E", "Done")
                     if selected.thread.unread { keyHint("⇧I", "Mark Read") }
                     keyHint("⇧M", "Unsubscribe")
@@ -526,6 +528,8 @@ struct NotificationsView: View {
                 switch press.characters {
                 case "e":
                     markDone([item], in: order, proxy: proxy)
+                case "r" where press.modifiers.isEmpty && model.canReviewInCopilot(item):
+                    model.reviewInCopilot(item)
                 case "I":
                     model.markRead([item])
                 case "M":
@@ -777,6 +781,24 @@ struct NotificationsView: View {
         Button("Open on GitHub") { model.open(item) }
         if let session = item.session, model.isConnected {
             Button("Go to Session") { model.goToSession(session, for: item) }
+        } else if model.canReviewInCopilot(item) {
+            let reviewing = model.reviewingThreads.contains(item.id)
+            let preferredId = model.preferredProjectId(for: item.thread)
+            let preferredName = model.projects.first { $0.id == preferredId }?.name ?? "Copilot Projects"
+            Button(reviewing ? "Starting Review…" : "Review in \(preferredName)") {
+                model.reviewInCopilot(item, projectId: preferredId)
+            }
+            .disabled(reviewing)
+            if model.projects.count > 1 {
+                Menu("Review in Project") {
+                    ForEach(model.projects, id: \.id) { project in
+                        Button(project.name) {
+                            model.reviewInCopilot(item, projectId: project.id)
+                        }
+                    }
+                }
+                .disabled(reviewing)
+            }
         }
         Divider()
         if item.thread.unread {

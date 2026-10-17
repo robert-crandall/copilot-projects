@@ -140,6 +140,8 @@ final class NotificationsModel: ObservableObject {
     /// While subject details are being read, counts may still include requests
     /// that turn out to be for a team or already merged; nothing is published.
     @Published private(set) var readingDetails = false
+    /// Pull request notification threads whose Review in Copilot request is in flight.
+    @Published private(set) var reviewingThreads: Set<NotificationThread.Key> = []
 
     enum Phase: Equatable {
         case idle, loading, loaded
@@ -165,6 +167,7 @@ final class NotificationsModel: ObservableObject {
     private let clock: () -> Date
     private let openURL: (URL) -> Void
     private let isVisible: () -> Bool
+    private let presentError: @MainActor (_ title: String, _ message: String) -> Void
     weak var banners: NotificationBannerPosting?
     /// The Dock badge; nil clears it.
     var setBadge: (String?) -> Void = { NSApp.dockTile.badgeLabel = $0 }
@@ -205,6 +208,16 @@ final class NotificationsModel: ObservableObject {
     /// When each subject's details were last read.
     private var detailReadAt: [NotificationThread.Key: Date] = [:]
 
+    private struct PendingReview {
+        let requestId: UUID
+        let projectId: String
+        let pullRequestURL: String
+    }
+
+    /// Review requests to Copilot Projects that didn't get an answer, by thread,
+    /// so trying again reuses the request id and never starts a second session.
+    private var pendingReviews: [NotificationThread.Key: PendingReview] = [:]
+
     init(
         workspace: PullRequestsWorkspace = ControlWorkspaceBridge(),
         host: PullRequestsHostApp = .none,
@@ -224,7 +237,8 @@ final class NotificationsModel: ObservableObject {
         },
         clock: @escaping () -> Date = Date.init,
         openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
-        isVisible: @escaping () -> Bool = { true }
+        isVisible: @escaping () -> Bool = { true },
+        presentError: @escaping @MainActor (_ title: String, _ message: String) -> Void = PullRequestsModel.presentAlert
     ) {
         source = workspace
         self.host = host
@@ -248,6 +262,7 @@ final class NotificationsModel: ObservableObject {
         self.clock = clock
         self.openURL = openURL
         self.isVisible = isVisible
+        self.presentError = presentError
         let looked = (defaults.object(forKey: Self.lookedAtKey) as? Double).map(Date.init(timeIntervalSince1970:))
         lookedAt = looked
         bannerHighWaters = ((defaults.dictionary(forKey: Self.bannerHighWaterKey) as? [String: Double]) ?? [:])
@@ -349,6 +364,44 @@ final class NotificationsModel: ObservableObject {
         case .disconnected(let lastGood?): return PullRequestSession.sessions(in: lastGood).mapValues(\.withUnknownState)
         case .connecting, .disconnected: return [:]
         }
+    }
+
+    var projects: [(id: String, name: String)] {
+        if case .connected(let snapshot) = workspace {
+            return snapshot.projects.map { ($0.id, $0.name) }
+        }
+        return []
+    }
+
+    var defaultProjectId: String? {
+        guard case .connected(let snapshot) = workspace else { return nil }
+        if let selected = snapshot.selectedProjectId,
+           snapshot.projects.contains(where: { $0.id == selected }) {
+            return selected
+        }
+        return snapshot.projects.first?.id
+    }
+
+    /// Picks the project whose name matches the notification's repository name,
+    /// falling back to the workspace's selected project.
+    func preferredProjectId(for thread: NotificationThread) -> String? {
+        let currentProjects = projects
+        guard !currentProjects.isEmpty else { return nil }
+        let repoName = thread.repository.split(separator: "/").last.map(String.init) ?? thread.repository
+        let matching = currentProjects.filter {
+            $0.name.caseInsensitiveCompare(repoName) == .orderedSame
+        }
+        if let selected = defaultProjectId, matching.contains(where: { $0.id == selected }) {
+            return selected
+        }
+        if let firstMatch = matching.first {
+            return firstMatch.id
+        }
+        return defaultProjectId
+    }
+
+    func canReviewInCopilot(_ item: NotificationItem) -> Bool {
+        isConnected && !projects.isEmpty && item.session == nil && item.thread.reviewTarget != nil
     }
 
     func bannersEnabled(for band: NotificationBand) -> Bool {
@@ -745,22 +798,22 @@ final class NotificationsModel: ObservableObject {
         }
         let pid = snapshot.hostProcessIdentifier
         Task {
-            if await reveal(session) {
+            if await reveal(projectId: session.projectId, sessionId: session.id) {
                 host.activate(pid)
                 if let item, item.thread.unread { markRead([item]) }
             }
         }
     }
 
-    private func reveal(_ session: PullRequestSession) async -> Bool {
-        switch await source.revealSession(projectId: session.projectId, sessionId: session.id) {
+    private func reveal(projectId: String, sessionId: String) async -> Bool {
+        switch await source.revealSession(projectId: projectId, sessionId: sessionId) {
         case .done:
             return true
         case .refused(code: "conflict", _):
             // It moved to another project since the last snapshot; show it there.
             await pollWorkspace()
-            if case .connected = workspace, let moved = liveSessions[session.id], moved.projectId != session.projectId,
-               case .done = await source.revealSession(projectId: moved.projectId, sessionId: session.id) {
+            if case .connected = workspace, let moved = liveSessions[sessionId], moved.projectId != projectId,
+               case .done = await source.revealSession(projectId: moved.projectId, sessionId: sessionId) {
                 return true
             }
             return false
@@ -771,6 +824,79 @@ final class NotificationsModel: ObservableObject {
     }
 
     func openHost() { host.open?() }
+
+    /// Starts a local adversarial review session in Copilot Projects for `item`'s
+    /// pull request, reveals and activates the session, and marks the thread read.
+    func reviewInCopilot(_ item: NotificationItem, projectId: String? = nil) {
+        guard isConnected, !reviewingThreads.contains(item.id),
+              let target = item.thread.reviewTarget else { return }
+        let existingPending = pendingReviews[item.id].flatMap { pending in
+            projects.contains(where: { $0.id == pending.projectId }) && pending.pullRequestURL == target.url
+                ? pending : nil
+        }
+        guard let targetProjectId = projectId ?? existingPending?.projectId ?? preferredProjectId(for: item.thread),
+              projects.contains(where: { $0.id == targetProjectId }) else { return }
+        let review = existingPending.flatMap {
+            $0.projectId == targetProjectId ? $0 : nil
+        } ?? PendingReview(requestId: UUID(), projectId: targetProjectId, pullRequestURL: target.url)
+        pendingReviews[item.id] = review
+        reviewingThreads.insert(item.id)
+        Task {
+            await performReview(review, item: item)
+            reviewingThreads.remove(item.id)
+        }
+    }
+
+    private func performReview(_ review: PendingReview, item: NotificationItem) async {
+        var result = await source.reviewPullRequest(
+            projectId: review.projectId,
+            requestId: review.requestId,
+            pullRequestURL: review.pullRequestURL
+        )
+        if result == .unreachable {
+            // The answer may have been lost after the review session started;
+            // the same request id returns that session instead of starting another.
+            result = await source.reviewPullRequest(
+                projectId: review.projectId,
+                requestId: review.requestId,
+                pullRequestURL: review.pullRequestURL
+            )
+        }
+        switch result {
+        case .done(_, let sessionId?) where !sessionId.isEmpty:
+            pendingReviews[item.id] = nil
+            await pollWorkspace()
+            if let prKey = item.thread.pullRequestKey {
+                links[prKey] = sessionId
+            }
+            if item.thread.unread {
+                markRead([item])
+            } else {
+                noteActed([item.thread])
+            }
+            var pid: Int32?
+            if case .connected(let snapshot) = workspace {
+                pid = snapshot.hostProcessIdentifier
+            }
+            let targetProjectId = liveSessions[sessionId]?.projectId ?? review.projectId
+            if await reveal(projectId: targetProjectId, sessionId: sessionId), let pid {
+                host.activate(pid)
+            }
+        case .done:
+            pendingReviews[item.id] = nil
+            presentError("Could Not Start Review", "Copilot Projects didn’t say which session it started.")
+        case .refused(let code, let message):
+            if code != "persistence-unavailable" { pendingReviews[item.id] = nil }
+            await pollWorkspace()
+            presentError("Could Not Start Review", message)
+        case .unreachable:
+            await pollWorkspace()
+            presentError(
+                "Could Not Start Review",
+                "Copilot Projects isn’t answering. Try again; a review session that did start won’t start twice."
+            )
+        }
+    }
 
     func copyLink(_ item: NotificationItem) {
         NSPasteboard.general.clearContents()

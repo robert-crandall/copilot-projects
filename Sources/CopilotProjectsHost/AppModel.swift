@@ -404,6 +404,21 @@ final class AppModel: ObservableObject {
                 requestId: requestId, projectId: projectId, copilotSessionId: copilotSessionId
             )
         },
+        reviewPullRequest: { [unowned self] request in
+            guard let projectId = request.projectId, !projectId.isEmpty,
+                  let rawRequestId = request.requestId,
+                  let requestId = UUID(uuidString: rawRequestId),
+                  let pullRequestURL = request.path ?? request.text, !pullRequestURL.isEmpty else {
+                return .failure(
+                    "review-pull-request requires a project, a UUID request id, and a pull request URL",
+                    code: "bad-request")
+            }
+            return self.startPullRequestReviewSession(
+                requestId: requestId,
+                projectId: projectId,
+                pullRequestURL: pullRequestURL
+            )
+        },
         sendSessionPrompt: { [unowned self] request in
             guard let sessionId = request.sessionId, !sessionId.isEmpty,
                   request.projectId.map({ !$0.isEmpty }) ?? true,
@@ -5146,6 +5161,49 @@ final class AppModel: ObservableObject {
             placement: selectOnMac ? .local : .project,
             fingerprintOverride: fingerprintOverride,
             pullRequestKeys: pullRequestKeys,
+            now: now
+        )
+        switch outcome {
+        case .unknownProject:
+            return .failure(CopilotSessionStartError.projectUnavailable.localizedDescription, code: "unknown-project")
+        case .invalid:
+            return .failure("This project’s working directory no longer exists.", code: "invalid")
+        case .persistenceUnavailable:
+            return .failure("Copilot Projects couldn’t save the session. Try again; it won’t start twice.",
+                            code: "persistence-unavailable")
+        default:
+            return Self.controlResponse(for: outcome)
+        }
+    }
+
+    /// Starts a local adversarial review session for a pull request from Copilot
+    /// Notifications or CLI control callers, linking the created tab to that PR
+    /// and recording `requestId` in the creation ledger for idempotent retries.
+    func startPullRequestReviewSession(
+        requestId: UUID,
+        projectId: String,
+        pullRequestURL: String,
+        selectOnMac: Bool = true,
+        now: Date = Date()
+    ) -> ControlResponse {
+        guard let target = PullRequestReviewTarget.parse(pullRequestURL) else {
+            return .failure(
+                "Use an HTTPS github.com URL such as https://github.com/owner/repo/pull/123.",
+                code: "bad-request")
+        }
+        guard !isTerminating else {
+            return .failure(CopilotSessionStartError.shuttingDown.localizedDescription, code: "unavailable")
+        }
+        let canonicalKey = "\(target.owner.lowercased())/\(target.repository.lowercased())#\(target.number)"
+        let outcome = createRemoteSession(
+            RemoteCreateSessionRequest(
+                requestId: requestId, projectId: projectId, pullRequestURL: target.url),
+            isPlainCreate: false,
+            kind: .copilot,
+            title: target.title,
+            initialPrompt: Self.adversarialReviewPrompt(for: target),
+            placement: selectOnMac ? .local : .project,
+            pullRequestKeys: [canonicalKey],
             now: now
         )
         switch outcome {
