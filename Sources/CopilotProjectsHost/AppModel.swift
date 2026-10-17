@@ -564,7 +564,7 @@ final class AppModel: ObservableObject {
     private var permissionStatusRestores: [String: PermissionStatusRestore] = [:]
     private let isAppActive: @MainActor () -> Bool
     private let agentActivityDirectory: URL
-    private let resumeMarkerDirectory: URL
+    let resumeMarkerDirectory: URL
     private var powerOffProtectionGeneration = 0
     private(set) var isPoweringOff = false
     private let remotePromptLiveSessions: ((Set<String>) -> Set<String>)?
@@ -5185,6 +5185,7 @@ final class AppModel: ObservableObject {
     /// when its folder is gone.
     func resumePullRequestsSession(
         requestId: UUID, projectId: String, copilotSessionId: String, selectOnMac: Bool = true,
+        initialTitle: String = "Copilot",
         fingerprintOverride: String? = nil, pullRequestKeys: [String]? = nil, now: Date = Date()
     ) -> ControlResponse {
         guard !isTerminating else {
@@ -5257,8 +5258,14 @@ final class AppModel: ObservableObject {
         guard let pi = projectIndex(projectId) else {
             return .failure(CopilotSessionStartError.projectUnavailable.localizedDescription, code: "unknown-project")
         }
-        let session = Session(id: tabId, title: "Copilot", cwd: cwd, creationFingerprint: fingerprint,
-                              pullRequestKeys: pullRequestKeys)
+        let resolvedTitle = initialTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let session = Session(
+            id: tabId,
+            title: resolvedTitle.isEmpty ? "Copilot" : resolvedTitle,
+            cwd: cwd,
+            creationFingerprint: fingerprint,
+            pullRequestKeys: pullRequestKeys
+        )
         let previousSelection = projects[pi].selectedSessionId
         projects[pi].sessions.append(session)
         if selectOnMac { projects[pi].selectedSessionId = session.id }
@@ -5326,6 +5333,105 @@ final class AppModel: ObservableObject {
             return launch.sessionId
         }
         return nil
+    }
+
+    /// In-memory Copilot CLI session IDs owned or currently being resumed by live tabs.
+    /// Does not perform filesystem or process-tree work.
+    func inMemoryActiveCopilotSessionIds(now: Date = Date()) -> Set<String> {
+        var ids = Set<String>()
+        for project in projects {
+            for session in project.sessions {
+                if let activeId = session.agentActivity?.copilotSessionId, !activeId.isEmpty {
+                    ids.insert(activeId.lowercased())
+                }
+            }
+        }
+        for (copilotId, launch) in pullRequestsResumeLaunches
+            where locateIndex(launch.sessionId) != nil
+                && now.timeIntervalSince(launch.launchedAt) < Self.pullRequestsResumeStartupGrace {
+            ids.insert(copilotId.lowercased())
+        }
+        return ids
+    }
+
+    /// Reads and validates resume markers for `sessionIds` off the main actor.
+    nonisolated static func validatedMarkerCopilotSessionIds(
+        sessionIds: [String], directory: URL
+    ) -> Set<String> {
+        var ids = Set<String>()
+        for sessionId in sessionIds {
+            guard let raw = try? String(
+                contentsOf: directory.appendingPathComponent("\(sessionId).copilot-session"),
+                encoding: .utf8
+            ) else { continue }
+            let marker = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !marker.isEmpty else { continue }
+            if TranscriptController.transcriptOwnerAllowsRead(sessionId: sessionId, directory: directory),
+               !TranscriptController.isCopilotSessionQuarantined(
+                   sessionId: sessionId, copilotSessionId: marker, directory: directory
+               ) {
+                ids.insert(marker.lowercased())
+            }
+        }
+        return ids
+    }
+
+    /// Lowercased Copilot CLI session IDs owned or currently being resumed by live tabs.
+    func activeAndResumingCopilotSessionIds(now: Date = Date()) -> Set<String> {
+        let sessionIds = projects.flatMap { $0.sessions.map(\.id) }
+        return inMemoryActiveCopilotSessionIds(now: now)
+            .union(Self.validatedMarkerCopilotSessionIds(sessionIds: sessionIds, directory: resumeMarkerDirectory))
+    }
+
+    enum ResumeFinderOutcome: Equatable {
+        case opened(projectId: String, sessionId: String)
+        case permanentlyUnavailable(String)
+        case temporarilyUnavailable(String)
+    }
+
+    /// Reopens an ended Copilot session chosen in Find Session (`⌘K`).
+    func resumeFromSessionFinder(
+        copilotSessionId: String,
+        preferredProjectId: String,
+        cwd: String,
+        repository: String? = nil,
+        title: String,
+        now: Date = Date()
+    ) -> ResumeFinderOutcome {
+        let projectId: String?
+        if projects.contains(where: { $0.id == preferredProjectId }) {
+            projectId = preferredProjectId
+        } else {
+            projectId = SessionFinderSearch.targetProject(
+                forCwd: cwd,
+                repository: repository,
+                projects: sessionFinderProjectTargets,
+                selectedProjectId: selectedProjectId
+            )?.id
+        }
+        guard let projectId else {
+            return .temporarilyUnavailable(CopilotSessionStartError.projectUnavailable.localizedDescription)
+        }
+        let requestId = UUID()
+        let response = resumePullRequestsSession(
+            requestId: requestId,
+            projectId: projectId,
+            copilotSessionId: copilotSessionId,
+            selectOnMac: true,
+            initialTitle: title,
+            now: now
+        )
+        let candidateSessionId = response.text ?? requestId.uuidString
+        if let loc = locateIndex(candidateSessionId) {
+            return .opened(projectId: projects[loc.p].id, sessionId: candidateSessionId)
+        }
+        let message = response.error ?? "That Copilot session could not be resumed."
+        switch response.code {
+        case "gone", "in-use", "invalid":
+            return .permanentlyUnavailable(message)
+        default:
+            return .temporarilyUnavailable(message)
+        }
     }
 
     /// Sends or queues a prompt into an existing live session for Copilot Pull Requests.

@@ -1,6 +1,15 @@
 import Foundation
+import SQLite3
 import CopilotProjectsCore
 import CopilotProjectsProtocol
+
+/// A workspace project that an ended Copilot CLI session can resume into.
+struct SessionFinderProjectTarget: Equatable, Sendable {
+    let id: String
+    let name: String
+    let cwd: String
+    let sessionCwds: [String]
+}
 
 /// The identity of a session as the finder sees it: copied off `AppModel` on the
 /// main actor so transcript indexing can run without touching live state.
@@ -13,6 +22,16 @@ struct SessionFinderSource: Equatable, Sendable {
     /// When the session's transcript last changed, read when the finder opens so
     /// recent ordering is known immediately and does not shift once indexed.
     var lastActivity: Date? = nil
+    /// Set for an ended Copilot CLI session that can be reopened with `copilot --resume`.
+    var resumableCopilotSessionId: String? = nil
+    /// Optional `owner/repo` recorded for an ended session.
+    var repository: String? = nil
+
+    var isResumable: Bool { resumableCopilotSessionId != nil }
+
+    static func resumableSessionId(for copilotSessionId: String) -> String {
+        "resumable:\(copilotSessionId.lowercased())"
+    }
 }
 
 /// One searchable session. Folded fields are lowercased and diacritic-insensitive
@@ -42,15 +61,29 @@ struct SessionFinderEntry: Identifiable, Equatable, Sendable {
     static let maximumOpeningCharacters = 2_000
 
     init(source: SessionFinderSource, transcript: TranscriptSnapshot? = nil) {
-        self.source = source
         let turns = transcript?.turns ?? []
-        lastActivity = source.lastActivity ?? turns.last.map { $0.endedAt ?? $0.startedAt }
+        self.init(
+            source: source,
+            requests: turns.map(\.userContent).filter { !$0.isEmpty },
+            replies: turns.flatMap { $0.assistantMessages.map(\.content) }.filter { !$0.isEmpty },
+            lastActivity: source.lastActivity ?? turns.last.map { $0.endedAt ?? $0.startedAt }
+        )
+    }
+
+    init(
+        source: SessionFinderSource,
+        requests rawRequests: [String],
+        replies rawReplies: [String],
+        lastActivity: Date? = nil
+    ) {
+        self.source = source
+        self.lastActivity = lastActivity ?? source.lastActivity
         requests = Self.boundedRequests(
-            turns.map(\.userContent).filter { !$0.isEmpty },
+            rawRequests.filter { !$0.isEmpty },
             characters: Self.maximumSearchCharacters
         )
         replies = Self.suffix(
-            turns.flatMap { $0.assistantMessages.map(\.content) }.filter { !$0.isEmpty },
+            rawReplies.filter { !$0.isEmpty },
             characters: Self.maximumSearchCharacters
         )
         foldedTitle = SessionFinderSearch.fold(source.title)
@@ -157,7 +190,8 @@ enum SessionFinderSearch {
     ) -> [LocalMatch] {
         let words = tokens(query)
         guard !words.isEmpty else { return [] }
-        let ordered = recent(entries)
+        let ordered = recent(entries.filter { !$0.source.isResumable })
+            + recent(entries.filter(\.source.isResumable))
         var matches: [(entry: SessionFinderEntry, score: Int, conversation: (word: String, text: String)?)] = []
         for entry in ordered {
             if Task.isCancelled { return [] }
@@ -260,6 +294,382 @@ enum SessionFinderSearch {
     static func collapseWhitespace(_ text: String) -> String {
         text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
+
+    /// Picks the project an ended session belongs to: a project sharing its
+    /// specific working directory or folder/repository name, or the currently
+    /// selected project when nothing more specific matches.
+    static func targetProject(
+        forCwd cwd: String,
+        repository: String? = nil,
+        projects: [SessionFinderProjectTarget],
+        selectedProjectId: String?,
+        defaultStartupDir: String = Paths.defaultStartupDir
+    ) -> SessionFinderProjectTarget? {
+        guard !projects.isEmpty else { return nil }
+        let selected = selectedProjectId.flatMap { id in projects.first { $0.id == id } }
+        let fallback = selected ?? projects[0]
+        let normalizedCwd = Paths.normalizedDirectory(cwd)
+        let normalizedDefault = Paths.normalizedDirectory(defaultStartupDir)
+
+        func preferred(_ candidates: [SessionFinderProjectTarget]) -> SessionFinderProjectTarget? {
+            guard !candidates.isEmpty else { return nil }
+            if let selected, candidates.contains(where: { $0.id == selected.id }) { return selected }
+            return candidates[0]
+        }
+
+        if !normalizedCwd.isEmpty, normalizedCwd != normalizedDefault {
+            let bySessionCwd = projects.filter { project in
+                project.sessionCwds.contains { Paths.normalizedDirectory($0) == normalizedCwd }
+            }
+            if let match = preferred(bySessionCwd) { return match }
+
+            let byProjectCwd = projects.filter {
+                Paths.normalizedDirectory($0.cwd) == normalizedCwd
+            }
+            if let match = preferred(byProjectCwd) { return match }
+        }
+
+        func folderToken(_ path: String) -> String? {
+            let norm = Paths.normalizedDirectory(path)
+            guard !norm.isEmpty, norm != "/", norm != normalizedDefault else { return nil }
+            let token = fold((norm as NSString).lastPathComponent)
+            return token.isEmpty ? nil : token
+        }
+
+        let folder = folderToken(normalizedCwd) ?? ""
+        let repoName = repository?.split(separator: "/").last.map(String.init) ?? ""
+        let tokens = [folder, fold(repoName)].filter { !$0.isEmpty }
+
+        // Check exact project name, session folder, or project folder matches across all tokens first.
+        for token in tokens {
+            let byName = projects.filter { fold($0.name) == token }
+            if let match = preferred(byName) { return match }
+
+            let bySessionFolder = projects.filter { project in
+                project.sessionCwds.contains { folderToken($0) == token }
+            }
+            if let match = preferred(bySessionFolder) { return match }
+
+            let byProjectFolder = projects.filter { folderToken($0.cwd) == token }
+            if let match = preferred(byProjectFolder) { return match }
+        }
+
+        // Next check worktree-prefix matches (`<project>-*`), preferring the longest prefix.
+        var bestPrefixLength = 0
+        var bestPrefixProjects: [SessionFinderProjectTarget] = []
+        for project in projects {
+            var longestForProject = 0
+            let candidatePrefixes = [fold(project.name)]
+                + ([project.cwd] + project.sessionCwds).compactMap(folderToken)
+            for token in tokens {
+                for prefix in candidatePrefixes where prefix.count >= 3 && token.hasPrefix(prefix + "-") {
+                    longestForProject = max(longestForProject, prefix.count)
+                }
+            }
+            guard longestForProject > 0 else { continue }
+            if longestForProject > bestPrefixLength {
+                bestPrefixLength = longestForProject
+                bestPrefixProjects = [project]
+            } else if longestForProject == bestPrefixLength {
+                bestPrefixProjects.append(project)
+            }
+        }
+        if let match = preferred(bestPrefixProjects) { return match }
+
+        return fallback
+    }
+}
+
+/// Loads recent ended Copilot CLI sessions from `$COPILOT_HOME` that can be
+/// resumed into the workspace.
+enum SessionFinderResumableLoader {
+    static let defaultLimit = 30
+    static let candidateScanLimit = 120
+    static let maximumTranscriptBytes = 2 * 1024 * 1024
+
+    private struct DatabaseCandidate {
+        let id: String
+        let repository: String?
+        let summary: String?
+        let updatedAt: Date?
+    }
+
+    static func load(
+        store: CopilotSessionStore = CopilotSessionStore(),
+        projects: [SessionFinderProjectTarget],
+        selectedProjectId: String?,
+        liveCopilotSessionIds: Set<String>,
+        defaultStartupDir: String = Paths.defaultStartupDir,
+        limit: Int = defaultLimit
+    ) -> [SessionFinderEntry] {
+        guard limit > 0, !projects.isEmpty else { return [] }
+        let live = Set(liveCopilotSessionIds.map { $0.lowercased() })
+        var db: OpaquePointer?
+        if FileManager.default.fileExists(atPath: store.databasePath) {
+            let uri = URL(fileURLWithPath: store.databasePath).absoluteString + "?mode=ro"
+            if sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK, let db {
+                sqlite3_busy_timeout(db, 250)
+            } else {
+                sqlite3_close(db)
+                db = nil
+            }
+        }
+        defer { sqlite3_close(db) }
+
+        let dbOrdered = db.map { readDatabaseCandidates($0, limit: candidateScanLimit) } ?? []
+        let dbById = Dictionary(dbOrdered.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var dirModifiedById: [String: Date] = [:]
+        var unindexedIds: [String] = []
+        if let dirNames = try? FileManager.default.contentsOfDirectory(atPath: store.sessionStateDirectory) {
+            var seen = Set(dbById.keys)
+            var unindexed: [(id: String, modified: Date)] = []
+            for name in dirNames {
+                let lowered = name.lowercased()
+                guard CopilotSessionStore.isValidSessionId(lowered),
+                      let dirPath = store.directory(for: lowered) else { continue }
+                let modified = (try? FileManager.default.attributesOfItem(atPath: dirPath)[.modificationDate] as? Date)
+                    ?? .distantPast
+                dirModifiedById[lowered] = modified
+                if seen.insert(lowered).inserted {
+                    unindexed.append((lowered, modified))
+                }
+            }
+            unindexed.sort { $0.modified != $1.modified ? $0.modified > $1.modified : $0.id < $1.id }
+            unindexedIds = unindexed.prefix(candidateScanLimit).map(\.id)
+        }
+
+        let allCandidateIds = dbOrdered.map(\.id) + unindexedIds
+        guard !allCandidateIds.isEmpty else { return [] }
+
+        var recordsById: [String: CopilotSessionRecord] = [:]
+        var rankedCandidates: [(id: String, sortDate: Date, order: Int)] = []
+        rankedCandidates.reserveCapacity(allCandidateIds.count)
+        for (order, id) in allCandidateIds.enumerated() {
+            let record = store.record(for: id)
+            if let record { recordsById[id] = record }
+            let dbRow = dbById[id]
+            let sortDate = record?.updatedAt
+                ?? dbRow?.updatedAt
+                ?? record?.createdAt
+                ?? dirModifiedById[id]
+                ?? .distantPast
+            rankedCandidates.append((id: id, sortDate: sortDate, order: order))
+        }
+        rankedCandidates.sort { lhs, rhs in
+            if lhs.sortDate != rhs.sortDate { return lhs.sortDate > rhs.sortDate }
+            return lhs.order < rhs.order
+        }
+
+        var entries: [SessionFinderEntry] = []
+        for candidate in rankedCandidates.prefix(candidateScanLimit) {
+            if Task.isCancelled { return [] }
+            guard entries.count < limit else { break }
+            let id = candidate.id
+            guard CopilotSessionStore.isValidSessionId(id), !live.contains(id),
+                  let record = recordsById[id],
+                  record.clientName == nil || record.clientName == "github/cli",
+                  !store.isInUse(id) else { continue }
+            let dbRow = dbById[id]
+            let cwd = Paths.normalizedDirectory(record.cwd ?? "")
+            guard !cwd.isEmpty, isDirectory(cwd) else { continue }
+            guard let (requests, replies) = loadConversation(for: id, db: db, store: store),
+                  !requests.isEmpty || !replies.isEmpty else { continue }
+            let lastActive = record.updatedAt ?? dbRow?.updatedAt ?? record.createdAt ?? dirModifiedById[id]
+            let recordedTitle = record.displayName ?? firstLine(dbRow?.summary)
+            guard let targetProject = SessionFinderSearch.targetProject(
+                forCwd: cwd,
+                repository: dbRow?.repository,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                defaultStartupDir: defaultStartupDir
+            ) else { continue }
+            let title = recordedTitle ?? firstLine(requests.first) ?? "Copilot session"
+            let source = SessionFinderSource(
+                sessionId: SessionFinderSource.resumableSessionId(for: id),
+                projectId: targetProject.id,
+                projectName: targetProject.name,
+                title: title,
+                cwd: cwd,
+                lastActivity: lastActive,
+                resumableCopilotSessionId: id,
+                repository: dbRow?.repository
+            )
+            entries.append(SessionFinderEntry(
+                source: source,
+                requests: requests,
+                replies: replies,
+                lastActivity: lastActive
+            ))
+        }
+        return SessionFinderSearch.recent(entries)
+    }
+
+    private static func readDatabaseCandidates(_ db: OpaquePointer, limit: Int) -> [DatabaseCandidate] {
+        let sql = "SELECT id, repository, summary, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?1"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            sqlite3_finalize(statement)
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(limit))
+        var result: [DatabaseCandidate] = []
+        var seen = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let idText = sqlite3_column_text(statement, 0) else { continue }
+            let id = String(cString: idText).lowercased()
+            guard seen.insert(id).inserted else { continue }
+            let repo = sqlite3_column_text(statement, 1).map { String(cString: $0) }
+            let summary = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+            let updatedText = sqlite3_column_text(statement, 3).map { String(cString: $0) }
+            result.append(DatabaseCandidate(
+                id: id,
+                repository: repo?.isEmpty == false ? repo : nil,
+                summary: summary?.isEmpty == false ? summary : nil,
+                updatedAt: updatedText.flatMap(parseDatabaseDate)
+            ))
+        }
+        return result
+    }
+
+    /// Reads the session's event log first so intermediate assistant explanations
+    /// are preserved, falling back to `turns` in `session-store.db` only when a
+    /// non-empty event log exists on disk. Sessions without a non-empty event log
+    /// cannot be resumed by the CLI and return `nil`.
+    private static func loadConversation(
+        for sessionId: String,
+        db: OpaquePointer?,
+        store: CopilotSessionStore
+    ) -> (requests: [String], replies: [String])? {
+        guard let path = store.transcriptPath(for: sessionId),
+              let data = readBoundedData(atPath: path, maxBytes: maximumTranscriptBytes),
+              !data.isEmpty else {
+            return nil
+        }
+        if let text = String(data: data, encoding: .utf8) {
+            let fromEvents = parseEventsJSONL(text)
+            if !fromEvents.requests.isEmpty || !fromEvents.replies.isEmpty {
+                return fromEvents
+            }
+        }
+        if let db {
+            let fromTurns = readDatabaseTurns(db, sessionId: sessionId)
+            if !fromTurns.requests.isEmpty || !fromTurns.replies.isEmpty {
+                return fromTurns
+            }
+        }
+        return nil
+    }
+
+    private static func readDatabaseTurns(
+        _ db: OpaquePointer,
+        sessionId: String
+    ) -> (requests: [String], replies: [String]) {
+        let sql = "SELECT user_message, assistant_response FROM turns WHERE session_id = ?1 ORDER BY turn_index ASC"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            sqlite3_finalize(statement)
+            return ([], [])
+        }
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(statement, 1, sessionId, -1, transient) == SQLITE_OK else {
+            return ([], [])
+        }
+        var requests: [String] = []
+        var replies: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let userText = sqlite3_column_text(statement, 0) {
+                let value = String(cString: userText)
+                if !value.isEmpty { requests.append(value) }
+            }
+            if let assistantText = sqlite3_column_text(statement, 1) {
+                let value = String(cString: assistantText)
+                if !value.isEmpty { replies.append(value) }
+            }
+        }
+        return (requests, replies)
+    }
+
+    private struct EventLine: Decodable {
+        struct Payload: Decodable {
+            let content: String?
+        }
+        let type: String?
+        let data: Payload?
+    }
+
+    static func parseEventsJSONL(_ text: String) -> (requests: [String], replies: [String]) {
+        let decoder = JSONDecoder()
+        var requests: [String] = []
+        var replies: [String] = []
+        var untyped: [String] = []
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let event = try? decoder.decode(EventLine.self, from: Data(line.utf8)),
+                  let content = event.data?.content, !content.isEmpty else { continue }
+            switch event.type {
+            case "user.message":
+                requests.append(content)
+            case "assistant.message":
+                replies.append(content)
+            case nil:
+                untyped.append(content)
+            default:
+                break
+            }
+        }
+        if requests.isEmpty && replies.isEmpty && !untyped.isEmpty {
+            return (untyped, [])
+        }
+        return (requests, replies)
+    }
+
+    private static func readBoundedData(atPath path: String, maxBytes: Int) -> Data? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue,
+              size > 0 else { return nil }
+        if size <= maxBytes {
+            return try? handle.readToEnd()
+        }
+        let headBytes = min(256 * 1024, maxBytes / 4)
+        let tailBytes = maxBytes - headBytes
+        let head = (try? handle.read(upToCount: headBytes)) ?? Data()
+        try? handle.seek(toOffset: UInt64(max(0, size - tailBytes)))
+        let tail = (try? handle.readToEnd()) ?? Data()
+        var combined = Data()
+        if let lastNewline = head.lastIndex(of: UInt8(ascii: "\n")) {
+            combined.append(head[...lastNewline])
+        }
+        if let firstNewline = tail.firstIndex(of: UInt8(ascii: "\n")), firstNewline + 1 < tail.endIndex {
+            combined.append(tail[(firstNewline + 1)...])
+        }
+        return combined
+    }
+
+    private static func firstLine(_ text: String?) -> String? {
+        text?.split(whereSeparator: \.isNewline).first
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : String($0.prefix(120)) }
+    }
+
+    private static func parseDatabaseDate(_ value: String) -> Date? {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: value) { return date }
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: value) { return date }
+        let sql = DateFormatter()
+        sql.locale = Locale(identifier: "en_US_POSIX")
+        sql.timeZone = TimeZone(secondsFromGMT: 0)
+        sql.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return sql.date(from: value)
+    }
+
+    private static func isDirectory(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
 }
 
 /// A session Luna picked, with its one-line explanation.
@@ -284,7 +694,9 @@ enum LunaSessionPrompt {
         var aliases: [String: String] = [:]
         var blocks: [String] = []
         var used = 0
-        for (offset, entry) in SessionFinderSearch.recent(entries).enumerated() {
+        let ordered = SessionFinderSearch.recent(entries.filter { !$0.source.isResumable })
+            + SessionFinderSearch.recent(entries.filter(\.source.isResumable))
+        for (offset, entry) in ordered.enumerated() {
             let alias = "S\(offset + 1)"
             let block = describe(entry, alias: alias, now: now)
             guard used + block.count <= maximumSessionCharacters else { break }
@@ -318,6 +730,9 @@ enum LunaSessionPrompt {
         header += " | folder: \(clip(abbreviateHome(entry.source.cwd), 100))"
         if let lastActivity = entry.lastActivity {
             header += " | last active: \(relative(lastActivity, now: now))"
+        }
+        if entry.source.isResumable {
+            header += " | status: ended (resumable)"
         }
         var lines = [header]
         if let first = entry.requests.first {

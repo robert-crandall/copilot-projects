@@ -18,16 +18,19 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     }
 
     enum Section: Hashable {
-        case recent, matches, luna
+        case recent, recentEnded, matches, luna
 
         var title: String {
             switch self {
             case .recent: return "Recent Sessions"
+            case .recentEnded: return "Recent Ended Sessions"
             case .matches: return "Matches"
             case .luna: return "Suggested by Luna"
             }
         }
     }
+
+    static let maximumRecentEndedRows = 15
 
     struct Row: Identifiable {
         let entry: SessionFinderEntry
@@ -59,6 +62,8 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     @Published private(set) var luna: LunaPhase = .idle
     @Published private(set) var highlightedId: String?
     @Published private(set) var isIndexing = true
+    @Published private(set) var isLoadingResumable = true
+    @Published private(set) var resumeError: String?
 
     var highlight: Highlight {
         Highlight(sessionId: highlightedId, lunaReason: rows.first { $0.id == highlightedId }?.lunaReason)
@@ -72,7 +77,9 @@ final class SessionFinderModel: ObservableObject, Identifiable {
 
     private(set) var entries: [SessionFinderEntry]
     private var liveSessionIds: Set<String>
+    private var activeCopilotSessionIds: Set<String> = []
     private var localMatches: [SessionFinderSearch.LocalMatch] = []
+    private var displayedLunaMatches: [LunaMatch] = []
     private var lunaCache: [String: [LunaMatch]] = [:]
     private var indexTask: Task<Void, Never>?
     private var lunaTask: Task<Void, Never>?
@@ -85,14 +92,17 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     init(
         sources: [SessionFinderSource],
         currentSessionId: String? = nil,
+        activeCopilotSessionIds: Set<String> = [],
         ranker: SessionRanking = LunaSessionRanker(),
         lunaDelay: TimeInterval = 0.6,
         loadTranscript: @escaping @Sendable (String) -> TranscriptSnapshot? = {
             TranscriptController.loadRemoteSnapshot(sessionId: $0)
         },
+        loadResumableEntries: @escaping @Sendable () -> [SessionFinderEntry] = { [] },
         onOpen: @escaping (String) -> Void
     ) {
         self.currentSessionId = currentSessionId
+        self.activeCopilotSessionIds = Set(activeCopilotSessionIds.map { $0.lowercased() })
         self.ranker = ranker
         self.lunaDelay = lunaDelay
         self.onOpen = onOpen
@@ -100,20 +110,66 @@ final class SessionFinderModel: ObservableObject, Identifiable {
         liveSessionIds = Set(sources.map(\.sessionId))
         rebuildRows()
         indexTask = Task { [weak self] in
-            let scan = Task.detached(priority: .userInitiated) {
+            let liveScan = Task.detached(priority: .userInitiated) {
                 SessionFinderSearch.index(sources, loadTranscript: loadTranscript)
             }
-            let indexed = await withTaskCancellationHandler {
-                await scan.value
+            let liveIndexed = await withTaskCancellationHandler {
+                await liveScan.value
             } onCancel: {
-                scan.cancel()
+                liveScan.cancel()
             }
             guard !Task.isCancelled, let self else { return }
-            self.entries = indexed
+            self.entries = liveIndexed
             self.isIndexing = false
             self.refreshLocalMatches()
             self.scheduleLuna()
+
+            let resumableScan = Task.detached(priority: .userInitiated) {
+                loadResumableEntries()
+            }
+            let resumableIndexed = await withTaskCancellationHandler {
+                await resumableScan.value
+            } onCancel: {
+                resumableScan.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            self.isLoadingResumable = false
+            if !resumableIndexed.isEmpty {
+                self.lunaTask?.cancel()
+                self.lunaTask = nil
+                if !SessionFinderSearch.tokens(self.query).isEmpty, self.highlightedId != nil {
+                    self.userMovedHighlight = true
+                }
+                self.entries = liveIndexed + resumableIndexed
+                self.lunaCache.removeAll()
+                self.refreshLocalMatches()
+                self.scheduleLuna(preserveDisplayedMatches: true)
+            }
         }
+    }
+
+    private func isAvailable(_ entry: SessionFinderEntry) -> Bool {
+        if let copilotId = entry.source.resumableCopilotSessionId?.lowercased() {
+            return !activeCopilotSessionIds.contains(copilotId)
+        }
+        return liveSessionIds.contains(entry.id)
+    }
+
+    private var availableEntries: [SessionFinderEntry] {
+        entries.filter(isAvailable)
+    }
+
+    var hasResumableSessions: Bool {
+        availableEntries.contains { $0.source.isResumable }
+    }
+
+    var highlightedIsResumable: Bool {
+        guard let highlightedId else { return false }
+        return rows.first { $0.id == highlightedId }?.entry.source.isResumable == true
+    }
+
+    func source(for sessionId: String) -> SessionFinderSource? {
+        availableEntries.first { $0.id == sessionId }?.source
     }
 
     /// Stops indexing and any Luna run. Call when the finder closes.
@@ -124,14 +180,31 @@ final class SessionFinderModel: ObservableObject, Identifiable {
         lunaTask = nil
     }
 
-    /// Drops sessions that ended while the finder was open.
-    func retainSessions(_ sessionIds: Set<String>) {
-        guard sessionIds != liveSessionIds else { return }
+    /// Drops sessions that ended while the finder was open and hides ended
+    /// sessions that are now live or resuming in a tab.
+    func retainSessions(_ sessionIds: Set<String>, activeCopilotSessionIds: Set<String>? = nil) {
+        let loweredCopilot = activeCopilotSessionIds.map { Set($0.map { $0.lowercased() }) }
+            ?? self.activeCopilotSessionIds
+        guard sessionIds != liveSessionIds || loweredCopilot != self.activeCopilotSessionIds else { return }
         liveSessionIds = sessionIds
-        rebuildRows()
+        self.activeCopilotSessionIds = loweredCopilot
+        refreshLocalMatches()
+    }
+
+    /// Drops a resumable entry that could not be reopened.
+    func removeResumableSession(id: String, error: String? = nil) {
+        resumeError = error
+        guard entries.contains(where: { $0.id == id && $0.source.isResumable }) else { return }
+        entries.removeAll { $0.id == id && $0.source.isResumable }
+        refreshLocalMatches()
+    }
+
+    func setResumeError(_ message: String?) {
+        resumeError = message
     }
 
     func moveHighlight(_ delta: Int) {
+        resumeError = nil
         guard !rows.isEmpty else { return }
         let current = rows.firstIndex { $0.id == highlightedId } ?? (delta > 0 ? -1 : rows.count)
         let next = min(max(current + delta, 0), rows.count - 1)
@@ -150,6 +223,8 @@ final class SessionFinderModel: ObservableObject, Identifiable {
 
     private func queryDidChange() {
         userMovedHighlight = false
+        resumeError = nil
+        displayedLunaMatches = []
         lunaTask?.cancel()
         lunaTask = nil
         refreshLocalMatches()
@@ -157,27 +232,35 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     }
 
     private func refreshLocalMatches() {
-        localMatches = SessionFinderSearch.localMatches(for: query, in: entries)
+        localMatches = SessionFinderSearch.localMatches(for: query, in: availableEntries)
         rebuildRows()
     }
 
     /// Any query with a non-space character goes to Luna once typing pauses.
-    private func scheduleLuna() {
+    private func scheduleLuna(preserveDisplayedMatches: Bool = false) {
+        lunaTask?.cancel()
+        lunaTask = nil
         let text = SessionFinderSearch.collapseWhitespace(query)
-        guard !isIndexing, !text.isEmpty, !entries.isEmpty else {
+        let searchable = availableEntries
+        guard !isIndexing, !text.isEmpty, !searchable.isEmpty else {
+            displayedLunaMatches = []
             luna = .idle
             rebuildRows()
             return
         }
         let key = SessionFinderSearch.fold(text)
         if let cached = lunaCache[key] {
+            displayedLunaMatches = cached
             luna = .finished(cached)
             rebuildRows()
             return
         }
+        if !preserveDisplayedMatches {
+            displayedLunaMatches = []
+        }
+        let previousDisplayed = displayedLunaMatches
         luna = .pending
         rebuildRows()
-        let entries = entries
         let ranker = ranker
         let delay = lunaDelay
         lunaTask = Task { [weak self] in
@@ -186,13 +269,26 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             self?.luna = .searching
             let phase: LunaPhase
             do {
-                let matches = try await ranker.rank(query: text, entries: entries)
+                let matches = try await ranker.rank(query: text, entries: searchable)
                 guard !Task.isCancelled else { return }
-                self?.lunaCache[key] = matches
-                phase = .finished(matches)
+                let combined: [LunaMatch]
+                if preserveDisplayedMatches && !previousDisplayed.isEmpty {
+                    let seen = Set(matches.map(\.sessionId))
+                    combined = matches + previousDisplayed.filter { !seen.contains($0.sessionId) }
+                } else {
+                    combined = matches
+                }
+                self?.displayedLunaMatches = combined
+                self?.lunaCache[key] = combined
+                phase = .finished(combined)
             } catch {
                 guard !Task.isCancelled, !(error is CancellationError) else { return }
-                phase = .failed((error as? LunaSearchError)?.message ?? error.localizedDescription)
+                if preserveDisplayedMatches && !previousDisplayed.isEmpty {
+                    phase = .finished(previousDisplayed)
+                } else {
+                    self?.displayedLunaMatches = []
+                    phase = .failed((error as? LunaSearchError)?.message ?? error.localizedDescription)
+                }
             }
             self?.luna = phase
             self?.rebuildRows()
@@ -200,18 +296,31 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     }
 
     private func rebuildRows() {
-        let live = entries.filter { liveSessionIds.contains($0.id) }
+        let available = availableEntries
+        let live = available.filter { !$0.source.isResumable }
+        let resumable = available.filter(\.source.isResumable)
+        let availableIds = Set(available.map(\.id))
         var built: [Row]
         let browsing = SessionFinderSearch.tokens(query).isEmpty
         if browsing {
-            built = SessionFinderSearch.recent(live).map {
+            let liveRows = SessionFinderSearch.recent(live).map {
                 Row(entry: $0, section: .recent, snippet: nil, lunaReason: nil)
             }
+            let endedRows = SessionFinderSearch.recent(resumable)
+                .prefix(Self.maximumRecentEndedRows)
+                .map {
+                    Row(entry: $0, section: .recentEnded, snippet: nil, lunaReason: nil)
+                }
+            built = liveRows + endedRows
         } else {
-            var picks: [LunaMatch] = []
-            if case .finished(let matches) = luna { picks = matches }
+            let picks: [LunaMatch]
+            if case .finished(let matches) = luna {
+                picks = matches
+            } else {
+                picks = displayedLunaMatches
+            }
             let reasons = Dictionary(picks.map { ($0.sessionId, $0.reason) }, uniquingKeysWith: { first, _ in first })
-            built = localMatches.filter { liveSessionIds.contains($0.entry.id) }.map { match in
+            built = localMatches.filter { availableIds.contains($0.entry.id) }.map { match in
                 Row(
                     entry: match.entry, section: .matches,
                     snippet: match.snippet, lunaReason: reasons[match.entry.id]
@@ -220,7 +329,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             // Luna's extra picks go below the instant matches so a late answer never
             // moves the row under the cursor.
             let listed = Set(built.map(\.id))
-            let byId = Dictionary(live.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let byId = Dictionary(available.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             for pick in picks where !listed.contains(pick.sessionId) {
                 guard let entry = byId[pick.sessionId] else { continue }
                 built.append(Row(entry: entry, section: .luna, snippet: nil, lunaReason: pick.reason))
@@ -228,8 +337,11 @@ final class SessionFinderModel: ObservableObject, Identifiable {
         }
         rows = built
         if !(userMovedHighlight && built.contains { $0.id == highlightedId }) {
-            // Browsing defaults past the current session, like ⌘Tab.
-            let preferred = browsing ? built.first { $0.id != currentSessionId } : nil
+            // Browsing defaults past the current session among live tabs, like ⌘Tab.
+            let liveBrowsing = browsing ? built.filter { !$0.entry.source.isResumable } : []
+            let preferred = browsing
+                ? (liveBrowsing.first { $0.id != currentSessionId } ?? liveBrowsing.first ?? built.first)
+                : nil
             highlightedId = (preferred ?? built.first)?.id
             userMovedHighlight = false
         }
@@ -260,6 +372,17 @@ extension AppModel {
             }
         }
     }
+
+    var sessionFinderProjectTargets: [SessionFinderProjectTarget] {
+        projects.map { project in
+            SessionFinderProjectTarget(
+                id: project.id,
+                name: project.name,
+                cwd: project.cwd,
+                sessionCwds: project.sessions.map(\.cwd)
+            )
+        }
+    }
 }
 
 struct SessionFinderView: View {
@@ -267,6 +390,7 @@ struct SessionFinderView: View {
     @ObservedObject var model: AppModel
     let onDismiss: () -> Void
     @FocusState private var searchFocused: Bool
+    @State private var markerCopilotSessionIds: Set<String> = []
 
     private struct LiveSession {
         let session: Session
@@ -286,12 +410,27 @@ struct SessionFinderView: View {
         .frame(width: 640, height: 460)
         .background(StudioStyle.chrome)
         .defaultFocus($searchFocused, true)
+        .task(id: liveSessionIds) {
+            let ids = liveSessionIds
+            let directory = model.resumeMarkerDirectory
+            let validated = await Task.detached(priority: .utility) {
+                AppModel.validatedMarkerCopilotSessionIds(sessionIds: ids, directory: directory)
+            }.value
+            guard !Task.isCancelled else { return }
+            markerCopilotSessionIds = validated
+        }
         .onAppear {
             searchFocused = true
+            finder.retainSessions(Set(liveSessionIds), activeCopilotSessionIds: activeCopilotSessionIds)
             announce(finder.highlightedId, live: live)
         }
         .onDisappear { finder.cancel() }
-        .onChange(of: liveSessionIds) { _, ids in finder.retainSessions(Set(ids)) }
+        .onChange(of: liveSessionIds) { _, ids in
+            finder.retainSessions(Set(ids), activeCopilotSessionIds: activeCopilotSessionIds)
+        }
+        .onChange(of: activeCopilotSessionIds) { _, copilotIds in
+            finder.retainSessions(Set(liveSessionIds), activeCopilotSessionIds: copilotIds)
+        }
         .onChange(of: finder.highlight) { previous, highlight in
             if highlight.isWorthAnnouncing(after: previous) { announce(highlight.sessionId, live: live) }
         }
@@ -299,6 +438,10 @@ struct SessionFinderView: View {
 
     private var liveSessionIds: [String] {
         model.projects.flatMap { $0.sessions.map(\.id) }
+    }
+
+    private var activeCopilotSessionIds: Set<String> {
+        model.inMemoryActiveCopilotSessionIds().union(markerCopilotSessionIds)
     }
 
     private var liveSessions: [String: LiveSession] {
@@ -313,9 +456,15 @@ struct SessionFinderView: View {
 
     /// Focus stays in the search field, so VoiceOver hears the highlighted row.
     private func announce(_ sessionId: String?, live: [String: LiveSession]) {
-        guard let sessionId, let current = live[sessionId],
-              let row = finder.rows.first(where: { $0.id == sessionId }) else { return }
-        var text = "\(current.session.title), \(current.projectName), \(current.session.attentionLabel)"
+        guard let sessionId, let row = finder.rows.first(where: { $0.id == sessionId }) else { return }
+        var text: String
+        if let current = live[sessionId] {
+            text = "\(current.session.title), \(current.projectName), \(current.session.attentionLabel)"
+        } else if row.entry.source.isResumable {
+            text = "\(row.entry.source.title), \(row.entry.source.projectName), Ended, resume in \(row.entry.source.projectName)"
+        } else {
+            return
+        }
         if let reason = row.lunaReason, !reason.isEmpty { text += ". Suggested by Luna: \(reason)" }
         AccessibilityNotification.Announcement(text).post()
     }
@@ -353,13 +502,17 @@ struct SessionFinderView: View {
     private func results(live: [String: LiveSession]) -> some View {
         let rows = finder.rows
         let searching = !SessionFinderSearch.tokens(finder.query).isEmpty
-        if live.isEmpty {
+        let isReadingConversations = finder.isIndexing || finder.isLoadingResumable
+        if live.isEmpty && !finder.hasResumableSessions && !isReadingConversations {
             ContentUnavailableView(
                 "No Sessions Yet", systemImage: "terminal",
                 description: Text("Start a Copilot session with ⌘T, then find it here.")
             )
-        } else if rows.isEmpty && searching && finder.isIndexing {
-            statusList(title: SessionFinderModel.Section.matches.title, message: "Reading conversations…")
+        } else if rows.isEmpty && isReadingConversations {
+            statusList(
+                title: searching ? SessionFinderModel.Section.matches.title : SessionFinderModel.Section.recent.title,
+                message: "Reading conversations…"
+            )
         } else if rows.isEmpty && finder.luna == .pending {
             statusList(title: SessionFinderModel.Section.luna.title, message: "Luna searches when you pause typing.")
         } else if rows.isEmpty && finder.luna == .searching {
@@ -376,10 +529,18 @@ struct SessionFinderView: View {
                                 if let current = live[row.id] {
                                     SessionFinderRow(
                                         row: row,
-                                        session: current.session,
-                                        projectName: current.projectName,
+                                        target: .live(session: current.session, projectName: current.projectName),
                                         isHighlighted: row.id == finder.highlightedId,
                                         isCurrent: row.id == model.globalSelectedSessionId,
+                                        onOpen: { finder.open(row.id) }
+                                    )
+                                    .id(row.id)
+                                } else if row.entry.source.isResumable {
+                                    SessionFinderRow(
+                                        row: row,
+                                        target: .resumable(projectName: row.entry.source.projectName),
+                                        isHighlighted: row.id == finder.highlightedId,
+                                        isCurrent: false,
                                         onOpen: { finder.open(row.id) }
                                     )
                                     .id(row.id)
@@ -444,7 +605,7 @@ struct SessionFinderView: View {
     private var footer: some View {
         HStack(spacing: 14) {
             keyHint("↑↓", "Move")
-            keyHint("↩", "Open")
+            keyHint("↩", finder.highlightedIsResumable ? "Resume" : "Open")
             // Escape clears a search before it closes; the legend says which.
             Button {
                 if finder.query.isEmpty { onDismiss() } else { finder.query = "" }
@@ -465,26 +626,35 @@ struct SessionFinderView: View {
 
     @ViewBuilder
     private var lunaNote: some View {
-        switch finder.luna {
-        case .idle, .pending:
-            Text("Luna joins when you pause typing")
-                .lineLimit(1)
-                .help("Meaning-based suggestions use \(LunaSessionRanker.model) through the Copilot CLI, with no tools.")
-        case .searching:
-            EmptyView()
-        case .finished:
-            let count = finder.lunaSuggestionCount
-            Text(count == 0
-                 ? "Luna found nothing more"
-                 : "Luna suggested \(count) \(count == 1 ? "session" : "sessions")")
-                .lineLimit(1)
-        case .failed(let message):
+        if let error = finder.resumeError, !error.isEmpty {
             Label {
-                Text(message).lineLimit(1).truncationMode(.tail)
+                Text(error).lineLimit(1).truncationMode(.tail)
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             }
-            .help(message)
+            .help(error)
+        } else {
+            switch finder.luna {
+            case .idle, .pending:
+                Text("Luna joins when you pause typing")
+                    .lineLimit(1)
+                    .help("Meaning-based suggestions use \(LunaSessionRanker.model) through the Copilot CLI, with no tools.")
+            case .searching:
+                EmptyView()
+            case .finished:
+                let count = finder.lunaSuggestionCount
+                Text(count == 0
+                     ? "Luna found nothing more"
+                     : "Luna suggested \(count) \(count == 1 ? "session" : "sessions")")
+                    .lineLimit(1)
+            case .failed(let message):
+                Label {
+                    Text(message).lineLimit(1).truncationMode(.tail)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+                .help(message)
+            }
         }
     }
 
@@ -498,20 +668,43 @@ struct SessionFinderView: View {
 }
 
 private struct SessionFinderRow: View {
+    enum Target {
+        case live(session: Session, projectName: String)
+        case resumable(projectName: String)
+    }
+
     let row: SessionFinderModel.Row
-    let session: Session
-    let projectName: String
+    let target: Target
     let isHighlighted: Bool
     let isCurrent: Bool
     let onOpen: () -> Void
     @State private var isHovering = false
 
+    private var title: String {
+        switch target {
+        case .live(let session, _): return session.title
+        case .resumable: return row.entry.source.title
+        }
+    }
+
+    private var projectName: String {
+        switch target {
+        case .live(_, let projectName), .resumable(let projectName):
+            return projectName
+        }
+    }
+
     private var context: String {
         var parts = [projectName]
         let folder = row.entry.folderName
         if !folder.isEmpty, folder != "/", folder != projectName { parts.append(folder) }
-        parts.append(session.attentionLabel)
-        if isCurrent { parts.append("Current") }
+        switch target {
+        case .live(let session, _):
+            parts.append(session.attentionLabel)
+            if isCurrent { parts.append("Current") }
+        case .resumable:
+            parts.append("Ended · Resume")
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -522,11 +715,21 @@ private struct SessionFinderRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 7) {
-            SessionStateIndicator(session: session)
-                .frame(width: 18, height: 18)
+            switch target {
+            case .live(let session, _):
+                SessionStateIndicator(session: session)
+                    .frame(width: 18, height: 18)
+            case .resumable:
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(StudioStyle.secondaryText)
+                    .frame(width: 18, height: 18)
+                    .help("Ended session — press Return to resume")
+                    .accessibilityHidden(true)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(session.title)
+                    Text(title)
                         .font(.body.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -578,7 +781,7 @@ private struct SessionFinderRow: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: onOpen)
         .onHover { isHovering = $0 }
-        .help(reason.map { "\(session.title)\nSuggested by Luna: \($0)" } ?? session.title)
+        .help(reason.map { "\(title)\nSuggested by Luna: \($0)" } ?? title)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isHighlighted ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { onOpen() }

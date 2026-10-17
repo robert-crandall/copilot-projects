@@ -503,14 +503,19 @@ private final class LoadCounter: @unchecked Sendable {
 private final class FakeRanker: SessionRanking, @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [String] = []
+    private var seenEntryIds: [[String]] = []
     var result: Result<[LunaMatch], Error>
 
     init(_ result: Result<[LunaMatch], Error>) { self.result = result }
 
     var queries: [String] { lock.withLock { calls } }
+    var lastEntryIds: [String] { lock.withLock { seenEntryIds.last ?? [] } }
 
     func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch] {
-        lock.withLock { calls.append(query) }
+        lock.withLock {
+            calls.append(query)
+            seenEntryIds.append(entries.map(\.id))
+        }
         return try result.get()
     }
 }
@@ -724,5 +729,332 @@ final class SessionFinderModelTests: XCTestCase {
         try await waitUntil { if case .failed = finder.luna { return true } else { return false } }
         XCTAssertEqual(finder.luna, .failed(LunaSearchError.notSignedIn.message))
         XCTAssertEqual(finder.rows.map(\.id), [])
+    }
+
+    func testResumableSessionsAppearInRecentEndedAndSearchAndLuna() async throws {
+        let now = Date()
+        let copilotId = "0f1e2d3c-4b5a-4000-8000-0000000000aa"
+        let endedSource = SessionFinderSource(
+            sessionId: SessionFinderSource.resumableSessionId(for: copilotId),
+            projectId: "p2",
+            projectName: "Docs",
+            title: "Audit flaky webhook retry",
+            cwd: "/r/docs",
+            lastActivity: now.addingTimeInterval(-120),
+            resumableCopilotSessionId: copilotId
+        )
+        let endedEntry = SessionFinderEntry(
+            source: endedSource,
+            requests: ["investigate the midnight timeout in webhook retries"],
+            replies: ["found the race condition in retry backoff"],
+            lastActivity: endedSource.lastActivity
+        )
+        let ranker = FakeRanker(.success([
+            LunaMatch(sessionId: endedEntry.id, reason: "debugged midnight retry backoff"),
+        ]))
+        var opened: [String] = []
+        let finder = SessionFinderModel(
+            sources: [alpha, beta],
+            currentSessionId: "alpha",
+            ranker: ranker,
+            lunaDelay: 0,
+            loadTranscript: { _ in nil },
+            loadResumableEntries: { [endedEntry] },
+            onOpen: { opened.append($0) }
+        )
+        try await waitUntil { finder.hasResumableSessions }
+
+        // Browsing lists live sessions under Recent Sessions and ended under Recent Ended Sessions,
+        // while keeping the default highlight on the next live tab.
+        XCTAssertEqual(finder.rows.map(\.id), ["alpha", "beta", endedEntry.id])
+        XCTAssertEqual(finder.rows.map(\.section), [.recent, .recent, .recentEnded])
+        XCTAssertEqual(finder.highlightedId, "beta")
+        XCTAssertFalse(finder.highlightedIsResumable)
+
+        finder.moveHighlight(1)
+        XCTAssertEqual(finder.highlightedId, endedEntry.id)
+        XCTAssertTrue(finder.highlightedIsResumable)
+        finder.openHighlighted()
+        XCTAssertEqual(opened, [endedEntry.id])
+
+        // Searching matches ended conversation text and includes ended sessions in Luna.
+        finder.query = "backoff"
+        XCTAssertEqual(finder.rows.map(\.id), [endedEntry.id])
+        XCTAssertEqual(finder.rows.map(\.section), [.matches])
+        try await waitUntil { if case .finished = finder.luna { return true } else { return false } }
+        XCTAssertTrue(ranker.lastEntryIds.contains(endedEntry.id))
+        XCTAssertEqual(finder.rows.first?.lunaReason, "debugged midnight retry backoff")
+
+        // Once the Copilot session becomes active in a tab, it leaves the resumable list.
+        finder.retainSessions(["alpha", "beta"], activeCopilotSessionIds: [copilotId.uppercased()])
+        XCTAssertTrue(finder.rows.isEmpty)
+        XCTAssertFalse(finder.hasResumableSessions)
+    }
+
+    func testLunaSuggestionsAndSelectionPersistWhenEndedSessionsFinishAfterFirstLunaPass() async throws {
+        let resumableGate = DispatchSemaphore(value: 0)
+        let copilotId = "0f1e2d3c-4b5a-4000-8000-0000000000bb"
+        let endedSource = SessionFinderSource(
+            sessionId: SessionFinderSource.resumableSessionId(for: copilotId),
+            projectId: "p2",
+            projectName: "Docs",
+            title: "Audit flaky webhook retry",
+            cwd: "/r/docs",
+            resumableCopilotSessionId: copilotId
+        )
+        let endedEntry = SessionFinderEntry(
+            source: endedSource,
+            requests: ["investigate the midnight timeout in webhook retries"],
+            replies: ["found the race condition in retry backoff"]
+        )
+        let ranker = FakeRanker(.success([
+            LunaMatch(sessionId: "beta", reason: "live retry analysis"),
+        ]))
+        let finder = SessionFinderModel(
+            sources: [alpha, beta],
+            currentSessionId: "alpha",
+            ranker: ranker,
+            lunaDelay: 0.2,
+            loadTranscript: { _ in nil },
+            loadResumableEntries: {
+                resumableGate.wait()
+                return [endedEntry]
+            },
+            onOpen: { _ in }
+        )
+        try await waitUntil { !finder.isIndexing }
+        XCTAssertTrue(finder.isLoadingResumable)
+
+        finder.query = "thundering herd"
+        try await waitUntil { if case .finished = finder.luna { return true } else { return false } }
+        XCTAssertEqual(finder.rows.map(\.id), ["beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+
+        // When ended-session loading finishes, the second Luna pass starts (.pending),
+        // and the live-only Luna suggestion and selection remain visible in the meantime.
+        ranker.result = .success([
+            LunaMatch(sessionId: endedEntry.id, reason: "ended retry backoff"),
+        ])
+        resumableGate.signal()
+        try await waitUntil { !finder.isLoadingResumable }
+        XCTAssertEqual(finder.luna, .pending)
+        XCTAssertEqual(finder.rows.map(\.id), ["beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+
+        try await waitUntil { if case .finished = finder.luna { return true } else { return false } }
+        XCTAssertEqual(finder.rows.map(\.id), [endedEntry.id, "beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+    }
+
+    func testTargetProjectMatchesByCwdFolderWorktreeAndRepositoryBeforeSelectedFallback() {
+        let projects = [
+            SessionFinderProjectTarget(
+                id: "p-general", name: "General", cwd: "/Users/me/Repos",
+                sessionCwds: ["/Users/me/Repos"]
+            ),
+            SessionFinderProjectTarget(
+                id: "p-cp", name: "copilot-projects", cwd: "/Users/me/Repos",
+                sessionCwds: ["/Users/me/Repos/copilot-projects"]
+            ),
+            SessionFinderProjectTarget(
+                id: "p-ios", name: "copilot-projects-ios", cwd: "/Users/me/Repos/copilot-projects-ios",
+                sessionCwds: []
+            ),
+            SessionFinderProjectTarget(
+                id: "p-work", name: "Work", cwd: "/Users/me/Repos/widget",
+                sessionCwds: []
+            ),
+        ]
+
+        // Exact session cwd match (non-default startup dir).
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos/copilot-projects",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-cp"
+        )
+        // Exact project cwd match.
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos/copilot-projects-ios",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-ios"
+        )
+        // Project cwd folder matches worktree prefix and repository name even when project.name differs
+        // and no live tabs remain at that directory.
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos/widget-fix",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-work"
+        )
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos",
+                repository: "owner/widget",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-work"
+        )
+        // Sibling worktree prefix prefers longest match (`copilot-projects-ios` over `copilot-projects`),
+        // even when `copilot-projects` is selected.
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos/copilot-projects-ios-fix",
+                repository: "sirfergy/copilot-projects-ios",
+                projects: projects,
+                selectedProjectId: "p-cp",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-ios"
+        )
+        // Worktree folder prefix match (`copilot-projects-fix` -> `copilot-projects`).
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos/copilot-projects-fix",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-cp"
+        )
+        // Generic startup dir uses repository name when it matches a project, else selectedProjectId.
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos",
+                repository: "sirfergy/copilot-projects",
+                projects: projects,
+                selectedProjectId: "p-general",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-cp"
+        )
+        XCTAssertEqual(
+            SessionFinderSearch.targetProject(
+                forCwd: "/Users/me/Repos",
+                projects: projects,
+                selectedProjectId: "p-ios",
+                defaultStartupDir: "/Users/me/Repos"
+            )?.id,
+            "p-ios"
+        )
+    }
+
+    func testResumableLoaderIndexesUsableEndedSessionsFromDatabaseAndEvents() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repoDir = root.appendingPathComponent("copilot-projects")
+        let otherDir = root.appendingPathComponent("other")
+        try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: otherDir, withIntermediateDirectories: true)
+
+        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
+        let resumableId = try home.addSession(
+            cwd: repoDir.path,
+            name: "Fix beachball in sidebar",
+            updated: Date(timeIntervalSince1970: 1_800_000_100),
+            transcript: """
+            {"type":"user.message","data":{"content":"investigate the main-thread beachball"}}
+            {"type":"assistant.message","data":{"content":"cached the file signature on background queue"}}
+            """
+        )
+        let unindexedId = UUID().uuidString.lowercased()
+        let unindexedDir = home.root.appendingPathComponent("session-state/\(unindexedId)")
+        try FileManager.default.createDirectory(at: unindexedDir, withIntermediateDirectories: true)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let unindexedDate = Date(timeIntervalSince1970: 1_800_000_500)
+        try Data("""
+            id: \(unindexedId)
+            cwd: \(repoDir.path)
+            client_name: github/cli
+            name: Newer unindexed session
+            created_at: \(formatter.string(from: unindexedDate.addingTimeInterval(-60)))
+            updated_at: \(formatter.string(from: unindexedDate))
+            """.utf8).write(to: unindexedDir.appendingPathComponent("workspace.yaml"))
+        try Data(#"{"type":"user.message","data":{"content":"unindexed conversation"}}"#.utf8)
+            .write(to: unindexedDir.appendingPathComponent("events.jsonl"))
+
+        let missingWorkspaceCwdId = try home.addSession(
+            cwd: repoDir.path,
+            name: "Missing workspace cwd",
+            updated: Date(timeIntervalSince1970: 1_800_000_600),
+            transcript: #"{"type":"user.message","data":{"content":"has db cwd only"}}"#
+        )
+        try Data("id: \(missingWorkspaceCwdId)\nclient_name: github/cli\nname: Missing workspace cwd\n".utf8)
+            .write(to: home.root.appendingPathComponent("session-state/\(missingWorkspaceCwdId)/workspace.yaml"))
+
+        let liveId = try home.addSession(
+            cwd: repoDir.path,
+            name: "Already live",
+            updated: Date(timeIntervalSince1970: 1_800_000_200),
+            transcript: #"{"type":"user.message","data":{"content":"live work"}}"#
+        )
+        let lockedId = try home.addSession(
+            cwd: otherDir.path,
+            name: "Locked elsewhere",
+            updated: Date(timeIntervalSince1970: 1_800_000_300),
+            transcript: #"{"type":"user.message","data":{"content":"locked work"}}"#
+        )
+        try home.lock(lockedId)
+        _ = try home.addSession(
+            cwd: root.appendingPathComponent("missing-dir").path,
+            name: "Deleted worktree",
+            transcript: #"{"type":"user.message","data":{"content":"missing folder"}}"#
+        )
+        _ = try home.addSession(
+            cwd: otherDir.path,
+            client: "vscode",
+            name: "Editor session",
+            transcript: #"{"type":"user.message","data":{"content":"editor"}}"#
+        )
+        _ = try home.addSession(
+            cwd: repoDir.path,
+            name: "Metadata only with empty events",
+            transcript: ""
+        )
+
+        let projects = [
+            SessionFinderProjectTarget(id: "p1", name: "General", cwd: otherDir.path, sessionCwds: []),
+            SessionFinderProjectTarget(id: "p2", name: "copilot-projects", cwd: otherDir.path, sessionCwds: [repoDir.path]),
+        ]
+        // Even with limit = 1, the newer directory-only session outranks the older database entry.
+        let topOne = SessionFinderResumableLoader.load(
+            store: home.store,
+            projects: projects,
+            selectedProjectId: "p1",
+            liveCopilotSessionIds: [liveId],
+            defaultStartupDir: root.path,
+            limit: 1
+        )
+        XCTAssertEqual(topOne.map(\.source.resumableCopilotSessionId), [unindexedId])
+
+        let loaded = SessionFinderResumableLoader.load(
+            store: home.store,
+            projects: projects,
+            selectedProjectId: "p1",
+            liveCopilotSessionIds: [liveId],
+            defaultStartupDir: root.path
+        )
+
+        XCTAssertEqual(loaded.map(\.source.resumableCopilotSessionId), [unindexedId, resumableId])
+        let entry = try XCTUnwrap(loaded.last)
+        XCTAssertEqual(entry.source.resumableCopilotSessionId, resumableId)
+        XCTAssertEqual(entry.source.projectId, "p2")
+        XCTAssertEqual(entry.source.projectName, "copilot-projects")
+        XCTAssertEqual(entry.source.title, "Fix beachball in sidebar")
+        XCTAssertEqual(entry.requests, ["investigate the main-thread beachball"])
+        XCTAssertEqual(entry.replies, ["cached the file signature on background queue"])
     }
 }
