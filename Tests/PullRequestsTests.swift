@@ -257,6 +257,42 @@ final class PullRequestTriageTests: XCTestCase {
             PullRequestItem.formattedCustomPrompt("check #42 again", for: pr),
             "check #42 again"
         )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with #420", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with #420"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with github/github#420", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with github/github#420"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with https://github.com/github/github/pull/420", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with https://github.com/github/github/pull/420"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare #420 with #42", for: pr),
+            "compare #420 with #42"
+        )
+
+        // Manual goals keep per-item session targeting and pick the lane's primary item
+        // from the items actually linked to the lane's session.
+        let unlinkedUrgentItem = PullRequestItem(
+            pr: pr,
+            assessment: PullRequestTriage.assess(pr, session: nil, now: now),
+            session: nil,
+            isManuallyAssigned: true
+        )
+        let manualGoal = PullRequestGoal(
+            id: "manual:1",
+            kind: .manual,
+            name: "Manual Goal",
+            session: nil,
+            items: [unlinkedUrgentItem, cleanItem]
+        )
+        XCTAssertEqual(manualGoal.laneSession, session)
+        XCTAssertNil(manualGoal.session(for: unlinkedUrgentItem))
+        XCTAssertEqual(manualGoal.session(for: cleanItem), session)
+        XCTAssertEqual(manualGoal.primaryDispatchItem(for: session)?.id, cleanItem.id)
     }
 
     func testDistinctiveBranchesAndLinkThresholds() {

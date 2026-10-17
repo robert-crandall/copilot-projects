@@ -629,12 +629,105 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertTrue(queued.ok, queued.error ?? "")
             XCTAssertEqual(queued.code, "queued")
             XCTAssertEqual(host.resuming.deliveredPrompts.count, 1, "native path does not use terminal fallback")
-            XCTAssertTrue(FileManager.default.fileExists(
-                atPath: host.root.appendingPathComponent("a1.session-send.json").path
-            ))
+            let handoffURL = host.root.appendingPathComponent("a1.session-send.json")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: handoffURL.path))
             let replayQueued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertTrue(replayQueued.ok)
             XCTAssertEqual(replayQueued.code, "queued")
+
+            // If workflow freshness expires or the epoch changes before a receipt confirms
+            // delivery, replaying the native request returns `indeterminate` and never
+            // reroutes to terminal injection or a new epoch.
+            let expiredReplay = model.sendPullRequestsSessionPrompt(
+                requestId: try XCTUnwrap(UUID(uuidString: nativeReqId)),
+                projectId: nil,
+                sessionId: "a1",
+                prompt: "Queue via SDK",
+                now: now.addingTimeInterval(60)
+            )
+            XCTAssertFalse(expiredReplay.ok)
+            XCTAssertEqual(expiredReplay.code, "indeterminate")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            try FileManager.default.removeItem(at: handoffURL)
+            let action = RemoteSessionAction(kind: .send, prompt: "Queue via SDK", mode: .enqueue)
+            let fingerprint = try XCTUnwrap(CLIOperationAdapter.payloadFingerprint(
+                kind: .sessionSend,
+                payload: action
+            ))
+            @MainActor func makeWorkflow(sendReady: Bool) -> RemoteSessionWorkflow {
+                RemoteSessionWorkflow(
+                    observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+                    capabilities: [RemoteSessionActionKind.send.rawValue],
+                    sendReady: sendReady,
+                    limitsKnown: true
+                )
+            }
+            snapshot.operationReceipts = [
+                TrackedOperationReceipt(
+                    operationId: nativeReqId,
+                    conversationEpoch: "epoch-1",
+                    kind: CLISDKOperationKind.sessionSend.rawValue,
+                    state: .applied,
+                    updatedAtMilliseconds: 10,
+                    errorCode: nil,
+                    payloadFingerprint: fingerprint
+                )
+            ]
+            snapshot.workflow = makeWorkflow(sendReady: false)
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let appliedReplay = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertTrue(appliedReplay.ok)
+            XCTAssertEqual(appliedReplay.code, "queued")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Rejected and indeterminate receipts surface their outcomes on replay.
+            let rejectedReqId = UUID()
+            snapshot.workflow = makeWorkflow(sendReady: true)
+            snapshot.operationReceipts = [
+                TrackedOperationReceipt(
+                    operationId: rejectedReqId.uuidString,
+                    conversationEpoch: "epoch-1",
+                    kind: CLISDKOperationKind.sessionSend.rawValue,
+                    state: .rejected,
+                    updatedAtMilliseconds: 20,
+                    errorCode: "busy",
+                    payloadFingerprint: fingerprint
+                )
+            ]
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let rejected = send(rejectedReqId.uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertFalse(rejected.ok)
+            XCTAssertEqual(rejected.code, "rejected")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            let indeterminateReqId = UUID()
+            snapshot.operationReceipts = [
+                TrackedOperationReceipt(
+                    operationId: indeterminateReqId.uuidString,
+                    conversationEpoch: "epoch-1",
+                    kind: CLISDKOperationKind.sessionSend.rawValue,
+                    state: .indeterminate,
+                    updatedAtMilliseconds: 30,
+                    errorCode: nil,
+                    payloadFingerprint: fingerprint
+                )
+            ]
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let indeterminate = send(indeterminateReqId.uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertFalse(indeterminate.ok)
+            XCTAssertEqual(indeterminate.code, "indeterminate")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+
+            // Native validation failure (e.g. sendReady == false or missing marker) refuses
+            // the attempt instead of falling back to terminal injection.
+            snapshot.operationReceipts = []
+            snapshot.workflow = makeWorkflow(sendReady: false)
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let notReady = send(UUID().uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
+            XCTAssertFalse(notReady.ok)
+            XCTAssertEqual(notReady.code, "busy")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
         }
     }
 }

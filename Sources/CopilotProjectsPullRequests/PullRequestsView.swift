@@ -604,7 +604,7 @@ private struct GoalLane: View {
     let actions: Actions
 
     private var laneSession: PullRequestSession? {
-        goal.session ?? goal.items.lazy.compactMap(\.session).first
+        goal.laneSession
     }
 
     /// The ended session to offer, once the workspace has said nothing live drives this goal.
@@ -667,7 +667,7 @@ private struct GoalLane: View {
     @ViewBuilder
     private func menu(_ item: PullRequestItem) -> some View {
         Button("Open on GitHub") { actions.openPullRequest(item.pr) }
-        if let session = item.session ?? laneSession, workspace == .connected {
+        if let session = goal.session(for: item), workspace == .connected {
             Button("Go to Session") { actions.goToSession(session) }
             if session.status != .waiting, !session.hasPendingInput {
                 Divider()
@@ -789,7 +789,8 @@ private struct GoalLane: View {
     private var connectedSessionAction: some View {
         if let session = laneSession {
             let sending = sendingSessions.contains(session.id)
-            if session.status != .waiting, !session.hasPendingInput, let primaryItem = goal.items.first {
+            if session.status != .waiting, !session.hasPendingInput,
+               let primaryItem = goal.primaryDispatchItem(for: session) {
                 Menu {
                     Button("Go to Session") { actions.goToSession(session) }
                     Divider()

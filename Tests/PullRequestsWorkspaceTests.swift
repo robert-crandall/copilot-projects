@@ -636,6 +636,35 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         try await waitUntil { model.sendingSessions.isEmpty }
         XCTAssertEqual(workspace.promptCalls.count, 4)
         XCTAssertEqual(workspace.promptCalls[3].requestId, firstRetryId, "retrying after a project move keeps the requestId")
+
+        // An indeterminate native outcome retains the original requestId until resolved,
+        // whereas a definite refusal clears it so the next attempt gets a fresh requestId.
+        workspace.answer(
+            fetches: [.snapshot(movedSnapshot), .snapshot(movedSnapshot)],
+            prompts: [
+                .refused(code: "indeterminate", message: "Outcome unknown."),
+                .done(code: "queued", text: "s1"),
+                .refused(code: "rejected", message: "Rejected."),
+                .done(code: "queued", text: "s1"),
+            ]
+        )
+        let uncertainPrompt = "For https://github.com/github/github/pull/7:\n\ncheck status"
+        model.sendPrompt(to: movedGoalSession, prompt: uncertainPrompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        let uncertainId = try XCTUnwrap(workspace.promptCalls.last?.requestId)
+
+        model.sendPrompt(to: movedGoalSession, prompt: uncertainPrompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(workspace.promptCalls.last?.requestId, uncertainId, "indeterminate outcome retains requestId")
+
+        model.sendPrompt(to: movedGoalSession, prompt: uncertainPrompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        let rejectedId = try XCTUnwrap(workspace.promptCalls.last?.requestId)
+        XCTAssertNotEqual(rejectedId, uncertainId, "completed dispatch cleared the previous requestId")
+
+        model.sendPrompt(to: movedGoalSession, prompt: uncertainPrompt)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertNotEqual(workspace.promptCalls.last?.requestId, rejectedId, "rejected outcome clears requestId")
     }
 
     func testRefreshAsksForTheWorkspaceFirstAndMatchesAgainWhenItArrives() async throws {

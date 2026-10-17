@@ -537,12 +537,28 @@ struct PullRequestItem: Identifiable, Equatable {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         let url = pr.url.absoluteString
-        if trimmed.localizedCaseInsensitiveContains(url)
-            || trimmed.localizedCaseInsensitiveContains(pr.shortName)
-            || trimmed.contains("#\(pr.key.number)") {
+        if containsCompletePRReference(url, in: trimmed)
+            || containsCompletePRReference(pr.shortName, in: trimmed)
+            || containsCompletePRReference("#\(pr.key.number)", in: trimmed) {
             return trimmed
         }
         return "For \(url):\n\n\(trimmed)"
+    }
+
+    private static func containsCompletePRReference(_ token: String, in text: String) -> Bool {
+        var searchStart = text.startIndex
+        while let range = text.range(
+            of: token,
+            options: [.caseInsensitive],
+            range: searchStart..<text.endIndex
+        ) {
+            let nextIndex = range.upperBound
+            if nextIndex == text.endIndex || !text[nextIndex].isNumber {
+                return true
+            }
+            searchStart = nextIndex
+        }
+        return false
     }
 }
 
@@ -568,6 +584,19 @@ struct PullRequestGoal: Identifiable, Equatable {
     /// An ended Copilot session that worked on these pull requests, offered only
     /// while no live session does.
     var resumable: ResumableSession? = nil
+
+    var laneSession: PullRequestSession? {
+        session ?? items.lazy.compactMap(\.session).first
+    }
+
+    func session(for item: PullRequestItem) -> PullRequestSession? {
+        item.session ?? session
+    }
+
+    func primaryDispatchItem(for session: PullRequestSession) -> PullRequestItem? {
+        items.first { $0.session?.id == session.id }
+            ?? (self.session?.id == session.id ? items.first { $0.session == nil } : nil)
+    }
 
     var actionCount: Int { items.filter { $0.assessment.needsAction }.count }
     var needsYouCount: Int { items.filter { $0.assessment.needsYou }.count }

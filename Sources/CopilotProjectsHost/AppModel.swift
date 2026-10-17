@@ -435,9 +435,14 @@ final class AppModel: ObservableObject {
     /// the command that resumes it, nothing else shows that it is coming back.
     private var pullRequestsResumeLaunches: [String: (sessionId: String, launchedAt: Date)] = [:]
     static let pullRequestsResumeStartupGrace: TimeInterval = 5
+    private enum PullRequestsPromptRoute: Equatable {
+        case terminal
+        case native(conversationEpoch: String)
+    }
     private struct SentPullRequestsPrompt {
         let sessionId: String
         let prompt: String
+        let route: PullRequestsPromptRoute
     }
     private var sentPullRequestsPrompts: [UUID: SentPullRequestsPrompt] = [:]
     private var sentPullRequestsPromptOrder: [UUID] = []
@@ -5324,8 +5329,8 @@ final class AppModel: ObservableObject {
     }
 
     /// Sends or queues a prompt into an existing live session for Copilot Pull Requests.
-    /// Replaying the same `requestId` for the same session and prompt returns `existing`
-    /// without delivering the prompt twice.
+    /// Replaying the same `requestId` for the same session and prompt resolves its prior
+    /// terminal or native outcome without delivering the prompt twice.
     func sendPullRequestsSessionPrompt(
         requestId: UUID,
         projectId: String?,
@@ -5333,6 +5338,7 @@ final class AppModel: ObservableObject {
         prompt: String,
         now: Date = Date()
     ) -> ControlResponse {
+        let clock = advancingClock(from: now)
         guard SessionInputValidation.isValidPrompt(prompt) else {
             return .failure(CopilotSessionStartError.invalidPrompt.localizedDescription, code: "bad-request")
         }
@@ -5342,6 +5348,17 @@ final class AppModel: ObservableObject {
         let normalizedPrompt = prompt
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+        let action = RemoteSessionAction(kind: .send, prompt: normalizedPrompt, mode: .enqueue)
+        guard let payloadFingerprint = CLIOperationAdapter.payloadFingerprint(
+            kind: .sessionSend,
+            payload: action
+        ) else {
+            return .failure("Could not send the prompt to that session.", code: "invalid")
+        }
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
         if let previous = sentPullRequestsPrompts[requestId] {
             guard previous.sessionId == sessionId, previous.prompt == normalizedPrompt else {
                 return .failure("request id is bound to a different session or prompt", code: "conflict")
@@ -5352,7 +5369,19 @@ final class AppModel: ObservableObject {
             if let projectId, projects[loc.p].id != projectId {
                 return .failure("The session moved to another project.", code: "conflict")
             }
-            return .success(sessionId, code: "existing")
+            switch previous.route {
+            case .terminal:
+                return .success(sessionId, code: "existing")
+            case .native(let epoch):
+                return resolveNativePullRequestsPrompt(
+                    sessionId: sessionId,
+                    requestId: requestId,
+                    conversationEpoch: epoch,
+                    payloadFingerprint: payloadFingerprint,
+                    adapter: adapter,
+                    clock: clock
+                )
+            }
         }
         guard let loc = locateIndex(sessionId) else {
             return .failure("The session has ended.", code: "gone")
@@ -5360,6 +5389,32 @@ final class AppModel: ObservableObject {
         if let projectId, projects[loc.p].id != projectId {
             return .failure("The session moved to another project.", code: "conflict")
         }
+
+        let freshSnapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: clock)
+        if let snapshot = freshSnapshot,
+           let epoch = snapshot.remoteOperationProjection(at: clock()).conversationEpoch {
+            let operation = CLIOperationRequest(operationId: requestId.uuidString, conversationEpoch: epoch)
+            let existingOutcome = adapter.submittedOperationOutcome(
+                sessionId: sessionId,
+                kind: .sessionSend,
+                operation: operation,
+                payloadFingerprint: payloadFingerprint,
+                handoffSuffix: "\(CLISDKOperationKind.sessionSend.rawValue).json",
+                now: clock
+            )
+            if existingOutcome != .notFound {
+                if existingOutcome != .conflict {
+                    rememberSentPullRequestsPrompt(
+                        requestId: requestId,
+                        sessionId: sessionId,
+                        prompt: normalizedPrompt,
+                        route: .native(conversationEpoch: epoch)
+                    )
+                }
+                return controlResponse(forNativePullRequestsPrompt: existingOutcome, sessionId: sessionId)
+            }
+        }
+
         let session = projects[loc.p].sessions[loc.s]
         if session.displayStatus == .waiting || session.hasPendingInput {
             return .failure("The session is waiting for your input in the terminal.", code: "busy")
@@ -5367,38 +5422,56 @@ final class AppModel: ObservableObject {
 
         // Authoritative fresh tracker snapshot: refuse if input is pending on disk even before
         // the asynchronous activity watcher updates the in-memory session model.
-        let adapter = CLIOperationAdapter(
-            activityDirectory: agentActivityDirectory,
-            resumeMarkerDirectory: resumeMarkerDirectory
-        )
-        let freshSnapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: { now })
         if freshSnapshot?.hasPendingInput == true {
             return .failure("The session is waiting for your input in the terminal.", code: "busy")
         }
 
         // Prefer native SDK queueing when the session has a fresh tracker workflow snapshot.
-        // CLIOperationAdapter deduplicates replays against the active handoff file and
-        // tracker operation receipts, so a rejected receipt is never cached as delivered.
         if let snapshot = freshSnapshot,
-           let epoch = snapshot.remoteOperationProjection().conversationEpoch,
+           let epoch = snapshot.remoteOperationProjection(at: clock()).conversationEpoch,
            let workflow = snapshot.workflow,
-           workflow.supports(.send, at: now),
-           workflow.sendReady {
-            let action = RemoteSessionAction(kind: .send, prompt: normalizedPrompt, mode: .enqueue)
+           workflow.supports(.send, at: clock()) {
             let operation = CLIOperationRequest(operationId: requestId.uuidString, conversationEpoch: epoch)
-            switch performSessionAction(sessionId: sessionId, action: action, operation: operation, now: now) {
+            switch performSessionAction(sessionId: sessionId, action: action, operation: operation, now: clock()) {
             case .accepted:
-                return .success(sessionId, code: "queued")
+                rememberSentPullRequestsPrompt(
+                    requestId: requestId,
+                    sessionId: sessionId,
+                    prompt: normalizedPrompt,
+                    route: .native(conversationEpoch: epoch)
+                )
+                return resolveNativePullRequestsPrompt(
+                    sessionId: sessionId,
+                    requestId: requestId,
+                    conversationEpoch: epoch,
+                    payloadFingerprint: payloadFingerprint,
+                    adapter: adapter,
+                    clock: clock
+                )
             case .conflict:
                 return .failure("Another session action is already awaiting Copilot.", code: "busy")
             case .invalid:
-                break
+                if let latest = adapter.loadFreshSnapshot(sessionId: sessionId, now: clock),
+                   latest.hasPendingInput || latest.workflow?.sendReady == false {
+                    return .failure(
+                        latest.hasPendingInput
+                            ? "The session is waiting for your input in the terminal."
+                            : "The session is busy or waiting for input in the terminal.",
+                        code: "busy"
+                    )
+                }
+                return .failure("Could not send the prompt to that session.", code: "invalid")
             }
         }
 
         switch sendRemotePrompt(sessionId: sessionId, value: normalizedPrompt) {
         case .sent:
-            rememberSentPullRequestsPrompt(requestId: requestId, sessionId: sessionId, prompt: normalizedPrompt)
+            rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                prompt: normalizedPrompt,
+                route: .terminal
+            )
             return .success(sessionId, code: "sent")
         case .busy:
             return .failure("The session is busy or waiting for input in the terminal.", code: "busy")
@@ -5409,7 +5482,54 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func rememberSentPullRequestsPrompt(requestId: UUID, sessionId: String, prompt: String) {
+    private func resolveNativePullRequestsPrompt(
+        sessionId: String,
+        requestId: UUID,
+        conversationEpoch: String,
+        payloadFingerprint: String,
+        adapter: CLIOperationAdapter,
+        clock: () -> Date
+    ) -> ControlResponse {
+        let operation = CLIOperationRequest(
+            operationId: requestId.uuidString,
+            conversationEpoch: conversationEpoch
+        )
+        let outcome = adapter.submittedOperationOutcome(
+            sessionId: sessionId,
+            kind: .sessionSend,
+            operation: operation,
+            payloadFingerprint: payloadFingerprint,
+            handoffSuffix: "\(CLISDKOperationKind.sessionSend.rawValue).json",
+            now: clock
+        )
+        return controlResponse(forNativePullRequestsPrompt: outcome, sessionId: sessionId)
+    }
+
+    private func controlResponse(
+        forNativePullRequestsPrompt outcome: CLISubmittedOperationOutcome,
+        sessionId: String
+    ) -> ControlResponse {
+        switch outcome {
+        case .pendingHandoff, .accepted, .applied:
+            return .success(sessionId, code: "queued")
+        case .rejected:
+            return .failure("Copilot did not accept the prompt.", code: "rejected")
+        case .indeterminate, .notFound:
+            return .failure(
+                "Could not confirm whether Copilot received the prompt. Inspect the terminal before trying again.",
+                code: "indeterminate"
+            )
+        case .conflict:
+            return .failure("request id is bound to a different session or prompt", code: "conflict")
+        }
+    }
+
+    private func rememberSentPullRequestsPrompt(
+        requestId: UUID,
+        sessionId: String,
+        prompt: String,
+        route: PullRequestsPromptRoute
+    ) {
         if sentPullRequestsPrompts[requestId] == nil {
             sentPullRequestsPromptOrder.append(requestId)
             while sentPullRequestsPromptOrder.count > Self.maximumSentPullRequestsPrompts {
@@ -5417,7 +5537,11 @@ final class AppModel: ObservableObject {
                 sentPullRequestsPrompts[oldest] = nil
             }
         }
-        sentPullRequestsPrompts[requestId] = SentPullRequestsPrompt(sessionId: sessionId, prompt: prompt)
+        sentPullRequestsPrompts[requestId] = SentPullRequestsPrompt(
+            sessionId: sessionId,
+            prompt: prompt,
+            route: route
+        )
     }
 
     /// Every project and live session with the state the workspace shows, for `list-sessions`.

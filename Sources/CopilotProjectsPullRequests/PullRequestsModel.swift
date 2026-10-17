@@ -22,8 +22,6 @@ final class PullRequestsModel: ObservableObject {
     static let workspacePollInterval: TimeInterval = 2
     /// How long Resume Session stays busy waiting for the resumed session to report itself.
     static let resumeSettleInterval: TimeInterval = 20
-    /// How long an unanswered prompt dispatch reuses its request id on retry.
-    static let promptRetryWindow: TimeInterval = 60
     /// The pause between searches for ended sessions while some are left unread.
     static let resumableSearchPause: TimeInterval = 0.25
 
@@ -120,12 +118,11 @@ final class PullRequestsModel: ObservableObject {
         let requestId: UUID
         let sessionId: String
         let prompt: String
-        let createdAt: Date
     }
 
-    /// Dispatched prompts that didn't get an answer, by session and prompt, so
-    /// trying again within `promptRetryWindow` reuses the request id and never
-    /// sends the same prompt twice, even if the session moved projects.
+    /// Dispatched prompts whose outcome has not resolved yet, by session and
+    /// prompt, so trying again reuses the request id and never sends the same
+    /// prompt twice, even if the session moved projects.
     private var pendingPrompts: [String: PendingPrompt] = [:]
 
     init(
@@ -821,13 +818,11 @@ final class PullRequestsModel: ObservableObject {
         guard !hostedReadOnly, isConnected, !sendingSessions.contains(session.id) else { return }
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let now = clock()
         let key = "\(session.id)\n\(trimmed)"
         let pending = pendingPrompts[key].flatMap {
-            $0.sessionId == session.id && $0.prompt == trimmed
-                && now.timeIntervalSince($0.createdAt) < Self.promptRetryWindow ? $0 : nil
+            $0.sessionId == session.id && $0.prompt == trimmed ? $0 : nil
         } ?? PendingPrompt(
-            requestId: UUID(), sessionId: session.id, prompt: trimmed, createdAt: now
+            requestId: UUID(), sessionId: session.id, prompt: trimmed
         )
         pendingPrompts[key] = pending
         sendingSessions.insert(session.id)
@@ -863,8 +858,10 @@ final class PullRequestsModel: ObservableObject {
             if await reveal(projectId: targetProjectId, sessionId: pending.sessionId), let pid {
                 host.activate(pid)
             }
-        case .refused(_, let message):
-            pendingPrompts[key] = nil
+        case .refused(let code, let message):
+            // An uncertain native outcome keeps its request id so a retry re-checks
+            // that operation instead of submitting a duplicate prompt.
+            if code != "indeterminate" { pendingPrompts[key] = nil }
             await pollWorkspace()
             presentError("Could Not Send Prompt", message)
         case .unreachable:
