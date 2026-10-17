@@ -18,10 +18,11 @@ final class WorkspaceInputControllerTests: XCTestCase {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let keys = ["SHELL", "COPILOT_PROJECTS_STATE_DIR", "COPILOT_PROJECTS_DTACH"]
+        let keys = ["SHELL", "COPILOT_PROJECTS_STATE_DIR", "COPILOT_PROJECTS_DTACH", "COPILOT_HOME"]
         let previous = Dictionary(uniqueKeysWithValues: keys.map { ($0, ProcessInfo.processInfo.environment[$0]) })
         setenv("SHELL", "/bin/cat", 1)
         setenv("COPILOT_PROJECTS_STATE_DIR", root.path, 1)
+        setenv("COPILOT_HOME", root.appendingPathComponent("copilot").path, 1)
         unsetenv("COPILOT_PROJECTS_DTACH")
         defer {
             for (key, value) in previous {
@@ -185,6 +186,82 @@ final class WorkspaceInputControllerTests: XCTestCase {
             XCTAssertEqual(finishedUnseen(other[1]), false)
             XCTAssertEqual(finishedUnseen(other[0]), true, "The tab that was shown before was never seen")
         }
+    }
+
+    func testOpeningAResumableSessionFromFinderResumesItInTheMatchedProject() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let repoWork = root.appendingPathComponent("other-work")
+        try FileManager.default.createDirectory(at: repoWork, withIntermediateDirectories: true)
+        let keys = ["SHELL", "COPILOT_PROJECTS_STATE_DIR", "COPILOT_PROJECTS_DTACH", "COPILOT_HOME"]
+        let previous = Dictionary(uniqueKeysWithValues: keys.map { ($0, ProcessInfo.processInfo.environment[$0]) })
+        setenv("SHELL", "/bin/cat", 1)
+        setenv("COPILOT_PROJECTS_STATE_DIR", root.path, 1)
+        setenv("COPILOT_HOME", root.appendingPathComponent("copilot").path, 1)
+        unsetenv("COPILOT_PROJECTS_DTACH")
+        defer {
+            for (key, value) in previous {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
+        let copilotId = try home.addSession(
+            cwd: repoWork.path,
+            name: "Investigate flaky webhook",
+            transcript: #"{"type":"user.message","data":{"content":"debug the webhook retry"}}"#
+        )
+
+        let p1Session = Session(title: "first", cwd: root.path)
+        let p2Session = Session(title: "second", cwd: repoWork.path)
+        let p1 = Project(id: "p1", name: "First", cwd: root.path, sessions: [p1Session], selectedSessionId: p1Session.id)
+        let p2 = Project(id: "p2", name: "Second", cwd: repoWork.path, sessions: [p2Session], selectedSessionId: p2Session.id)
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
+
+        var launches: [(id: String, executable: String?, prompt: String?)] = []
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
+            remoteReposDirectory: { root.path },
+            remoteSessionBackendAvailable: { true },
+            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        defer {
+            model.forcePendingSessionDestroys()
+            model.detachAllClients()
+        }
+
+        let input = WorkspaceInputController(
+            model: model,
+            sessionRanker: OfflineRanker(),
+            copilotSessionStore: { home.store }
+        )
+        input.presentSessionFinder()
+        let finder = try XCTUnwrap(input.sessionFinder)
+        for _ in 0..<200 where !finder.hasResumableSessions {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(finder.hasResumableSessions)
+        let resumableRowId = SessionFinderSource.resumableSessionId(for: copilotId)
+        XCTAssertTrue(finder.rows.contains { $0.id == resumableRowId && $0.section == .recentEnded })
+
+        input.openFromSessionFinder(resumableRowId)
+        XCTAssertNil(input.sessionFinder)
+        XCTAssertEqual(model.selectedProjectId, "p2")
+        XCTAssertEqual(launches.count, 1)
+        let resumedTabId = launches[0].id
+        XCTAssertEqual(model.capturedResumeLaunches[resumedTabId], copilotId)
+        let resumedSession = try XCTUnwrap(model.project("p2")?.sessions.first { $0.id == resumedTabId })
+        XCTAssertEqual(resumedSession.title, "Investigate flaky webhook")
+        XCTAssertEqual(resumedSession.cwd, repoWork.path)
+        XCTAssertEqual(model.project("p2")?.selectedSessionId, resumedTabId)
     }
 
     func testStalePreviewIsRejectedAndBusinessCloseIsNotGatedByUIState() throws {

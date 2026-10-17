@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CopilotProjectsCore
 
 @MainActor
 final class WorkspaceInputController: ObservableObject {
@@ -7,10 +8,16 @@ final class WorkspaceInputController: ObservableObject {
     @Published private(set) var sessionFinder: SessionFinderModel?
     private let model: AppModel
     private let sessionRanker: SessionRanking
+    private let copilotSessionStore: @Sendable () -> CopilotSessionStore
 
-    init(model: AppModel, sessionRanker: SessionRanking = LunaSessionRanker()) {
+    init(
+        model: AppModel,
+        sessionRanker: SessionRanking = LunaSessionRanker(),
+        copilotSessionStore: @escaping @Sendable () -> CopilotSessionStore = { CopilotSessionStore() }
+    ) {
         self.model = model
         self.sessionRanker = sessionRanker
+        self.copilotSessionStore = copilotSessionStore
     }
 
     /// A workspace sheet owns the keyboard, so workspace commands stay disabled.
@@ -29,10 +36,24 @@ final class WorkspaceInputController: ObservableObject {
     func presentSessionFinder() {
         guard !hasWorkspaceSheet, NSApp.modalWindow == nil else { return }
         model.setNumberHint(.none)
+        let projects = model.sessionFinderProjectTargets
+        let selectedProjectId = model.selectedProjectId
+        let liveCopilotIds = model.activeAndResumingCopilotSessionIds()
+        let storeProvider = copilotSessionStore
+        let defaultStartupDir = Paths.defaultStartupDir
         sessionFinder = SessionFinderModel(
             sources: model.sessionFinderSources,
             currentSessionId: model.globalSelectedSessionId,
-            ranker: sessionRanker
+            ranker: sessionRanker,
+            loadResumableEntries: {
+                SessionFinderResumableLoader.load(
+                    store: storeProvider(),
+                    projects: projects,
+                    selectedProjectId: selectedProjectId,
+                    liveCopilotSessionIds: liveCopilotIds,
+                    defaultStartupDir: defaultStartupDir
+                )
+            }
         ) { [weak self] sessionId in
             self?.openFromSessionFinder(sessionId)
         }
@@ -44,16 +65,40 @@ final class WorkspaceInputController: ObservableObject {
     }
 
     func openFromSessionFinder(_ sessionId: String) {
-        // A session that ended while the finder was open leaves it open.
-        guard let project = model.projects.first(where: { project in
+        // Select a live session directly when it is open in the workspace.
+        if let project = model.projects.first(where: { project in
             project.sessions.contains { $0.id == sessionId }
-        }) else { return }
-        dismissSessionFinder()
-        // Select the session first: switching projects marks the project's
-        // selected tab as seen, and that should be the tab being opened.
-        model.selectSession(projectId: project.id, sessionId: sessionId)
-        if model.selectedProjectId != project.id { model.selectProject(project.id) }
-        DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+        }) {
+            dismissSessionFinder()
+            // Select the session first: switching projects marks the project's
+            // selected tab as seen, and that should be the tab being opened.
+            model.selectSession(projectId: project.id, sessionId: sessionId)
+            if model.selectedProjectId != project.id { model.selectProject(project.id) }
+            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+            return
+        }
+        // Resume an ended Copilot CLI session into its matched project.
+        guard let source = sessionFinder?.source(for: sessionId),
+              let copilotSessionId = source.resumableCopilotSessionId else {
+            return
+        }
+        switch model.resumeFromSessionFinder(
+            copilotSessionId: copilotSessionId,
+            preferredProjectId: source.projectId,
+            cwd: source.cwd,
+            repository: source.repository,
+            title: source.title
+        ) {
+        case .opened(let projectId, let resumedSessionId):
+            dismissSessionFinder()
+            model.selectSession(projectId: projectId, sessionId: resumedSessionId)
+            if model.selectedProjectId != projectId { model.selectProject(projectId) }
+            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+        case .permanentlyUnavailable:
+            sessionFinder?.removeResumableSession(id: sessionId)
+        case .temporarilyUnavailable:
+            break
+        }
     }
 
     func allowsWorkspaceEvents(_ event: NSEvent) -> Bool {

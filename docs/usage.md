@@ -33,11 +33,14 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   Drag a row to reorder it or onto another project to move it (show Projects first
   if that column is hidden). Background sessions keep
   running. Hold **⌘** (projects) or **⌃** (sessions) to see numbered hints.
-- **Find Session (`⌘K`):** search every project's sessions by name, project, folder, or
-  conversation text; matches update as you type. After a pause, Luna (`gpt-6-luna`) adds
-  meaning-based suggestions through a tool-less `copilot -p` run in a throwaway
-  `COPILOT_HOME` seeded only with your signed-in account, so it never adds sessions to your
-  Copilot history. `↑`/`↓` or `⌃N`/`⌃P` move, Return opens, Escape clears then closes.
+- **Find Session (`⌘K`):** search every project's live sessions and recent ended Copilot CLI
+  sessions by name, project, folder, or conversation text; matches update as you type, and
+  browsing lists **Recent Ended Sessions** below live ones. After a pause, Luna (`gpt-6-luna`)
+  adds meaning-based suggestions across both live and ended sessions through a tool-less
+  `copilot -p` run in a throwaway `COPILOT_HOME` seeded only with your signed-in account, so it
+  never adds sessions to your Copilot history. `↑`/`↓` or `⌃N`/`⌃P` move, Return opens a live
+  session or resumes an ended one in its matching project (or the current project) with
+  `copilot --resume` in the folder it worked in, and Escape clears then closes.
 - **Pull Requests (`⇧⌘P`):** opens Copilot Pull Requests, a separate app nested in
   `Copilot Projects.app/Contents/Helpers/`, with its own Dock icon and `⌘Tab` entry
   (Control-click its Dock icon ▸ **Options ▸ Keep in Dock** to keep it there). It shows

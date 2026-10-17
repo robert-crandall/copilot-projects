@@ -5156,6 +5156,7 @@ final class AppModel: ObservableObject {
     /// when its folder is gone.
     func resumePullRequestsSession(
         requestId: UUID, projectId: String, copilotSessionId: String, selectOnMac: Bool = true,
+        initialTitle: String = "Copilot",
         fingerprintOverride: String? = nil, pullRequestKeys: [String]? = nil, now: Date = Date()
     ) -> ControlResponse {
         guard !isTerminating else {
@@ -5228,8 +5229,14 @@ final class AppModel: ObservableObject {
         guard let pi = projectIndex(projectId) else {
             return .failure(CopilotSessionStartError.projectUnavailable.localizedDescription, code: "unknown-project")
         }
-        let session = Session(id: tabId, title: "Copilot", cwd: cwd, creationFingerprint: fingerprint,
-                              pullRequestKeys: pullRequestKeys)
+        let resolvedTitle = initialTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let session = Session(
+            id: tabId,
+            title: resolvedTitle.isEmpty ? "Copilot" : resolvedTitle,
+            cwd: cwd,
+            creationFingerprint: fingerprint,
+            pullRequestKeys: pullRequestKeys
+        )
         let previousSelection = projects[pi].selectedSessionId
         projects[pi].sessions.append(session)
         if selectOnMac { projects[pi].selectedSessionId = session.id }
@@ -5297,6 +5304,80 @@ final class AppModel: ObservableObject {
             return launch.sessionId
         }
         return nil
+    }
+
+    /// Lowercased Copilot CLI session IDs owned or currently being resumed by live tabs.
+    func activeAndResumingCopilotSessionIds(now: Date = Date()) -> Set<String> {
+        var ids = Set<String>()
+        for project in projects {
+            for session in project.sessions {
+                if let activeId = session.agentActivity?.copilotSessionId, !activeId.isEmpty {
+                    ids.insert(activeId.lowercased())
+                }
+                guard let marker = resumeMarkerValue(sessionId: session.id, suffix: "copilot-session"),
+                      !marker.isEmpty else { continue }
+                if TranscriptController.transcriptOwnerAllowsRead(sessionId: session.id, directory: resumeMarkerDirectory),
+                   !TranscriptController.isCopilotSessionQuarantined(
+                       sessionId: session.id, copilotSessionId: marker, directory: resumeMarkerDirectory
+                   ) {
+                    ids.insert(marker.lowercased())
+                }
+            }
+        }
+        for (copilotId, launch) in pullRequestsResumeLaunches
+            where locateIndex(launch.sessionId) != nil
+                && now.timeIntervalSince(launch.launchedAt) < Self.pullRequestsResumeStartupGrace {
+            ids.insert(copilotId.lowercased())
+        }
+        return ids
+    }
+
+    enum ResumeFinderOutcome: Equatable {
+        case opened(projectId: String, sessionId: String)
+        case permanentlyUnavailable
+        case temporarilyUnavailable
+    }
+
+    /// Reopens an ended Copilot session chosen in Find Session (`⌘K`).
+    func resumeFromSessionFinder(
+        copilotSessionId: String,
+        preferredProjectId: String,
+        cwd: String,
+        repository: String? = nil,
+        title: String,
+        now: Date = Date()
+    ) -> ResumeFinderOutcome {
+        let projectId: String?
+        if projects.contains(where: { $0.id == preferredProjectId }) {
+            projectId = preferredProjectId
+        } else {
+            projectId = SessionFinderSearch.targetProject(
+                forCwd: cwd,
+                repository: repository,
+                projects: sessionFinderProjectTargets,
+                selectedProjectId: selectedProjectId
+            )?.id
+        }
+        guard let projectId else { return .temporarilyUnavailable }
+        let requestId = UUID()
+        let response = resumePullRequestsSession(
+            requestId: requestId,
+            projectId: projectId,
+            copilotSessionId: copilotSessionId,
+            selectOnMac: true,
+            initialTitle: title,
+            now: now
+        )
+        let candidateSessionId = response.text ?? requestId.uuidString
+        if let loc = locateIndex(candidateSessionId) {
+            return .opened(projectId: projects[loc.p].id, sessionId: candidateSessionId)
+        }
+        switch response.code {
+        case "gone", "in-use", "invalid":
+            return .permanentlyUnavailable
+        default:
+            return .temporarilyUnavailable
+        }
     }
 
     /// Every project and live session with the state the workspace shows, for `list-sessions`.
