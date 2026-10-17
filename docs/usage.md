@@ -88,7 +88,11 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   while you were away, and a red exclamation with **Request failed** marks a session whose latest
   request ended in a Copilot error (hover it for the CLI's message); the project column counts
   those sessions behind the same red exclamation. The failure clears when the
-  next request starts. With the Copilot CLI hooks installed (below), this is driven automatically.
+  next request starts. Clicking any active count in the top-right fleet status bar
+  (`waiting`, `failed`, `ready`, `running`, `background`, `scheduled`) jumps to the
+  next session in that state across all projects, and **Session ▸ Next Session Needing
+  Attention** (`⇧⌘A`) cycles across projects in urgency order (`waiting` → `failed` →
+  `unread` / `finished`). With the Copilot CLI hooks installed (below), this is driven automatically.
 - **Completed-turn drawer:** Copilot CLI remains the native interactive terminal, while a
   collapsible drawer overlays its right edge with independently scrollable completed turns
   rendered as Markdown. Live work, permissions, shortcuts, and input stay entirely in the CLI.

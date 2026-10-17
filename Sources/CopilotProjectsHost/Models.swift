@@ -83,6 +83,14 @@ struct Session: Identifiable, Codable, Equatable {
         }
     }
 
+    /// Urgency tier for jumping to the next session that needs the user's attention.
+    var attentionTier: SessionAttentionTier? {
+        if displayStatus == .waiting { return .waiting }
+        if failedRequest != nil { return .failed }
+        if finishedUnseen || isUnread { return .unread }
+        return nil
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, title, cwd, creationFingerprint, pullRequestKeys
         case manuallyMarkedUnread = "markedUnread"
@@ -156,6 +164,36 @@ struct PersistedState: Codable {
         self.schemaVersion = Self.currentSchemaVersion
         self.projects = projects
         self.selectedProjectId = selectedProjectId
+    }
+}
+
+/// Urgency order when cycling through sessions that need attention (`⇧⌘A`).
+enum SessionAttentionTier: Int, Comparable, Sendable {
+    case waiting = 0
+    case failed = 1
+    case unread = 2
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// Interactive categories in `FleetStatusBar`.
+enum FleetActivityKind: String, CaseIterable, Equatable, Sendable {
+    case running
+    case background
+    case scheduled
+    case waiting
+    case failed
+    case ready
+
+    func matches(_ session: Session) -> Bool {
+        switch self {
+        case .running: return session.displayStatus == .running
+        case .background: return session.hasBackgroundWork
+        case .scheduled: return !session.schedules.isEmpty
+        case .waiting: return session.displayStatus == .waiting
+        case .failed: return session.failedRequest != nil
+        case .ready: return session.finishedUnseen
+        }
     }
 }
 

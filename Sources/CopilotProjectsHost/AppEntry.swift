@@ -48,6 +48,19 @@ private struct SessionReadStateButton: View {
     }
 }
 
+/// Session ▸ Next Session Needing Attention (⇧⌘A).
+private struct NextAttentionSessionButton: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button("Next Session Needing Attention") {
+            model.selectNextAttentionSession()
+        }
+        .keyboardShortcut("a", modifiers: [.command, .shift])
+        .disabled(!model.hasAttentionSessions)
+    }
+}
+
 private struct WorkspaceCommands: Commands {
     let model: AppModel
     @ObservedObject var input: WorkspaceInputController
@@ -90,6 +103,7 @@ private struct WorkspaceCommands: Commands {
                 Divider()
                 Button("Find Session…") { input.presentSessionFinder() }
                     .keyboardShortcut("k", modifiers: .command)
+                NextAttentionSessionButton(model: model)
                 Button("Next Session") { model.selectAdjacentSession(1) }
                     .keyboardShortcut("]", modifiers: [.command, .shift])
                 Button("Previous Session") { model.selectAdjacentSession(-1) }
@@ -271,12 +285,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateNumberHint(event.modifierFlags)
             return event
         case .leftMouseDown:
-            // Double-click the top title strip (but not the traffic lights) to run
-            // the user's title-bar double-click action; .hiddenTitleBar + our
-            // SwiftUI strip otherwise swallows the native gesture.
+            // Double-click the top title strip (but not the traffic lights or interactive
+            // FleetStatusBar pills) to run the user's title-bar double-click action;
+            // .hiddenTitleBar + our SwiftUI strip otherwise swallows the native gesture.
             if event.clickCount == 2,
                let window = event.window ?? NSApp.keyWindow ?? NSApp.mainWindow,
-               isInTitleStrip(event, window: window) {
+               isInTitleStrip(event, window: window),
+               !FleetStatusBarMarkerView.contains(event.locationInWindow, in: window.contentView) {
                 performTitleBarDoubleClick(window)
                 return nil
             }
