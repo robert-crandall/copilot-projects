@@ -441,12 +441,10 @@ final class AppModel: ObservableObject {
     }
     private struct SentPullRequestsPrompt {
         let sessionId: String
-        let prompt: String
+        let payloadFingerprint: String
         let route: PullRequestsPromptRoute
     }
     private var sentPullRequestsPrompts: [UUID: SentPullRequestsPrompt] = [:]
-    private var sentPullRequestsPromptOrder: [UUID] = []
-    private static let maximumSentPullRequestsPrompts = 128
     /// The Copilot session each captured launch resumes, by tab. Launches are
     /// captured only when `remoteSessionLauncher` is set, in tests.
     private(set) var capturedResumeLaunches: [String: String] = [:]
@@ -5360,7 +5358,8 @@ final class AppModel: ObservableObject {
             resumeMarkerDirectory: resumeMarkerDirectory
         )
         if let previous = sentPullRequestsPrompts[requestId] {
-            guard previous.sessionId == sessionId, previous.prompt == normalizedPrompt else {
+            guard previous.sessionId == sessionId,
+                  previous.payloadFingerprint == payloadFingerprint else {
                 return .failure("request id is bound to a different session or prompt", code: "conflict")
             }
             guard let loc = locateIndex(sessionId) else {
@@ -5407,7 +5406,7 @@ final class AppModel: ObservableObject {
                     rememberSentPullRequestsPrompt(
                         requestId: requestId,
                         sessionId: sessionId,
-                        prompt: normalizedPrompt,
+                        payloadFingerprint: payloadFingerprint,
                         route: .native(conversationEpoch: epoch)
                     )
                 }
@@ -5437,7 +5436,7 @@ final class AppModel: ObservableObject {
                 rememberSentPullRequestsPrompt(
                     requestId: requestId,
                     sessionId: sessionId,
-                    prompt: normalizedPrompt,
+                    payloadFingerprint: payloadFingerprint,
                     route: .native(conversationEpoch: epoch)
                 )
                 return resolveNativePullRequestsPrompt(
@@ -5469,7 +5468,7 @@ final class AppModel: ObservableObject {
             rememberSentPullRequestsPrompt(
                 requestId: requestId,
                 sessionId: sessionId,
-                prompt: normalizedPrompt,
+                payloadFingerprint: payloadFingerprint,
                 route: .terminal
             )
             return .success(sessionId, code: "sent")
@@ -5527,19 +5526,12 @@ final class AppModel: ObservableObject {
     private func rememberSentPullRequestsPrompt(
         requestId: UUID,
         sessionId: String,
-        prompt: String,
+        payloadFingerprint: String,
         route: PullRequestsPromptRoute
     ) {
-        if sentPullRequestsPrompts[requestId] == nil {
-            sentPullRequestsPromptOrder.append(requestId)
-            while sentPullRequestsPromptOrder.count > Self.maximumSentPullRequestsPrompts {
-                let oldest = sentPullRequestsPromptOrder.removeFirst()
-                sentPullRequestsPrompts[oldest] = nil
-            }
-        }
         sentPullRequestsPrompts[requestId] = SentPullRequestsPrompt(
             sessionId: sessionId,
-            prompt: prompt,
+            payloadFingerprint: payloadFingerprint,
             route: route
         )
     }

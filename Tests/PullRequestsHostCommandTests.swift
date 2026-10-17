@@ -578,6 +578,20 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertEqual(send(project: "B", session: "b1").code, "conflict")
             XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
 
+            // Retrying an older terminal request after more than 128 later dispatches
+            // still returns `existing` instead of resending the prompt.
+            for index in 0..<130 {
+                let extra = send(UUID().uuidString, prompt: "Follow-up \(index)")
+                XCTAssertEqual(extra.code, "sent")
+            }
+            let expectedDeliveredCount = host.resuming.deliveredPrompts.count
+            XCTAssertEqual(expectedDeliveredCount, 131)
+            let replayAfterManyDispatches = send()
+            XCTAssertTrue(replayAfterManyDispatches.ok)
+            XCTAssertEqual(replayAfterManyDispatches.code, "existing")
+            XCTAssertEqual(send(prompt: "different").code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
             // Mismatched project, ended session, or waiting session are refused.
             XCTAssertEqual(send(UUID().uuidString, project: "B", session: "a1").code, "conflict")
             XCTAssertEqual(send(UUID().uuidString, project: "A", session: "gone").code, "gone")
@@ -585,7 +599,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             waiting.status = "waiting"
             XCTAssertTrue(model.handle(waiting).ok)
             XCTAssertEqual(send(UUID().uuidString, project: "B", session: "b1").code, "busy")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             // A fresh on-disk pending-input snapshot blocks sending even when the in-memory
             // session status is still `.idle`.
@@ -618,7 +632,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             )
             try JSONEncoder().encode(snapshot).write(to: snapshotURL)
             XCTAssertEqual(send(UUID().uuidString, project: "A", session: "a1").code, "busy")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             // Native workflow `.send` writes `session-send.json` and returns `queued` without
             // falling back to terminal injection.
@@ -628,7 +642,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let queued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertTrue(queued.ok, queued.error ?? "")
             XCTAssertEqual(queued.code, "queued")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1, "native path does not use terminal fallback")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount, "native path does not use terminal fallback")
             let handoffURL = host.root.appendingPathComponent("a1.session-send.json")
             XCTAssertTrue(FileManager.default.fileExists(atPath: handoffURL.path))
             let replayQueued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
@@ -647,7 +661,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             )
             XCTAssertFalse(expiredReplay.ok)
             XCTAssertEqual(expiredReplay.code, "indeterminate")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             try FileManager.default.removeItem(at: handoffURL)
             let action = RemoteSessionAction(kind: .send, prompt: "Queue via SDK", mode: .enqueue)
@@ -679,7 +693,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let appliedReplay = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertTrue(appliedReplay.ok)
             XCTAssertEqual(appliedReplay.code, "queued")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             // Rejected and indeterminate receipts surface their outcomes on replay.
             let rejectedReqId = UUID()
@@ -699,7 +713,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let rejected = send(rejectedReqId.uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertFalse(rejected.ok)
             XCTAssertEqual(rejected.code, "rejected")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             let indeterminateReqId = UUID()
             snapshot.operationReceipts = [
@@ -717,7 +731,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let indeterminate = send(indeterminateReqId.uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertFalse(indeterminate.ok)
             XCTAssertEqual(indeterminate.code, "indeterminate")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             // Native validation failure (e.g. sendReady == false or missing marker) refuses
             // the attempt instead of falling back to terminal injection.
@@ -727,7 +741,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             let notReady = send(UUID().uuidString, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertFalse(notReady.ok)
             XCTAssertEqual(notReady.code, "busy")
-            XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
         }
     }
 }

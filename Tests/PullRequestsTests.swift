@@ -215,7 +215,7 @@ final class PullRequestTriageTests: XCTestCase {
         XCTAssertTrue(matching.reasons.isEmpty, "no session claim before transcripts are matched")
     }
 
-    func testDispatchActionsFollowAttentionReasonsAndCustomPromptsAddContext() {
+    func testDispatchActionsFollowAttentionReasonsAndCustomPromptsAddContext() throws {
         let pr = makePR(
             42,
             repo: "github/github",
@@ -273,6 +273,32 @@ final class PullRequestTriageTests: XCTestCase {
             PullRequestItem.formattedCustomPrompt("compare #420 with #42", for: pr),
             "compare #420 with #42"
         )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with other/repo#42", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with other/repo#42"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with other/github#42", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with other/github#42"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with github/github#42", for: pr),
+            "compare with github/github#42"
+        )
+
+        // Large failing check lists stay within the 8,192-byte prompt budget.
+        let hugeChecks = (1...200).map { "ci/matrix-leg-\($0)-\(String(repeating: "x", count: 50))" }
+        let hugePR = makePR(44, checks: .failure, requiredFailing: hugeChecks)
+        let hugeItem = PullRequestItem(
+            pr: hugePR,
+            assessment: PullRequestTriage.assess(hugePR, session: session, now: now),
+            session: session,
+            isManuallyAssigned: false
+        )
+        let fixChecksPrompt = try XCTUnwrap(hugeItem.dispatchActions.first { $0.kind == .fixChecks }?.prompt)
+        XCTAssertLessThanOrEqual(fixChecksPrompt.utf8.count, PullRequestItem.maxDispatchPromptUTF8Bytes)
+        XCTAssertTrue(fixChecksPrompt.contains("https://github.com/github/github/pull/44"))
+        XCTAssertTrue(fixChecksPrompt.contains("more)"))
 
         // Manual goals keep per-item session targeting and pick the lane's primary item
         // from the items actually linked to the lane's session.

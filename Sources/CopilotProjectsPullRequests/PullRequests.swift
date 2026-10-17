@@ -467,6 +467,8 @@ struct PullRequestItem: Identifiable, Equatable {
 
     var id: PullRequestKey { pr.key }
 
+    static let maxDispatchPromptUTF8Bytes = 8_192
+
     var dispatchActions: [PullRequestDispatchAction] {
         Self.dispatchActions(for: pr, reasons: assessment.reasons)
     }
@@ -480,16 +482,10 @@ struct PullRequestItem: Identifiable, Equatable {
             switch reason {
             case .failingRequiredChecks, .failingChecks:
                 guard seen.insert(.fixChecks).inserted else { continue }
-                let checksDetail: String
-                if let failing = pr.failingRequiredChecks, !failing.isEmpty {
-                    checksDetail = " (\(failing.joined(separator: ", ")))"
-                } else {
-                    checksDetail = ""
-                }
                 actions.append(PullRequestDispatchAction(
                     kind: .fixChecks,
                     title: "Ask Session to Fix Checks",
-                    prompt: "Fix the failing checks on \(pr.url.absoluteString)\(checksDetail). Inspect the failing job logs, reproduce locally if needed, and push a fix."
+                    prompt: fixChecksPrompt(for: pr)
                 ))
             case .conflicts:
                 guard seen.insert(.resolveConflicts).inserted else { continue }
@@ -533,32 +529,95 @@ struct PullRequestItem: Identifiable, Equatable {
         return actions
     }
 
+    private static func fixChecksPrompt(for pr: PullRequestSnapshot) -> String {
+        let prefix = "Fix the failing checks on \(pr.url.absoluteString)"
+        let suffix = ". Inspect the failing job logs, reproduce locally if needed, and push a fix."
+        let basePrompt = prefix + suffix
+        guard let rawFailing = pr.failingRequiredChecks else { return basePrompt }
+        let failing = rawFailing
+            .map(sanitizePromptFragment)
+            .filter { !$0.isEmpty }
+        guard !failing.isEmpty else { return basePrompt }
+
+        let fullCandidate = "\(prefix) (\(failing.joined(separator: ", ")))\(suffix)"
+        if fullCandidate.utf8.count <= maxDispatchPromptUTF8Bytes {
+            return fullCandidate
+        }
+
+        var included: [String] = []
+        var best = basePrompt
+        for name in failing {
+            included.append(name)
+            let remaining = failing.count - included.count
+            let tail = remaining > 0 ? ", and \(remaining) more" : ""
+            let candidate = "\(prefix) (\(included.joined(separator: ", "))\(tail))\(suffix)"
+            if candidate.utf8.count <= maxDispatchPromptUTF8Bytes {
+                best = candidate
+            } else {
+                break
+            }
+        }
+        return best
+    }
+
+    private static func sanitizePromptFragment(_ value: String) -> String {
+        let scalars = value.unicodeScalars.filter { scalar in
+            scalar.value >= 0x20 && !(0x7F...0x9F).contains(scalar.value)
+        }
+        return String(String.UnicodeScalarView(scalars))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func formattedCustomPrompt(_ text: String, for pr: PullRequestSnapshot) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         let url = pr.url.absoluteString
-        if containsCompletePRReference(url, in: trimmed)
-            || containsCompletePRReference(pr.shortName, in: trimmed)
-            || containsCompletePRReference("#\(pr.key.number)", in: trimmed) {
+        let qualifiedName = "\(pr.key.owner)/\(pr.key.repo)#\(pr.key.number)"
+        if containsCompletePRReference(url, in: trimmed, requireLeftBoundary: false)
+            || containsCompletePRReference(qualifiedName, in: trimmed, requireLeftBoundary: true)
+            || containsCompletePRReference(pr.shortName, in: trimmed, requireLeftBoundary: true)
+            || containsCompletePRReference("#\(pr.key.number)", in: trimmed, requireLeftBoundary: true) {
             return trimmed
         }
         return "For \(url):\n\n\(trimmed)"
     }
 
-    private static func containsCompletePRReference(_ token: String, in text: String) -> Bool {
+    private static func containsCompletePRReference(
+        _ token: String,
+        in text: String,
+        requireLeftBoundary: Bool
+    ) -> Bool {
         var searchStart = text.startIndex
         while let range = text.range(
             of: token,
             options: [.caseInsensitive],
             range: searchStart..<text.endIndex
         ) {
+            let leftOK: Bool
+            if !requireLeftBoundary || range.lowerBound == text.startIndex {
+                leftOK = true
+            } else {
+                let prevIndex = text.index(before: range.lowerBound)
+                leftOK = isReferenceBoundaryBefore(text[prevIndex])
+            }
             let nextIndex = range.upperBound
-            if nextIndex == text.endIndex || !text[nextIndex].isNumber {
+            let rightOK = nextIndex == text.endIndex || !text[nextIndex].isNumber
+            if leftOK && rightOK {
                 return true
             }
             searchStart = nextIndex
         }
         return false
+    }
+
+    private static func isReferenceBoundaryBefore(_ character: Character) -> Bool {
+        !character.isLetter
+            && !character.isNumber
+            && character != "_"
+            && character != "."
+            && character != "-"
+            && character != "/"
+            && character != ":"
     }
 }
 
