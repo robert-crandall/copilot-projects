@@ -215,6 +215,112 @@ final class PullRequestTriageTests: XCTestCase {
         XCTAssertTrue(matching.reasons.isEmpty, "no session claim before transcripts are matched")
     }
 
+    func testDispatchActionsFollowAttentionReasonsAndCustomPromptsAddContext() throws {
+        let pr = makePR(
+            42,
+            repo: "github/github",
+            branch: "me/fix-everything",
+            mergeable: .conflicting,
+            mergeState: .dirty,
+            review: .changesRequested,
+            checks: .failure,
+            requiredFailing: ["ci/build"],
+            threads: 2,
+            copilotThreads: 1
+        )
+        let assessment = PullRequestTriage.assess(pr, session: session, now: now)
+        let item = PullRequestItem(pr: pr, assessment: assessment, session: session, isManuallyAssigned: false)
+        XCTAssertEqual(item.dispatchActions.map(\.kind), [.resolveConflicts, .fixChecks, .addressFeedback])
+        XCTAssertEqual(item.dispatchActions.map(\.title), [
+            "Ask Session to Resolve Conflicts",
+            "Ask Session to Fix Checks",
+            "Ask Session to Address Feedback",
+        ])
+        XCTAssertTrue(item.dispatchActions[1].prompt.contains("(ci/build)"))
+
+        // Clean PR still offers a status check fallback.
+        let cleanPR = makePR(43, mergeState: .clean, review: .approved)
+        let cleanItem = PullRequestItem(
+            pr: cleanPR,
+            assessment: PullRequestTriage.assess(cleanPR, session: session, now: now),
+            session: session,
+            isManuallyAssigned: false
+        )
+        XCTAssertEqual(cleanItem.dispatchActions.map(\.kind), [.checkStatus])
+
+        // Custom prompts add the PR URL only when the user didn't already name the PR.
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("fix the failing snapshot test", for: pr),
+            "For https://github.com/github/github/pull/42:\n\nfix the failing snapshot test"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("check #42 again", for: pr),
+            "check #42 again"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with #420", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with #420"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with github/github#420", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with github/github#420"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with https://github.com/github/github/pull/420", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with https://github.com/github/github/pull/420"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare #420 with #42", for: pr),
+            "compare #420 with #42"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with other/repo#42", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with other/repo#42"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with other/github#42", for: pr),
+            "For https://github.com/github/github/pull/42:\n\ncompare with other/github#42"
+        )
+        XCTAssertEqual(
+            PullRequestItem.formattedCustomPrompt("compare with github/github#42", for: pr),
+            "compare with github/github#42"
+        )
+
+        // Large failing check lists stay within the 8,192-byte prompt budget.
+        let hugeChecks = (1...200).map { "ci/matrix-leg-\($0)-\(String(repeating: "x", count: 50))" }
+        let hugePR = makePR(44, checks: .failure, requiredFailing: hugeChecks)
+        let hugeItem = PullRequestItem(
+            pr: hugePR,
+            assessment: PullRequestTriage.assess(hugePR, session: session, now: now),
+            session: session,
+            isManuallyAssigned: false
+        )
+        let fixChecksPrompt = try XCTUnwrap(hugeItem.dispatchActions.first { $0.kind == .fixChecks }?.prompt)
+        XCTAssertLessThanOrEqual(fixChecksPrompt.utf8.count, PullRequestItem.maxDispatchPromptUTF8Bytes)
+        XCTAssertTrue(fixChecksPrompt.contains("https://github.com/github/github/pull/44"))
+        XCTAssertTrue(fixChecksPrompt.contains("more)"))
+
+        // Manual goals keep per-item session targeting and pick the lane's primary item
+        // from the items actually linked to the lane's session.
+        let unlinkedUrgentItem = PullRequestItem(
+            pr: pr,
+            assessment: PullRequestTriage.assess(pr, session: nil, now: now),
+            session: nil,
+            isManuallyAssigned: true
+        )
+        let manualGoal = PullRequestGoal(
+            id: "manual:1",
+            kind: .manual,
+            name: "Manual Goal",
+            session: nil,
+            items: [unlinkedUrgentItem, cleanItem]
+        )
+        XCTAssertEqual(manualGoal.laneSession, session)
+        XCTAssertNil(manualGoal.session(for: unlinkedUrgentItem))
+        XCTAssertEqual(manualGoal.session(for: cleanItem), session)
+        XCTAssertEqual(manualGoal.primaryDispatchItem(for: session)?.id, cleanItem.id)
+    }
+
     func testDistinctiveBranchesAndLinkThresholds() {
         XCTAssertTrue(PullRequestLinker.isDistinctiveBranch("obvioussean/ccr-auto-review-effort"))
         for common in ["main", "patch-1", "fix-12", "dev", "feature"] {

@@ -260,14 +260,21 @@ struct PullRequestsView: View {
     /// can act right now.
     private func footer(_ goals: [PullRequestGoal]) -> some View {
         let lanesShown = pullRequests.phase == .loaded && !goals.isEmpty
-        let selected = goals.lazy.flatMap(\.items).first { $0.id == selection }
+        let selectedGoal = goals.first { $0.items.contains { $0.id == selection } }
+        let selected = selectedGoal?.items.first { $0.id == selection }
+        let selectedSession = selected?.session ?? selectedGoal?.session
         let canGoToSession = selected?.session != nil && pullRequests.isConnected
+        let canPromptSession = selectedSession != nil
+            && selectedSession?.status != .waiting
+            && selectedSession?.hasPendingInput != true
+            && pullRequests.isConnected
         return HStack(spacing: 14) {
             if lanesShown {
                 keyHint("↑↓", "Move")
                 if selected != nil {
                     keyHint("↩", canGoToSession ? "Go to Session" : "Open on GitHub")
                     if canGoToSession { keyHint("⌘↩", "Open on GitHub") }
+                    if canPromptSession { keyHint("P", "Prompt Session") }
                 }
             }
             keyHint("⌘R", "Refresh")
@@ -374,6 +381,8 @@ struct PullRequestsView: View {
                                 defaultProjectId: pullRequests.defaultProjectId,
                                 isStarting: pullRequests.startingGoals.contains(goal.id),
                                 resumingSessions: pullRequests.resumingSessions,
+                                sendingSessions: pullRequests.sendingSessions,
+                                retryablePromptSessions: pullRequests.retryablePromptSessions,
                                 goalChoices: goalChoices(allGoals),
                                 actions: laneActions
                             )
@@ -398,6 +407,32 @@ struct PullRequestsView: View {
                     pullRequests.goToSession(session)
                 } else {
                     pullRequests.openOnGitHub(item.pr)
+                }
+                return .handled
+            }
+            .onKeyPress(characters: .letters, phases: .down) { press in
+                guard press.modifiers.subtracting([.shift]).isDisjoint(with: [.command, .control, .option]),
+                      press.characters.lowercased() == "p",
+                      let item = order.first(where: { $0.id == selection }),
+                      let session = item.session ?? goals.first(where: { $0.items.contains { $0.id == item.id } })?.session,
+                      pullRequests.isConnected,
+                      session.status != .waiting,
+                      !session.hasPendingInput,
+                      !pullRequests.sendingSessions.contains(session.id) else { return .ignored }
+                if press.modifiers.contains(.shift) {
+                    if pullRequests.retryablePromptSessions.contains(session.id) {
+                        pullRequests.retryPendingPrompt(for: session)
+                    } else if let action = item.dispatchActions.first {
+                        pullRequests.sendPrompt(to: session, prompt: action.prompt, pullRequestKey: item.pr.key)
+                    }
+                } else {
+                    Self.promptSession(
+                        session,
+                        for: item.pr,
+                        initialText: pullRequests.promptDraft(for: item.pr, session: session)
+                    ) { draft, _ in
+                        pullRequests.sendCustomPrompt(draft, for: item.pr, to: session)
+                    }
                 }
                 return .handled
             }
@@ -491,6 +526,17 @@ struct PullRequestsView: View {
             openPullRequest: { pullRequests.openOnGitHub($0) },
             copyLink: { pullRequests.copyLink($0) },
             goToSession: { pullRequests.goToSession($0) },
+            sendPrompt: { session, prompt in pullRequests.sendPrompt(to: session, prompt: prompt) },
+            retryPrompt: { session in pullRequests.retryPendingPrompt(for: session) },
+            promptSession: { session, pr in
+                Self.promptSession(
+                    session,
+                    for: pr,
+                    initialText: pullRequests.promptDraft(for: pr, session: session)
+                ) { draft, _ in
+                    pullRequests.sendCustomPrompt(draft, for: pr, to: session)
+                }
+            },
             startSession: { goal, projectId in pullRequests.startSession(for: goal, projectId: projectId) },
             resumeSession: { candidate, projectId in pullRequests.resume(candidate, projectId: projectId) },
             openHost: { pullRequests.openHost() },
@@ -501,6 +547,18 @@ struct PullRequestsView: View {
                 }
             }
         )
+    }
+
+    private static func promptSession(
+        _ session: PullRequestSession,
+        for pr: PullRequestSnapshot,
+        initialText: String = "",
+        send: @MainActor (_ draft: String, _ prompt: String) -> Void
+    ) {
+        let composer = PullRequestPromptComposer(session: session, pr: pr, initialText: initialText)
+        if let prompt = composer.run() {
+            send(composer.textView.string, prompt)
+        }
     }
 
     private static func promptForGoalName(suggested: String) -> String? {
@@ -526,6 +584,9 @@ private struct GoalLane: View {
         let openPullRequest: (PullRequestSnapshot) -> Void
         let copyLink: (PullRequestSnapshot) -> Void
         let goToSession: (PullRequestSession) -> Void
+        let sendPrompt: (PullRequestSession, String) -> Void
+        let retryPrompt: (PullRequestSession) -> Void
+        let promptSession: (PullRequestSession, PullRequestSnapshot) -> Void
         let startSession: (PullRequestGoal, String) -> Void
         let resumeSession: (ResumableSession, String) -> Void
         let openHost: () -> Void
@@ -555,11 +616,15 @@ private struct GoalLane: View {
     let isStarting: Bool
     /// Copilot sessions on their way back; their Resume Session buttons wait.
     let resumingSessions: Set<String>
+    /// Live sessions whose dispatched prompt is in flight.
+    let sendingSessions: Set<String>
+    /// Live sessions with an unresolved prompt that can be retried with its original request id.
+    let retryablePromptSessions: Set<String>
     let goalChoices: [(id: String, name: String)]
     let actions: Actions
 
     private var laneSession: PullRequestSession? {
-        goal.session ?? goal.items.lazy.compactMap(\.session).first
+        goal.laneSession
     }
 
     /// The ended session to offer, once the workspace has said nothing live drives this goal.
@@ -622,8 +687,21 @@ private struct GoalLane: View {
     @ViewBuilder
     private func menu(_ item: PullRequestItem) -> some View {
         Button("Open on GitHub") { actions.openPullRequest(item.pr) }
-        if let session = item.session, workspace == .connected {
+        if let session = goal.session(for: item), workspace == .connected {
             Button("Go to Session") { actions.goToSession(session) }
+            if session.status != .waiting, !session.hasPendingInput {
+                Divider()
+                if retryablePromptSessions.contains(session.id) {
+                    Button("Retry Last Prompt") { actions.retryPrompt(session) }
+                        .disabled(sendingSessions.contains(session.id))
+                }
+                ForEach(item.dispatchActions) { action in
+                    Button(action.title) { actions.sendPrompt(session, action.prompt) }
+                        .disabled(sendingSessions.contains(session.id))
+                }
+                Button("Send Prompt to Session…") { actions.promptSession(session, item.pr) }
+                    .disabled(sendingSessions.contains(session.id))
+            }
         }
         Button("Copy Link") { actions.copyLink(item.pr) }
         Divider()
@@ -734,9 +812,38 @@ private struct GoalLane: View {
     @ViewBuilder
     private var connectedSessionAction: some View {
         if let session = laneSession {
-            Button("Go to Session") { actions.goToSession(session) }
+            let sending = sendingSessions.contains(session.id)
+            if session.status != .waiting, !session.hasPendingInput,
+               let primaryItem = goal.primaryDispatchItem(for: session) {
+                Menu {
+                    Button("Go to Session") { actions.goToSession(session) }
+                    Divider()
+                    if retryablePromptSessions.contains(session.id) {
+                        Button("Retry Last Prompt") { actions.retryPrompt(session) }
+                            .disabled(sending)
+                    }
+                    ForEach(primaryItem.dispatchActions) { action in
+                        Button(action.title) { actions.sendPrompt(session, action.prompt) }
+                            .disabled(sending)
+                    }
+                    Button("Send Prompt to Session…") { actions.promptSession(session, primaryItem.pr) }
+                        .disabled(sending)
+                } label: {
+                    Text(sending ? "Sending…" : "Go to Session")
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                } primaryAction: {
+                    actions.goToSession(session)
+                }
+                .menuStyle(.button)
                 .controlSize(.small)
-                .help("Show \(PullRequestGrouping.goalName(sessionTitle: session.title)) in the workspace")
+                .fixedSize()
+                .help("Show \(PullRequestGrouping.goalName(sessionTitle: session.title)) in the workspace, or choose an action from the menu to send it a prompt")
+            } else {
+                Button("Go to Session") { actions.goToSession(session) }
+                    .controlSize(.small)
+                    .help("Show \(PullRequestGrouping.goalName(sessionTitle: session.title)) in the workspace")
+            }
         } else if !sessionsKnown || checkingStatus {
             EmptyView()
         } else if let previous = previousSession, !projects.isEmpty {
@@ -1153,5 +1260,88 @@ private enum SkeletonLanes {
         return PullRequestGoal(
             id: "placeholder-\(lane)", kind: .single, name: "Placeholder goal name", session: nil, items: items
         )
+    }
+}
+
+/// Modal prompt composer for sending a custom prompt about a pull request to its linked session.
+@MainActor
+final class PullRequestPromptComposer: NSObject, NSTextViewDelegate {
+    let alert = NSAlert()
+    let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 440, height: 160))
+    private let pr: PullRequestSnapshot
+    private let instructions: String
+
+    init(session: PullRequestSession, pr: PullRequestSnapshot, initialText: String = "") {
+        self.pr = pr
+        let sessionName = PullRequestGrouping.goalName(sessionTitle: session.title)
+        self.instructions = "Send a prompt about \(pr.shortName) to “\(sessionName)”. "
+            + "Return adds a line; Command-Return sends."
+        super.init()
+        alert.messageText = "Send Prompt to Session"
+        alert.addButton(withTitle: "Send Prompt")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].keyEquivalent = "\r"
+        alert.buttons[0].keyEquivalentModifierMask = .command
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.allowsUndo = true
+        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        textView.autoresizingMask = [.width]
+        textView.setAccessibilityLabel("Session prompt")
+        textView.string = initialText
+        textView.delegate = self
+
+        let scrollView = NSScrollView(frame: textView.frame)
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+        alert.window.initialFirstResponder = textView
+        updateValidation()
+    }
+
+    func textDidChange(_ notification: Notification) {
+        updateValidation()
+    }
+
+    static func isValidPrompt(_ value: String) -> Bool {
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let trimmed = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, normalized.utf8.count <= 8_192 else { return false }
+        for scalar in normalized.unicodeScalars {
+            if scalar == "\n" || scalar == "\t" { continue }
+            if scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value) { return false }
+        }
+        return true
+    }
+
+    private func updateValidation() {
+        let formatted = PullRequestItem.formattedCustomPrompt(textView.string, for: pr)
+        let valid = Self.isValidPrompt(formatted)
+        alert.buttons[0].isEnabled = valid
+        alert.informativeText = valid || textView.string.isEmpty
+            ? instructions
+            : "Enter a nonempty prompt of at most 8,192 UTF-8 bytes, without terminal control characters."
+    }
+
+    func run(
+        present: @MainActor (NSAlert) -> NSApplication.ModalResponse = { $0.runModal() }
+    ) -> String? {
+        alert.layout()
+        alert.window.initialFirstResponder = textView
+        guard present(alert) == .alertFirstButtonReturn else { return nil }
+        let formatted = PullRequestItem.formattedCustomPrompt(textView.string, for: pr)
+        return Self.isValidPrompt(formatted) ? formatted : nil
     }
 }

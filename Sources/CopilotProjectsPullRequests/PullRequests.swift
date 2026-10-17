@@ -441,6 +441,22 @@ struct PullRequestSession: Equatable, Sendable {
     }
 }
 
+/// A reason-aware prompt action offered for a pull request whose session is live.
+struct PullRequestDispatchAction: Equatable, Identifiable, Sendable {
+    enum Kind: String, Equatable, Sendable {
+        case fixChecks
+        case resolveConflicts
+        case addressFeedback
+        case updateBranch
+        case checkStatus
+    }
+
+    let kind: Kind
+    let title: String
+    let prompt: String
+    var id: Kind { kind }
+}
+
 struct PullRequestItem: Identifiable, Equatable {
     let pr: PullRequestSnapshot
     let assessment: PullRequestAssessment
@@ -450,6 +466,159 @@ struct PullRequestItem: Identifiable, Equatable {
     let isManuallyAssigned: Bool
 
     var id: PullRequestKey { pr.key }
+
+    static let maxDispatchPromptUTF8Bytes = 8_192
+
+    var dispatchActions: [PullRequestDispatchAction] {
+        Self.dispatchActions(for: pr, reasons: assessment.reasons)
+    }
+
+    static func dispatchActions(
+        for pr: PullRequestSnapshot, reasons: [PullRequestAttention]
+    ) -> [PullRequestDispatchAction] {
+        var actions: [PullRequestDispatchAction] = []
+        var seen = Set<PullRequestDispatchAction.Kind>()
+        for reason in reasons {
+            switch reason {
+            case .failingRequiredChecks, .failingChecks:
+                guard seen.insert(.fixChecks).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .fixChecks,
+                    title: "Ask Session to Fix Checks",
+                    prompt: fixChecksPrompt(for: pr)
+                ))
+            case .conflicts:
+                guard seen.insert(.resolveConflicts).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .resolveConflicts,
+                    title: "Ask Session to Resolve Conflicts",
+                    prompt: "Resolve the merge conflicts on \(pr.url.absoluteString) (branch `\(pr.headRefName)`), verify the build and tests pass, and push the updated branch."
+                ))
+            case .changesRequested, .unresolvedThreads:
+                guard seen.insert(.addressFeedback).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .addressFeedback,
+                    title: "Ask Session to Address Feedback",
+                    prompt: "Review and address the unresolved review feedback on \(pr.url.absoluteString), run the relevant tests, and push any needed updates."
+                ))
+            case .behindBase:
+                guard seen.insert(.updateBranch).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .updateBranch,
+                    title: "Ask Session to Update Branch",
+                    prompt: "Update \(pr.url.absoluteString) (branch `\(pr.headRefName)`) with its base branch, verify checks pass, and push."
+                ))
+            case .stale:
+                guard seen.insert(.checkStatus).inserted else { continue }
+                actions.append(PullRequestDispatchAction(
+                    kind: .checkStatus,
+                    title: "Ask Session to Check Status",
+                    prompt: PullRequestsModel.startingPrompt(urls: [pr.url.absoluteString])
+                ))
+            case .sessionWaiting, .readyToMerge, .noSession:
+                break
+            }
+        }
+        if actions.isEmpty {
+            actions.append(PullRequestDispatchAction(
+                kind: .checkStatus,
+                title: "Ask Session to Check Status",
+                prompt: PullRequestsModel.startingPrompt(urls: [pr.url.absoluteString])
+            ))
+        }
+        return actions
+    }
+
+    private static func fixChecksPrompt(for pr: PullRequestSnapshot) -> String {
+        let prefix = "Fix the failing checks on \(pr.url.absoluteString)"
+        let suffix = ". Inspect the failing job logs, reproduce locally if needed, and push a fix."
+        let basePrompt = prefix + suffix
+        guard let rawFailing = pr.failingRequiredChecks else { return basePrompt }
+        let failing = rawFailing
+            .map(sanitizePromptFragment)
+            .filter { !$0.isEmpty }
+        guard !failing.isEmpty else { return basePrompt }
+
+        let fullCandidate = "\(prefix) (\(failing.joined(separator: ", ")))\(suffix)"
+        if fullCandidate.utf8.count <= maxDispatchPromptUTF8Bytes {
+            return fullCandidate
+        }
+
+        var included: [String] = []
+        var best = basePrompt
+        for name in failing {
+            included.append(name)
+            let remaining = failing.count - included.count
+            let tail = remaining > 0 ? ", and \(remaining) more" : ""
+            let candidate = "\(prefix) (\(included.joined(separator: ", "))\(tail))\(suffix)"
+            if candidate.utf8.count <= maxDispatchPromptUTF8Bytes {
+                best = candidate
+            } else {
+                break
+            }
+        }
+        return best
+    }
+
+    private static func sanitizePromptFragment(_ value: String) -> String {
+        let scalars = value.unicodeScalars.filter { scalar in
+            scalar.value >= 0x20 && !(0x7F...0x9F).contains(scalar.value)
+        }
+        return String(String.UnicodeScalarView(scalars))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func formattedCustomPrompt(_ text: String, for pr: PullRequestSnapshot) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let url = pr.url.absoluteString
+        let qualifiedName = "\(pr.key.owner)/\(pr.key.repo)#\(pr.key.number)"
+        if containsCompletePRReference(url, in: trimmed, requireLeftBoundary: false)
+            || containsCompletePRReference(qualifiedName, in: trimmed, requireLeftBoundary: true)
+            || containsCompletePRReference(pr.shortName, in: trimmed, requireLeftBoundary: true)
+            || containsCompletePRReference("#\(pr.key.number)", in: trimmed, requireLeftBoundary: true) {
+            return trimmed
+        }
+        return "For \(url):\n\n\(trimmed)"
+    }
+
+    private static func containsCompletePRReference(
+        _ token: String,
+        in text: String,
+        requireLeftBoundary: Bool
+    ) -> Bool {
+        var searchStart = text.startIndex
+        while let range = text.range(
+            of: token,
+            options: [.caseInsensitive],
+            range: searchStart..<text.endIndex
+        ) {
+            let leftOK: Bool
+            if !requireLeftBoundary || range.lowerBound == text.startIndex {
+                leftOK = true
+            } else {
+                let prevIndex = text.index(before: range.lowerBound)
+                leftOK = isReferenceBoundaryBefore(text[prevIndex])
+            }
+            let nextIndex = range.upperBound
+            let rightOK = nextIndex == text.endIndex || !text[nextIndex].isNumber
+            if leftOK && rightOK {
+                return true
+            }
+            searchStart = nextIndex
+        }
+        return false
+    }
+
+    private static func isReferenceBoundaryBefore(_ character: Character) -> Bool {
+        !character.isLetter
+            && !character.isNumber
+            && character != "_"
+            && character != "."
+            && character != "-"
+            && character != "/"
+            && character != ":"
+    }
 }
 
 /// Pull requests working toward one outcome.
@@ -474,6 +643,19 @@ struct PullRequestGoal: Identifiable, Equatable {
     /// An ended Copilot session that worked on these pull requests, offered only
     /// while no live session does.
     var resumable: ResumableSession? = nil
+
+    var laneSession: PullRequestSession? {
+        session ?? items.lazy.compactMap(\.session).first
+    }
+
+    func session(for item: PullRequestItem) -> PullRequestSession? {
+        item.session ?? session
+    }
+
+    func primaryDispatchItem(for session: PullRequestSession) -> PullRequestItem? {
+        items.first { $0.session?.id == session.id }
+            ?? (self.session?.id == session.id ? items.first { $0.session == nil } : nil)
+    }
 
     var actionCount: Int { items.filter { $0.assessment.needsAction }.count }
     var needsYouCount: Int { items.filter { $0.assessment.needsYou }.count }

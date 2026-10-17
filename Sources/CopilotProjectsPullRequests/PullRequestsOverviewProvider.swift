@@ -184,4 +184,10 @@ private struct ReadOnlyWorkspace: PullRequestsWorkspace {
     func resumeCopilotSession(projectId: String, requestId: UUID, copilotSessionId: String) async -> WorkspaceCommandResult {
         .refused(code: "unsupported", message: "Read-only workspace.")
     }
+
+    func sendSessionPrompt(
+        projectId: String?, sessionId: String, requestId: UUID, prompt: String
+    ) async -> WorkspaceCommandResult {
+        .refused(code: "unsupported", message: "Read-only workspace.")
+    }
 }

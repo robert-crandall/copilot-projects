@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Darwin
+import CopilotProjectsProtocol
 
 enum CLISDKOperationKind: String, Codable {
     case answerUserInput = "answer-user-input"
@@ -50,6 +51,16 @@ public enum CLIOperationRequestParse: Equatable, Sendable {
     case legacy
     case correlated(CLIOperationRequest)
     case invalid
+}
+
+enum CLISubmittedOperationOutcome: Equatable {
+    case notFound
+    case pendingHandoff
+    case accepted
+    case applied
+    case rejected
+    case indeterminate
+    case conflict
 }
 
 struct CLIOperationHandoffMetadata {
@@ -241,6 +252,107 @@ struct CLIOperationAdapter {
             return nil
         }
         return bound.snapshot
+    }
+
+    func submittedOperationOutcome(
+        sessionId: String,
+        kind: CLISDKOperationKind,
+        operation: CLIOperationRequest,
+        payloadFingerprint: String,
+        handoffSuffix: String,
+        now: () -> Date
+    ) -> CLISubmittedOperationOutcome {
+        let loaded = loadFresh(sessionId: sessionId, now: now)
+        let currentEpochBound: Bool
+        if let loaded {
+            switch bind(
+                loaded.snapshot,
+                sessionId: sessionId,
+                correlatedEpoch: nil,
+                now: loaded.readAt
+            ) {
+            case .ready:
+                let matchingId = (loaded.snapshot.operationReceipts ?? []).filter {
+                    $0.operationId == operation.operationId
+                        && $0.conversationEpoch == operation.conversationEpoch
+                }
+                if !matchingId.isEmpty {
+                    guard matchingId.allSatisfy({
+                        $0.kind == kind.rawValue
+                            && $0.payloadFingerprint == payloadFingerprint
+                            && $0.state != nil
+                            && $0.updatedAtMilliseconds != nil
+                    }) else {
+                        return .conflict
+                    }
+                    let newest = matchingId.max { lhs, rhs in
+                        let lhsTerminal = lhs.state != .accepted
+                        let rhsTerminal = rhs.state != .accepted
+                        if lhsTerminal != rhsTerminal {
+                            return !lhsTerminal && rhsTerminal
+                        }
+                        return (lhs.updatedAtMilliseconds ?? 0) < (rhs.updatedAtMilliseconds ?? 0)
+                    }
+                    let projection = loaded.snapshot.remoteOperationProjection(at: loaded.readAt)
+                    switch newest?.state {
+                    case .applied:
+                        return .applied
+                    case .rejected:
+                        return .rejected
+                    case .indeterminate, .none:
+                        return .indeterminate
+                    case .accepted:
+                        return projection.support == .receipts
+                            && projection.conversationEpoch == operation.conversationEpoch
+                            ? .accepted
+                            : .indeterminate
+                    }
+                }
+                let projection = loaded.snapshot.remoteOperationProjection(at: loaded.readAt)
+                currentEpochBound = projection.support == .receipts
+                    && projection.conversationEpoch == operation.conversationEpoch
+            case .invalid, .conflict:
+                currentEpochBound = false
+            }
+        } else {
+            currentEpochBound = false
+        }
+
+        let handoffURL = SessionArtifacts.cliOperationHandoffURL(
+            sessionId: sessionId,
+            suffix: handoffSuffix,
+            sessionsDirectory: activityDirectory
+        )
+        for suffix in Self.handoffSuffixes {
+            let url = SessionArtifacts.cliOperationHandoffURL(
+                sessionId: sessionId,
+                suffix: suffix,
+                sessionsDirectory: activityDirectory
+            )
+            guard FileManager.default.fileExists(atPath: url.path),
+                  let data = try? Data(contentsOf: url),
+                  let existing = try? JSONDecoder().decode(
+                    ExistingOperationHandoff.self,
+                    from: data
+                  ),
+                  existing.operationId == operation.operationId else {
+                continue
+            }
+            guard url == handoffURL,
+                  existing.conversationEpoch == operation.conversationEpoch,
+                  existing.kind == kind.rawValue,
+                  existing.payloadFingerprint == payloadFingerprint else {
+                return .conflict
+            }
+            if currentEpochBound,
+               let loaded,
+               let actionKind = RemoteSessionActionKind(rawValue: kind.rawValue),
+               loaded.snapshot.workflow?.supports(actionKind, at: loaded.readAt) == true {
+                return .pendingHandoff
+            }
+            return .indeterminate
+        }
+        return .notFound
     }
 
     private func loadBoundSnapshot(
