@@ -791,6 +791,61 @@ final class SessionFinderModelTests: XCTestCase {
         XCTAssertFalse(finder.hasResumableSessions)
     }
 
+    func testLunaSuggestionsAndSelectionPersistWhenEndedSessionsFinishAfterFirstLunaPass() async throws {
+        let resumableGate = DispatchSemaphore(value: 0)
+        let copilotId = "0f1e2d3c-4b5a-4000-8000-0000000000bb"
+        let endedSource = SessionFinderSource(
+            sessionId: SessionFinderSource.resumableSessionId(for: copilotId),
+            projectId: "p2",
+            projectName: "Docs",
+            title: "Audit flaky webhook retry",
+            cwd: "/r/docs",
+            resumableCopilotSessionId: copilotId
+        )
+        let endedEntry = SessionFinderEntry(
+            source: endedSource,
+            requests: ["investigate the midnight timeout in webhook retries"],
+            replies: ["found the race condition in retry backoff"]
+        )
+        let ranker = FakeRanker(.success([
+            LunaMatch(sessionId: "beta", reason: "live retry analysis"),
+        ]))
+        let finder = SessionFinderModel(
+            sources: [alpha, beta],
+            currentSessionId: "alpha",
+            ranker: ranker,
+            lunaDelay: 0.2,
+            loadTranscript: { _ in nil },
+            loadResumableEntries: {
+                resumableGate.wait()
+                return [endedEntry]
+            },
+            onOpen: { _ in }
+        )
+        try await waitUntil { !finder.isIndexing }
+        XCTAssertTrue(finder.isLoadingResumable)
+
+        finder.query = "thundering herd"
+        try await waitUntil { if case .finished = finder.luna { return true } else { return false } }
+        XCTAssertEqual(finder.rows.map(\.id), ["beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+
+        // When ended-session loading finishes, the second Luna pass starts (.pending),
+        // and the live-only Luna suggestion and selection remain visible in the meantime.
+        ranker.result = .success([
+            LunaMatch(sessionId: endedEntry.id, reason: "ended retry backoff"),
+        ])
+        resumableGate.signal()
+        try await waitUntil { !finder.isLoadingResumable }
+        XCTAssertEqual(finder.luna, .pending)
+        XCTAssertEqual(finder.rows.map(\.id), ["beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+
+        try await waitUntil { if case .finished = finder.luna { return true } else { return false } }
+        XCTAssertEqual(finder.rows.map(\.id), [endedEntry.id, "beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+    }
+
     func testTargetProjectMatchesByCwdFolderWorktreeAndRepositoryBeforeSelectedFallback() {
         let projects = [
             SessionFinderProjectTarget(

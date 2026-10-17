@@ -38,20 +38,25 @@ final class WorkspaceInputController: ObservableObject {
         model.setNumberHint(.none)
         let projects = model.sessionFinderProjectTargets
         let selectedProjectId = model.selectedProjectId
-        let liveCopilotIds = model.activeAndResumingCopilotSessionIds()
+        let inMemoryCopilotIds = model.inMemoryActiveCopilotSessionIds()
+        let initialSessionIds = model.projects.flatMap { $0.sessions.map(\.id) }
+        let markerDirectory = model.resumeMarkerDirectory
         let storeProvider = copilotSessionStore
         let defaultStartupDir = Paths.defaultStartupDir
         sessionFinder = SessionFinderModel(
             sources: model.sessionFinderSources,
             currentSessionId: model.globalSelectedSessionId,
-            activeCopilotSessionIds: liveCopilotIds,
+            activeCopilotSessionIds: inMemoryCopilotIds,
             ranker: sessionRanker,
             loadResumableEntries: {
-                SessionFinderResumableLoader.load(
+                let markerIds = AppModel.validatedMarkerCopilotSessionIds(
+                    sessionIds: initialSessionIds, directory: markerDirectory
+                )
+                return SessionFinderResumableLoader.load(
                     store: storeProvider(),
                     projects: projects,
                     selectedProjectId: selectedProjectId,
-                    liveCopilotSessionIds: liveCopilotIds,
+                    liveCopilotSessionIds: inMemoryCopilotIds.union(markerIds),
                     defaultStartupDir: defaultStartupDir
                 )
             }

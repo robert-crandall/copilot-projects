@@ -535,7 +535,7 @@ final class AppModel: ObservableObject {
     private var permissionStatusRestores: [String: PermissionStatusRestore] = [:]
     private let isAppActive: @MainActor () -> Bool
     private let agentActivityDirectory: URL
-    private let resumeMarkerDirectory: URL
+    let resumeMarkerDirectory: URL
     private var powerOffProtectionGeneration = 0
     private(set) var isPoweringOff = false
     private let remotePromptLiveSessions: ((Set<String>) -> Set<String>)?
@@ -5306,21 +5306,14 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    /// Lowercased Copilot CLI session IDs owned or currently being resumed by live tabs.
-    func activeAndResumingCopilotSessionIds(now: Date = Date()) -> Set<String> {
+    /// In-memory Copilot CLI session IDs owned or currently being resumed by live tabs.
+    /// Does not perform filesystem or process-tree work.
+    func inMemoryActiveCopilotSessionIds(now: Date = Date()) -> Set<String> {
         var ids = Set<String>()
         for project in projects {
             for session in project.sessions {
                 if let activeId = session.agentActivity?.copilotSessionId, !activeId.isEmpty {
                     ids.insert(activeId.lowercased())
-                }
-                guard let marker = resumeMarkerValue(sessionId: session.id, suffix: "copilot-session"),
-                      !marker.isEmpty else { continue }
-                if TranscriptController.transcriptOwnerAllowsRead(sessionId: session.id, directory: resumeMarkerDirectory),
-                   !TranscriptController.isCopilotSessionQuarantined(
-                       sessionId: session.id, copilotSessionId: marker, directory: resumeMarkerDirectory
-                   ) {
-                    ids.insert(marker.lowercased())
                 }
             }
         }
@@ -5330,6 +5323,35 @@ final class AppModel: ObservableObject {
             ids.insert(copilotId.lowercased())
         }
         return ids
+    }
+
+    /// Reads and validates resume markers for `sessionIds` off the main actor.
+    nonisolated static func validatedMarkerCopilotSessionIds(
+        sessionIds: [String], directory: URL
+    ) -> Set<String> {
+        var ids = Set<String>()
+        for sessionId in sessionIds {
+            guard let raw = try? String(
+                contentsOf: directory.appendingPathComponent("\(sessionId).copilot-session"),
+                encoding: .utf8
+            ) else { continue }
+            let marker = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !marker.isEmpty else { continue }
+            if TranscriptController.transcriptOwnerAllowsRead(sessionId: sessionId, directory: directory),
+               !TranscriptController.isCopilotSessionQuarantined(
+                   sessionId: sessionId, copilotSessionId: marker, directory: directory
+               ) {
+                ids.insert(marker.lowercased())
+            }
+        }
+        return ids
+    }
+
+    /// Lowercased Copilot CLI session IDs owned or currently being resumed by live tabs.
+    func activeAndResumingCopilotSessionIds(now: Date = Date()) -> Set<String> {
+        let sessionIds = projects.flatMap { $0.sessions.map(\.id) }
+        return inMemoryActiveCopilotSessionIds(now: now)
+            .union(Self.validatedMarkerCopilotSessionIds(sessionIds: sessionIds, directory: resumeMarkerDirectory))
     }
 
     enum ResumeFinderOutcome: Equatable {
