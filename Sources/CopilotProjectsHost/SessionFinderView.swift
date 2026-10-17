@@ -62,6 +62,8 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     @Published private(set) var luna: LunaPhase = .idle
     @Published private(set) var highlightedId: String?
     @Published private(set) var isIndexing = true
+    @Published private(set) var isLoadingResumable = true
+    @Published private(set) var resumeError: String?
 
     var highlight: Highlight {
         Highlight(sessionId: highlightedId, lunaReason: rows.first { $0.id == highlightedId }?.lunaReason)
@@ -128,6 +130,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
                 resumableScan.cancel()
             }
             guard !Task.isCancelled else { return }
+            self.isLoadingResumable = false
             if !resumableIndexed.isEmpty {
                 self.lunaTask?.cancel()
                 self.lunaTask = nil
@@ -183,13 +186,19 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     }
 
     /// Drops a resumable entry that could not be reopened.
-    func removeResumableSession(id: String) {
+    func removeResumableSession(id: String, error: String? = nil) {
+        resumeError = error
         guard entries.contains(where: { $0.id == id && $0.source.isResumable }) else { return }
         entries.removeAll { $0.id == id && $0.source.isResumable }
         refreshLocalMatches()
     }
 
+    func setResumeError(_ message: String?) {
+        resumeError = message
+    }
+
     func moveHighlight(_ delta: Int) {
+        resumeError = nil
         guard !rows.isEmpty else { return }
         let current = rows.firstIndex { $0.id == highlightedId } ?? (delta > 0 ? -1 : rows.count)
         let next = min(max(current + delta, 0), rows.count - 1)
@@ -208,6 +217,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
 
     private func queryDidChange() {
         userMovedHighlight = false
+        resumeError = nil
         lunaTask?.cancel()
         lunaTask = nil
         refreshLocalMatches()
@@ -444,12 +454,13 @@ struct SessionFinderView: View {
     private func results(live: [String: LiveSession]) -> some View {
         let rows = finder.rows
         let searching = !SessionFinderSearch.tokens(finder.query).isEmpty
-        if live.isEmpty && !finder.hasResumableSessions && !finder.isIndexing {
+        let isReadingConversations = finder.isIndexing || finder.isLoadingResumable
+        if live.isEmpty && !finder.hasResumableSessions && !isReadingConversations {
             ContentUnavailableView(
                 "No Sessions Yet", systemImage: "terminal",
                 description: Text("Start a Copilot session with ⌘T, then find it here.")
             )
-        } else if rows.isEmpty && finder.isIndexing {
+        } else if rows.isEmpty && isReadingConversations {
             statusList(
                 title: searching ? SessionFinderModel.Section.matches.title : SessionFinderModel.Section.recent.title,
                 message: "Reading conversations…"
@@ -567,26 +578,35 @@ struct SessionFinderView: View {
 
     @ViewBuilder
     private var lunaNote: some View {
-        switch finder.luna {
-        case .idle, .pending:
-            Text("Luna joins when you pause typing")
-                .lineLimit(1)
-                .help("Meaning-based suggestions use \(LunaSessionRanker.model) through the Copilot CLI, with no tools.")
-        case .searching:
-            EmptyView()
-        case .finished:
-            let count = finder.lunaSuggestionCount
-            Text(count == 0
-                 ? "Luna found nothing more"
-                 : "Luna suggested \(count) \(count == 1 ? "session" : "sessions")")
-                .lineLimit(1)
-        case .failed(let message):
+        if let error = finder.resumeError, !error.isEmpty {
             Label {
-                Text(message).lineLimit(1).truncationMode(.tail)
+                Text(error).lineLimit(1).truncationMode(.tail)
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             }
-            .help(message)
+            .help(error)
+        } else {
+            switch finder.luna {
+            case .idle, .pending:
+                Text("Luna joins when you pause typing")
+                    .lineLimit(1)
+                    .help("Meaning-based suggestions use \(LunaSessionRanker.model) through the Copilot CLI, with no tools.")
+            case .searching:
+                EmptyView()
+            case .finished:
+                let count = finder.lunaSuggestionCount
+                Text(count == 0
+                     ? "Luna found nothing more"
+                     : "Luna suggested \(count) \(count == 1 ? "session" : "sessions")")
+                    .lineLimit(1)
+            case .failed(let message):
+                Label {
+                    Text(message).lineLimit(1).truncationMode(.tail)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+                .help(message)
+            }
         }
     }
 

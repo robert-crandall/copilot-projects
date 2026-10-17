@@ -213,6 +213,14 @@ final class WorkspaceInputControllerTests: XCTestCase {
             transcript: #"{"type":"user.message","data":{"content":"debug the webhook retry"}}"#
         )
 
+        let lockedCopilotId = try home.addSession(
+            cwd: repoWork.path,
+            name: "Locked session",
+            updated: Date(timeIntervalSince1970: 1_800_000_200),
+            transcript: #"{"type":"user.message","data":{"content":"locked conversation"}}"#
+        )
+        try home.lock(lockedCopilotId)
+
         let p1Session = Session(title: "first", cwd: root.path)
         let p2Session = Session(title: "second", cwd: repoWork.path)
         let p1 = Project(id: "p1", name: "First", cwd: root.path, sessions: [p1Session], selectedSessionId: p1Session.id)
@@ -220,6 +228,7 @@ final class WorkspaceInputControllerTests: XCTestCase {
         let repository = StateRepository(path: root.appendingPathComponent("state.json"))
         try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
 
+        var backendAvailable = false
         var launches: [(id: String, executable: String?, prompt: String?)] = []
         let model = AppModel(
             stateRepository: repository,
@@ -228,7 +237,7 @@ final class WorkspaceInputControllerTests: XCTestCase {
             resumeMarkerDirectory: root,
             remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
             remoteReposDirectory: { root.path },
-            remoteSessionBackendAvailable: { true },
+            remoteSessionBackendAvailable: { backendAvailable },
             remoteSessionLauncher: { launches.append(($0, $1, $2)) },
             sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
             kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
@@ -245,13 +254,21 @@ final class WorkspaceInputControllerTests: XCTestCase {
         )
         input.presentSessionFinder()
         let finder = try XCTUnwrap(input.sessionFinder)
-        for _ in 0..<200 where !finder.hasResumableSessions {
+        for _ in 0..<200 where finder.isLoadingResumable {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+        XCTAssertFalse(finder.isLoadingResumable)
         XCTAssertTrue(finder.hasResumableSessions)
         let resumableRowId = SessionFinderSource.resumableSessionId(for: copilotId)
         XCTAssertTrue(finder.rows.contains { $0.id == resumableRowId && $0.section == .recentEnded })
 
+        // Temporary failure preserves the row and surfaces the error in the finder.
+        input.openFromSessionFinder(resumableRowId)
+        XCTAssertNotNil(input.sessionFinder)
+        XCTAssertNotNil(finder.resumeError)
+        XCTAssertTrue(finder.rows.contains { $0.id == resumableRowId })
+
+        backendAvailable = true
         input.openFromSessionFinder(resumableRowId)
         XCTAssertNil(input.sessionFinder)
         XCTAssertEqual(model.selectedProjectId, "p2")

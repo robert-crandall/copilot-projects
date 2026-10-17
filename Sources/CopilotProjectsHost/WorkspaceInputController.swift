@@ -94,10 +94,10 @@ final class WorkspaceInputController: ObservableObject {
             model.selectSession(projectId: projectId, sessionId: resumedSessionId)
             if model.selectedProjectId != projectId { model.selectProject(projectId) }
             DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
-        case .permanentlyUnavailable:
-            sessionFinder?.removeResumableSession(id: sessionId)
-        case .temporarilyUnavailable:
-            break
+        case .permanentlyUnavailable(let message):
+            sessionFinder?.removeResumableSession(id: sessionId, error: message)
+        case .temporarilyUnavailable(let message):
+            sessionFinder?.setResumeError(message)
         }
     }
 

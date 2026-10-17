@@ -5334,8 +5334,8 @@ final class AppModel: ObservableObject {
 
     enum ResumeFinderOutcome: Equatable {
         case opened(projectId: String, sessionId: String)
-        case permanentlyUnavailable
-        case temporarilyUnavailable
+        case permanentlyUnavailable(String)
+        case temporarilyUnavailable(String)
     }
 
     /// Reopens an ended Copilot session chosen in Find Session (`⌘K`).
@@ -5358,7 +5358,9 @@ final class AppModel: ObservableObject {
                 selectedProjectId: selectedProjectId
             )?.id
         }
-        guard let projectId else { return .temporarilyUnavailable }
+        guard let projectId else {
+            return .temporarilyUnavailable(CopilotSessionStartError.projectUnavailable.localizedDescription)
+        }
         let requestId = UUID()
         let response = resumePullRequestsSession(
             requestId: requestId,
@@ -5372,11 +5374,12 @@ final class AppModel: ObservableObject {
         if let loc = locateIndex(candidateSessionId) {
             return .opened(projectId: projects[loc.p].id, sessionId: candidateSessionId)
         }
+        let message = response.error ?? "That Copilot session could not be resumed."
         switch response.code {
         case "gone", "in-use", "invalid":
-            return .permanentlyUnavailable
+            return .permanentlyUnavailable(message)
         default:
-            return .temporarilyUnavailable
+            return .temporarilyUnavailable(message)
         }
     }
 
