@@ -33,10 +33,18 @@ protocol PullRequestsWorkspace: Sendable {
     func startCopilotSession(projectId: String, requestId: UUID, prompt: String) async -> WorkspaceCommandResult
     /// Opens an ended Copilot session in a new tab; replaying `requestId` never opens a second one.
     func resumeCopilotSession(projectId: String, requestId: UUID, copilotSessionId: String) async -> WorkspaceCommandResult
+    /// Starts a local adversarial review session for `pullRequestURL` in `projectId`; replaying `requestId` never starts a second one.
+    func reviewPullRequest(projectId: String, requestId: UUID, pullRequestURL: String) async -> WorkspaceCommandResult
     /// Sends or queues `prompt` in an existing session; replaying `requestId` never sends it twice.
     func sendSessionPrompt(
         projectId: String?, sessionId: String, requestId: UUID, prompt: String
     ) async -> WorkspaceCommandResult
+}
+
+extension PullRequestsWorkspace {
+    func reviewPullRequest(projectId: String, requestId: UUID, pullRequestURL: String) async -> WorkspaceCommandResult {
+        .refused(code: "unsupported", message: "Reviewing pull requests is not supported by this workspace.")
+    }
 }
 
 /// Copilot Projects over its control socket. Each request runs on a dispatch
@@ -79,6 +87,14 @@ actor ControlWorkspaceBridge: PullRequestsWorkspace {
         request.projectId = projectId
         request.requestId = requestId.uuidString
         request.copilotSessionId = copilotSessionId
+        return Self.result(await send(request))
+    }
+
+    func reviewPullRequest(projectId: String, requestId: UUID, pullRequestURL: String) async -> WorkspaceCommandResult {
+        var request = ControlRequest(command: "review-pull-request")
+        request.projectId = projectId
+        request.requestId = requestId.uuidString
+        request.path = pullRequestURL
         return Self.result(await send(request))
     }
 

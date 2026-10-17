@@ -69,7 +69,10 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   **Quiet** (CI and the rest, never badged), with columns **Since you looked**, **Today**,
   **This week**, and **Older**. Review requests are split by each pull request's
   review-request history. Opening a thread marks it read on GitHub; `E` marks it done.
-  Pull request threads a live session works on offer **Go to Session**.
+  Pull request threads a live session works on offer **Go to Session**; pull request
+  threads with no live session offer **Review in Copilot** (`R`, or choose a project
+  from the context menu) to launch a local adversarial review in Copilot Projects and
+  link the resulting session to the thread.
 - **Prompt-first sessions:** the **+** split button's dropdown, Session menu, and project context
   menu offer **Start with Prompt…**. Compose multiple lines, then use `⌘Return` to launch
   an interactive session (not a one-shot/headless command). Cancel creates no session.
