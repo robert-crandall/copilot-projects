@@ -730,7 +730,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             try JSONEncoder().encode(snapshot).write(to: snapshotURL)
             let appliedReplay = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")
             XCTAssertTrue(appliedReplay.ok)
-            XCTAssertEqual(appliedReplay.code, "queued")
+            XCTAssertEqual(appliedReplay.code, "applied")
             XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             // Rejected and indeterminate receipts surface their outcomes on replay.

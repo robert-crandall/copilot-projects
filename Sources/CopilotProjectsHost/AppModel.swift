@@ -5599,8 +5599,10 @@ final class AppModel: ObservableObject {
         sessionId: String
     ) -> ControlResponse {
         switch outcome {
-        case .pendingHandoff, .accepted, .applied:
+        case .pendingHandoff, .accepted:
             return .success(sessionId, code: "queued")
+        case .applied:
+            return .success(sessionId, code: "applied")
         case .rejected:
             return .failure("Copilot did not accept the prompt.", code: "rejected")
         case .indeterminate, .notFound:

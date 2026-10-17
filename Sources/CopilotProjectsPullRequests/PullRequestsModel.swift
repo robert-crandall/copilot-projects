@@ -119,18 +119,21 @@ final class PullRequestsModel: ObservableObject {
     }
 
     private struct PendingPrompt {
+        let key: String
         let requestId: UUID
         let sessionId: String
         let prompt: String
         let pullRequestKey: PullRequestKey?
         let draft: String?
+        var sequence: UInt64
+        var isQueuedNative: Bool
     }
 
     /// Dispatched prompts whose outcome has not resolved yet, by session and
     /// prompt, so trying again reuses the request id and never sends the same
     /// prompt twice, even if the session moved projects.
     private var pendingPrompts: [String: PendingPrompt] = [:]
-    private var latestPendingPromptBySession: [String: PendingPrompt] = [:]
+    private var pendingPromptSequence: UInt64 = 0
 
     init(
         workspace: any PullRequestsWorkspace,
@@ -328,6 +331,9 @@ final class PullRequestsModel: ObservableObject {
         workspacePollInFlight = true
         defer { workspacePollInFlight = false }
         apply(await source.snapshot())
+        if isConnected {
+            await reconcileQueuedPrompts()
+        }
     }
 
     func apply(_ fetch: WorkspaceFetch) {
@@ -826,7 +832,7 @@ final class PullRequestsModel: ObservableObject {
             return draft
         }
         if let session,
-           let pending = latestPendingPromptBySession[session.id],
+           let pending = latestRetryablePrompt(for: session.id),
            pending.pullRequestKey == nil || pending.pullRequestKey == pr.key {
             return pending.draft ?? pending.prompt
         }
@@ -842,9 +848,9 @@ final class PullRequestsModel: ObservableObject {
         sendPrompt(to: session, prompt: formatted, pullRequestKey: pr.key, draft: draft)
     }
 
-    /// Retries the last unresolved prompt for `session` with its original text and request id.
+    /// Retries the latest unresolved prompt for `session` with its original text and request id.
     func retryPendingPrompt(for session: PullRequestSession) {
-        guard let pending = latestPendingPromptBySession[session.id] else { return }
+        guard let pending = latestRetryablePrompt(for: session.id) else { return }
         sendPrompt(
             to: session,
             prompt: pending.prompt,
@@ -871,15 +877,18 @@ final class PullRequestsModel: ObservableObject {
         let existing = pendingPrompts[key].flatMap {
             $0.sessionId == session.id && $0.prompt == trimmed ? $0 : nil
         }
+        pendingPromptSequence &+= 1
         let pending = PendingPrompt(
+            key: key,
             requestId: existing?.requestId ?? UUID(),
             sessionId: session.id,
             prompt: trimmed,
             pullRequestKey: pullRequestKey ?? existing?.pullRequestKey,
-            draft: draft ?? existing?.draft
+            draft: draft ?? existing?.draft,
+            sequence: pendingPromptSequence,
+            isQueuedNative: false
         )
         pendingPrompts[key] = pending
-        latestPendingPromptBySession[session.id] = pending
         sendingSessions.insert(session.id)
         let initialProjectId = session.projectId
         Task {
@@ -906,16 +915,18 @@ final class PullRequestsModel: ObservableObject {
             )
         }
         switch result {
-        case .done:
-            pendingPrompts[key] = nil
-            if latestPendingPromptBySession[pending.sessionId]?.requestId == pending.requestId {
-                latestPendingPromptBySession[pending.sessionId] = nil
+        case .done(let code, _):
+            if code == "queued" {
+                pendingPrompts[key]?.isQueuedNative = true
+            } else {
+                pendingPrompts[key] = nil
+                if let prKey = pending.pullRequestKey,
+                   let draft = pending.draft,
+                   promptDrafts[prKey] == draft {
+                    promptDrafts[prKey] = nil
+                }
             }
             updateRetryablePromptSessions()
-            if let prKey = pending.pullRequestKey,
-               pending.draft == nil || promptDrafts[prKey] == pending.draft {
-                promptDrafts[prKey] = nil
-            }
             let pid = connectedSnapshot?.hostProcessIdentifier
             let targetProjectId = liveSessions[pending.sessionId]?.projectId ?? initialProjectId
             if await reveal(projectId: targetProjectId, sessionId: pending.sessionId), let pid {
@@ -924,16 +935,16 @@ final class PullRequestsModel: ObservableObject {
         case .refused(let code, let message):
             // An uncertain native outcome keeps its request id so a retry re-checks
             // that operation instead of submitting a duplicate prompt.
-            if code != "indeterminate" {
+            if code == "indeterminate" {
+                pendingPrompts[key]?.isQueuedNative = false
+            } else {
                 pendingPrompts[key] = nil
-                if latestPendingPromptBySession[pending.sessionId]?.requestId == pending.requestId {
-                    latestPendingPromptBySession[pending.sessionId] = nil
-                }
             }
             updateRetryablePromptSessions()
             await pollWorkspace()
             presentError("Could Not Send Prompt", message)
         case .unreachable:
+            pendingPrompts[key]?.isQueuedNative = false
             updateRetryablePromptSessions()
             await pollWorkspace()
             presentError(
@@ -943,8 +954,57 @@ final class PullRequestsModel: ObservableObject {
         }
     }
 
+    private func reconcileQueuedPrompts() async {
+        let queued = pendingPrompts.values
+            .filter(\.isQueuedNative)
+            .sorted { $0.sequence < $1.sequence }
+        guard !queued.isEmpty else { return }
+        for pending in queued {
+            guard pendingPrompts[pending.key]?.requestId == pending.requestId,
+                  pendingPrompts[pending.key]?.isQueuedNative == true else { continue }
+            let result = await source.sendSessionPrompt(
+                projectId: nil,
+                sessionId: pending.sessionId,
+                requestId: pending.requestId,
+                prompt: pending.prompt
+            )
+            switch result {
+            case .done(let code, _) where code == "queued":
+                break
+            case .done:
+                pendingPrompts[pending.key] = nil
+                if let prKey = pending.pullRequestKey,
+                   let draft = pending.draft,
+                   promptDrafts[prKey] == draft {
+                    promptDrafts[prKey] = nil
+                }
+                updateRetryablePromptSessions()
+            case .refused(let code, let message):
+                if code == "indeterminate" {
+                    pendingPrompts[pending.key]?.isQueuedNative = false
+                } else {
+                    pendingPrompts[pending.key] = nil
+                }
+                updateRetryablePromptSessions()
+                presentError("Could Not Send Prompt", message)
+            case .unreachable:
+                break
+            }
+        }
+    }
+
+    private func latestRetryablePrompt(for sessionId: String) -> PendingPrompt? {
+        pendingPrompts.values
+            .filter { $0.sessionId == sessionId && !$0.isQueuedNative }
+            .max { $0.sequence < $1.sequence }
+    }
+
     private func updateRetryablePromptSessions() {
-        retryablePromptSessions = Set(latestPendingPromptBySession.keys)
+        retryablePromptSessions = Set(
+            pendingPrompts.values
+                .filter { !$0.isQueuedNative }
+                .map(\.sessionId)
+        )
     }
 
     private func performResume(_ resume: PendingResume, copilotSessionId copilotId: String) async {

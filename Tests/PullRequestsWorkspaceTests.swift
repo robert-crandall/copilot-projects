@@ -643,9 +643,9 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
             fetches: [.snapshot(movedSnapshot), .snapshot(movedSnapshot)],
             prompts: [
                 .refused(code: "indeterminate", message: "Outcome unknown."),
-                .done(code: "queued", text: "s1"),
+                .done(code: "applied", text: "s1"),
                 .refused(code: "rejected", message: "Rejected."),
-                .done(code: "queued", text: "s1"),
+                .done(code: "applied", text: "s1"),
             ]
         )
         let uncertainPrompt = "For https://github.com/github/github/pull/7:\n\ncheck status"
@@ -666,13 +666,15 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         try await waitUntil { model.sendingSessions.isEmpty }
         XCTAssertNotEqual(workspace.promptCalls.last?.requestId, rejectedId, "rejected outcome clears requestId")
 
-        // Custom prompt drafts are preserved across failures, restored in the composer,
-        // retried with the original requestId when uncertain, and cleared on success.
+        // Sending a second prompt B while prompt A is indeterminate restores A as the
+        // session's retry target once B settles, and a predefined action without a draft
+        // never clears a retained custom prompt draft.
         workspace.answer(
             fetches: [.snapshot(movedSnapshot), .snapshot(movedSnapshot)],
             prompts: [
                 .refused(code: "indeterminate", message: "Outcome unknown."),
-                .done(code: "queued", text: "s1"),
+                .done(code: "sent", text: "s1"),
+                .done(code: "applied", text: "s1"),
             ]
         )
         let rawDraft = "investigate flaky login test"
@@ -688,11 +690,36 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         XCTAssertEqual(composer.textView.string, rawDraft)
         let customDraftRequestId = try XCTUnwrap(workspace.promptCalls.last?.requestId)
 
+        // Predefined action B on the same PR succeeds: it must not clear rawDraft or lose A's retry target.
+        model.sendPrompt(to: movedGoalSession, prompt: action.prompt, pullRequestKey: pr.key)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(model.promptDraft(for: pr, session: movedGoalSession), rawDraft)
+        XCTAssertTrue(model.retryablePromptSessions.contains(movedGoalSession.id))
+
         model.retryPendingPrompt(for: movedGoalSession)
         try await waitUntil { model.sendingSessions.isEmpty }
         XCTAssertEqual(workspace.promptCalls.last?.requestId, customDraftRequestId)
         XCTAssertEqual(model.promptDraft(for: pr, session: movedGoalSession), "")
         XCTAssertFalse(model.retryablePromptSessions.contains(movedGoalSession.id))
+
+        // A queued native handoff (`code == "queued"`) retains its draft and requestId
+        // until workspace polling reconciles the terminal receipt (`applied`).
+        workspace.answer(
+            fetches: [.snapshot(movedSnapshot)],
+            prompts: [
+                .done(code: "queued", text: "s1"),
+                .done(code: "applied", text: "s1"),
+            ]
+        )
+        let queuedDraft = "verify queued reconciliation"
+        model.sendCustomPrompt(queuedDraft, for: pr, to: movedGoalSession)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        let queuedRequestId = try XCTUnwrap(workspace.promptCalls.last?.requestId)
+        XCTAssertEqual(model.promptDraft(for: pr, session: movedGoalSession), queuedDraft,
+                       "draft stays until the queued handoff is confirmed applied")
+        await model.pollWorkspace()
+        XCTAssertEqual(workspace.promptCalls.last?.requestId, queuedRequestId)
+        XCTAssertEqual(model.promptDraft(for: pr, session: movedGoalSession), "")
     }
 
     func testRefreshAsksForTheWorkspaceFirstAndMatchesAgainWhenItArrives() async throws {
