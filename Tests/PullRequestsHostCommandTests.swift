@@ -579,7 +579,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertEqual(host.resuming.deliveredPrompts.count, 1)
 
             // Retrying an older terminal request after more than 128 later dispatches
-            // still returns `existing` instead of resending the prompt.
+            // or after a host restart still returns `existing` instead of resending.
             for index in 0..<130 {
                 let extra = send(UUID().uuidString, prompt: "Follow-up \(index)")
                 XCTAssertEqual(extra.code, "sent")
@@ -590,6 +590,44 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertTrue(replayAfterManyDispatches.ok)
             XCTAssertEqual(replayAfterManyDispatches.code, "existing")
             XCTAssertEqual(send(prompt: "different").code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            let restarted = host.restart()
+            let replayAfterRestart = restarted.handle(request(
+                "send-session-prompt", project: "A", session: "a1", requestId: requestId,
+                prompt: "Fix the failing checks\r\non this PR"
+            ))
+            XCTAssertTrue(replayAfterRestart.ok)
+            XCTAssertEqual(replayAfterRestart.code, "existing")
+            XCTAssertEqual(restarted.handle(request(
+                "send-session-prompt", project: "A", session: "a1", requestId: requestId, prompt: "different"
+            )).code, "conflict")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+
+            // An interrupted `.pending` terminal intent on disk recovers as `indeterminate`
+            // after restart rather than resending the prompt.
+            let interruptedId = UUID()
+            let interruptedAction = RemoteSessionAction(kind: .send, prompt: "Interrupted send", mode: .enqueue)
+            let interruptedFingerprint = try XCTUnwrap(CLIOperationAdapter.payloadFingerprint(
+                kind: .sessionSend,
+                payload: interruptedAction
+            ))
+            let ledger = SessionCreationLedger(url: host.root.appendingPathComponent("ledger.json"))
+            try ledger.rememberPrompt(PullRequestsPromptRecord(
+                requestId: interruptedId.uuidString,
+                sessionId: "a1",
+                payloadFingerprint: interruptedFingerprint,
+                route: .terminal,
+                conversationEpoch: nil,
+                state: .pending,
+                createdAt: Date()
+            ))
+            let interruptedReplay = host.restart().handle(request(
+                "send-session-prompt", project: "A", session: "a1", requestId: interruptedId.uuidString,
+                prompt: "Interrupted send"
+            ))
+            XCTAssertFalse(interruptedReplay.ok)
+            XCTAssertEqual(interruptedReplay.code, "indeterminate")
             XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
             // Mismatched project, ended session, or waiting session are refused.

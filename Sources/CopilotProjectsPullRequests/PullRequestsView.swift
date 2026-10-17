@@ -382,6 +382,7 @@ struct PullRequestsView: View {
                                 isStarting: pullRequests.startingGoals.contains(goal.id),
                                 resumingSessions: pullRequests.resumingSessions,
                                 sendingSessions: pullRequests.sendingSessions,
+                                retryablePromptSessions: pullRequests.retryablePromptSessions,
                                 goalChoices: goalChoices(allGoals),
                                 actions: laneActions
                             )
@@ -419,11 +420,19 @@ struct PullRequestsView: View {
                       !session.hasPendingInput,
                       !pullRequests.sendingSessions.contains(session.id) else { return .ignored }
                 if press.modifiers.contains(.shift) {
-                    if let action = item.dispatchActions.first {
-                        pullRequests.sendPrompt(to: session, prompt: action.prompt)
+                    if pullRequests.retryablePromptSessions.contains(session.id) {
+                        pullRequests.retryPendingPrompt(for: session)
+                    } else if let action = item.dispatchActions.first {
+                        pullRequests.sendPrompt(to: session, prompt: action.prompt, pullRequestKey: item.pr.key)
                     }
                 } else {
-                    Self.promptSession(session, for: item.pr) { pullRequests.sendPrompt(to: session, prompt: $0) }
+                    Self.promptSession(
+                        session,
+                        for: item.pr,
+                        initialText: pullRequests.promptDraft(for: item.pr, session: session)
+                    ) { draft, _ in
+                        pullRequests.sendCustomPrompt(draft, for: item.pr, to: session)
+                    }
                 }
                 return .handled
             }
@@ -518,8 +527,15 @@ struct PullRequestsView: View {
             copyLink: { pullRequests.copyLink($0) },
             goToSession: { pullRequests.goToSession($0) },
             sendPrompt: { session, prompt in pullRequests.sendPrompt(to: session, prompt: prompt) },
+            retryPrompt: { session in pullRequests.retryPendingPrompt(for: session) },
             promptSession: { session, pr in
-                Self.promptSession(session, for: pr) { pullRequests.sendPrompt(to: session, prompt: $0) }
+                Self.promptSession(
+                    session,
+                    for: pr,
+                    initialText: pullRequests.promptDraft(for: pr, session: session)
+                ) { draft, _ in
+                    pullRequests.sendCustomPrompt(draft, for: pr, to: session)
+                }
             },
             startSession: { goal, projectId in pullRequests.startSession(for: goal, projectId: projectId) },
             resumeSession: { candidate, projectId in pullRequests.resume(candidate, projectId: projectId) },
@@ -536,11 +552,12 @@ struct PullRequestsView: View {
     private static func promptSession(
         _ session: PullRequestSession,
         for pr: PullRequestSnapshot,
-        send: @MainActor (String) -> Void
+        initialText: String = "",
+        send: @MainActor (_ draft: String, _ prompt: String) -> Void
     ) {
-        let composer = PullRequestPromptComposer(session: session, pr: pr)
+        let composer = PullRequestPromptComposer(session: session, pr: pr, initialText: initialText)
         if let prompt = composer.run() {
-            send(prompt)
+            send(composer.textView.string, prompt)
         }
     }
 
@@ -568,6 +585,7 @@ private struct GoalLane: View {
         let copyLink: (PullRequestSnapshot) -> Void
         let goToSession: (PullRequestSession) -> Void
         let sendPrompt: (PullRequestSession, String) -> Void
+        let retryPrompt: (PullRequestSession) -> Void
         let promptSession: (PullRequestSession, PullRequestSnapshot) -> Void
         let startSession: (PullRequestGoal, String) -> Void
         let resumeSession: (ResumableSession, String) -> Void
@@ -600,6 +618,8 @@ private struct GoalLane: View {
     let resumingSessions: Set<String>
     /// Live sessions whose dispatched prompt is in flight.
     let sendingSessions: Set<String>
+    /// Live sessions with an unresolved prompt that can be retried with its original request id.
+    let retryablePromptSessions: Set<String>
     let goalChoices: [(id: String, name: String)]
     let actions: Actions
 
@@ -671,6 +691,10 @@ private struct GoalLane: View {
             Button("Go to Session") { actions.goToSession(session) }
             if session.status != .waiting, !session.hasPendingInput {
                 Divider()
+                if retryablePromptSessions.contains(session.id) {
+                    Button("Retry Last Prompt") { actions.retryPrompt(session) }
+                        .disabled(sendingSessions.contains(session.id))
+                }
                 ForEach(item.dispatchActions) { action in
                     Button(action.title) { actions.sendPrompt(session, action.prompt) }
                         .disabled(sendingSessions.contains(session.id))
@@ -794,6 +818,10 @@ private struct GoalLane: View {
                 Menu {
                     Button("Go to Session") { actions.goToSession(session) }
                     Divider()
+                    if retryablePromptSessions.contains(session.id) {
+                        Button("Retry Last Prompt") { actions.retryPrompt(session) }
+                            .disabled(sending)
+                    }
                     ForEach(primaryItem.dispatchActions) { action in
                         Button(action.title) { actions.sendPrompt(session, action.prompt) }
                             .disabled(sending)
@@ -1243,7 +1271,7 @@ final class PullRequestPromptComposer: NSObject, NSTextViewDelegate {
     private let pr: PullRequestSnapshot
     private let instructions: String
 
-    init(session: PullRequestSession, pr: PullRequestSnapshot) {
+    init(session: PullRequestSession, pr: PullRequestSnapshot, initialText: String = "") {
         self.pr = pr
         let sessionName = PullRequestGrouping.goalName(sessionTitle: session.title)
         self.instructions = "Send a prompt about \(pr.shortName) to “\(sessionName)”. "
@@ -1269,6 +1297,7 @@ final class PullRequestPromptComposer: NSObject, NSTextViewDelegate {
         textView.textContainer?.widthTracksTextView = true
         textView.autoresizingMask = [.width]
         textView.setAccessibilityLabel("Session prompt")
+        textView.string = initialText
         textView.delegate = self
 
         let scrollView = NSScrollView(frame: textView.frame)

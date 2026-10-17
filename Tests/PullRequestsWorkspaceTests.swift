@@ -665,6 +665,34 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         model.sendPrompt(to: movedGoalSession, prompt: uncertainPrompt)
         try await waitUntil { model.sendingSessions.isEmpty }
         XCTAssertNotEqual(workspace.promptCalls.last?.requestId, rejectedId, "rejected outcome clears requestId")
+
+        // Custom prompt drafts are preserved across failures, restored in the composer,
+        // retried with the original requestId when uncertain, and cleared on success.
+        workspace.answer(
+            fetches: [.snapshot(movedSnapshot), .snapshot(movedSnapshot)],
+            prompts: [
+                .refused(code: "indeterminate", message: "Outcome unknown."),
+                .done(code: "queued", text: "s1"),
+            ]
+        )
+        let rawDraft = "investigate flaky login test"
+        model.sendCustomPrompt(rawDraft, for: pr, to: movedGoalSession)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(model.promptDraft(for: pr, session: movedGoalSession), rawDraft)
+        XCTAssertTrue(model.retryablePromptSessions.contains(movedGoalSession.id))
+        let composer = PullRequestPromptComposer(
+            session: movedGoalSession,
+            pr: pr,
+            initialText: model.promptDraft(for: pr, session: movedGoalSession)
+        )
+        XCTAssertEqual(composer.textView.string, rawDraft)
+        let customDraftRequestId = try XCTUnwrap(workspace.promptCalls.last?.requestId)
+
+        model.retryPendingPrompt(for: movedGoalSession)
+        try await waitUntil { model.sendingSessions.isEmpty }
+        XCTAssertEqual(workspace.promptCalls.last?.requestId, customDraftRequestId)
+        XCTAssertEqual(model.promptDraft(for: pr, session: movedGoalSession), "")
+        XCTAssertFalse(model.retryablePromptSessions.contains(movedGoalSession.id))
     }
 
     func testRefreshAsksForTheWorkspaceFirstAndMatchesAgainWhenItArrives() async throws {
