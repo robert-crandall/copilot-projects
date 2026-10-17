@@ -914,6 +914,7 @@ final class PullRequestsModel: ObservableObject {
                 prompt: pending.prompt
             )
         }
+        guard pendingPrompts[key]?.requestId == pending.requestId else { return }
         switch result {
         case .done(let code, _):
             if code == "queued" {
@@ -968,6 +969,7 @@ final class PullRequestsModel: ObservableObject {
                 requestId: pending.requestId,
                 prompt: pending.prompt
             )
+            guard pendingPrompts[pending.key]?.requestId == pending.requestId else { continue }
             switch result {
             case .done(let code, _) where code == "queued":
                 break

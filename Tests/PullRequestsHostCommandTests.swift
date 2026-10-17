@@ -733,6 +733,19 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertEqual(appliedReplay.code, "applied")
             XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
 
+            // Once `applied` has been confirmed and persisted, replaying after a conversation
+            // epoch reset and host restart still returns `applied` from the ledger.
+            snapshot.conversationEpoch = "epoch-2"
+            snapshot.operationReceipts = []
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let appliedAfterEpochResetAndRestart = host.restart().handle(request(
+                "send-session-prompt", project: nil, session: "a1", requestId: nativeReqId, prompt: "Queue via SDK"
+            ))
+            XCTAssertTrue(appliedAfterEpochResetAndRestart.ok)
+            XCTAssertEqual(appliedAfterEpochResetAndRestart.code, "applied")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+            snapshot.conversationEpoch = "epoch-1"
+
             // Rejected and indeterminate receipts surface their outcomes on replay.
             let rejectedReqId = UUID()
             snapshot.workflow = makeWorkflow(sendReady: true)

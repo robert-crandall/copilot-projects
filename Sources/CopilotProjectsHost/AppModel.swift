@@ -5413,21 +5413,31 @@ final class AppModel: ObservableObject {
                 switch previous.state {
                 case .delivered:
                     return .success(sessionId, code: "existing")
-                case .pending:
+                case .pending, .queued:
                     return .failure(
                         "Could not confirm whether Copilot received the prompt. Inspect the terminal before trying again.",
                         code: "indeterminate"
                     )
+                case .rejected:
+                    return .failure("Copilot did not accept the prompt.", code: "rejected")
                 }
             case .native(let epoch):
-                return resolveNativePullRequestsPrompt(
-                    sessionId: sessionId,
-                    requestId: requestId,
-                    conversationEpoch: epoch,
-                    payloadFingerprint: payloadFingerprint,
-                    adapter: adapter,
-                    clock: clock
-                )
+                switch previous.state {
+                case .delivered:
+                    return .success(sessionId, code: "applied")
+                case .rejected:
+                    return .failure("Copilot did not accept the prompt.", code: "rejected")
+                case .pending, .queued:
+                    return resolveNativePullRequestsPrompt(
+                        sessionId: sessionId,
+                        requestId: requestId,
+                        conversationEpoch: epoch,
+                        payloadFingerprint: payloadFingerprint,
+                        createdAt: previous.createdAt,
+                        adapter: adapter,
+                        clock: clock
+                    )
+                }
             }
         }
         guard let loc = locateIndex(sessionId) else {
@@ -5450,17 +5460,14 @@ final class AppModel: ObservableObject {
                 now: clock
             )
             if existingOutcome != .notFound {
-                if existingOutcome != .conflict {
-                    _ = rememberSentPullRequestsPrompt(
-                        requestId: requestId,
-                        sessionId: sessionId,
-                        payloadFingerprint: payloadFingerprint,
-                        route: .native(conversationEpoch: epoch),
-                        state: .delivered,
-                        now: clock()
-                    )
-                }
-                return controlResponse(forNativePullRequestsPrompt: existingOutcome, sessionId: sessionId)
+                return recordAndRespondToNativePullRequestsPrompt(
+                    outcome: existingOutcome,
+                    requestId: requestId,
+                    sessionId: sessionId,
+                    payloadFingerprint: payloadFingerprint,
+                    conversationEpoch: epoch,
+                    createdAt: clock()
+                )
             }
         }
 
@@ -5505,7 +5512,7 @@ final class AppModel: ObservableObject {
                     sessionId: sessionId,
                     payloadFingerprint: payloadFingerprint,
                     route: .native(conversationEpoch: epoch),
-                    state: .delivered,
+                    state: .queued,
                     now: intentAt
                 )
                 return resolveNativePullRequestsPrompt(
@@ -5513,6 +5520,7 @@ final class AppModel: ObservableObject {
                     requestId: requestId,
                     conversationEpoch: epoch,
                     payloadFingerprint: payloadFingerprint,
+                    createdAt: intentAt,
                     adapter: adapter,
                     clock: clock
                 )
@@ -5576,6 +5584,7 @@ final class AppModel: ObservableObject {
         requestId: UUID,
         conversationEpoch: String,
         payloadFingerprint: String,
+        createdAt: Date,
         adapter: CLIOperationAdapter,
         clock: () -> Date
     ) -> ControlResponse {
@@ -5591,19 +5600,54 @@ final class AppModel: ObservableObject {
             handoffSuffix: "\(CLISDKOperationKind.sessionSend.rawValue).json",
             now: clock
         )
-        return controlResponse(forNativePullRequestsPrompt: outcome, sessionId: sessionId)
+        return recordAndRespondToNativePullRequestsPrompt(
+            outcome: outcome,
+            requestId: requestId,
+            sessionId: sessionId,
+            payloadFingerprint: payloadFingerprint,
+            conversationEpoch: conversationEpoch,
+            createdAt: createdAt
+        )
     }
 
-    private func controlResponse(
-        forNativePullRequestsPrompt outcome: CLISubmittedOperationOutcome,
-        sessionId: String
+    private func recordAndRespondToNativePullRequestsPrompt(
+        outcome: CLISubmittedOperationOutcome,
+        requestId: UUID,
+        sessionId: String,
+        payloadFingerprint: String,
+        conversationEpoch: String,
+        createdAt: Date
     ) -> ControlResponse {
         switch outcome {
         case .pendingHandoff, .accepted:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: conversationEpoch),
+                state: .queued,
+                now: createdAt
+            )
             return .success(sessionId, code: "queued")
         case .applied:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: conversationEpoch),
+                state: .delivered,
+                now: createdAt
+            )
             return .success(sessionId, code: "applied")
         case .rejected:
+            _ = rememberSentPullRequestsPrompt(
+                requestId: requestId,
+                sessionId: sessionId,
+                payloadFingerprint: payloadFingerprint,
+                route: .native(conversationEpoch: conversationEpoch),
+                state: .rejected,
+                now: createdAt
+            )
             return .failure("Copilot did not accept the prompt.", code: "rejected")
         case .indeterminate, .notFound:
             return .failure(
@@ -5650,7 +5694,7 @@ final class AppModel: ObservableObject {
             state: state,
             createdAt: now
         )
-        if state == .delivered {
+        if state != .pending {
             sentPullRequestsPrompts[requestId] = entry
         }
         do {
@@ -5658,7 +5702,7 @@ final class AppModel: ObservableObject {
             sentPullRequestsPrompts[requestId] = entry
             return true
         } catch {
-            return state == .delivered
+            return state != .pending
         }
     }
 

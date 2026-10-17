@@ -95,7 +95,9 @@ struct PullRequestsPromptRecord: Codable, Equatable, Sendable {
 
     enum DeliveryState: String, Codable, Equatable, Sendable {
         case pending
+        case queued
         case delivered
+        case rejected
     }
 
     let requestId: String
