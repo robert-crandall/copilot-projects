@@ -1501,8 +1501,9 @@ final class NotificationsTests: XCTestCase {
         ]
         var scope = NotificationScope()
         var scoped = ScopedNotifications(items, scope: scope)
-        XCTAssertEqual(scoped.shown.map(\.id.id), ["open", "draft", "issue", "unknown", "ci"], "an unknown state is never hidden")
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["open", "issue", "unknown", "ci"], "an unknown state is never hidden")
         XCTAssertEqual(scoped.hiddenByState, 4)
+        XCTAssertEqual(scoped.hiddenDrafts, 1)
         XCTAssertEqual(scoped.total, items.count)
 
         scope.hidesMergedPullRequests = false
@@ -1511,6 +1512,7 @@ final class NotificationsTests: XCTestCase {
         scope.hidesClosedPullRequests = false
         XCTAssertEqual(ScopedNotifications(items, scope: scope).hiddenByState, 2, "closed issues stay hidden")
         scope.hidesClosedIssues = false
+        scope.hidesDraftPullRequests = false
         scoped = ScopedNotifications(items, scope: scope)
         XCTAssertEqual(scoped.shown.count, items.count)
     }
@@ -1601,29 +1603,36 @@ final class NotificationsTests: XCTestCase {
     }
 
     func testThePullDownAndNotesNameWhatIsHidden() {
-        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding CI, your PRs, merged & closed")
-        XCTAssertEqual(NotificationScope(hidesYourPullRequests: false).hidingLabel, "Hiding CI, merged & closed")
-        XCTAssertEqual(NotificationScope(hidesCIActivity: false, hidesYourPullRequests: false).hidingLabel, "Hiding merged & closed")
+        XCTAssertEqual(NotificationScope().hidingLabel, "Hiding CI, your PRs, drafts, merged & closed")
+        XCTAssertEqual(NotificationScope(hidesDraftPullRequests: false).hidingLabel, "Hiding CI, your PRs, merged & closed")
+        XCTAssertEqual(NotificationScope(hidesYourPullRequests: false, hidesDraftPullRequests: false).hidingLabel, "Hiding CI, merged & closed")
         XCTAssertEqual(
-            NotificationScope(hidesClosedIssues: false, hidesCIActivity: false, hidesYourPullRequests: false).hidingLabel,
+            NotificationScope(hidesCIActivity: false, hidesYourPullRequests: false, hidesDraftPullRequests: false).hidingLabel,
+            "Hiding merged & closed"
+        )
+        XCTAssertEqual(
+            NotificationScope(hidesClosedIssues: false, hidesCIActivity: false, hidesYourPullRequests: false, hidesDraftPullRequests: false).hidingLabel,
             "Hiding merged & closed PRs"
         )
         XCTAssertEqual(
-            NotificationScope(hidesClosedPullRequests: false, hidesCIActivity: false, hidesYourPullRequests: false).hidingLabel,
+            NotificationScope(hidesClosedPullRequests: false, hidesCIActivity: false, hidesYourPullRequests: false, hidesDraftPullRequests: false).hidingLabel,
             "Hiding merged PRs & closed issues"
         )
         XCTAssertEqual(
             NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesYourPullRequests: false).hidingLabel,
-            "Hiding CI, closed issues"
-        )
-        XCTAssertEqual(
-            NotificationScope(hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false, hidesCIActivity: false).hidingLabel,
-            "Hiding your PRs"
+            "Hiding CI, drafts, closed issues"
         )
         XCTAssertEqual(
             NotificationScope(
                 hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false,
                 hidesCIActivity: false, hidesYourPullRequests: false
+            ).hidingLabel,
+            "Hiding drafts"
+        )
+        XCTAssertEqual(
+            NotificationScope(
+                hidesMergedPullRequests: false, hidesClosedPullRequests: false, hidesClosedIssues: false,
+                hidesCIActivity: false, hidesYourPullRequests: false, hidesDraftPullRequests: false
             ).hidingLabel,
             "Showing everything"
         )
@@ -1655,6 +1664,30 @@ final class NotificationsTests: XCTestCase {
         scoped = ScopedNotifications([ci, mention], scope: scope)
         XCTAssertEqual(scoped.shown.map(\.id.id), ["ci", "m"])
         XCTAssertEqual(scoped.hiddenCI, 0)
+    }
+
+    func testDraftsAreHiddenUntilReadyAndOnlyOnStateReadForThisCopy() {
+        func pr(_ id: String, _ reason: String, _ state: NotificationSubjectDetail.State?, current: Bool = true) -> NotificationItem {
+            NotificationItem(thread: thread(id, reason), detail: state.map { NotificationSubjectDetail(state: $0) },
+                             detailsSettled: true, stateIsCurrent: current)
+        }
+        let draft = pr("draft", "review_requested", .draft)
+        let ready = pr("ready", "review_requested", .open)
+        let stale = pr("stale", "mention", .draft, current: false)
+        var scope = NotificationScope()
+        var scoped = ScopedNotifications([draft, ready, stale], scope: scope)
+        XCTAssertEqual(scoped.shown.map(\.id.id), ["ready", "stale"], "a draft read for an older copy may be ready now")
+        XCTAssertEqual(scoped.hiddenDrafts, 1)
+        XCTAssertTrue(scope.mightHide(stale), "it waits while it's read again")
+        XCTAssertEqual(ScopedNotifications([stale], scope: scope) { _ in true }.pending, 1)
+        XCTAssertEqual(NotificationsView.countHelp(scoped, owners: [], unreadOnly: false), "Hidden: 1 draft")
+        XCTAssertEqual(
+            NotificationsView.allHiddenDescription(ScopedNotifications([draft], scope: scope), owners: []),
+            "1 draft pull request is hidden. They stay in your GitHub inbox."
+        )
+        scope.hidesDraftPullRequests = false
+        scoped = ScopedNotifications([draft, ready, stale], scope: scope)
+        XCTAssertEqual(scoped.shown.count, 3)
     }
 
     func testActivityOnYourPullRequestsIsHiddenByDefaultButWhatAsksYouIsNot() {
@@ -1736,6 +1769,8 @@ final class NotificationsTests: XCTestCase {
         model.hidesCIActivity = false
         XCTAssertTrue(model.hidesYourPullRequests)
         model.hidesYourPullRequests = false
+        XCTAssertTrue(model.hidesDraftPullRequests)
+        model.hidesDraftPullRequests = false
 
         let relaunched = answeringModel(github, details: box, clears: false, clock: clock, defaults: defaults)
         XCTAssertFalse(relaunched.hidesMergedPullRequests)
@@ -1743,6 +1778,7 @@ final class NotificationsTests: XCTestCase {
         XCTAssertFalse(relaunched.hidesClosedIssues)
         XCTAssertFalse(relaunched.hidesCIActivity)
         XCTAssertFalse(relaunched.hidesYourPullRequests)
+        XCTAssertFalse(relaunched.hidesDraftPullRequests)
         XCTAssertEqual(relaunched.owners, "")
     }
 

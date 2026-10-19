@@ -531,16 +531,19 @@ struct NotificationScope: Equatable, Sendable {
     var hidesCIActivity = true
     /// Activity on the user's own pull requests, which the Pull Requests window covers too.
     var hidesYourPullRequests = true
+    /// Pull requests still in draft, review requests on them included.
+    var hidesDraftPullRequests = true
     /// Organizations or users whose repositories count; empty means every owner.
     var owners: [String] = []
 
     enum Hidden: Equatable, Sendable {
-        case owner, ciActivity, yourPullRequest, mergedPullRequest, closedPullRequest, closedIssue
+        case owner, ciActivity, yourPullRequest, draftPullRequest, mergedPullRequest, closedPullRequest, closedIssue
     }
 
     /// Why a thread is out of scope; nil when it's in. A subject whose state
-    /// isn't known is never hidden for its state, and neither is a closed one
-    /// read for an older copy: it may have been reopened since. Merged stays merged.
+    /// isn't known is never hidden for its state, and neither is a draft or
+    /// closed one read for an older copy: it may be ready or reopened since.
+    /// Merged stays merged.
     func hidden(_ item: NotificationItem) -> Hidden? {
         if !owners.isEmpty {
             let owner = item.thread.repository.split(separator: "/").first.map { $0.lowercased() } ?? ""
@@ -549,30 +552,33 @@ struct NotificationScope: Equatable, Sendable {
         if hidesCIActivity, item.lane == .ciActivity { return .ciActivity }
         // A mention or review request on it still asks something of the user, so only its activity goes.
         if hidesYourPullRequests, item.lane == .yourWork, item.thread.kind == .pullRequest { return .yourPullRequest }
-        guard let state = item.detail?.state, state.isSettled, item.stateIsCurrent || state == .merged else { return nil }
+        guard let state = item.detail?.state, state != .open, item.stateIsCurrent || state == .merged else { return nil }
         switch item.thread.kind {
         case .pullRequest:
-            if state == .merged { return hidesMergedPullRequests ? .mergedPullRequest : nil }
-            return hidesClosedPullRequests ? .closedPullRequest : nil
+            switch state {
+            case .merged: return hidesMergedPullRequests ? .mergedPullRequest : nil
+            case .draft: return hidesDraftPullRequests ? .draftPullRequest : nil
+            default: return hidesClosedPullRequests ? .closedPullRequest : nil
+            }
         case .issue:
-            return hidesClosedIssues ? .closedIssue : nil
+            return state.isSettled && hidesClosedIssues ? .closedIssue : nil
         default:
             return nil
         }
     }
 
     /// Whether a subject could turn out hidden once its state is read: one never
-    /// read, or one last read closed for an older copy. Open ones stay put.
+    /// read, or one last read draft or closed for an older copy. Open ones stay put.
     func mightHide(_ item: NotificationItem) -> Bool {
         guard item.thread.number != nil, hidesSomeState(of: item.thread.kind) else { return false }
         guard let state = item.detail?.state else { return true }
-        return state.isSettled && state != .merged && !item.stateIsCurrent
+        return state != .open && state != .merged && !item.stateIsCurrent
     }
 
     /// Whether a subject of this kind could be hidden once its state is read.
     func hidesSomeState(of kind: NotificationSubjectKind) -> Bool {
         switch kind {
-        case .pullRequest: return hidesMergedPullRequests || hidesClosedPullRequests
+        case .pullRequest: return hidesMergedPullRequests || hidesClosedPullRequests || hidesDraftPullRequests
         case .issue: return hidesClosedIssues
         default: return false
         }
@@ -591,12 +597,15 @@ struct NotificationScope: Equatable, Sendable {
         case (false, false, true): states = "closed issues"
         case (false, false, false): states = nil
         }
-        let hidden = [hidesCIActivity ? "CI" : nil, hidesYourPullRequests ? "your PRs" : nil, states].compactMap { $0 }
+        let hidden = [
+            hidesCIActivity ? "CI" : nil, hidesYourPullRequests ? "your PRs" : nil, hidesDraftPullRequests ? "drafts" : nil, states,
+        ].compactMap { $0 }
         return hidden.isEmpty ? "Showing everything" : "Hiding " + hidden.joined(separator: ", ")
     }
 
     var hidesAnything: Bool {
         hidesMergedPullRequests || hidesClosedPullRequests || hidesClosedIssues || hidesCIActivity || hidesYourPullRequests
+            || hidesDraftPullRequests
     }
 }
 
@@ -610,12 +619,14 @@ struct ScopedNotifications: Equatable {
     var hiddenCI = 0
     /// Activity on the user's own pull requests they hide.
     var hiddenYourPullRequests = 0
+    /// Draft pull requests the user hides.
+    var hiddenDrafts = 0
     /// Threads in repositories outside the chosen owners.
     var hiddenByOwner = 0
     /// Subjects whose state is being read for the first time and might be hidden.
     var pending = 0
     var total: Int { shown.count + hidden + pending }
-    var hidden: Int { hiddenByState + hiddenCI + hiddenYourPullRequests + hiddenByOwner }
+    var hidden: Int { hiddenByState + hiddenCI + hiddenYourPullRequests + hiddenDrafts + hiddenByOwner }
 
     init(_ items: [NotificationItem], scope: NotificationScope, isPending: (NotificationItem) -> Bool = { _ in false }) {
         for item in items {
@@ -623,6 +634,7 @@ struct ScopedNotifications: Equatable {
             case .owner: hiddenByOwner += 1
             case .ciActivity: hiddenCI += 1
             case .yourPullRequest: hiddenYourPullRequests += 1
+            case .draftPullRequest: hiddenDrafts += 1
             case .mergedPullRequest, .closedPullRequest, .closedIssue: hiddenByState += 1
             case nil:
                 if scope.mightHide(item), isPending(item) {
