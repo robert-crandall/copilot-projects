@@ -277,24 +277,24 @@ struct NotificationsView: View {
     private var hidingMenu: some View {
         let scope = model.scope
         return Menu {
-            Section("Hide") {
-                Toggle("CI Activity", isOn: $model.hidesCIActivity)
-                Toggle("Your Pull Requests", isOn: $model.hidesYourPullRequests)
-                Toggle("Draft Pull Requests", isOn: $model.hidesDraftPullRequests)
-                Toggle("Merged Pull Requests", isOn: $model.hidesMergedPullRequests)
-                Toggle("Closed Pull Requests", isOn: $model.hidesClosedPullRequests)
-                Toggle("Closed Issues", isOn: $model.hidesClosedIssues)
-            }
+            Toggle("CI Activity", isOn: $model.hidesCIActivity)
+            Toggle("Your Pull Requests", isOn: $model.hidesYourPullRequests)
+            Toggle("Draft Pull Requests", isOn: $model.hidesDraftPullRequests)
+            Toggle("Merged Pull Requests", isOn: $model.hidesMergedPullRequests)
+            Toggle("Closed Pull Requests", isOn: $model.hidesClosedPullRequests)
+            Toggle("Closed Issues", isOn: $model.hidesClosedIssues)
         } label: {
-            Text(scope.hidingLabel)
+            // What's hidden is in the tooltip; listing it here grew with every filter.
+            Label("Hide", systemImage: scope.hidesAnything ? "eye.slash" : "eye")
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.visible)
+        .menuStyle(.button)
+        // A control, not caption text: the row's secondary ink would read as disabled.
+        .foregroundStyle(.primary)
         .fixedSize()
         .help(scope.hidesAnything
-              ? "Hidden threads stay in your GitHub inbox but don’t show here, count toward the badge, or raise banners."
+              ? "\(scope.hidingLabel). Hidden threads stay in your GitHub inbox but don’t show here, count toward the badge, or raise banners."
               : "CI, your pull requests, drafts, merged and closed pull requests, and closed issues show here. Choose which to hide.")
-        .accessibilityLabel("Hidden threads")
+        .accessibilityLabel("Hide")
         .accessibilityValue(scope.hidingLabel)
     }
 

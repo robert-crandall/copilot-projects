@@ -114,8 +114,8 @@ as in the Pull Requests build. The contract blocks above are unchanged.
 Scope refinement (user-requested filters, option A chosen by the user): the header
 gains the Pull Requests window's Owners button and token-field popover, with its own
 list (`notifications.owners`), before Banners; the filter row gains a native
-borderless pull-down after Unread | All, labeled by what it hides ("Hiding CI, your PRs, drafts, merged &
-closed" by default), with checkmarks for CI Activity and Your Pull Requests (added later at
+pull-down after Unread | All, first labeled by what it hides and later, at the user's
+request, a bordered Hide button (eye.slash / eye) with that list in its tooltip, with checkmarks for CI Activity and Your Pull Requests (added later at
 the user's request: the Pull Requests window covers both), Draft Pull Requests (also added
 at the user's request), Merged Pull Requests, Closed Pull Requests,
 and Closed Issues. Out-of-scope threads leave the lanes, header, badge, banners, and

@@ -584,7 +584,7 @@ struct NotificationScope: Equatable, Sendable {
         }
     }
 
-    /// The filter row's pull-down: what's hidden, in as few words as hold it.
+    /// What's hidden, in as few words as hold it, for the Hide button's tooltip and VoiceOver.
     var hidingLabel: String {
         let states: String?
         switch (hidesMergedPullRequests, hidesClosedPullRequests, hidesClosedIssues) {

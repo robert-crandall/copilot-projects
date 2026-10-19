@@ -284,8 +284,8 @@ five threads, unread and newest first; **Show more** reveals the rest.
   activity on your own pull requests (the Pull Requests window already covers
   both; a mention or review request on one still shows), draft pull requests
   (review requests on them too), merged pull requests, closed pull requests, and
-  closed issues are hidden by default; the filter row's **Hiding CI, your PRs,
-  drafts, merged & closed** menu turns each back on. **Owners** in the header (like the
+  closed issues are hidden by default; the filter row's **Hide** menu turns each
+  back on, and its tooltip lists what's hidden. **Owners** in the header (like the
   Pull Requests window's, but its own list) keeps only threads from repositories in
   the organizations or users you name. Hidden threads stay in your GitHub inbox
   (threads you'd already answered are still cleared) but don't show, count toward
