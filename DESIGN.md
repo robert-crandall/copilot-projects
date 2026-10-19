@@ -380,10 +380,11 @@ Banners button (bell, or bell.slash when off) whose 300pt popover holds per-band
 checkboxes and, when System Settings denies banners, a note behind the native
 orange symbol with Open Notification Settings, then Refresh (Command-R). A caption
 secondary filter row follows: an Unread | All segmented picker (opening on All,
-disabled until loaded), a native borderless pull-down at the picker's control size
-naming what it hides ("Hiding CI, your PRs, drafts, merged & closed", down to "Showing everything")
-with a Hide section of CI Activity, Your Pull Requests, Draft Pull Requests, Merged Pull Requests, Closed Pull Requests, and Closed Issues
-checkmarks (each kept in `notifications.hides…`), "N of M threads" (M counts every
+disabled until loaded), a native bordered Hide pull-down button at the picker's
+control size (eye.slash while anything is hidden, eye otherwise; what it hides, "Hiding CI,
+your PRs, drafts, merged & closed" down to "Showing everything", is in its tooltip and
+VoiceOver value rather than its title, which would grow with every filter) with checkmarks for CI Activity, Your Pull Requests, Draft Pull Requests, Merged Pull Requests, Closed Pull Requests, and Closed Issues
+(each kept in `notifications.hides…`), "N of M threads" (M counts every
 loaded thread; its tooltip names what's hidden and why), and trailing refresh progress, a "GitHub
 checked" relative time that never wraps, or "Copilot Projects unavailable · sessions not linked".
 Later refresh or sync failures keep the lanes and add one selectable caption line
