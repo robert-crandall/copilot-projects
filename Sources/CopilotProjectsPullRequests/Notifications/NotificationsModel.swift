@@ -90,6 +90,7 @@ final class NotificationsModel: ObservableObject {
     static let hidesClosedIssuesKey = "notifications.hidesClosedIssues"
     static let hidesCIActivityKey = "notifications.hidesCIActivity"
     static let hidesYourPullRequestsKey = "notifications.hidesYourPullRequests"
+    static let hidesDraftPullRequestsKey = "notifications.hidesDraftPullRequests"
     static let lastReviewProjectIdKey = "notifications.lastReviewProjectId"
 
     @Published private(set) var threads: [NotificationThread] = []
@@ -137,6 +138,9 @@ final class NotificationsModel: ObservableObject {
     }
     @Published var hidesYourPullRequests: Bool {
         didSet { scopeChanged(hidesYourPullRequests, Self.hidesYourPullRequestsKey) }
+    }
+    @Published var hidesDraftPullRequests: Bool {
+        didSet { scopeChanged(hidesDraftPullRequests, Self.hidesDraftPullRequestsKey) }
     }
     /// While subject details are being read, counts may still include requests
     /// that turn out to be for a team or already merged; nothing is published.
@@ -280,6 +284,7 @@ final class NotificationsModel: ObservableObject {
         hidesClosedIssues = defaults.object(forKey: Self.hidesClosedIssuesKey) as? Bool ?? true
         hidesCIActivity = defaults.object(forKey: Self.hidesCIActivityKey) as? Bool ?? true
         hidesYourPullRequests = defaults.object(forKey: Self.hidesYourPullRequestsKey) as? Bool ?? true
+        hidesDraftPullRequests = defaults.object(forKey: Self.hidesDraftPullRequestsKey) as? Bool ?? true
         lastReviewProjectId = defaults.string(forKey: Self.lastReviewProjectIdKey)
         // Old actions are kept until threads are on hand to judge them by.
         for (name, at) in (defaults.dictionary(forKey: Self.actedAtKey) as? [String: Double]) ?? [:] {
@@ -331,7 +336,8 @@ final class NotificationsModel: ObservableObject {
         NotificationScope(
             hidesMergedPullRequests: hidesMergedPullRequests, hidesClosedPullRequests: hidesClosedPullRequests,
             hidesClosedIssues: hidesClosedIssues, hidesCIActivity: hidesCIActivity,
-            hidesYourPullRequests: hidesYourPullRequests, owners: ownerList
+            hidesYourPullRequests: hidesYourPullRequests,
+            hidesDraftPullRequests: hidesDraftPullRequests, owners: ownerList
         )
     }
 

@@ -280,6 +280,7 @@ struct NotificationsView: View {
             Section("Hide") {
                 Toggle("CI Activity", isOn: $model.hidesCIActivity)
                 Toggle("Your Pull Requests", isOn: $model.hidesYourPullRequests)
+                Toggle("Draft Pull Requests", isOn: $model.hidesDraftPullRequests)
                 Toggle("Merged Pull Requests", isOn: $model.hidesMergedPullRequests)
                 Toggle("Closed Pull Requests", isOn: $model.hidesClosedPullRequests)
                 Toggle("Closed Issues", isOn: $model.hidesClosedIssues)
@@ -292,7 +293,7 @@ struct NotificationsView: View {
         .fixedSize()
         .help(scope.hidesAnything
               ? "Hidden threads stay in your GitHub inbox but don’t show here, count toward the badge, or raise banners."
-              : "CI, your pull requests, merged and closed pull requests, and closed issues show here. Choose which to hide.")
+              : "CI, your pull requests, drafts, merged and closed pull requests, and closed issues show here. Choose which to hide.")
         .accessibilityLabel("Hidden threads")
         .accessibilityValue(scope.hidingLabel)
     }
@@ -302,6 +303,7 @@ struct NotificationsView: View {
         var parts: [String] = []
         if scoped.hiddenCI > 0 { parts.append("\(scoped.hiddenCI.formatted()) CI") }
         if scoped.hiddenYourPullRequests > 0 { parts.append("\(scoped.hiddenYourPullRequests.formatted()) on your PRs") }
+        if scoped.hiddenDrafts > 0 { parts.append(scoped.hiddenDrafts == 1 ? "1 draft" : "\(scoped.hiddenDrafts.formatted()) drafts") }
         if scoped.hiddenByState > 0 { parts.append("\(scoped.hiddenByState.formatted()) merged or closed") }
         if scoped.hiddenByOwner > 0 {
             parts.append("\(scoped.hiddenByOwner.formatted()) outside \(owners.joined(separator: ", "))")
@@ -429,6 +431,9 @@ struct NotificationsView: View {
                         if scoped.hiddenYourPullRequests > 0 {
                             Button("Show Your PRs") { model.hidesYourPullRequests = false }
                         }
+                        if scoped.hiddenDrafts > 0 {
+                            Button("Show Drafts") { model.hidesDraftPullRequests = false }
+                        }
                         if scoped.hiddenByState > 0 {
                             Button("Show Merged & Closed") {
                                 model.hidesMergedPullRequests = false
@@ -475,6 +480,9 @@ struct NotificationsView: View {
         }
         if scoped.hiddenYourPullRequests > 0 {
             parts.append(scoped.hiddenYourPullRequests == 1 ? "1 thread on your PRs" : "\(scoped.hiddenYourPullRequests.formatted()) threads on your PRs")
+        }
+        if scoped.hiddenDrafts > 0 {
+            parts.append(scoped.hiddenDrafts == 1 ? "1 draft pull request" : "\(scoped.hiddenDrafts.formatted()) draft pull requests")
         }
         if scoped.hiddenByState > 0 {
             parts.append(scoped.hiddenByState == 1 ? "1 merged or closed thread" : "\(scoped.hiddenByState.formatted()) merged or closed threads")
