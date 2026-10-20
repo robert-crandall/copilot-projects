@@ -358,6 +358,36 @@ final class WorkspaceInputControllerTests: XCTestCase {
             input.openFromSessionFinder(other[1].id)
             XCTAssertEqual(model.globalSelectedSessionId, other[1].id)
             XCTAssertEqual(model.previousHistorySessionTitle, sessions[1].title)
+            XCTAssertEqual(
+                model.backHistoryMenuItems.map(\.menuTitle),
+                ["second — Input fixture", "first — Input fixture"],
+                "Back menu lists previous sessions most-recent-first with their project name"
+            )
+            XCTAssertTrue(model.forwardHistoryMenuItems.isEmpty)
+
+            // Jumping directly to the earliest item via the Back right-click menu
+            // populates the Forward menu in nearest-first order.
+            let earliestBack = try XCTUnwrap(model.backHistoryMenuItems.last)
+            XCTAssertEqual(model.navigateToSessionHistory(index: earliestBack.index)?.sessionId, sessions[0].id)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
+            XCTAssertTrue(model.backHistoryMenuItems.isEmpty)
+            XCTAssertEqual(
+                model.forwardHistoryMenuItems.map(\.menuTitle),
+                ["second — Input fixture", "Other 2 — Other fixture"]
+            )
+            let furthestForward = try XCTUnwrap(model.forwardHistoryMenuItems.last)
+            XCTAssertEqual(model.navigateToSessionHistory(index: furthestForward.index)?.sessionId, other[1].id)
+            XCTAssertEqual(model.globalSelectedSessionId, other[1].id)
+
+            // Back and Forward menus cap at 10 entries.
+            var capped = SessionNavigationHistory()
+            let validIds = Set((0..<15).map { "s\($0)" })
+            for i in 0..<15 {
+                capped.reconcile(validSessionIds: validIds, currentSessionId: "s\(i)")
+            }
+            XCTAssertEqual(capped.backEntries().map(\.sessionId), (4..<14).reversed().map { "s\($0)" })
+            _ = capped.goTo(index: 0, validSessionIds: validIds)
+            XCTAssertEqual(capped.forwardEntries().map(\.sessionId), (1...10).map { "s\($0)" })
 
             let commandBack = try key("[", code: 33, modifiers: .command)
             let commandForward = try key("]", code: 30, modifiers: .command)

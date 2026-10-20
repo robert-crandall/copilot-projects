@@ -207,6 +207,7 @@ enum NumberHint {
 /// Bounded Back/Forward history of visited sessions across all projects.
 struct SessionNavigationHistory: Equatable, Sendable {
     static let maxEntries = 100
+    static let maxMenuEntries = 10
     private(set) var entries: [String] = []
     private(set) var index: Int? = nil
     private(set) var isCurrentEntryDisplayed = false
@@ -227,6 +228,22 @@ struct SessionNavigationHistory: Equatable, Sendable {
     var forwardTarget: String? {
         guard let index, entries.indices.contains(index + 1) else { return nil }
         return entries[index + 1]
+    }
+
+    /// Up to `limit` previous entries in the back stack, most recent first.
+    func backEntries(limit: Int = Self.maxMenuEntries) -> [(index: Int, sessionId: String)] {
+        guard limit > 0, let index, entries.indices.contains(index) else { return [] }
+        let upperBound = isCurrentEntryDisplayed ? index : index + 1
+        guard upperBound > 0 else { return [] }
+        return (0..<upperBound).reversed().prefix(limit).map { (index: $0, sessionId: entries[$0]) }
+    }
+
+    /// Up to `limit` upcoming entries in the forward stack, nearest first.
+    func forwardEntries(limit: Int = Self.maxMenuEntries) -> [(index: Int, sessionId: String)] {
+        guard limit > 0, let index else { return [] }
+        let lowerBound = max(0, index + 1)
+        guard lowerBound < entries.count else { return [] }
+        return (lowerBound..<entries.count).prefix(limit).map { (index: $0, sessionId: entries[$0]) }
     }
 
     mutating func prune(validSessionIds: Set<String>) {
@@ -303,5 +320,36 @@ struct SessionNavigationHistory: Equatable, Sendable {
         index = current + 1
         isCurrentEntryDisplayed = true
         return entries[current + 1]
+    }
+
+    mutating func goTo(index targetIndex: Int, validSessionIds: Set<String>) -> String? {
+        guard entries.indices.contains(targetIndex) else {
+            prune(validSessionIds: validSessionIds)
+            return nil
+        }
+        let targetId = entries[targetIndex]
+        guard validSessionIds.contains(targetId) else {
+            prune(validSessionIds: validSessionIds)
+            return nil
+        }
+        index = targetIndex
+        isCurrentEntryDisplayed = true
+        prune(validSessionIds: validSessionIds)
+        return targetId
+    }
+}
+
+/// One entry in the Back or Forward right-click history menu.
+struct SessionHistoryMenuItem: Equatable, Identifiable, Sendable {
+    let index: Int
+    let projectId: String
+    let projectName: String
+    let sessionId: String
+    let sessionTitle: String
+
+    var id: Int { index }
+
+    var menuTitle: String {
+        "\(sessionTitle) — \(projectName)"
     }
 }

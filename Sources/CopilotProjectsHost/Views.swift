@@ -126,6 +126,13 @@ private struct SessionHistoryButtons: View {
             .help(model.previousHistorySessionTitle.map { "Back to \($0) (⌘[)" } ?? "Back (⌘[)")
             .accessibilityLabel("Back")
             .accessibilityIdentifier("session-history-back")
+            .contextMenu {
+                ForEach(model.backHistoryMenuItems) { item in
+                    Button(item.menuTitle) {
+                        model.navigateToSessionHistory(index: item.index)
+                    }
+                }
+            }
 
             Button {
                 model.navigateSessionForward()
@@ -140,6 +147,13 @@ private struct SessionHistoryButtons: View {
             .help(model.nextHistorySessionTitle.map { "Forward to \($0) (⌘])" } ?? "Forward (⌘])")
             .accessibilityLabel("Forward")
             .accessibilityIdentifier("session-history-forward")
+            .contextMenu {
+                ForEach(model.forwardHistoryMenuItems) { item in
+                    Button(item.menuTitle) {
+                        model.navigateToSessionHistory(index: item.index)
+                    }
+                }
+            }
         }
         .background(FleetStatusBarHitArea())
     }
