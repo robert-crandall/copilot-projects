@@ -375,6 +375,33 @@ final class WorkspaceInputControllerTests: XCTestCase {
             XCTAssertEqual(model.selectedProjectId, model.projects[1].id)
             XCTAssertFalse(model.canNavigateSessionForward)
 
+            // Mouse Back (button 3) and Forward (button 4) navigate history on mouseDown,
+            // swallow mouseUp, leave middle-click (button 2) untouched, and ignore sheets.
+            func mouse(_ type: NSEvent.EventType, button: Int) throws -> NSEvent {
+                try XCTUnwrap(NSEvent.mouseEvent(
+                    with: type, location: .zero, modifierFlags: [], timestamp: 0,
+                    windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1,
+                    pressure: type == .otherMouseDown ? 1 : 0, buttonNumber: button,
+                    deltaX: 0, deltaY: 0, deltaZ: 0
+                ))
+            }
+            let middleDown = try mouse(.otherMouseDown, button: 2)
+            XCTAssertNotNil(input.handleOtherMouse(middleDown))
+            XCTAssertEqual(model.globalSelectedSessionId, other[1].id)
+
+            XCTAssertNil(input.handleOtherMouse(try mouse(.otherMouseDown, button: 3)))
+            XCTAssertNil(input.handleOtherMouse(try mouse(.otherMouseUp, button: 3)))
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id)
+
+            input.presentSessionFinder()
+            XCTAssertNotNil(input.handleOtherMouse(try mouse(.otherMouseDown, button: 4)))
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id, "Mouse Back/Forward is ignored while a workspace sheet is open")
+            input.dismissSessionFinder()
+
+            XCTAssertNil(input.handleOtherMouse(try mouse(.otherMouseDown, button: 4)))
+            XCTAssertNil(input.handleOtherMouse(try mouse(.otherMouseUp, button: 4)))
+            XCTAssertEqual(model.globalSelectedSessionId, other[1].id)
+
             // Navigating back and then choosing a new branch truncates forward history.
             XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[1].id)
             model.selectSession(projectId: model.projects[1].id, sessionId: other[0].id)

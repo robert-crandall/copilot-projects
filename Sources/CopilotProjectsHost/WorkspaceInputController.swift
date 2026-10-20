@@ -113,6 +113,24 @@ final class WorkspaceInputController: ObservableObject {
             && NSApp.keyWindow?.sheetParent == nil && NSApp.keyWindow?.attachedSheet == nil
     }
 
+    func handleOtherMouse(_ event: NSEvent) -> NSEvent? {
+        guard !hasWorkspaceSheet, allowsWorkspaceEvents(event) else { return event }
+        switch event.buttonNumber {
+        case 3:
+            if event.type == .otherMouseDown {
+                model.navigateSessionBack()
+            }
+            return nil
+        case 4:
+            if event.type == .otherMouseDown {
+                model.navigateSessionForward()
+            }
+            return nil
+        default:
+            return event
+        }
+    }
+
     func handleKeyDown(_ event: NSEvent, cancelNumberHint: () -> Void = {}) -> NSEvent? {
         let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
         func clearNumberHint() {
