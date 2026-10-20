@@ -481,6 +481,8 @@ final class AppModel: ObservableObject {
     /// flag was cleared by `selectNextAttentionSession()`, so pressing `⇧⌘A` again
     /// from that session continues advancing through the cycle instead of restarting.
     private var lastClearedAttentionCursor: (sessionId: String, tier: SessionAttentionTier, workspaceIndex: Int)?
+    @Published private(set) var sessionNavigationHistory = SessionNavigationHistory()
+    private var isNavigatingSessionHistory = false
 
     private var livenessTimer: Timer?
     private var footerTimer: Timer?
@@ -966,6 +968,7 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshSelectedTranscriptController() {
+        syncSessionNavigationHistory()
         guard let sessionId = globalSelectedSessionId else {
             selectedTranscriptController = nil
             return
@@ -974,6 +977,61 @@ final class AppModel: ObservableObject {
         let controller = TranscriptController(sessionId: sessionId)
         selectedTranscriptController = controller
         controller.start()
+    }
+
+    private func syncSessionNavigationHistory() {
+        let validIds = Set(projects.flatMap { $0.sessions.map(\.id) })
+        if isNavigatingSessionHistory {
+            sessionNavigationHistory.prune(validSessionIds: validIds)
+        } else {
+            sessionNavigationHistory.reconcile(
+                validSessionIds: validIds,
+                currentSessionId: globalSelectedSessionId
+            )
+        }
+    }
+
+    var canNavigateSessionBack: Bool { sessionNavigationHistory.canGoBack }
+    var canNavigateSessionForward: Bool { sessionNavigationHistory.canGoForward }
+
+    var previousHistorySessionTitle: String? {
+        guard let id = sessionNavigationHistory.backTarget,
+              let loc = locateIndex(id) else { return nil }
+        return projects[loc.p].sessions[loc.s].title
+    }
+
+    var nextHistorySessionTitle: String? {
+        guard let id = sessionNavigationHistory.forwardTarget,
+              let loc = locateIndex(id) else { return nil }
+        return projects[loc.p].sessions[loc.s].title
+    }
+
+    @discardableResult
+    func navigateSessionBack() -> (projectId: String, sessionId: String)? {
+        let validIds = Set(projects.flatMap { $0.sessions.map(\.id) })
+        guard let targetId = sessionNavigationHistory.goBack(validSessionIds: validIds),
+              let loc = locateIndex(targetId) else { return nil }
+        let projectId = projects[loc.p].id
+        isNavigatingSessionHistory = true
+        defer { isNavigatingSessionHistory = false }
+        show(projectId: projectId, sessionId: targetId)
+        save()
+        focusActiveTerminal()
+        return (projectId, targetId)
+    }
+
+    @discardableResult
+    func navigateSessionForward() -> (projectId: String, sessionId: String)? {
+        let validIds = Set(projects.flatMap { $0.sessions.map(\.id) })
+        guard let targetId = sessionNavigationHistory.goForward(validSessionIds: validIds),
+              let loc = locateIndex(targetId) else { return nil }
+        let projectId = projects[loc.p].id
+        isNavigatingSessionHistory = true
+        defer { isNavigatingSessionHistory = false }
+        show(projectId: projectId, sessionId: targetId)
+        save()
+        focusActiveTerminal()
+        return (projectId, targetId)
     }
 
     func isTranscriptDrawerOpen(sessionId: String) -> Bool {

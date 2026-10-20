@@ -61,6 +61,25 @@ private struct NextAttentionSessionButton: View {
     }
 }
 
+/// Session ▸ Back (⌘[) / Forward (⌘]).
+private struct SessionHistoryMenuButtons: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button("Back") {
+            model.navigateSessionBack()
+        }
+        .keyboardShortcut("[", modifiers: .command)
+        .disabled(!model.canNavigateSessionBack)
+
+        Button("Forward") {
+            model.navigateSessionForward()
+        }
+        .keyboardShortcut("]", modifiers: .command)
+        .disabled(!model.canNavigateSessionForward)
+    }
+}
+
 private struct WorkspaceCommands: Commands {
     let model: AppModel
     @ObservedObject var input: WorkspaceInputController
@@ -104,6 +123,8 @@ private struct WorkspaceCommands: Commands {
                 Button("Find Session…") { input.presentSessionFinder() }
                     .keyboardShortcut("k", modifiers: .command)
                 NextAttentionSessionButton(model: model)
+                Divider()
+                SessionHistoryMenuButtons(model: model)
                 Button("Next Session") { model.selectAdjacentSession(1) }
                     .keyboardShortcut("]", modifiers: [.command, .shift])
                 Button("Previous Session") { model.selectAdjacentSession(-1) }

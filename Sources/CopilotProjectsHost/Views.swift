@@ -89,7 +89,8 @@ struct RootView: View {
     }
 
     private var topStrip: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
+            SessionHistoryButtons(model: model)
             Text("Copilot Projects")
                 .font(.callout.weight(.semibold))
                 .lineLimit(1)
@@ -105,6 +106,43 @@ struct RootView: View {
         .background(StudioStyle.chrome)
     }
 
+}
+
+private struct SessionHistoryButtons: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Button {
+                model.navigateSessionBack()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .disabled(!model.canNavigateSessionBack)
+            .help(model.previousHistorySessionTitle.map { "Back to \($0) (⌘[)" } ?? "Back (⌘[)")
+            .accessibilityLabel("Back")
+            .accessibilityIdentifier("session-history-back")
+
+            Button {
+                model.navigateSessionForward()
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .disabled(!model.canNavigateSessionForward)
+            .help(model.nextHistorySessionTitle.map { "Forward to \($0) (⌘])" } ?? "Forward (⌘])")
+            .accessibilityLabel("Forward")
+            .accessibilityIdentifier("session-history-forward")
+        }
+        .background(FleetStatusBarHitArea())
+    }
 }
 
 private struct WorkspaceHeading: View {

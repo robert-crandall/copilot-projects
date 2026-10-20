@@ -151,6 +151,16 @@ final class WorkspaceInputController: ObservableObject {
             presentSessionFinder()
             return nil
         }
+        if mods == .command, event.charactersIgnoringModifiers == "[" {
+            clearNumberHint()
+            model.navigateSessionBack()
+            return nil
+        }
+        if mods == .command, event.charactersIgnoringModifiers == "]" {
+            clearNumberHint()
+            model.navigateSessionForward()
+            return nil
+        }
         if mods == [.command, .shift], event.charactersIgnoringModifiers?.lowercased() == "a" {
             clearNumberHint()
             model.selectNextAttentionSession()

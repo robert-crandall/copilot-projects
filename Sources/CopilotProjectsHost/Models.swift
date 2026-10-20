@@ -203,3 +203,81 @@ enum NumberHint {
     case projects  // ⌘ held → number badges on projects
     case tabs      // ⌃ held → number badges on session tabs
 }
+
+/// Bounded Back/Forward history of visited sessions across all projects.
+struct SessionNavigationHistory: Equatable, Sendable {
+    static let maxEntries = 100
+    private(set) var entries: [String] = []
+    private(set) var index: Int? = nil
+
+    var canGoBack: Bool { (index ?? 0) > 0 }
+
+    var canGoForward: Bool {
+        guard let index else { return false }
+        return index + 1 < entries.count
+    }
+
+    var backTarget: String? {
+        guard let index, index > 0, entries.indices.contains(index - 1) else { return nil }
+        return entries[index - 1]
+    }
+
+    var forwardTarget: String? {
+        guard let index, index + 1 < entries.count else { return nil }
+        return entries[index + 1]
+    }
+
+    mutating func prune(validSessionIds: Set<String>) {
+        guard !entries.isEmpty else {
+            index = nil
+            return
+        }
+        let targetIndex = index ?? (entries.count - 1)
+        var nextEntries: [String] = []
+        var nextIndex: Int? = nil
+        for (offset, id) in entries.enumerated() where validSessionIds.contains(id) {
+            if nextEntries.last != id {
+                nextEntries.append(id)
+            }
+            if offset <= targetIndex {
+                nextIndex = nextEntries.count - 1
+            } else if nextIndex == nil {
+                nextIndex = 0
+            }
+        }
+        entries = nextEntries
+        index = nextEntries.isEmpty ? nil : nextIndex
+    }
+
+    mutating func reconcile(validSessionIds: Set<String>, currentSessionId: String?) {
+        prune(validSessionIds: validSessionIds)
+        guard let currentSessionId, validSessionIds.contains(currentSessionId) else { return }
+        if let index, entries.indices.contains(index), entries[index] == currentSessionId {
+            return
+        }
+        if let index, index + 1 < entries.count {
+            entries.removeSubrange((index + 1)...)
+        }
+        if entries.last != currentSessionId {
+            entries.append(currentSessionId)
+        }
+        if entries.count > Self.maxEntries {
+            entries.removeFirst(entries.count - Self.maxEntries)
+        }
+        index = entries.indices.last
+    }
+
+    mutating func goBack(validSessionIds: Set<String>) -> String? {
+        prune(validSessionIds: validSessionIds)
+        guard let current = index, current > 0 else { return nil }
+        index = current - 1
+        return entries[current - 1]
+    }
+
+    mutating func goForward(validSessionIds: Set<String>) -> String? {
+        prune(validSessionIds: validSessionIds)
+        guard let current = index, current + 1 < entries.count else { return nil }
+        index = current + 1
+        return entries[current + 1]
+    }
+}
