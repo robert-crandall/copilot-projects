@@ -768,6 +768,55 @@ final class RemotePullRequestsOverviewTests: XCTestCase {
         XCTAssertEqual(cached.openCount, 1)
         XCTAssertNotNil(cached.warning)
         XCTAssertFalse(cached.isRefreshing)
+
+        // A transient 502 retries automatically; a persistent 502 on one of two
+        // accounts preserves the previously loaded PRs while surfacing the warning.
+        var attempts = 0
+        GraphQLStub.respond = { token, body in
+            let query = body["query"] as? String ?? ""
+            if token == "other", query.contains("search(") {
+                return (200, #"{"data":{"viewer":{"login":"other"},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}"#)
+            }
+            attempts += 1
+            if attempts == 1 { return (502, "") }
+            if query.contains("search(") {
+                return (200, """
+                {"data":{"viewer":{"login":"me"},"search":{"issueCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{
+                "id":"n1","number":1,"title":"Cached PR","url":"https://github.com/o/r/pull/1",
+                "state":"OPEN","isDraft":false,"createdAt":"2026-10-01T00:00:00Z","updatedAt":"2026-10-06T00:00:00Z",
+                "headRefName":"me/cached-branch","author":{"login":"me"},"repository":{"nameWithOwner":"o/r"},
+                "reviewThreads":{"pageInfo":{"hasPreviousPage":false},"nodes":[]},"commits":{"nodes":[]}
+                }]}}}
+                """)
+            }
+            return (200, #"{"data":{"node":{"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}}}"#)
+        }
+        now = now.addingTimeInterval(60)
+        _ = provider.snapshot(refresh: true)
+        try await settle(model)
+        let retried = provider.snapshot()
+        XCTAssertEqual(retried.openCount, 1)
+        XCTAssertNil(retried.warning, "transient 502 succeeds on automatic retry")
+
+        GraphQLStub.respond = { token, body in
+            let query = body["query"] as? String ?? ""
+            if token == "other", query.contains("search(") {
+                return (200, #"{"data":{"viewer":{"login":"other"},"search":{"issueCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}"#)
+            }
+            return (502, "")
+        }
+        let multiAccount = make(loadAccounts: { [
+            GitHubAccount(login: "me", token: "fixture"),
+            GitHubAccount(login: "other", token: "other"),
+        ] })
+        multiAccount.model.show([makePR()], links: [:], updated: now)
+        now = now.addingTimeInterval(60)
+        _ = multiAccount.provider.snapshot(refresh: true)
+        try await settle(multiAccount.model)
+        let partialFailure = multiAccount.provider.snapshot()
+        XCTAssertEqual(partialFailure.openCount, 1, "one account failing with 502 must not clear another account's cached PRs")
+        XCTAssertEqual(partialFailure.warning, "Couldn’t read me’s pull requests: GitHub returned HTTP 502.")
+        XCTAssertTrue(partialFailure.goals.first?.items.first?.isPartial == true)
     }
 
     func testOldSessionJSONAndPersistedAssociationPriorityAreDeterministic() throws {

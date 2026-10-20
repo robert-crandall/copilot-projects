@@ -532,7 +532,8 @@ final class PullRequestsModel: ObservableObject {
         }
         lastAttempt = clock()
         let generation = scopeGeneration
-        let firstLoad = lastUpdated == nil
+        let previousPullRequests = pullRequests
+        let firstLoad = lastUpdated == nil && previousPullRequests.isEmpty
         if pullRequests.isEmpty, !isFailed { phase = .loading }
         do {
             let accounts = try await loadAccounts()
@@ -577,10 +578,24 @@ final class PullRequestsModel: ObservableObject {
             let enriched = await service.enrich(fetch.pullRequests, tokens: fetch.tokens)
             guard generation == scopeGeneration, !Task.isCancelled else { return }
             // Owners may have changed while this ran; a later refresh fills in the rest.
-            apply(Self.inScope(enriched, owners: ownerList), links: newLinks, animated: !firstLoad)
+            var merged = Self.inScope(enriched, owners: ownerList)
+            if fetch.hadAccountFailure, !previousPullRequests.isEmpty {
+                let freshKeys = Set(merged.map(\.key))
+                let preserved = Self.inScope(previousPullRequests, owners: ownerList)
+                    .filter { !freshKeys.contains($0.key) }
+                    .map { pr -> PullRequestSnapshot in
+                        var copy = pr
+                        copy.isIncomplete = true
+                        return copy
+                    }
+                merged.append(contentsOf: preserved)
+            }
+            apply(merged, links: fetch.hadAccountFailure ? links : newLinks, animated: !firstLoad)
             omitted = fetch.omitted
             warning = fetch.warnings.first
-            lastUpdated = clock()
+            if !fetch.hadAccountFailure || lastUpdated == nil {
+                lastUpdated = clock()
+            }
             phase = .loaded
             // Ended sessions are looked for only against current live ones;
             // otherwise the last ones found stay.
