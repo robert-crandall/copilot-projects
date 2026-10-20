@@ -225,7 +225,7 @@ struct SessionNavigationHistory: Equatable, Sendable {
     }
 
     var forwardTarget: String? {
-        guard let index, index + 1 < entries.count else { return nil }
+        guard let index, entries.indices.contains(index + 1) else { return nil }
         return entries[index + 1]
     }
 
@@ -250,7 +250,7 @@ struct SessionNavigationHistory: Equatable, Sendable {
             if offset <= targetIndex {
                 nextIndex = nextEntries.count - 1
             } else if nextIndex == nil {
-                nextIndex = 0
+                nextIndex = -1
             }
         }
         entries = nextEntries
@@ -273,7 +273,7 @@ struct SessionNavigationHistory: Equatable, Sendable {
             return
         }
         if let index, index + 1 < entries.count {
-            entries.removeSubrange((index + 1)...)
+            entries.removeSubrange(max(0, index + 1)...)
         }
         if entries.last != currentSessionId {
             entries.append(currentSessionId)
@@ -299,7 +299,7 @@ struct SessionNavigationHistory: Equatable, Sendable {
 
     mutating func goForward(validSessionIds: Set<String>) -> String? {
         prune(validSessionIds: validSessionIds)
-        guard let current = index, current + 1 < entries.count else { return nil }
+        guard let current = index, entries.indices.contains(current + 1) else { return nil }
         index = current + 1
         isCurrentEntryDisplayed = true
         return entries[current + 1]

@@ -408,6 +408,24 @@ final class WorkspaceInputControllerTests: XCTestCase {
             XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
             XCTAssertFalse(model.canNavigateSessionBack)
             XCTAssertFalse(model.canNavigateSessionForward)
+
+            // Closing the earliest visit with only forward survivors preserves a
+            // before-first cursor so Forward opens the next surviving session in order.
+            let reopenedB = try XCTUnwrap(model.addSession(toProjectId: model.projects[1].id, cwd: "/tmp"))
+            model.selectProject(model.projects[1].id)
+            let reopenedC = try XCTUnwrap(model.addSession(toProjectId: model.projects[1].id, cwd: "/tmp"))
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, reopenedB)
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[0].id)
+            _ = model.closeRemoteSession(sessionId: sessions[0].id)
+            XCTAssertNil(model.globalSelectedSessionId)
+            XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertTrue(model.canNavigateSessionForward)
+            XCTAssertEqual(model.navigateSessionForward()?.sessionId, reopenedB)
+            XCTAssertEqual(model.globalSelectedSessionId, reopenedB)
+            XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertTrue(model.canNavigateSessionForward)
+            XCTAssertEqual(model.navigateSessionForward()?.sessionId, reopenedC)
+            XCTAssertEqual(model.globalSelectedSessionId, reopenedC)
         }
     }
 
