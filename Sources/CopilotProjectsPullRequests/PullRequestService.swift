@@ -111,6 +111,8 @@ struct GitHubGraphQLError: Error, Equatable {
 struct GitHubGraphQL: Sendable {
     var endpoint = URL(string: "https://api.github.com/graphql")!
     var timeout: TimeInterval = 30
+    var maxBadGatewayRetries = 2
+    var retryDelayNanoseconds: UInt64 = 300_000_000
 
     struct Response<Payload: Decodable>: Decodable {
         struct Message: Decodable {
@@ -155,8 +157,18 @@ struct GitHubGraphQL: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("copilot-projects", forHTTPHeaderField: "User-Agent")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["query": query, "variables": variables])
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        var status = 0
+        var data = Data()
+        for attempt in 0...max(0, maxBadGatewayRetries) {
+            let (responseData, response) = try await URLSession.shared.data(for: request)
+            data = responseData
+            status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 502, attempt < maxBadGatewayRetries {
+                try await Task.sleep(nanoseconds: retryDelayNanoseconds * UInt64(attempt + 1))
+                continue
+            }
+            break
+        }
         guard status == 200 else {
             throw GitHubGraphQLError(status: status, message: status == 401
                 ? "GitHub rejected the gh token. Run gh auth login again."
@@ -298,6 +310,7 @@ struct PullRequestFetch: Sendable {
     /// Open pull requests the search matched but did not return.
     var omitted = 0
     var warnings: [String] = []
+    var hadAccountFailure = false
 
     mutating func add(_ pr: PullRequestSnapshot, token: String) {
         guard tokens[pr.key] == nil else { return }
@@ -361,7 +374,6 @@ struct PullRequestService: Sendable {
                         throw GitHubGraphQLError(status: nil, message: response.errors?.first?.message ?? "GitHub returned no data.")
                     }
                     viewer = data.viewer.login ?? viewer
-                    fetch.logins.insert(viewer.lowercased())
                     if let message = response.errors?.first?.message { fetch.warnings.append(message) }
                     // An error inside one search result leaves that pull request partly
                     // read; an error anywhere else could have touched any of them.
@@ -382,10 +394,12 @@ struct PullRequestService: Sendable {
             } catch {
                 let failure = error as? GitHubGraphQLError ?? GitHubGraphQLError(status: nil, message: error.localizedDescription)
                 failures.append(failure)
+                fetch.hadAccountFailure = true
                 let name = viewer.isEmpty ? "a signed-in account" : viewer
                 accountWarnings.append("Couldn’t read \(name)’s pull requests: \(failure.message)")
                 continue
             }
+            fetch.logins.insert(viewer.lowercased())
             if hasMore { fetch.omitted += max(0, total - found.count) }
             let mine = signedIn.union([viewer.lowercased()])
             for pr in found where fetch.tokens[pr.key] == nil {
