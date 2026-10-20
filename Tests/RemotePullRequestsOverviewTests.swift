@@ -805,18 +805,35 @@ final class RemotePullRequestsOverviewTests: XCTestCase {
             }
             return (502, "")
         }
-        let multiAccount = make(loadAccounts: { [
+        let (multiAccountProvider, multiAccountModel) = make(loadAccounts: { [
             GitHubAccount(login: "me", token: "fixture"),
             GitHubAccount(login: "other", token: "other"),
         ] })
-        multiAccount.model.show([makePR()], links: [:], updated: now)
+        let preservedPR = makePR()
+        let previousSessionId = UUID().uuidString.lowercased()
+        current?.projects[0].sessions = [
+            .init(id: "live", title: "Live", status: .idle, copilotSessionId: previousSessionId),
+        ]
+        multiAccountModel.apply(.snapshot(current!))
+        multiAccountModel.show([preservedPR], links: [preservedPR.key: "live"], updated: now)
+        let unrelatedSessionId = UUID().uuidString.lowercased()
+        current?.projects[0].sessions[0].copilotSessionId = unrelatedSessionId
         now = now.addingTimeInterval(60)
-        _ = multiAccount.provider.snapshot(refresh: true)
-        try await settle(multiAccount.model)
-        let partialFailure = multiAccount.provider.snapshot()
+        _ = multiAccountProvider.snapshot(refresh: true)
+        try await settle(multiAccountModel)
+        let partialFailure = multiAccountProvider.snapshot()
         XCTAssertEqual(partialFailure.openCount, 1, "one account failing with 502 must not clear another account's cached PRs")
         XCTAssertEqual(partialFailure.warning, "Couldn’t read me’s pull requests: GitHub returned HTTP 502.")
         XCTAssertTrue(partialFailure.goals.first?.items.first?.isPartial == true)
+        XCTAssertNil(multiAccountModel.links[preservedPR.key], "preserved PRs must rematch transcripts and drop stale links")
+        let unrelatedResume = RemotePullRequestSessionRequest(
+            requestId: UUID(), kind: "resume", projectId: "p",
+            pullRequestKeys: [preservedPR.key.description], copilotSessionId: unrelatedSessionId
+        )
+        if case .stale = multiAccountProvider.validate(unrelatedResume, workspace: current!, existingSessionId: "live") {
+        } else {
+            XCTFail("Stale transcript link on a preserved PR must not authorize an unrelated session resume")
+        }
     }
 
     func testOldSessionJSONAndPersistedAssociationPriorityAreDeterministic() throws {

@@ -556,21 +556,26 @@ final class PullRequestsModel: ObservableObject {
             // Set before matching, so Copilot Projects answering while it runs
             // queues another refresh instead of being missed.
             matchedWithoutSessions = !matchedLive
+            let fetchedKeys = Set(fetch.pullRequests.map(\.key))
+            let preservedPullRequests = fetch.hadAccountFailure
+                ? Self.inScope(previousPullRequests, owners: ownerList).filter { !fetchedKeys.contains($0.key) }
+                : []
+            let matchingPullRequests = fetch.pullRequests + preservedPullRequests
             let newLinks: [PullRequestKey: String]
             if knowsSessions {
                 let sources = transcriptSources()
-                let branches = Set(fetch.pullRequests.map(\.headRefName).filter(PullRequestLinker.isDistinctiveBranch))
+                let branches = Set(matchingPullRequests.map(\.headRefName).filter(PullRequestLinker.isDistinctiveBranch))
                 let evidence = await index.evidence(for: sources, branches: branches)
                 guard generation == scopeGeneration, !Task.isCancelled else { return }
-                newLinks = PullRequestLinker.links(pullRequests: fetch.pullRequests, evidence: evidence)
+                newLinks = PullRequestLinker.links(pullRequests: matchingPullRequests, evidence: evidence)
             } else {
                 // No sessions known: matching against none would empty the
                 // on-disk index, and every session would be read from the start
                 // again once Copilot Projects answers.
                 newLinks = links
             }
-            let fetchedKeys = Set(fetch.pullRequests.map(\.key))
-            links = newLinks.merging(links.filter { !fetchedKeys.contains($0.key) }) { new, _ in new }
+            let matchedKeys = Set(matchingPullRequests.map(\.key))
+            links = newLinks.merging(links.filter { !matchedKeys.contains($0.key) }) { new, _ in new }
             sessionsMatched = true
             if hostedReadOnly, matchedLive { matchedWorkspace = matchedIdentity }
             isMatchingSessions = false
@@ -579,9 +584,9 @@ final class PullRequestsModel: ObservableObject {
             guard generation == scopeGeneration, !Task.isCancelled else { return }
             // Owners may have changed while this ran; a later refresh fills in the rest.
             var merged = Self.inScope(enriched, owners: ownerList)
-            if fetch.hadAccountFailure, !previousPullRequests.isEmpty {
+            if !preservedPullRequests.isEmpty {
                 let freshKeys = Set(merged.map(\.key))
-                let preserved = Self.inScope(previousPullRequests, owners: ownerList)
+                let preserved = Self.inScope(preservedPullRequests, owners: ownerList)
                     .filter { !freshKeys.contains($0.key) }
                     .map { pr -> PullRequestSnapshot in
                         var copy = pr
@@ -590,7 +595,7 @@ final class PullRequestsModel: ObservableObject {
                     }
                 merged.append(contentsOf: preserved)
             }
-            apply(merged, links: fetch.hadAccountFailure ? links : newLinks, animated: !firstLoad)
+            apply(merged, links: newLinks, animated: !firstLoad)
             omitted = fetch.omitted
             warning = fetch.warnings.first
             if !fetch.hadAccountFailure || lastUpdated == nil {
