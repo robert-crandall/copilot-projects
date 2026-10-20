@@ -209,17 +209,19 @@ struct SessionNavigationHistory: Equatable, Sendable {
     static let maxEntries = 100
     private(set) var entries: [String] = []
     private(set) var index: Int? = nil
+    private(set) var isCurrentEntryDisplayed = false
 
-    var canGoBack: Bool { (index ?? 0) > 0 }
+    var canGoBack: Bool { backTarget != nil }
 
-    var canGoForward: Bool {
-        guard let index else { return false }
-        return index + 1 < entries.count
-    }
+    var canGoForward: Bool { forwardTarget != nil }
 
     var backTarget: String? {
-        guard let index, index > 0, entries.indices.contains(index - 1) else { return nil }
-        return entries[index - 1]
+        guard let index, entries.indices.contains(index) else { return nil }
+        if isCurrentEntryDisplayed {
+            guard index > 0 else { return nil }
+            return entries[index - 1]
+        }
+        return entries[index]
     }
 
     var forwardTarget: String? {
@@ -230,7 +232,13 @@ struct SessionNavigationHistory: Equatable, Sendable {
     mutating func prune(validSessionIds: Set<String>) {
         guard !entries.isEmpty else {
             index = nil
+            isCurrentEntryDisplayed = false
             return
+        }
+        let displayedId: String? = if isCurrentEntryDisplayed, let index, entries.indices.contains(index) {
+            entries[index]
+        } else {
+            nil
         }
         let targetIndex = index ?? (entries.count - 1)
         var nextEntries: [String] = []
@@ -247,12 +255,21 @@ struct SessionNavigationHistory: Equatable, Sendable {
         }
         entries = nextEntries
         index = nextEntries.isEmpty ? nil : nextIndex
+        if let displayedId, let index, entries.indices.contains(index), entries[index] == displayedId {
+            isCurrentEntryDisplayed = true
+        } else {
+            isCurrentEntryDisplayed = false
+        }
     }
 
     mutating func reconcile(validSessionIds: Set<String>, currentSessionId: String?) {
         prune(validSessionIds: validSessionIds)
-        guard let currentSessionId, validSessionIds.contains(currentSessionId) else { return }
+        guard let currentSessionId, validSessionIds.contains(currentSessionId) else {
+            isCurrentEntryDisplayed = false
+            return
+        }
         if let index, entries.indices.contains(index), entries[index] == currentSessionId {
+            isCurrentEntryDisplayed = true
             return
         }
         if let index, index + 1 < entries.count {
@@ -265,19 +282,26 @@ struct SessionNavigationHistory: Equatable, Sendable {
             entries.removeFirst(entries.count - Self.maxEntries)
         }
         index = entries.indices.last
+        isCurrentEntryDisplayed = true
     }
 
     mutating func goBack(validSessionIds: Set<String>) -> String? {
         prune(validSessionIds: validSessionIds)
-        guard let current = index, current > 0 else { return nil }
-        index = current - 1
-        return entries[current - 1]
+        guard let current = index, entries.indices.contains(current) else { return nil }
+        if isCurrentEntryDisplayed {
+            guard current > 0 else { return nil }
+            index = current - 1
+            return entries[current - 1]
+        }
+        isCurrentEntryDisplayed = true
+        return entries[current]
     }
 
     mutating func goForward(validSessionIds: Set<String>) -> String? {
         prune(validSessionIds: validSessionIds)
         guard let current = index, current + 1 < entries.count else { return nil }
         index = current + 1
+        isCurrentEntryDisplayed = true
         return entries[current + 1]
     }
 }

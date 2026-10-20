@@ -2097,6 +2097,7 @@ final class AppModel: ObservableObject {
             }
             forcedSessionDestroyer(Array(intent.sessionIds))
             finishPersistedSessionCloses()
+            syncSessionNavigationHistory()
             if didLoadWorkspaceState {
                 SessionArtifacts.removeLeakedFiles(
                     keeping: Set(projects.flatMap { $0.sessions.map(\.id) })
@@ -6351,6 +6352,7 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+        syncSessionNavigationHistory()
     }
 
     private func restoredStatusState(

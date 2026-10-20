@@ -345,6 +345,7 @@ final class WorkspaceInputControllerTests: XCTestCase {
         let other = [Session(id: "other-1", title: "Other 1", cwd: "/tmp"),
                      Session(id: "other-2", title: "Other 2", cwd: "/tmp")]
         try withWorkspace(otherSessions: other) { model, input, sessions in
+            model.bootstrapIfNeeded()
             XCTAssertFalse(model.canNavigateSessionBack)
             XCTAssertFalse(model.canNavigateSessionForward)
             XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
@@ -382,10 +383,31 @@ final class WorkspaceInputControllerTests: XCTestCase {
             XCTAssertFalse(model.canNavigateSessionForward)
             XCTAssertEqual(model.previousHistorySessionTitle, sessions[1].title)
 
-            // Closing a session in the history prunes it cleanly.
+            // Closing the selected project's last session leaves no session displayed,
+            // and Back reaches the most recent surviving visit without skipping entries.
+            _ = model.closeRemoteSession(sessionId: other[1].id)
+            _ = model.closeRemoteSession(sessionId: other[0].id)
+            XCTAssertNil(model.globalSelectedSessionId)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[1].title)
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[1].id)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[0].title)
+
+            // Pruning a session in history while no session is displayed keeps the
+            // remaining entry reachable via Back.
+            model.selectProject(model.projects[1].id)
+            XCTAssertNil(model.globalSelectedSessionId)
             _ = model.closeRemoteSession(sessionId: sessions[1].id)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[0].title)
             XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[0].id)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
             XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
         }
     }
 
