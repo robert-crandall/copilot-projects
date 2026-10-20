@@ -377,13 +377,14 @@ final class WorkspaceInputControllerTests: XCTestCase {
 
             // Mouse Back (button 3) and Forward (button 4) navigate history on mouseDown,
             // swallow mouseUp, leave middle-click (button 2) untouched, and ignore sheets.
-            func mouse(_ type: NSEvent.EventType, button: Int) throws -> NSEvent {
-                try XCTUnwrap(NSEvent.mouseEvent(
-                    with: type, location: .zero, modifierFlags: [], timestamp: 0,
-                    windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1,
-                    pressure: type == .otherMouseDown ? 1 : 0, buttonNumber: button,
-                    deltaX: 0, deltaY: 0, deltaZ: 0
+            func mouse(_ type: CGEventType, button: Int) throws -> NSEvent {
+                let cgEvent = try XCTUnwrap(CGEvent(
+                    mouseEventSource: nil,
+                    mouseType: type,
+                    mouseCursorPosition: .zero,
+                    mouseButton: try XCTUnwrap(CGMouseButton(rawValue: UInt32(button)))
                 ))
+                return try XCTUnwrap(NSEvent(cgEvent: cgEvent))
             }
             let middleDown = try mouse(.otherMouseDown, button: 2)
             XCTAssertNotNil(input.handleOtherMouse(middleDown))
