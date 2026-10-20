@@ -1006,6 +1006,45 @@ final class AppModel: ObservableObject {
         return projects[loc.p].sessions[loc.s].title
     }
 
+    var backHistoryMenuItems: [SessionHistoryMenuItem] {
+        historyMenuItems(for: sessionNavigationHistory.backEntries())
+    }
+
+    var forwardHistoryMenuItems: [SessionHistoryMenuItem] {
+        historyMenuItems(for: sessionNavigationHistory.forwardEntries())
+    }
+
+    private func historyMenuItems(
+        for entries: [(index: Int, sessionId: String)]
+    ) -> [SessionHistoryMenuItem] {
+        entries.compactMap { entry in
+            guard let loc = locateIndex(entry.sessionId) else { return nil }
+            let project = projects[loc.p]
+            let session = project.sessions[loc.s]
+            return SessionHistoryMenuItem(
+                index: entry.index,
+                projectId: project.id,
+                projectName: project.name,
+                sessionId: session.id,
+                sessionTitle: session.title
+            )
+        }
+    }
+
+    @discardableResult
+    func navigateToSessionHistory(index: Int) -> (projectId: String, sessionId: String)? {
+        let validIds = Set(projects.flatMap { $0.sessions.map(\.id) })
+        guard let targetId = sessionNavigationHistory.goTo(index: index, validSessionIds: validIds),
+              let loc = locateIndex(targetId) else { return nil }
+        let projectId = projects[loc.p].id
+        isNavigatingSessionHistory = true
+        defer { isNavigatingSessionHistory = false }
+        show(projectId: projectId, sessionId: targetId)
+        save()
+        focusActiveTerminal()
+        return (projectId, targetId)
+    }
+
     @discardableResult
     func navigateSessionBack() -> (projectId: String, sessionId: String)? {
         let validIds = Set(projects.flatMap { $0.sessions.map(\.id) })
