@@ -217,9 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         // ⌘/⌃ + number navigation, the modifier-hold number overlay, double-click
-        // title-bar zoom, link-vs-selection disambiguation, and scroll-wheel
-        // forwarding into mouse-reporting TUIs.
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .scrollWheel, .leftMouseDown, .leftMouseUp]) { [weak self] event in
+        // title-bar zoom, link-vs-selection disambiguation, mouse Back/Forward,
+        // and scroll-wheel forwarding into mouse-reporting TUIs.
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .scrollWheel, .leftMouseDown, .leftMouseUp, .otherMouseDown, .otherMouseUp]) { [weak self] event in
             guard let self else { return event }
             return self.handleKeyEvent(event)
         }
@@ -347,6 +347,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             return event
+        case .otherMouseDown, .otherMouseUp:
+            return input.handleOtherMouse(event)
         default:
             return event
         }
