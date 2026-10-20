@@ -341,6 +341,94 @@ final class WorkspaceInputControllerTests: XCTestCase {
         }
     }
 
+    func testSessionBackAndForwardNavigationAcrossProjectsAndClosedSessions() throws {
+        let other = [Session(id: "other-1", title: "Other 1", cwd: "/tmp"),
+                     Session(id: "other-2", title: "Other 2", cwd: "/tmp")]
+        try withWorkspace(otherSessions: other) { model, input, sessions in
+            model.bootstrapIfNeeded()
+            XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
+
+            model.selectSession(projectId: model.projects[0].id, sessionId: sessions[1].id)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[0].title)
+
+            input.openFromSessionFinder(other[1].id)
+            XCTAssertEqual(model.globalSelectedSessionId, other[1].id)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[1].title)
+
+            let commandBack = try key("[", code: 33, modifiers: .command)
+            let commandForward = try key("]", code: 30, modifiers: .command)
+
+            XCTAssertNil(input.handleKeyDown(commandBack))
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id)
+            XCTAssertEqual(model.selectedProjectId, model.projects[0].id)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertTrue(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[0].title)
+            XCTAssertEqual(model.nextHistorySessionTitle, other[1].title)
+
+            XCTAssertNil(input.handleKeyDown(commandForward))
+            XCTAssertEqual(model.globalSelectedSessionId, other[1].id)
+            XCTAssertEqual(model.selectedProjectId, model.projects[1].id)
+            XCTAssertFalse(model.canNavigateSessionForward)
+
+            // Navigating back and then choosing a new branch truncates forward history.
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[1].id)
+            model.selectSession(projectId: model.projects[1].id, sessionId: other[0].id)
+            model.selectProject(model.projects[1].id)
+            XCTAssertEqual(model.globalSelectedSessionId, other[0].id)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[1].title)
+
+            // Closing the selected project's last session leaves no session displayed,
+            // and Back reaches the most recent surviving visit without skipping entries.
+            _ = model.closeRemoteSession(sessionId: other[1].id)
+            _ = model.closeRemoteSession(sessionId: other[0].id)
+            XCTAssertNil(model.globalSelectedSessionId)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[1].title)
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[1].id)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[0].title)
+
+            // Pruning a session in history while no session is displayed keeps the
+            // remaining entry reachable via Back.
+            model.selectProject(model.projects[1].id)
+            XCTAssertNil(model.globalSelectedSessionId)
+            _ = model.closeRemoteSession(sessionId: sessions[1].id)
+            XCTAssertTrue(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+            XCTAssertEqual(model.previousHistorySessionTitle, sessions[0].title)
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[0].id)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
+            XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertFalse(model.canNavigateSessionForward)
+
+            // Closing the earliest visit with only forward survivors preserves a
+            // before-first cursor so Forward opens the next surviving session in order.
+            let reopenedB = try XCTUnwrap(model.addSession(toProjectId: model.projects[1].id, cwd: "/tmp"))
+            model.selectProject(model.projects[1].id)
+            let reopenedC = try XCTUnwrap(model.addSession(toProjectId: model.projects[1].id, cwd: "/tmp"))
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, reopenedB)
+            XCTAssertEqual(model.navigateSessionBack()?.sessionId, sessions[0].id)
+            _ = model.closeRemoteSession(sessionId: sessions[0].id)
+            XCTAssertNil(model.globalSelectedSessionId)
+            XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertTrue(model.canNavigateSessionForward)
+            XCTAssertEqual(model.navigateSessionForward()?.sessionId, reopenedB)
+            XCTAssertEqual(model.globalSelectedSessionId, reopenedB)
+            XCTAssertFalse(model.canNavigateSessionBack)
+            XCTAssertTrue(model.canNavigateSessionForward)
+            XCTAssertEqual(model.navigateSessionForward()?.sessionId, reopenedC)
+            XCTAssertEqual(model.globalSelectedSessionId, reopenedC)
+        }
+    }
+
     func testRestoredModifiedReturnIsConsumedOnlyInRestoredLiveCopilotTabs() throws {
         try withWorkspace { model, input, sessions in
             let terminal = try XCTUnwrap(model.controller(for: sessions[0].id))
