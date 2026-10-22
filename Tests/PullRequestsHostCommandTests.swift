@@ -404,7 +404,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             shell: "/bin/zsh", copilotSessionId: id, resumeCopilotExecutable: "/opt/copilot", launchCopilotExecutable: nil
         )
         XCTAssertTrue(ProcessTree.resumes(resume, copilotSessionId: id.uppercased()), "the tab's shell while it runs")
-        XCTAssertTrue(ProcessTree.resumes(["/opt/copilot", "--no-remote", "--no-remote-export", "--resume=\(id)"],
+        XCTAssertTrue(ProcessTree.resumes(["/opt/copilot", "--resume=\(id)"],
                                           copilotSessionId: id), "the Copilot it starts")
         XCTAssertTrue(ProcessTree.resumes(["copilot", "--resume", id], copilotSessionId: id), "typed by hand")
         XCTAssertTrue(ProcessTree.resumes(
@@ -418,7 +418,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
         XCTAssertFalse(ProcessTree.resumes(["rg", "-c", "x", "copilot", "--resume=\(id)"], copilotSessionId: id))
         XCTAssertTrue(ProcessTree.resumes(["node", "/opt/homebrew/bin/copilot", "--resume=\(id)"], copilotSessionId: id))
         XCTAssertTrue(ProcessTree.resumes(
-            ["/bin/sh", "-c", #"exec "$0" "$@""#, "/opt/copilot", "--no-remote", "--resume=\(id)"], copilotSessionId: id
+            ["/bin/sh", "-c", #"exec "$0" "$@""#, "/opt/copilot", "--resume=\(id)"], copilotSessionId: id
         ), "the wrapper that starts it")
 
         // A session started to talk about it, however its prompt quotes the command.
@@ -435,7 +435,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             )
             XCTAssertFalse(ProcessTree.resumes(start, copilotSessionId: id), prompt)
             XCTAssertFalse(ProcessTree.resumes(
-                ["/opt/copilot", "--no-remote", "--no-remote-export", "--interactive", prompt], copilotSessionId: id
+                ["/opt/copilot", "--interactive", prompt], copilotSessionId: id
             ), prompt)
         }
     }

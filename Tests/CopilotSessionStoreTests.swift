@@ -113,7 +113,7 @@ final class CopilotSessionStoreTests: XCTestCase {
         let done = "6780CCA3-92AF-4506-95F2-F018A195A1A1"
         let id = "0f1e2d3c-4b5a-4000-8000-0000000000aa"
         let sessions = URL(fileURLWithPath: "/tmp/state/sessions", isDirectory: true)
-        let command = "/bin/sh -c 'exec \"$0\" \"$@\"' '/opt/copilot' '--no-remote' '--resume=\(id)'"
+        let command = "/bin/sh -c 'exec \"$0\" \"$@\"' '/opt/copilot' '--resume=\(id)'"
             + " || printf '\\n[Copilot Projects] could not resume Copilot session \(id)\\n'; exec '/bin/zsh' -l"
         func dtach(_ session: String, _ pid: pid_t) -> [String] {
             ["dtach", "-A", sessions.appendingPathComponent("\(session).sock").path, "-r", "winch", "-z", "-E",
@@ -123,7 +123,7 @@ final class CopilotSessionStoreTests: XCTestCase {
         snapshot.childrenOf = [30: [20], 20: [10], 31: [21]]
         snapshot.nameOf = [30: "dtach", 20: "zsh", 10: "copilot", 31: "dtach", 21: "zsh"]
         var arguments: [pid_t: [String]] = [
-            30: dtach(tab, 30), 20: ["/bin/zsh", "-l", "-c", command], 10: ["/opt/copilot", "--no-remote", "--resume=\(id)"],
+            30: dtach(tab, 30), 20: ["/bin/zsh", "-l", "-c", command], 10: ["/opt/copilot", "--resume=\(id)"],
             // Its Copilot exited without resuming: the shell replaced the command.
             31: dtach(done, 31), 21: ["/bin/zsh", "-l"],
         ]
