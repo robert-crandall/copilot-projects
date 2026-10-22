@@ -306,7 +306,10 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
         // managed/supervised child: its `/restart` shuts down (COPILOT_SUPERVISED)
         // or defers to the launcher's (wrong, often gone) loader instead of
         // re-spawning. Strip them so each session's copilot owns its own lifecycle.
-        var env = Self.sessionEnvironment(from: processEnv)
+        var env = ProjectInstructionsStore.environment(
+            from: Self.sessionEnvironment(from: processEnv),
+            sessionDirectory: extraEnvironment[ProjectInstructionsStore.sessionDirectoryKey]
+        )
         for (key, value) in extraEnvironment { env[key] = value }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"

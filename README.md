@@ -122,6 +122,32 @@ accessibility labels.
 Hold `⌘` or `⌃` to reveal numbered navigation hints. Use the session-details
 button to open the completed-turn drawer.
 
+### Project Copilot instructions
+
+Control-click a project and choose **Copilot Instructions…**, or use
+**File > Project Copilot Instructions…** for the selected project. Save additional
+guidance for that project's Copilot sessions; leave the editor empty to remove it.
+Return adds a line and Command-Return saves.
+
+Instructions stay in the app's local state directory, not in your repositories.
+They combine with your personal and repository instructions rather than replacing
+them. Copilot does not guarantee precedence between conflicting instruction files.
+Each project has its own instructions, even when projects share a working directory.
+
+Restart or resume Copilot after saving to load changes. Running conversations are
+not interrupted. A terminal moved to another project picks up that project's
+instructions the next time Copilot starts. Terminals created before this feature
+need to be replaced once so their shells receive the additional instruction path.
+Reattaching a terminal after restarting the app does not replace its shell.
+If an existing tab's project instructions cannot be read, its terminal does not
+start and shows **Retry**. Explicit start or resume requests return the read error
+without leaving an unstarted tab. Repair the file and retry; other projects remain available.
+
+The app adds a directory to `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`, preserving inherited
+user-configured directories. If your shell startup files set this variable, append
+to its existing value rather than replacing it. App state paths containing commas
+cannot use project instructions because the CLI uses commas as directory separators.
+
 ### Find a session
 
 **Find Session…** (`⌘K`, also in the Session menu) lists every session across

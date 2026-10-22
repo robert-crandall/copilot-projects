@@ -61,6 +61,17 @@ private struct NextAttentionSessionButton: View {
     }
 }
 
+private struct ProjectInstructionsButton: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button("Project Copilot Instructions…") {
+            if let id = model.selectedProjectId { model.editProjectInstructionsInteractive(id) }
+        }
+        .disabled(model.selectedProject == nil)
+    }
+}
+
 private struct WorkspaceCommands: Commands {
     let model: AppModel
     @ObservedObject var input: WorkspaceInputController
@@ -72,6 +83,8 @@ private struct WorkspaceCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Project…") { model.addProjectInteractive() }
                 .keyboardShortcut("n", modifiers: .command)
+                .disabled(input.hasWorkspaceSheet)
+            ProjectInstructionsButton(model: model)
                 .disabled(input.hasWorkspaceSheet)
         }
         CommandGroup(after: .appSettings) {
