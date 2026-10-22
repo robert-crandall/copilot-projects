@@ -7035,7 +7035,9 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let existing = Session(id: "existing", title: "shell", cwd: "/tmp/old")
+        let existingDirectory = root.appendingPathComponent("old")
+        try FileManager.default.createDirectory(at: existingDirectory, withIntermediateDirectories: true)
+        let existing = Session(id: "existing", title: "shell", cwd: existingDirectory.path)
         let project = Project(
             id: "p1",
             name: "Reviews",
@@ -7065,7 +7067,7 @@ final class AppLogicTests: XCTestCase {
             model.project("p1")?.sessions.first { $0.id == sessionId }
         )
         XCTAssertEqual(session.title, "Review github/github#123")
-        XCTAssertEqual(session.cwd, "/tmp/old")
+        XCTAssertEqual(session.cwd, existingDirectory.path)
         XCTAssertEqual(model.project("p1")?.selectedSessionId, sessionId)
         XCTAssertEqual(launches.count, 1)
         XCTAssertEqual(

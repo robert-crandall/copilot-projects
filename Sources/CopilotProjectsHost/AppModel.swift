@@ -472,6 +472,7 @@ final class AppModel: ObservableObject {
     private var didLoadWorkspaceState = false
     private var stateRecoveryMessage: String?
     private var didPresentStateMessage = false
+    private var projectInstructionFailures: [String: String] = [:]
     private var server: ControlServer?
     private var integration: (any HostIntegration)?
     private weak var notifications: (any NotificationPosting)?
@@ -871,6 +872,7 @@ final class AppModel: ObservableObject {
         guard let loc = locateIndex(sessionId) else { return nil }
         let project = projects[loc.p]
         let session = project.sessions[loc.s]
+        guard prepareProjectInstructions(sessionId: sessionId, projectId: project.id) else { return nil }
         Paths.ensureStateDir()
         let dtach = Paths.dtachExecutable
         let socket = dtach != nil ? Paths.dtachSocketPath(sessionId: sessionId) : nil
@@ -990,6 +992,9 @@ final class AppModel: ObservableObject {
 
     /// Message + button title shown by the container when nothing is selected.
     var emptyContextHint: (message: String, button: String) {
+        if let id = globalSelectedSessionId, let error = projectInstructionFailures[id] {
+            return ("Could not load project instructions. The terminal was not started.\n\(error)", "Retry")
+        }
         if let project = selectedProject {
             return ("No sessions in “\(project.name)”", "New Copilot Session")
         }
@@ -999,6 +1004,11 @@ final class AppModel: ObservableObject {
     /// Backs the empty-state button: add a session to the selected project, or
     /// create a project if there is none.
     func newInActiveContext() {
+        if let id = globalSelectedSessionId, projectInstructionFailures[id] != nil {
+            objectWillChange.send()
+            controller(for: id)
+            return
+        }
         if let pid = selectedProjectId {
             addCopilotSessionInteractive(toProjectId: pid)
         } else {
@@ -1007,12 +1017,46 @@ final class AppModel: ObservableObject {
     }
 
     private func environment(projectId: String, sessionId: String) -> [String: String] {
-        [
+        var environment = [
             "COPILOT_PROJECTS": "1",
             "COPILOT_PROJECTS_SOCKET": Paths.socketPath,
             "COPILOT_PROJECTS_PROJECT": projectId,
             "COPILOT_PROJECTS_SESSION": sessionId,
         ]
+        if projectInstructions.supportsCustomInstructions {
+            environment[ProjectInstructionsStore.sessionDirectoryKey] =
+                projectInstructions.sessionDirectory(sessionId).path
+        }
+        return environment
+    }
+
+    var projectInstructions: ProjectInstructionsStore {
+        ProjectInstructionsStore(
+            root: stateRepository.path.deletingLastPathComponent().appendingPathComponent("project-instructions")
+        )
+    }
+
+    private func prepareProjectInstructions(sessionId: String, projectId: String) -> Bool {
+        do {
+            if projectInstructions.supportsCustomInstructions {
+                try projectInstructions.link(sessionId: sessionId, projectId: projectId)
+            }
+            projectInstructionFailures.removeValue(forKey: sessionId)
+            return true
+        } catch {
+            let message = error.localizedDescription
+            if projectInstructionFailures[sessionId] != message {
+                NSLog("copilot-projects: could not prepare instructions for \(sessionId): \(error)")
+            }
+            projectInstructionFailures[sessionId] = message
+            return false
+        }
+    }
+
+    private func discardProjectInstructionLink(sessionId: String) {
+        projectInstructionFailures.removeValue(forKey: sessionId)
+        do { try projectInstructions.removeClosed(sessionIds: [sessionId], projectIds: []) }
+        catch { NSLog("copilot-projects: could not remove instruction link for \(sessionId): \(error)") }
     }
 
     // MARK: - project / session mutations
@@ -1189,9 +1233,12 @@ final class AppModel: ObservableObject {
         // a view update must not lazily create a plain shell for this tab.
         launchSession(session.id, executable: executable, initialPrompt: prompt)
         if remoteSessionLauncher == nil, controllers[session.id]?.terminalView.process?.running != true {
+            let instructionError = projectInstructionFailures[session.id]
+            discardProjectInstructionLink(sessionId: session.id)
             controllers[session.id] = nil
             projects[pi].sessions.removeAll { $0.id == session.id }
             projects[pi].selectedSessionId = previousSelection
+            if let instructionError { throw WorkspacePersistenceError(errorDescription: instructionError) }
             throw CopilotSessionStartError.terminalUnavailable
         }
         refreshSelectedTranscriptController()
@@ -1234,8 +1281,9 @@ final class AppModel: ObservableObject {
             }
             initialText = input
             presentAlert(
-                title: "Invalid Pull Request URL",
-                message: "Use an HTTPS github.com URL such as https://github.com/owner/repo/pull/123."
+                title: "Could Not Start Review",
+                message: "Check the Copilot installation and project instructions, and use an HTTPS "
+                    + "github.com URL such as https://github.com/owner/repo/pull/123."
             )
         }
     }
@@ -1245,26 +1293,16 @@ final class AppModel: ObservableObject {
         toProjectId pid: String,
         pullRequestURL: String
     ) -> String? {
-        guard let pi = projectIndex(pid),
-              let target = PullRequestReviewTarget.parse(pullRequestURL),
-              remoteSessionBackendAvailable(),
-              let copilotExecutable = remoteCopilotExecutable() else {
+        guard let target = PullRequestReviewTarget.parse(pullRequestURL) else { return nil }
+        do {
+            let id = try addCopilotSession(toProjectId: pid, initialPrompt: Self.adversarialReviewPrompt(for: target))
+            if let loc = locateIndex(id) { projects[loc.p].sessions[loc.s].title = target.title }
+            save()
+            return id
+        } catch {
+            NSLog("copilot-projects: could not start review: \(error)")
             return nil
         }
-
-        let cwd = defaultCwd(forProjectIndex: pi)
-        let session = Session(title: target.title, cwd: cwd)
-        projects[pi].sessions.append(session)
-        projects[pi].selectedSessionId = session.id
-        let prompt = Self.adversarialReviewPrompt(for: target)
-        launchSession(
-            session.id,
-            executable: copilotExecutable,
-            initialPrompt: prompt
-        )
-        refreshSelectedTranscriptController()
-        save()
-        return session.id
     }
 
     private func launchSession(
@@ -1638,8 +1676,9 @@ final class AppModel: ObservableObject {
         )
         // Like Start Session in the app, never keep a tab whose terminal didn't
         // start; nothing is recorded, so nothing was created.
-        if placement != .remote, remoteSessionLauncher == nil,
+        if remoteSessionLauncher == nil,
            controllers[sessionId]?.terminalView.process?.running != true {
+            discardProjectInstructionLink(sessionId: sessionId)
             controllers[sessionId] = nil
             projects[pi].sessions.removeAll { $0.id == sessionId }
             projects[pi].selectedSessionId = previousSelection
@@ -1915,6 +1954,10 @@ final class AppModel: ObservableObject {
     private func finishPersistedSessionCloses() {
         guard pendingSessionDestroys.isEmpty, stateLoadFailure == nil else { return }
         do {
+            let intent = try stateRepository.pendingCloses()
+            // The close journal remains until both instructions and workspace
+            // cleanup finish, so an interrupted cleanup is retried on launch.
+            try projectInstructions.removeClosed(sessionIds: intent.sessionIds, projectIds: intent.projectIds)
             try stateRepository.finishCloses(
                 PersistedState(projects: projects, selectedProjectId: selectedProjectId)
             )
@@ -2050,6 +2093,15 @@ final class AppModel: ObservableObject {
             let message = "Could not recover session closes (intent: \(stateRepository.closeIntentPath.path)): \(error)"
             stateLoadFailure = message
             NSLog("copilot-projects: \(message)")
+        }
+        guard stateLoadFailure == nil else { return }
+        for project in projects {
+            for session in project.sessions {
+                _ = prepareProjectInstructions(sessionId: session.id, projectId: project.id)
+            }
+        }
+        if !projectInstructions.supportsCustomInstructions {
+            NSLog("copilot-projects: \(ProjectInstructionsStore.StoreError.commaInPath.localizedDescription)")
         }
     }
 
@@ -3349,6 +3401,25 @@ final class AppModel: ObservableObject {
         renameProject(pid, name: name)
     }
 
+    func editProjectInstructionsInteractive(_ pid: String) {
+        guard !isTerminating, NSApp.modalWindow == nil, let project = project(pid) else { return }
+        do {
+            guard projectInstructions.supportsCustomInstructions else {
+                throw ProjectInstructionsStore.StoreError.commaInPath
+            }
+            let text = try projectInstructions.read(projectId: pid)
+            let editor = ProjectInstructionsEditor(projectName: project.name, text: text)
+            editor.run(present: alertPresenter, isTerminating: { self.isTerminating }) { text in
+                guard self.project(pid) != nil else {
+                    throw CopilotSessionStartError.projectUnavailable
+                }
+                try self.projectInstructions.save(text, projectId: pid)
+            }
+        } catch {
+            presentAlert(title: "Could Not Open Copilot Instructions", message: error.localizedDescription)
+        }
+    }
+
     func selectProject(_ id: String?) {
         selectedProjectId = id
         if let id, let pi = projectIndex(id) {
@@ -3428,11 +3499,23 @@ final class AppModel: ObservableObject {
     func moveSession(
         toProjectId targetPid: String,
         draggedId sid: String,
-        selectInTarget: Bool = true
+        selectInTarget: Bool = true,
+        presentErrors: Bool = true
     ) -> Bool {
         guard let tpi = projectIndex(targetPid), let from = locateIndex(sid),
               projects[from.p].id != targetPid else { return false }
 
+        let previousProjects = projects
+        let sourcePid = projects[from.p].id
+        do {
+            if projectInstructions.supportsCustomInstructions {
+                try projectInstructions.link(sessionId: sid, projectId: targetPid)
+            }
+        } catch {
+            NSLog("copilot-projects: could not move session: \(error)")
+            if presentErrors { presentAlert(title: "Could Not Move Session", message: error.localizedDescription) }
+            return false
+        }
         let previousGlobalSelection = globalSelectedSessionId
         let targetWasEmpty = projects[tpi].sessions.isEmpty
         let session = projects[from.p].sessions.remove(at: from.s)
@@ -3449,11 +3532,24 @@ final class AppModel: ObservableObject {
             projects[tpi].selectedSessionId = session.id
         }
         clearManualMarkIfShown(replacing: previousGlobalSelection)
+        do {
+            try persistWorkspace()
+        } catch {
+            projects = previousProjects
+            var message = error.localizedDescription
+            if projectInstructions.supportsCustomInstructions {
+                do { try projectInstructions.link(sessionId: sid, projectId: sourcePid) }
+                catch { message += "\nCould not restore the instruction link: \(error.localizedDescription)" }
+            }
+            NSLog("copilot-projects: could not move session: \(message)")
+            if presentErrors { presentAlert(title: "Could Not Move Session", message: message) }
+            return false
+        }
+        projectInstructionFailures.removeValue(forKey: sid)
         if globalSelectedSessionId != previousGlobalSelection {
             refreshSelectedTranscriptController()
         }
         updateDockBadge()
-        save()
         return true
     }
 
@@ -3471,7 +3567,8 @@ final class AppModel: ObservableObject {
         return moveSession(
             toProjectId: targetProjectId,
             draggedId: sessionId,
-            selectInTarget: false
+            selectInTarget: false,
+            presentErrors: false
         ) ? .moved : .missing
     }
 
@@ -5402,6 +5499,7 @@ final class AppModel: ObservableObject {
         // marker isn't written here; Copilot writes it once it has resumed.
         launchSession(session.id, executable: executable, initialPrompt: nil, resumeCopilotSessionId: copilotId)
         if remoteSessionLauncher == nil, controllers[session.id]?.terminalView.process?.running != true {
+            discardProjectInstructionLink(sessionId: session.id)
             controllers[session.id] = nil
             projects[pi].sessions.removeAll { $0.id == session.id }
             projects[pi].selectedSessionId = previousSelection

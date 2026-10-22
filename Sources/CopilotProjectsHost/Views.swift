@@ -321,6 +321,9 @@ struct SidebarView: View {
                         Button("New Terminal") { model.addSession(toProjectId: project.id) }
                         Divider()
                         Button("Rename…") { model.renameProjectInteractive(project.id) }
+                        Button("Copilot Instructions…") {
+                            model.editProjectInstructionsInteractive(project.id)
+                        }
                         Divider()
                         Button("End Project", role: .destructive) {
                             model.requestCloseProject(project.id)
