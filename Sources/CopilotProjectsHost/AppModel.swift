@@ -5499,11 +5499,12 @@ final class AppModel: ObservableObject {
         // marker isn't written here; Copilot writes it once it has resumed.
         launchSession(session.id, executable: executable, initialPrompt: nil, resumeCopilotSessionId: copilotId)
         if remoteSessionLauncher == nil, controllers[session.id]?.terminalView.process?.running != true {
+            let instructionError = projectInstructionFailures[session.id]
             discardProjectInstructionLink(sessionId: session.id)
             controllers[session.id] = nil
             projects[pi].sessions.removeAll { $0.id == session.id }
             projects[pi].selectedSessionId = previousSelection
-            return .failure("The terminal could not be started.", code: "unavailable")
+            return .failure(instructionError ?? "The terminal could not be started.", code: "unavailable")
         }
         pullRequestsResumeLaunches[copilotId] = (session.id, now)
         refreshSelectedTranscriptController()

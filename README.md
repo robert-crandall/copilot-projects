@@ -139,8 +139,9 @@ not interrupted. A terminal moved to another project picks up that project's
 instructions the next time Copilot starts. Terminals created before this feature
 need to be replaced once so their shells receive the additional instruction path.
 Reattaching a terminal after restarting the app does not replace its shell.
-If a project's instruction file cannot be read, its terminal does not start and
-shows **Retry**. Repair the file and retry; other projects remain available.
+If an existing tab's project instructions cannot be read, its terminal does not
+start and shows **Retry**. Explicit start or resume requests return the read error
+without leaving an unstarted tab. Repair the file and retry; other projects remain available.
 
 The app adds a directory to `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`, preserving inherited
 user-configured directories. If your shell startup files set this variable, append

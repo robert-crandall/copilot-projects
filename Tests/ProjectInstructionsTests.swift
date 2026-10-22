@@ -275,6 +275,37 @@ final class ProjectInstructionsTests: XCTestCase {
                        ProjectInstructionsStore.header + "Readable again")
     }
 
+    func testResumeReturnsInstructionErrorBeforeDiscardingUnstartedSession() throws {
+        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
+        let overrides = ["COPILOT_HOME": home.root.path, "COPILOT_PROJECTS_STATE_DIR": root.path]
+        let previous = overrides.keys.map { ($0, ProcessInfo.processInfo.environment[$0]) }
+        for (key, value) in overrides { setenv(key, value, 1) }
+        defer {
+            for (key, value) in previous {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+        }
+        let model = try model { _ in XCTFail("Resume must return its error without a modal"); return .alertFirstButtonReturn }
+        let copilotId = try home.addSession(cwd: root.path, transcript: "")
+        try store.save("Original", projectId: "first")
+        try Data([0xff]).write(to: instructionFile(store.projectDirectory("first")))
+        var expectedError: String?
+        XCTAssertThrowsError(try store.read(projectId: "first")) { expectedError = $0.localizedDescription }
+        let requestId = UUID()
+        let previousSelection = model.projects[0].selectedSessionId
+
+        for _ in 0..<2 {
+            let result = model.resumePullRequestsSession(
+                requestId: requestId, projectId: "first", copilotSessionId: copilotId)
+            XCTAssertFalse(result.ok)
+            XCTAssertEqual(result.code, "unavailable")
+            XCTAssertEqual(result.error, expectedError)
+            XCTAssertEqual(model.projects[0].sessions.map(\.id), ["session"])
+            XCTAssertEqual(model.projects[0].selectedSessionId, previousSelection)
+            XCTAssertTrue(model.hostedTerminals.isEmpty)
+        }
+    }
+
     func testFailedStateLoadLeavesInstructionFilesAndLinksUntouched() throws {
         try store.save("Keep me", projectId: "first")
         try store.link(sessionId: "session", projectId: "first")
