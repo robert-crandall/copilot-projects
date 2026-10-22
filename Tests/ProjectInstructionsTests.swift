@@ -11,7 +11,9 @@ final class ProjectInstructionsTests: XCTestCase {
 
     override func setUp() async throws {
         _ = NSApplication.shared
-        root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/project-instructions-tests")
+            .appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         store = ProjectInstructionsStore(root: root.appendingPathComponent("project-instructions"))
     }
@@ -71,6 +73,29 @@ final class ProjectInstructionsTests: XCTestCase {
         try store.save("", projectId: "second")
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
         XCTAssertEqual(try store.read(projectId: "first"), "Updated")
+    }
+
+    func testUnreadableInstructionsRejectExistingNewAndMovedSessionLinks() throws {
+        try store.save("First project", projectId: "first")
+        try store.link(sessionId: "existing", projectId: "first")
+        try store.link(sessionId: "moving", projectId: "second")
+        let file = instructionFile(store.projectDirectory("first"))
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try store.link(sessionId: "existing", projectId: "first"))
+        XCTAssertThrowsError(try store.link(sessionId: "new", projectId: "first"))
+        XCTAssertThrowsError(try store.link(sessionId: "moving", projectId: "first"))
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(
+            atPath: store.sessionDirectory("moving").path), store.projectDirectory("second").path)
+        XCTAssertThrowsError(try FileManager.default.destinationOfSymbolicLink(
+            atPath: store.sessionDirectory("new").path))
+
+        try FileManager.default.removeItem(at: file)
+        try Data([0xff]).write(to: file)
+        XCTAssertThrowsError(try store.link(sessionId: "existing", projectId: "first"))
+        try store.save("Readable again", projectId: "first")
+        XCTAssertNoThrow(try store.link(sessionId: "existing", projectId: "first"))
     }
 
     func testEnvironmentPreservesUserDirectoriesAndRemovesOnlyInheritedAppEntry() {
@@ -193,6 +218,34 @@ final class ProjectInstructionsTests: XCTestCase {
         XCTAssertThrowsError(try model.addCopilotSession(toProjectId: "first", initialPrompt: "Keep this request"))
         XCTAssertEqual(model.projects[0].sessions.map(\.id), ["session"])
         XCTAssertTrue(model.hostedTerminals.isEmpty)
+    }
+
+    func testUnreadableInstructionsWithExistingLinkUseScopedFailureAndRecover() throws {
+        let model = try model(otherSessions: [Session(id: "healthy", title: "Healthy", cwd: root.path)]) { _ in
+            XCTFail("Instruction preparation must not open a modal")
+            return .alertFirstButtonReturn
+        }
+        try store.save("First", projectId: "first")
+        try store.link(sessionId: "session", projectId: "first")
+        let file = instructionFile(store.projectDirectory("first"))
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+
+        model.finishInterruptedSessionDestroys()
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(
+            atPath: store.sessionDirectory("healthy").path), store.projectDirectory("second").path)
+        XCTAssertNil(model.controller(for: "session"))
+        XCTAssertTrue(model.hostedTerminals.isEmpty)
+        model.selectProject("first")
+        XCTAssertTrue(model.emptyContextHint.message.contains("Could not load project instructions"))
+        XCTAssertEqual(model.emptyContextHint.button, "Retry")
+
+        try FileManager.default.removeItem(at: file)
+        try store.save("Readable again", projectId: "first")
+        model.finishInterruptedSessionDestroys()
+        XCTAssertFalse(model.emptyContextHint.message.contains("Could not load project instructions"))
+        XCTAssertEqual(try String(contentsOf: instructionFile(store.sessionDirectory("session")), encoding: .utf8),
+                       ProjectInstructionsStore.header + "Readable again")
     }
 
     func testFailedStateLoadLeavesInstructionFilesAndLinksUntouched() throws {

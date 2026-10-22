@@ -46,7 +46,7 @@ struct ProjectInstructionsStore {
     /// redirect it before the next Copilot process discovers instructions.
     func link(sessionId: String, projectId: String) throws {
         try validate(sessionId)
-        try validate(projectId)
+        _ = try read(projectId: projectId)
         let target = projectDirectory(projectId)
         let link = sessionDirectory(sessionId)
         try createDirectory(target)
