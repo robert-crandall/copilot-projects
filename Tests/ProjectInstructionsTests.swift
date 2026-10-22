@@ -183,6 +183,33 @@ final class ProjectInstructionsTests: XCTestCase {
         XCTAssertTrue(model.projects[1].sessions.isEmpty)
     }
 
+    func testFailedMoveRestoresUnreadableSourceInstructionLink() throws {
+        let model = try model()
+        try store.save("Source", projectId: "first")
+        try store.save("Destination", projectId: "second")
+        try store.link(sessionId: "session", projectId: "first")
+        let state = root.appendingPathComponent("state.json")
+        try FileManager.default.removeItem(at: state)
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        let file = instructionFile(store.projectDirectory("first"))
+
+        for isDirectory in [false, true] {
+            try FileManager.default.removeItem(at: file)
+            if isDirectory {
+                try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+            } else {
+                try Data([0xff]).write(to: file)
+            }
+            XCTAssertFalse(model.moveSession(toProjectId: "second", draggedId: "session"))
+            XCTAssertEqual(model.projects[0].sessions.first?.id, "session")
+            XCTAssertTrue(model.projects[1].sessions.isEmpty)
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(
+                atPath: store.sessionDirectory("session").path), store.projectDirectory("first").path)
+            XCTAssertThrowsError(try store.read(projectId: "first"))
+            XCTAssertEqual(try store.read(projectId: "second"), "Destination")
+        }
+    }
+
     func testInstructionFailureDoesNotBlockWorkspaceRecoveryOrShowModalAlerts() throws {
         let model = try model(otherSessions: [Session(id: "healthy", title: "Healthy", cwd: root.path)]) { _ in
             XCTFail("Non-interactive paths must not open a modal")

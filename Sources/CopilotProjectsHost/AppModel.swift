@@ -3538,7 +3538,7 @@ final class AppModel: ObservableObject {
             projects = previousProjects
             var message = error.localizedDescription
             if projectInstructions.supportsCustomInstructions {
-                do { try projectInstructions.link(sessionId: sid, projectId: sourcePid) }
+                do { try projectInstructions.restoreLink(sessionId: sid, projectId: sourcePid) }
                 catch { message += "\nCould not restore the instruction link: \(error.localizedDescription)" }
             }
             NSLog("copilot-projects: could not move session: \(message)")

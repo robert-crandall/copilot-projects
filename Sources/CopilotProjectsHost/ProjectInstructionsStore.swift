@@ -47,6 +47,13 @@ struct ProjectInstructionsStore {
     func link(sessionId: String, projectId: String) throws {
         try validate(sessionId)
         _ = try read(projectId: projectId)
+        try restoreLink(sessionId: sessionId, projectId: projectId)
+    }
+
+    /// Rollback must restore ownership even when the source instructions are unreadable.
+    func restoreLink(sessionId: String, projectId: String) throws {
+        try validate(sessionId)
+        try validate(projectId)
         let target = projectDirectory(projectId)
         let link = sessionDirectory(sessionId)
         try createDirectory(target)
