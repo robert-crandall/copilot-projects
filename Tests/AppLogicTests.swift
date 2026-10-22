@@ -4893,7 +4893,7 @@ final class AppLogicTests: XCTestCase {
             TerminalController.resumeCommand(sessionId: sessionId),
             TerminalController.profiledCopilotCommand(
                 "copilot",
-                arguments: ["--no-remote", "--no-remote-export", "--resume=\(sessionId)"]
+                arguments: ["--sync-session", "off", "--resume=\(sessionId)"]
             )
         )
         XCTAssertEqual(
@@ -4937,7 +4937,7 @@ final class AppLogicTests: XCTestCase {
             TerminalController.launchCommand(executable: executable, shell: shell),
             TerminalController.profiledCopilotCommand(
                 executable,
-                arguments: ["--no-remote", "--no-remote-export"]
+                arguments: ["--sync-session", "off"]
             )
                 + " || printf '\\n[Copilot Projects] could not launch Copilot\\n';"
                 + " exec '/bin/zsh' -l"
@@ -4952,8 +4952,8 @@ final class AppLogicTests: XCTestCase {
             TerminalController.profiledCopilotCommand(
                 executable,
                 arguments: [
-                    "--no-remote",
-                    "--no-remote-export",
+                    "--sync-session",
+                    "off",
                     "--interactive",
                     initialPrompt,
                 ]
@@ -6545,7 +6545,7 @@ final class AppLogicTests: XCTestCase {
             process.waitUntilExit()
             let fields = String(decoding: bytes, as: UTF8.self).components(separatedBy: "\0")
             XCTAssertEqual(Array(fields.prefix(4)), [
-                "--no-remote", "--no-remote-export", "--interactive", prompt,
+                "--sync-session", "off", "--interactive", prompt,
             ])
             XCTAssertTrue(fields.last?.contains("FALLBACK:-l") == true)
             XCTAssertEqual(fields.last?.contains("could not launch Copilot"), status != 0)
