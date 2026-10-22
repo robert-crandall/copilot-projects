@@ -442,11 +442,9 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
         sessionId: String,
         executable: String = "copilot"
     ) -> String {
-        // Pass both flags because the CLI can otherwise inherit persisted remote
-        // steering on resume even when event export was explicitly disabled.
         profiledCopilotCommand(
             executable,
-            arguments: ["--no-remote", "--no-remote-export", "--resume=\(sessionId)"]
+            arguments: ["--sync-session", "off", "--resume=\(sessionId)"]
         )
     }
 
@@ -526,7 +524,7 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
         shell: String,
         initialPrompt: String? = nil
     ) -> String {
-        var arguments = ["--no-remote", "--no-remote-export"]
+        var arguments = ["--sync-session", "off"]
         if let initialPrompt, !initialPrompt.isEmpty {
             arguments.append(contentsOf: ["--interactive", initialPrompt])
         }
