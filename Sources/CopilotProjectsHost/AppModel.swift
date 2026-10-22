@@ -170,7 +170,7 @@ public enum RemoteSessionCreationOutcome: Equatable, Sendable {
     /// The ledger shows this request was already processed but the session is gone;
     /// it is deliberately not recreated. (410)
     case gone
-    /// A required executable or backend is unavailable, so no session was created. (503)
+    /// Copilot, the terminal backend, or project instructions could not be used. (503)
     case unavailable
     /// The workspace or creation ledger could not be read or durably written.
     /// The client must retry with the same request id. (503)
@@ -1496,7 +1496,10 @@ final class AppModel: ObservableObject {
             return .failure("request id already created a session that has since ended",
                             code: "gone")
         case .unavailable:
-            return .failure("Copilot or the session backend is unavailable", code: "unavailable")
+            return .failure(
+                "Copilot could not start. Check the CLI, terminal backend, and project instructions. "
+                    + "The app log contains the failure details.",
+                code: "unavailable")
         case .persistenceUnavailable:
             return .failure("could not persist the session; retry with the same request id",
                             code: "persistence-unavailable")

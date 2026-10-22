@@ -130,7 +130,9 @@ final class ProjectInstructionsTests: XCTestCase {
         try repository.save(PersistedState(projects: projects, selectedProjectId: "second"))
         return AppModel(
             stateRepository: repository, agentActivityDirectory: root, resumeMarkerDirectory: root,
-            remoteCopilotExecutable: { "/fake/copilot" }, remoteSessionBackendAvailable: { true },
+            remoteCopilotExecutable: { "/fake/copilot" }, remoteReposDirectory: { self.root.path },
+            remoteSessionBackendAvailable: { true },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("creation-ledger.json")),
             kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images")),
             forcedSessionDestroyer: { _ in }, alertPresenter: present
         )
@@ -304,6 +306,26 @@ final class ProjectInstructionsTests: XCTestCase {
             XCTAssertEqual(model.projects[0].selectedSessionId, previousSelection)
             XCTAssertTrue(model.hostedTerminals.isEmpty)
         }
+    }
+
+    func testExplicitStartControlErrorsIncludeProjectInstructions() throws {
+        let model = try model { _ in XCTFail("Control calls must not open a modal"); return .alertFirstButtonReturn }
+        try store.save("Original", projectId: "first")
+        try Data([0xff]).write(to: instructionFile(store.projectDirectory("first")))
+        let local = AppModel.controlResponse(for: model.createLocalCopilotSession(
+            requestId: UUID(), projectId: "first", title: "New session", prompt: "Start here"))
+        let pullRequests = model.startPullRequestsSession(
+            requestId: UUID(), projectId: "first", prompt: "Start here")
+        let review = model.startPullRequestReviewSession(
+            requestId: UUID(), projectId: "first", pullRequestURL: "https://github.com/octo/repo/pull/1")
+        for response in [local, pullRequests, review] {
+            XCTAssertFalse(response.ok)
+            XCTAssertEqual(response.code, "unavailable")
+            XCTAssertTrue(response.error?.contains("project instructions") == true)
+            XCTAssertTrue(response.error?.contains("app log") == true)
+        }
+        XCTAssertEqual(model.projects[0].sessions.map(\.id), ["session"])
+        XCTAssertTrue(model.hostedTerminals.isEmpty)
     }
 
     func testFailedStateLoadLeavesInstructionFilesAndLinksUntouched() throws {
