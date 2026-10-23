@@ -288,6 +288,8 @@ final class AppModel: ObservableObject {
     @Published var numberHint: NumberHint = .none
     @Published private(set) var transcriptOpenSessions: Set<String> = []
     @Published private(set) var conversationErrors: [String: String] = [:]
+    private weak var activeComposer: NSTextView?
+    private var activeComposerSessionId: String?
     private var inspectedUncertainSends: Set<String> = []
     var requestMainWindow: (() -> Void)?
 
@@ -963,8 +965,10 @@ final class AppModel: ObservableObject {
 
     func sessionSurface(sessionId: String) -> SessionSurface {
         guard let location = locateIndex(sessionId) else { return .terminal }
-        let session = projects[location.p].sessions[location.s]
-        if let preferred = session.preferredSurface { return preferred }
+        return projects[location.p].sessions[location.s].preferredSurface ?? .terminal
+    }
+
+    private func legacySessionSurface(sessionId: String) -> SessionSurface {
         guard TranscriptController.transcriptOwnerAllowsRead(
             sessionId: sessionId, directory: resumeMarkerDirectory
         ), let marker = resumeMarkerValue(sessionId: sessionId, suffix: "copilot-session"),
@@ -991,6 +995,10 @@ final class AppModel: ObservableObject {
             if surface == .terminal,
                projects[location.p].sessions[location.s].pendingConversationSend?.uncertain == true {
                 inspectedUncertainSends.insert(sessionId)
+            } else if surface == .conversation,
+                      projects[location.p].sessions[location.s].pendingConversationSend?.uncertain == true,
+                      previous == .terminal {
+                inspectedUncertainSends.insert(sessionId)
             }
             conversationErrors[sessionId] = nil
         } catch {
@@ -1007,10 +1015,12 @@ final class AppModel: ObservableObject {
     func setConversationDraft(_ text: String, sessionId: String) {
         guard let location = locateIndex(sessionId) else { return }
         guard projects[location.p].sessions[location.s].conversationDraft != text else { return }
-        projects[location.p].sessions[location.s].conversationDraft = text
-        projects[location.p].sessions[location.s].draftRevision &+= 1
-        do { try persistWorkspace(); conversationErrors[sessionId] = nil }
-        catch { conversationErrors[sessionId] = "Could not save draft: \(error.localizedDescription)" }
+        var session = projects[location.p].sessions[location.s]
+        session.conversationDraft = text
+        session.draftRevision &+= 1
+        projects[location.p].sessions[location.s] = session
+        scheduleSave()
+        if conversationErrors[sessionId] != nil { conversationErrors[sessionId] = nil }
     }
 
     @discardableResult
@@ -1081,6 +1091,16 @@ final class AppModel: ObservableObject {
         )
         switch outcome {
         case .accepted, .pendingHandoff:
+            guard pending.uncertain else { return }
+            projects[location.p].sessions[location.s].pendingConversationSend?.uncertain = false
+            do {
+                try persistWorkspace()
+                inspectedUncertainSends.remove(sessionId)
+                conversationErrors[sessionId] = nil
+            } catch {
+                projects[location.p].sessions[location.s].pendingConversationSend = pending
+                conversationErrors[sessionId] = "Could not save confirmed send state: \(error.localizedDescription)"
+            }
             return
         case .applied, .rejected:
             let previous = projects[location.p].sessions[location.s]
@@ -1111,6 +1131,7 @@ final class AppModel: ObservableObject {
     }
 
     func unlockConversationSendAfterInspection(sessionId: String) {
+        reconcileConversationSend(sessionId: sessionId)
         guard let location = locateIndex(sessionId),
               let pending = projects[location.p].sessions[location.s].pendingConversationSend,
               pending.uncertain, inspectedUncertainSends.contains(sessionId) else { return }
@@ -1929,6 +1950,8 @@ final class AppModel: ObservableObject {
             selectedTranscriptController = nil
         }
         transcriptOpenSessions.remove(sid)
+        conversationErrors.removeValue(forKey: sid)
+        inspectedUncertainSends.remove(sid)
         sessionSemantics.reset(sessionId: sid)
         backgroundAgentsSuppressed.remove(sid)
         completionPending.remove(sid)
@@ -3479,6 +3502,8 @@ final class AppModel: ObservableObject {
                 selectedTranscriptController = nil
             }
             transcriptOpenSessions.remove(session.id)
+            conversationErrors.removeValue(forKey: session.id)
+            inspectedUncertainSends.remove(session.id)
             backgroundAgentsSuppressed.remove(session.id)
             completionPending.remove(session.id)
             completionSummaryContexts[session.id] = nil
@@ -3675,7 +3700,7 @@ final class AppModel: ObservableObject {
             guard kind.matches(candidate.session) else { continue }
             show(projectId: candidate.projectId, sessionId: candidate.session.id)
             save()
-            focusActiveTerminal()
+            focusActiveWorkspace()
             return (candidate.projectId, candidate.session.id)
         }
         return nil
@@ -3717,7 +3742,7 @@ final class AppModel: ObservableObject {
         }
         show(projectId: target.projectId, sessionId: target.sessionId)
         save()
-        focusActiveTerminal()
+        focusActiveWorkspace()
         return (target.projectId, target.sessionId)
     }
 
@@ -5199,7 +5224,7 @@ final class AppModel: ObservableObject {
         requestMainWindow?()
         NSApp.activate(ignoringOtherApps: true)
         // An already-visible session may not trigger activation or reveal callbacks.
-        focusActiveTerminal()
+        focusActiveWorkspace()
     }
 
     /// Selects a session, or a project's shown session, and marks it read.
@@ -5246,7 +5271,7 @@ final class AppModel: ObservableObject {
         }
         show(projectId: owner, sessionId: sessionId)
         requestMainWindow?()
-        focusActiveTerminal()
+        focusActiveWorkspace()
         return .success(sessionId, code: "revealed")
     }
 
@@ -6235,8 +6260,33 @@ final class AppModel: ObservableObject {
         if clearsMark { save() }
     }
 
-    /// Make the visible session's terminal the first responder on activation or
-    /// an explicit focus request. Hidden/unattached targets are focused on reveal.
+    func registerComposer(_ editor: NSTextView, sessionId: String) {
+        activeComposer = editor
+        activeComposerSessionId = sessionId
+    }
+
+    func unregisterComposer(_ editor: NSTextView) {
+        if activeComposer === editor {
+            activeComposer = nil
+            activeComposerSessionId = nil
+        }
+    }
+
+    func focusActiveWorkspace(in targetWindow: NSWindow? = nil) {
+        guard let id = globalSelectedSessionId else {
+            targetWindow?.makeFirstResponder(nil)
+            return
+        }
+        if sessionSurface(sessionId: id) == .terminal {
+            focusActiveTerminal()
+        } else if activeComposerSessionId == id, let editor = activeComposer,
+                  let window = editor.window, targetWindow == nil || targetWindow === window,
+                  window.attachedSheet == nil, window.firstResponder !== editor {
+            window.makeFirstResponder(editor)
+        }
+    }
+
+    /// Focus the visible terminal only; hidden terminals must not take the keyboard.
     func focusActiveTerminal() {
         guard visibleTerminalSessionId != nil else { return }
         guard let view = activeController?.terminalView, !view.isHidden,
@@ -6437,9 +6487,14 @@ final class AppModel: ObservableObject {
         }
         projects = state.projects
         selectedProjectId = state.selectedProjectId ?? state.projects.first?.id
+        var migratedSurfaces = false
         for pi in projects.indices {
             for si in projects[pi].sessions.indices {
                 let sid = projects[pi].sessions[si].id
+                if projects[pi].sessions[si].preferredSurface == nil {
+                    projects[pi].sessions[si].preferredSurface = legacySessionSurface(sessionId: sid)
+                    migratedSurfaces = true
+                }
                 let restored = restoredStatusState(forSession: sid)
                 let status = restored.status
                 let statusTimestamp = restored.statusTimestamp
@@ -6468,6 +6523,14 @@ final class AppModel: ObservableObject {
                 ) {
                     backgroundAgentsSuppressed.insert(sid)
                 }
+            }
+        }
+        if migratedSurfaces {
+            do { try persistWorkspace() }
+            catch {
+                let message = "Could not save migrated session surfaces: \(error.localizedDescription)"
+                stateRecoveryMessage = message
+                NSLog("copilot-projects: \(message)")
             }
         }
     }

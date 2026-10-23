@@ -30,6 +30,14 @@ final class SessionEndingTests: XCTestCase {
         activity.pendingPermissionRequestIds = ["permission"]
         session.agentActivity = activity
         XCTAssertTrue(session.requiresEndConfirmation)
+        session.agentActivity = nil
+        session.pendingConversationSend = PendingConversationSend(
+            action: RemoteSessionAction(kind: .send, prompt: "still pending", mode: .enqueue),
+            operationId: "operation", conversationEpoch: "epoch", draftRevision: 0, uncertain: true
+        )
+        XCTAssertTrue(session.requiresEndConfirmation)
+        session.pendingConversationSend = nil
+        XCTAssertFalse(session.requiresEndConfirmation)
         activity.pendingPermissionRequestIds = []
         activity.schedules = [TrackedSchedule(
             id: 1, intervalMs: 60_000, cron: nil, tz: nil, at: nil,

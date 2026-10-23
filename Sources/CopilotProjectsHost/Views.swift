@@ -49,7 +49,7 @@ struct RootView: View {
         .ignoresSafeArea(.container, edges: .top)
         .background(StudioStyle.chrome)
         .background(WindowConfigurator())
-        .sheet(item: sessionFinderBinding) { finder in
+        .sheet(item: sessionFinderBinding, onDismiss: { model.focusActiveWorkspace() }) { finder in
             SessionFinderView(finder: finder, model: model, onDismiss: input.dismissSessionFinder)
         }
         .sheet(item: $input.imagePreview) { item in
@@ -81,12 +81,7 @@ struct RootView: View {
     }
 
     private func focusVisibleWorkspace(in window: NSWindow) {
-        if let terminal = model.activeController?.terminalView,
-           !terminal.isHidden, terminal.window === window {
-            model.focusActiveTerminal()
-        } else {
-            window.makeFirstResponder(nil)
-        }
+        model.focusActiveWorkspace(in: window)
     }
 
     private var topStrip: some View {
@@ -688,7 +683,7 @@ private struct SessionList: View {
                             showNumber: model.numberHint == .tabs,
                             onSelect: {
                                 model.selectSession(projectId: project.id, sessionId: session.id)
-                                model.focusActiveTerminal()
+                                model.focusActiveWorkspace()
                             },
                             onClose: { model.requestCloseSession(projectId: project.id, sessionId: session.id) }
                         )

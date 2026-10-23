@@ -52,7 +52,7 @@ struct ConversationView: View {
                     HStack {
                         Text(pending.uncertain
                              ? "Send outcome unknown. Inspect Terminal before unlocking. Sending again may duplicate it."
-                             : "Waiting for Copilot to confirm this send. You can keep editing your next message.")
+                             : "Waiting for Copilot to confirm this send. You can keep editing this draft.")
                             .font(.callout)
                             .foregroundStyle(pending.uncertain ? .orange : StudioStyle.secondaryText)
                         Spacer()
@@ -68,7 +68,7 @@ struct ConversationView: View {
                 if let error = model.conversationErrors[sessionId] {
                     Text(error).font(.callout).foregroundStyle(.red)
                 }
-                ConversationEditor(text: Binding(
+                ConversationEditor(model: model, sessionId: sessionId, text: Binding(
                     get: { model.conversationSession(sessionId)?.conversationDraft ?? "" },
                     set: { model.setConversationDraft($0, sessionId: sessionId) }
                 ), onSend: send)
@@ -123,7 +123,7 @@ struct ConversationView: View {
     }
 
     private func send() {
-        guard pending == nil else { return }
+        guard pending == nil, canSend else { return }
         _ = model.sendConversationDraft(sessionId: sessionId, mode: mode)
     }
 
@@ -153,6 +153,8 @@ struct ConversationView: View {
 }
 
 private struct ConversationEditor: NSViewRepresentable {
+    let model: AppModel
+    let sessionId: String
     @Binding var text: String
     let onSend: () -> Void
 
@@ -182,16 +184,24 @@ private struct ConversationEditor: NSViewRepresentable {
         editor.onSend = onSend
         editor.string = text
         scroll.documentView = editor
+        model.registerComposer(editor, sessionId: sessionId)
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? ComposerTextView else { return }
+        model.registerComposer(editor, sessionId: sessionId)
         editor.onSend = onSend
         if editor.string != text {
             editor.string = text
             editor.undoManager?.removeAllActions()
+        }
+    }
+
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        if let editor = scroll.documentView as? ComposerTextView {
+            coordinator.parent.model.unregisterComposer(editor)
         }
     }
 

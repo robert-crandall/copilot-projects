@@ -223,7 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor [weak self] in
                 self?.model.markActiveSessionSeen()
                 if self?.input.hasWorkspaceSheet == false {
-                    self?.model.focusActiveTerminal()
+                    self?.model.focusActiveWorkspace()
                 }
             }
         }

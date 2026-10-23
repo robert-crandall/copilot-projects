@@ -62,6 +62,7 @@ final class WorkspaceLayoutTests: XCTestCase {
 
     @MainActor
     private func withWorkspace(
+        initialSurface: SessionSurface? = nil,
         _ body: (AppModel, Navigation, WorkspaceWindow) async throws -> Void
     ) async throws {
         _ = NSApplication.shared
@@ -93,7 +94,7 @@ final class WorkspaceLayoutTests: XCTestCase {
             XCTFail("Layout fixtures must not create persistent dtach sessions")
             return
         }
-        let session = Session(title: "Layout fixture", cwd: root.path)
+        let session = Session(title: "Layout fixture", cwd: root.path, preferredSurface: initialSurface)
         let project = Project(name: "Projects", cwd: root.path, sessions: [session], selectedSessionId: session.id)
         let repository = StateRepository(path: root.appendingPathComponent("state.json"))
         try repository.save(PersistedState(
@@ -117,6 +118,40 @@ final class WorkspaceLayoutTests: XCTestCase {
         }
         try await settle(window)
         try await body(model, navigation, window)
+    }
+
+    @MainActor
+    func testConversationFirstMountKeepsTerminalSizedAndHosted() async throws {
+        try await withWorkspace(initialSurface: .conversation) { model, _, window in
+            let id = try XCTUnwrap(model.globalSelectedSessionId)
+            let controller = try XCTUnwrap(model.activeController)
+            let terminal = controller.terminalView
+            let host = terminal.superview
+            let pid = controller.shellPID
+            XCTAssertNil(model.visibleTerminalSessionId)
+            XCTAssertTrue(terminal.isHidden)
+            XCTAssertGreaterThan(terminal.frame.width, 0)
+            XCTAssertGreaterThan(terminal.frame.height, 0)
+            XCTAssertGreaterThan(terminal.terminalDimensions.cols, 0)
+            XCTAssertGreaterThan(terminal.terminalDimensions.rows, 0)
+            XCTAssertEqual(terminal.frame.size, host?.bounds.size)
+            window.setContentSize(NSSize(width: 820, height: 520))
+            try await settle(window)
+            XCTAssertGreaterThan(terminal.frame.width, 400)
+            XCTAssertEqual(terminal.frame.size, host?.bounds.size,
+                           "The selected hidden terminal must resize with its host")
+            XCTAssertGreaterThan(terminal.terminalDimensions.cols, 0)
+            model.setSessionSurface(.terminal, sessionId: id)
+            try await settle(window)
+            XCTAssertFalse(terminal.isHidden)
+            XCTAssertTrue(terminal.superview === host)
+            XCTAssertTrue(model.activeController === controller)
+            XCTAssertEqual(model.activeController?.shellPID, pid)
+            model.setSessionSurface(.conversation, sessionId: id)
+            try await settle(window)
+            XCTAssertTrue(terminal.superview === host)
+            XCTAssertEqual(model.activeController?.shellPID, pid)
+        }
     }
 
     @MainActor
@@ -205,7 +240,7 @@ final class WorkspaceLayoutTests: XCTestCase {
 
     @MainActor
     func testConversationToggleKeepsTerminalMountedAndDoesNotRefocusIt() async throws {
-        try await withWorkspace { model, _, window in
+        try await withWorkspace { model, navigation, window in
             let id = try XCTUnwrap(model.globalSelectedSessionId)
             let controller = try XCTUnwrap(model.activeController)
             let terminal = controller.terminalView
@@ -220,6 +255,32 @@ final class WorkspaceLayoutTests: XCTestCase {
             XCTAssertTrue(terminal.isHidden)
             XCTAssertFalse(window.firstResponder === terminal)
             XCTAssertTrue(terminal.superview === container)
+            let editor = try XCTUnwrap(textEditor(in: try XCTUnwrap(window.contentView)))
+            XCTAssertTrue(window.makeFirstResponder(editor))
+            navigation.showsProjects = false
+            try await settle(window)
+            XCTAssertTrue(window.firstResponder === editor, "Hiding Projects must retain composer focus")
+            navigation.showsProjects = true
+            try await settle(window)
+            if let table = projectTable(in: try XCTUnwrap(window.contentView)) {
+                XCTAssertTrue(window.makeFirstResponder(table))
+                navigation.showsProjects = false
+                try await settle(window)
+                XCTAssertTrue(window.firstResponder === editor,
+                              "Hiding Projects should return focus from its table to the composer")
+            }
+            navigation.showsProjects = true
+            try await settle(window)
+            XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(projectTable(in: try XCTUnwrap(window.contentView)))))
+            model.focusActiveWorkspace()
+            XCTAssertTrue(window.firstResponder === editor, "Activation should focus the visible composer")
+            let finder = WorkspaceInputController(model: model)
+            XCTAssertTrue(window.makeFirstResponder(try XCTUnwrap(projectTable(in: try XCTUnwrap(window.contentView)))))
+            finder.openFromSessionFinder(id)
+            try await settle(window)
+            XCTAssertTrue(window.firstResponder === editor, "Reopening the selected session restores composer focus")
+            model.focusActiveTerminal()
+            XCTAssertTrue(window.firstResponder === editor, "Terminal-only callbacks cannot steal focus")
             let before = window.responderChanges
             model.focusActiveTerminal()
             XCTAssertEqual(window.responderChanges, before)
@@ -281,12 +342,30 @@ final class WorkspaceLayoutTests: XCTestCase {
             XCTAssertEqual(model.activeTranscriptController?.snapshot?.turns.count, 1)
             XCTAssertTrue(window.makeFirstResponder(editor))
             let originalSends = process.sendCount
+            let commandReturn = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: "\r",
+                charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+            XCTAssertTrue(window.performKeyEquivalent(with: commandReturn))
+            XCTAssertNil(model.conversationSession(id)?.pendingConversationSend)
+            XCTAssertNil(model.conversationErrors[id], "An empty disabled send should be a no-op")
             editor.insertText("first line", replacementRange: NSRange(location: NSNotFound, length: 0))
             editor.insertNewline(nil)
             editor.insertText("second line", replacementRange: NSRange(location: NSNotFound, length: 0))
             try await settle(window)
             XCTAssertEqual(model.conversationSession(id)?.conversationDraft, "first line\nsecond line")
             XCTAssertEqual(process.sendCount, originalSends)
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            editor.setSelectedRange(NSRange(location: 0, length: editor.string.utf16.count))
+            let textType = try XCTUnwrap(editor.writablePasteboardTypes.first)
+            pasteboard.declareTypes(editor.writablePasteboardTypes, owner: nil)
+            XCTAssertTrue(editor.writeSelection(to: pasteboard, types: editor.writablePasteboardTypes))
+            XCTAssertEqual(pasteboard.string(forType: .string), "first line\nsecond line")
+            editor.insertText("", replacementRange: editor.selectedRange())
+            XCTAssertTrue(editor.readSelection(from: pasteboard, type: textType))
+            try await settle(window)
+            XCTAssertEqual(model.conversationSession(id)?.conversationDraft, "first line\nsecond line")
             editor.breakUndoCoalescing()
             editor.insertText("!", replacementRange: NSRange(location: NSNotFound, length: 0))
             editor.breakUndoCoalescing()
@@ -308,10 +387,6 @@ final class WorkspaceLayoutTests: XCTestCase {
             XCTAssertGreaterThan(editor.visibleRect.width, 300)
             XCTAssertGreaterThan(editor.visibleRect.height, 50)
 
-            let commandReturn = try XCTUnwrap(NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
-                windowNumber: window.windowNumber, context: nil, characters: "\r",
-                charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
             XCTAssertTrue(window.performKeyEquivalent(with: commandReturn))
             try await settle(window)
             let pending = try XCTUnwrap(model.conversationSession(id)?.pendingConversationSend)

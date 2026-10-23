@@ -24,6 +24,7 @@ final class TerminalsContainerView: NSView {
     /// state a real affordance without a SwiftUI overlay punching through the NSView.
     private let cover = EmptyStateView()
     private var activeId: String?
+    private var selectedId: String?
     private var rendererLRU: [String] = []
     private static let rendererWarmCapacity = 3
 
@@ -42,7 +43,12 @@ final class TerminalsContainerView: NSView {
     /// every project, and covered panes burn no draw cycles.
     private func layoutVisible() {
         cover.frame = bounds
-        if let id = activeId, let view = hosted[id] { view.frame = bounds }
+        if let id = activeId, let view = hosted[id],
+           bounds.width > 0, bounds.height > 0 { view.frame = bounds }
+        if let id = selectedId, id != activeId, let view = hosted[id],
+           bounds.width > 0, bounds.height > 0 {
+            view.frame = bounds
+        }
     }
 
     override func layout() {
@@ -63,7 +69,7 @@ final class TerminalsContainerView: NSView {
     ///   - emptyHint: message + button title for the cover when nothing is selected.
     ///   - onNew: backs the cover's button (new session, or new project).
     ///   - provider: supplies the terminal view for a newly-created session.
-    func sync(order: [String], active: String?,
+    func sync(order: [String], active: String?, selected: String? = nil,
               emptyHint: (message: String, button: String),
               onNew: @escaping () -> Void,
               provider: (String) -> ProjectsTerminalView?) {
@@ -80,7 +86,7 @@ final class TerminalsContainerView: NSView {
                 hosted[id]?.removeFromSuperview()
                 view.setRendererActive(false)
                 view.isHidden = true
-                view.frame = bounds
+                if bounds.width > 0, bounds.height > 0 { view.frame = bounds }
                 addSubview(view)
                 hosted[id] = view
                 inserted.insert(id)
@@ -100,6 +106,7 @@ final class TerminalsContainerView: NSView {
             window?.makeFirstResponder(nil)
         }
         activeId = active
+        selectedId = selected ?? active
         let needsReveal = activeChanged || active.map(inserted.contains) == true
         // Hide the outgoing and incoming panes before parking/activating renderers.
         // Keeping the NSView hierarchy stable avoids the blank-on-switch backing
@@ -115,7 +122,7 @@ final class TerminalsContainerView: NSView {
             capacity: Self.rendererWarmCapacity
         )
         if let active, let view = hosted[active] {
-            view.frame = bounds
+            if bounds.width > 0, bounds.height > 0 { view.frame = bounds }
             view.layoutSubtreeIfNeeded()
         }
         let warm = Set(rendererLRU)
@@ -157,7 +164,7 @@ final class TerminalsContainerView: NSView {
     /// Size, request the current frame, and focus the newly revealed terminal.
     /// The view also schedules one deferred redraw for drawable readiness.
     private func reveal(_ view: ProjectsTerminalView) {
-        view.frame = bounds
+        if bounds.width > 0, bounds.height > 0 { view.frame = bounds }
         view.layoutSubtreeIfNeeded()
         view.forceRedraw()
         if let window, window.firstResponder !== view {
@@ -238,6 +245,7 @@ struct TerminalsContainer: NSViewRepresentable {
         nsView.sync(
             order: model.hostedTerminals.map(\.id),
             active: visibleTerminalId,
+            selected: selectedSessionId,
             emptyHint: model.emptyContextHint,
             onNew: { [weak model] in model?.newInActiveContext() },
             provider: { id in model.terminalView(for: id) }

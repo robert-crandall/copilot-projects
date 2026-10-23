@@ -91,6 +91,7 @@ struct Session: Identifiable, Codable, Equatable {
 
     var requiresEndConfirmation: Bool {
         status != .idle || hasBackgroundWork || !schedules.isEmpty || hasPendingInput
+            || pendingConversationSend != nil
     }
 
     /// The attention state shown beside a session's name.

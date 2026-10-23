@@ -101,6 +101,7 @@ final class WorkspaceInputControllerTests: XCTestCase {
             model.setConversationDraft("second draft", sessionId: second)
             model.selectSession(projectId: projectId, sessionId: first)
             XCTAssertEqual(model.conversationSession(first)?.conversationDraft, "first draft")
+            model.save() // The application delegate flushes pending drafts on quit.
             let root = try XCTUnwrap(ProcessInfo.processInfo.environment["COPILOT_PROJECTS_STATE_DIR"])
             let rootURL = URL(fileURLWithPath: root)
             let restored = AppModel(

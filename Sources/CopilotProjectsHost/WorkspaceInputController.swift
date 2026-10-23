@@ -81,7 +81,7 @@ final class WorkspaceInputController: ObservableObject {
             // selected tab as seen, and that should be the tab being opened.
             model.selectSession(projectId: project.id, sessionId: sessionId)
             if model.selectedProjectId != project.id { model.selectProject(project.id) }
-            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+            DispatchQueue.main.async { [model] in model.focusActiveWorkspace() }
             return
         }
         // Resume an ended Copilot CLI session into its matched project.
@@ -100,7 +100,7 @@ final class WorkspaceInputController: ObservableObject {
             dismissSessionFinder()
             model.selectSession(projectId: projectId, sessionId: resumedSessionId)
             if model.selectedProjectId != projectId { model.selectProject(projectId) }
-            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+            DispatchQueue.main.async { [model] in model.focusActiveWorkspace() }
         case .permanentlyUnavailable(let message):
             sessionFinder?.removeResumableSession(id: sessionId, error: message)
         case .temporarilyUnavailable(let message):

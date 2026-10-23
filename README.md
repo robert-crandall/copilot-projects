@@ -65,7 +65,8 @@ discards it. Leaving the transcript surface or switching sessions dismisses that
   open in Conversation; plain shells open in Terminal. The per-session choice is remembered.
   Conversation has a multiline draft (Return inserts a newline; `⌘Return` sends), Markdown
   turns, and response/code copy controls. Select enqueue or immediate delivery before sending.
-  Drafts survive session switches and app relaunches. If delivery cannot be confirmed, inspect
+  Drafts survive session switches and relaunches; edits save shortly after typing and flush
+  when the app quits. If delivery cannot be confirmed, inspect
   Terminal before explicitly unlocking the draft; sending again might duplicate a request.
   Permissions and unsupported or disconnected trackers also direct you to Terminal.
   Hide the project column to

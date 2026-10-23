@@ -6,6 +6,39 @@ import CopilotProjectsProtocol
 
 final class SessionWorkflowTests: XCTestCase {
     @MainActor
+    func testDraftEditsDebounceAndExplicitQuitSavePersistsLatestRevision() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var sessions = (0..<30).map { Session(id: "benchmark-\($0)", title: "session", cwd: root.path) }
+        for index in sessions.indices { sessions[index].conversationDraft = String(repeating: "a", count: 8192) }
+        let project = Project(name: "benchmark", cwd: root.path, sessions: sessions)
+        let repo = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repo.save(PersistedState(projects: [project], selectedProjectId: project.id))
+        let model = AppModel(stateRepository: repo, isAppActive: { false },
+                             agentActivityDirectory: root, resumeMarkerDirectory: root,
+                             kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images")))
+        for index in 0..<20 {
+            model.setConversationDraft(String(repeating: "x", count: 8192) + "\(index)", sessionId: "benchmark-0")
+        }
+        if case .loaded(let saved) = repo.load() {
+            XCTAssertEqual(saved.projects[0].sessions[0].conversationDraft.count, 8192,
+                           "Typing should not write the whole workspace for every key")
+        } else { XCTFail("Missing baseline") }
+        try await Task.sleep(for: .milliseconds(1200))
+        if case .loaded(let saved) = repo.load() {
+            XCTAssertTrue(saved.projects[0].sessions[0].conversationDraft.hasSuffix("19"))
+            XCTAssertEqual(saved.projects[0].sessions[0].draftRevision, 20)
+        } else { XCTFail("Debounced save did not run") }
+        model.setConversationDraft("last edit", sessionId: "benchmark-0")
+        model.save()
+        if case .loaded(let saved) = repo.load() {
+            XCTAssertEqual(saved.projects[0].sessions[0].conversationDraft, "last edit")
+            XCTAssertEqual(saved.projects[0].sessions[0].draftRevision, 21)
+        } else { XCTFail("Quit save did not flush") }
+    }
+    @MainActor
     func testLegacySurfaceDefaultsRequireOwnedNonquarantinedCopilotMarker() throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -18,7 +51,16 @@ final class SessionWorkflowTests: XCTestCase {
         XCTAssertEqual(legacy.conversationDraft, "")
         XCTAssertEqual(legacy.draftRevision, 0)
         let plain = Session(id: "plain", title: "shell", cwd: root.path, preferredSurface: .terminal)
-        let project = Project(name: "Legacy", cwd: root.path, sessions: [legacy, plain],
+        let owned = Session(id: "owned", title: "Copilot", cwd: root.path)
+        let quarantined = Session(id: "quarantined", title: "Copilot", cwd: root.path)
+        let sdkID = UUID().uuidString
+        for id in [owned.id, quarantined.id] {
+            try Data(sdkID.utf8).write(to: root.appendingPathComponent("\(id).copilot-session"))
+        }
+        let owner = #"{"appSessionId":"other","copilotSessionId":"\#(sdkID)","pid":1}"#
+        try Data(owner.utf8).write(
+            to: root.appendingPathComponent("\(quarantined.id).transcript-owner.json"))
+        let project = Project(name: "Legacy", cwd: root.path, sessions: [legacy, plain, owned, quarantined],
                               selectedSessionId: legacy.id)
         let repository = StateRepository(path: root.appendingPathComponent("state.json"))
         try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
@@ -29,14 +71,22 @@ final class SessionWorkflowTests: XCTestCase {
         )
         XCTAssertEqual(model.sessionSurface(sessionId: legacy.id), .terminal,
                        "A title is not owned Copilot metadata")
-        let sdkID = UUID().uuidString
+        XCTAssertEqual(model.sessionSurface(sessionId: owned.id), .conversation)
+        XCTAssertEqual(model.sessionSurface(sessionId: quarantined.id), .terminal)
         try Data(sdkID.utf8).write(
             to: root.appendingPathComponent("\(legacy.id).copilot-session"))
-        XCTAssertEqual(model.sessionSurface(sessionId: legacy.id), .conversation)
+        XCTAssertEqual(model.sessionSurface(sessionId: legacy.id), .terminal,
+                       "A late marker cannot switch an existing shell")
         XCTAssertEqual(model.sessionSurface(sessionId: plain.id), .terminal)
-        let owner = #"{"appSessionId":"other","copilotSessionId":"\#(sdkID)","pid":1}"#
-        try Data(owner.utf8).write(
-            to: root.appendingPathComponent("\(legacy.id).transcript-owner.json"))
+        try FileManager.default.removeItem(at: root.appendingPathComponent("\(owned.id).copilot-session"))
+        let restarted = AppModel(
+            stateRepository: repository, isAppActive: { false },
+            agentActivityDirectory: root, resumeMarkerDirectory: root,
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        XCTAssertEqual(restarted.sessionSurface(sessionId: legacy.id), .terminal)
+        XCTAssertEqual(restarted.sessionSurface(sessionId: owned.id), .conversation,
+                       "Migration must survive marker deletion and restart")
         XCTAssertEqual(model.sessionSurface(sessionId: legacy.id), .terminal)
         model.setSessionSurface(.conversation, sessionId: legacy.id)
         XCTAssertEqual(model.sessionSurface(sessionId: legacy.id), .conversation,
@@ -122,6 +172,41 @@ final class SessionWorkflowTests: XCTestCase {
         model.reconcileConversationSend(sessionId: session.id)
         XCTAssertTrue(model.conversationSession(session.id)?.pendingConversationSend?.uncertain == true)
         XCTAssertFalse(model.sendConversationDraft(sessionId: session.id, mode: .enqueue))
+        snapshot.operationReceipts = []
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        model.reconcileConversationSend(sessionId: session.id)
+        XCTAssertFalse(try XCTUnwrap(model.conversationSession(session.id)?.pendingConversationSend).uncertain,
+                       "Matching handoff confirms this operation is still in flight")
+        snapshot.operationReceipts = [receipt(.applied, fingerprint: "wrong")]
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        model.reconcileConversationSend(sessionId: session.id)
+        XCTAssertTrue(model.conversationSession(session.id)?.pendingConversationSend?.uncertain == true)
+        model.setSessionSurface(.terminal, sessionId: session.id)
+        model.setSessionSurface(.conversation, sessionId: session.id)
+        XCTAssertTrue(model.hasInspectedUncertainSend(sessionId: session.id))
+        snapshot.operationReceipts = [receipt(.accepted)]
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        let stateDirectory = root.appendingPathComponent("state")
+        let parkedState = root.appendingPathComponent("state-parked")
+        try FileManager.default.moveItem(at: stateDirectory, to: parkedState)
+        try Data("blocked".utf8).write(to: stateDirectory)
+        model.reconcileConversationSend(sessionId: session.id)
+        XCTAssertTrue(model.conversationSession(session.id)?.pendingConversationSend?.uncertain == true)
+        XCTAssertNotNil(model.conversationErrors[session.id])
+        try FileManager.default.removeItem(at: stateDirectory)
+        try FileManager.default.moveItem(at: parkedState, to: stateDirectory)
+        model.reconcileConversationSend(sessionId: session.id)
+        XCTAssertFalse(try XCTUnwrap(model.conversationSession(session.id)?.pendingConversationSend).uncertain)
+        XCTAssertFalse(model.hasInspectedUncertainSend(sessionId: session.id))
+        if case .loaded(let saved) = repository.load() {
+            XCTAssertFalse(try XCTUnwrap(saved.projects[0].sessions[0].pendingConversationSend).uncertain)
+        } else { XCTFail("Confirmed send state must be durable") }
+        snapshot.operationReceipts = [receipt(.applied, fingerprint: "wrong")]
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        model.reconcileConversationSend(sessionId: session.id)
+        XCTAssertTrue(model.conversationSession(session.id)?.pendingConversationSend?.uncertain == true)
+        XCTAssertFalse(model.hasInspectedUncertainSend(sessionId: session.id),
+                       "A new uncertainty requires a fresh inspection")
         snapshot.operationReceipts = [receipt(.applied)]
         try JSONEncoder().encode(snapshot).write(to: snapshotURL)
         model.reconcileConversationSend(sessionId: session.id)
@@ -237,10 +322,12 @@ final class SessionWorkflowTests: XCTestCase {
         model.unlockConversationSendAfterInspection(sessionId: session.id)
         XCTAssertNotNil(model.conversationSession(session.id)?.pendingConversationSend)
         model.setSessionSurface(.terminal, sessionId: session.id)
+        model.setSessionSurface(.conversation, sessionId: session.id)
+        XCTAssertTrue(model.hasInspectedUncertainSend(sessionId: session.id))
         model.unlockConversationSendAfterInspection(sessionId: session.id)
         XCTAssertNil(model.conversationSession(session.id)?.pendingConversationSend)
         XCTAssertEqual(model.conversationSession(session.id)?.conversationDraft, "keep me")
-        XCTAssertEqual(model.sessionSurface(sessionId: session.id), .terminal)
+        XCTAssertEqual(model.sessionSurface(sessionId: session.id), .conversation)
         model = AppModel(
             stateRepository: repository, isAppActive: { false },
             agentActivityDirectory: root, resumeMarkerDirectory: root,
