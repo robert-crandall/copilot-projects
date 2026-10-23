@@ -6164,7 +6164,7 @@ final class AppLogicTests: XCTestCase {
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any]
         )
-        XCTAssertEqual(Set(object.keys), ["id", "title", "cwd"])
+        XCTAssertEqual(Set(object.keys), ["id", "title", "cwd", "conversationDraft", "draftRevision"])
     }
 
     func testStateRepositoryRecoversBackupAndNormalizesSelection() throws {
@@ -6324,11 +6324,13 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(launches[0].1, "/opt/copilot/bin/copilot")
         XCTAssertEqual(launches[0].2, prompt.replacingOccurrences(of: "\r\n", with: "\n"))
         XCTAssertEqual(model.project(project.id)?.sessions.last?.title, "Copilot")
+        XCTAssertEqual(model.sessionSurface(sessionId: id), .conversation)
         XCTAssertEqual(model.project(project.id)?.sessions.last?.cwd, root.path)
         XCTAssertEqual(model.project(project.id)?.selectedSessionId, id)
         guard case .loaded(let persisted) = StateRepository(path: root.appendingPathComponent("state.json")).load()
         else { return XCTFail("Created Copilot session was not persisted") }
         XCTAssertEqual(persisted.projects.first?.selectedSessionId, id)
+        XCTAssertEqual(persisted.projects.first?.sessions.last?.preferredSurface, .conversation)
         XCTAssertFalse(try String(contentsOf: root.appendingPathComponent("state.json"), encoding: .utf8)
             .contains("SHOULD_NOT_EXIST"))
 
@@ -6674,6 +6676,7 @@ final class AppLogicTests: XCTestCase {
         let created = try XCTUnwrap(
             model.project("p1")?.sessions.first { $0.id == requestId.uuidString })
         XCTAssertEqual(created.title, "Copilot")
+        XCTAssertEqual(created.preferredSurface, .conversation)
         XCTAssertEqual(created.cwd, repos.path)
         XCTAssertTrue(created.cwd.hasPrefix("/"))
         // Mac selection is not stolen.
@@ -7714,6 +7717,7 @@ final class AppLogicTests: XCTestCase {
         try FileManager.default.removeItem(at: orphanSocket)
         XCTAssertEqual(model.createRemoteConfiguredSession(request), .created(RemoteCreateSessionResponse(
             requestId: request.requestId, projectId: "p1", sessionId: request.requestId.uuidString)))
+        XCTAssertEqual(model.sessionSurface(sessionId: request.requestId.uuidString), .terminal)
         XCTAssertFalse(FileManager.default.fileExists(atPath: staleMarker.path))
         for _ in 0 ..< 200 {
             if FileManager.default.fileExists(atPath: capturedArguments.path) { break }

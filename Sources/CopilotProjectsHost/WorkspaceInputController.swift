@@ -26,7 +26,8 @@ final class WorkspaceInputController: ObservableObject {
     func presentImage(_ item: TranscriptImagePreviewItem) {
         guard sessionFinder == nil else { return }
         guard model.globalSelectedSessionId == item.id.sessionId,
-              model.isTranscriptDrawerOpen(sessionId: item.id.sessionId) else {
+              (model.isTranscriptDrawerOpen(sessionId: item.id.sessionId)
+                || model.sessionSurface(sessionId: item.id.sessionId) == .conversation) else {
             NSLog("Ignoring an image preview from an inactive session drawer.")
             return
         }
@@ -174,7 +175,7 @@ final class WorkspaceInputController: ObservableObject {
             }
         }
         clearNumberHint()
-        if let controller = model.activeController,
+        if model.visibleTerminalSessionId != nil, let controller = model.activeController,
            controller.terminalView.sendRestoredModifiedReturnIfNeeded(
                for: event,
                restoredAgentLive: controller.reattachedToExistingShell

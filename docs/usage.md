@@ -1,9 +1,9 @@
 # Copilot Projects: usage and development
 
-A deliberately small macOS terminal app that organizes CLI sessions by **project**.
+A deliberately small macOS conversation and terminal app that organizes CLI sessions by **project**.
 Projects and their sessions occupy separate vertical navigation columns beside
-the working terminal. It keeps the parts of [cmux](https://github.com/manaflow-ai/cmux) that
-matter most for working with coding agents — **status indicators** and **notifications** —
+the working conversation or terminal. It keeps the parts of [cmux](https://github.com/manaflow-ai/cmux) that
+matter most for working with coding agents - **status indicators** and **notifications** -
 and drops everything else.
 
 This repository builds the standalone desktop app. Web access, tunnel authentication,
@@ -25,7 +25,9 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   remembered across launches, and hiding/showing Projects preserves its width.
   Hover a truncated project name to read it in full.
 - **Sessions (vertical browser):** the selected project's sessions appear beside the project
-  column, with their names and explicit state. One terminal is visible at a time.
+  column, with their names and explicit state. New Copilot sessions show Conversation,
+  and plain shells show Terminal. Use the workspace selector to switch per session;
+  the choice persists across launches. Terminals keep running while Conversation is visible.
   Start Copilot with `⌘T` or a plain shell with `⌥⌘T`, switch with a click / **`⌃Tab`** (next) / `⌃⇧Tab`
   (prev) / **`⌃1`–`⌃9`** / `⌘⇧[` / `⌘⇧]`, or end with `⌘W`, the row's ✕,
   or a double-click on the session selector. Sessions with active or pending work
@@ -93,9 +95,14 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   next session in that state across all projects, and **Session ▸ Next Session Needing
   Attention** (`⇧⌘A`) cycles across projects in urgency order (`waiting` → `failed` →
   `unread` / `finished`). With the Copilot CLI hooks installed (below), this is driven automatically.
-- **Completed-turn drawer:** Copilot CLI remains the native interactive terminal, while a
-  collapsible drawer overlays its right edge with independently scrollable completed turns
-  rendered as Markdown. Live work, permissions, shortcuts, and input stay entirely in the CLI.
+- **Conversation and terminal:** Conversation shows selectable Markdown turns, images,
+  expandable tools, response/code copy buttons, and native workflow controls. The native
+  multiline composer uses Return for a newline and `⌘Return` to send; choose enqueue or
+  immediate delivery. Its per-session drafts persist across tabs and launches. Unconfirmed
+  sends block further sending until you inspect Terminal and explicitly accept the duplicate risk
+  before unlocking. You can keep editing your draft. Permissions, questions, and unsupported or disconnected tracker state
+  direct you to Terminal. In Terminal, the collapsible session-details drawer still shows
+  the same completed turns without changing the underlying CLI process.
 - **Schedules + background work:** queued scheduled prompts show a clock with cadence/next-run
   details; active scheduled turns and subagents use a separate background indicator instead of
   making the foreground session look busy.

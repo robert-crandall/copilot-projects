@@ -1,6 +1,6 @@
 ---
 name: "Copilot Projects - Studio Console"
-description: "Native macOS workspace with graphite and satin surfaces, steel selection, and a dominant live terminal."
+description: "Native macOS conversation and terminal workspace with graphite and satin surfaces and steel selection."
 colors:
   selection: "#3C4A56"
   selection-edge: "#AAC6D9"
@@ -183,9 +183,10 @@ under `copilot-projects.sessions`; Projects uses `copilot-projects.projects`.
 Drag either native divider to adjust the navigation widths. Session rows scroll vertically with a 6pt gap
 and 10pt column inset. The main pane identifies the active session; its project
 appears in the Sessions header rather than being repeated beneath the session title.
-Its session-details opener sits beside the terminal glyph in that heading,
-not over terminal output or in the native title strip. It appears only when
-transcript or workflow details are available and the drawer is closed.
+The heading selects Conversation or Terminal per session. In Terminal, the
+session-details opener sits beside the terminal glyph, not over terminal output
+or in the native title strip. It appears only when transcript or workflow
+details are available and the drawer is closed.
 
 Projects can collapse immediately while Sessions remains visible. Visibility is
 scene-owned ephemeral `@State`, passed as a `Binding` through `MainWindowContent`;
@@ -193,11 +194,13 @@ it is neither `AppModel` state nor a persisted preference. The native View menu'
 Show Projects toggle (Command-0) and the resident session-header toggle share it.
 Collapse preserves the terminal container, instance, and process. Focus leaves
 the hidden project table for the visible terminal, or is cleared for an empty
-project; an already-focused terminal is not blurred and refocused.
+project; an already-focused terminal is not blurred and refocused. Conversation
+keeps the terminal mounted but hidden, so it never steals focus from the composer.
 
-The root no-project and empty-session states remain. The unchanged details
-drawer overlays the trailing side (420pt), with a 44pt heading row and 18pt
-horizontal transcript inset. It does not become a second primary workspace.
+The root no-project and empty-session states remain. Conversation reuses the
+drawer turn, tool, image, Markdown, and workflow content with a native composer.
+In Terminal, the details drawer still overlays the trailing side (420pt), with
+a 44pt heading row and 18pt horizontal transcript inset.
 
 **The Steady Selection Rule.** Change fill and edge without scaling or moving the selected session; retain separate select, end, and drag actions.
 
@@ -459,7 +462,7 @@ renders. Its generated tonal ramps are swatch previews, not additional app token
 ### Do:
 - Do resolve the complete native appearance family for custom chrome, while leaving native List row ink inherited.
 - Do retain native labels, traffic lights, keyboard shortcuts, drag/drop, and ending safeguards.
-- Do keep the terminal primary and the details drawer secondary.
+- Do keep Conversation primary for Copilot and the Terminal drawer secondary.
 
 ### Don't:
 - Don't dim inactive session titles or merge high-contrast-light surface roles.

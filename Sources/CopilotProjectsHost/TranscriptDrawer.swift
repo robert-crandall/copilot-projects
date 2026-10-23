@@ -33,16 +33,18 @@ struct TranscriptOverlay: View {
     let operation: AgentOperationProjection
     let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     let onPreview: (TranscriptImagePreviewItem) -> Void
+    var isConversation = false
 
     var body: some View {
-        if controller.snapshot != nil || workflow != nil {
+        if isConversation || controller.snapshot != nil || workflow != nil {
             if isOpen {
                 Group {
                     if let capture = imageCapture() {
                         ImageAssociatedTranscriptDrawer(
                             capture: capture, snapshot: controller.snapshot,
                             workflow: workflow, operation: operation,
-                            onClose: onClose, onAction: onAction, onPreview: onPreview
+                            onClose: onClose, onAction: onAction, onPreview: onPreview,
+                            isConversation: isConversation
                         )
                     } else {
                         TranscriptDrawer(
@@ -51,7 +53,8 @@ struct TranscriptOverlay: View {
                             } ?? [],
                             imageCapture: nil,
                             workflow: workflow, operation: operation,
-                            onClose: onClose, onAction: onAction, onPreview: onPreview
+                            onClose: onClose, onAction: onAction, onPreview: onPreview,
+                            isConversation: isConversation
                         )
                     }
                 }
@@ -69,6 +72,7 @@ private struct ImageAssociatedTranscriptDrawer: View {
     let onClose: () -> Void
     let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     let onPreview: (TranscriptImagePreviewItem) -> Void
+    var isConversation = false
 
     var body: some View {
         TranscriptDrawer(
@@ -77,7 +81,8 @@ private struct ImageAssociatedTranscriptDrawer: View {
             } ?? [],
             imageCapture: capture,
             workflow: workflow, operation: operation,
-            onClose: onClose, onAction: onAction, onPreview: onPreview
+            onClose: onClose, onAction: onAction, onPreview: onPreview,
+            isConversation: isConversation
         )
     }
 }
@@ -90,26 +95,29 @@ private struct TranscriptDrawer: View {
     let onClose: () -> Void
     let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     let onPreview: (TranscriptImagePreviewItem) -> Void
+    var isConversation = false
     @State private var isAtBottom = true
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Label("Session details", systemImage: "text.bubble")
-                    .font(.headline)
-                Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
+            if !isConversation {
+                HStack {
+                    Label("Session details", systemImage: "text.bubble")
+                        .font(.headline)
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Hide session details")
+                    .accessibilityLabel("Hide session details")
+                    .accessibilityIdentifier("hide-session-details")
                 }
-                .buttonStyle(.borderless)
-                .help("Hide session details")
-                .accessibilityLabel("Hide session details")
-                .accessibilityIdentifier("hide-session-details")
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 44)
+                .padding(.horizontal, 14)
+                .frame(height: 44)
 
-            Divider()
+                Divider()
+            }
             if let workflow {
                 SessionWorkflowView(
                     workflow: workflow, canWrite: true,
@@ -123,6 +131,13 @@ private struct TranscriptDrawer: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
+                        if isConversation && turns.isEmpty {
+                            ContentUnavailableView(
+                                "Start a conversation",
+                                systemImage: "text.bubble",
+                                description: Text("Write a message below. Your draft stays with this session.")
+                            )
+                        }
                         ForEach(turns) { turn in
                             TranscriptTurnCard(turn: turn, imageCapture: imageCapture, onPreview: onPreview)
                         }
@@ -144,13 +159,15 @@ private struct TranscriptDrawer: View {
                 }
             }
         }
-        .frame(width: 420)
+        .frame(width: isConversation ? nil : 420)
         .frame(maxHeight: .infinity)
         .background(StudioStyle.chrome)
         .overlay(alignment: .leading) {
-            Color(nsColor: .separatorColor).frame(width: 1).allowsHitTesting(false)
+            if !isConversation {
+                Color(nsColor: .separatorColor).frame(width: 1).allowsHitTesting(false)
+            }
         }
-        .shadow(color: .black.opacity(0.2), radius: 12, x: -4)
+        .shadow(color: .black.opacity(isConversation ? 0 : 0.2), radius: 12, x: -4)
     }
 }
 
@@ -203,6 +220,17 @@ private struct TranscriptTurnCard: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(StudioStyle.secondaryText)
                     transcriptText(message.content)
+                    HStack {
+                        Spacer()
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(message.content, forType: .string)
+                        } label: {
+                            Label("Copy response", systemImage: "doc.on.doc").labelStyle(.iconOnly)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy response")
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 6)

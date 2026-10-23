@@ -95,6 +95,10 @@ final class TerminalsContainerView: NSView {
         cover.configure(message: emptyHint.message, button: emptyHint.button, onNew: onNew)
 
         let activeChanged = activeId != active
+        if active == nil, let outgoing = activeId.flatMap({ hosted[$0] }),
+           window?.firstResponder === outgoing {
+            window?.makeFirstResponder(nil)
+        }
         activeId = active
         let needsReveal = activeChanged || active.map(inserted.contains) == true
         // Hide the outgoing and incoming panes before parking/activating renderers.
@@ -217,7 +221,8 @@ private final class EmptyStateView: NSView {
 /// change and re-runs `updateNSView` on a tab/project switch.
 struct TerminalsContainer: NSViewRepresentable {
     let model: AppModel
-    let activeSessionId: String?
+    let selectedSessionId: String?
+    let visibleTerminalId: String?
     let hostedIds: [String]
 
     func makeNSView(context: Context) -> TerminalsContainerView {
@@ -229,10 +234,10 @@ struct TerminalsContainer: NSViewRepresentable {
         // created). The rest of a project's sessions are started eagerly in
         // `selectProject` / `bootstrapIfNeeded` — NOT here — so a SwiftUI layout pass
         // never synchronously forks a batch of dtach processes.
-        if let active = activeSessionId { _ = model.controller(for: active) }
+        if let selected = selectedSessionId { _ = model.controller(for: selected) }
         nsView.sync(
             order: model.hostedTerminals.map(\.id),
-            active: model.globalSelectedSessionId,
+            active: visibleTerminalId,
             emptyHint: model.emptyContextHint,
             onNew: { [weak model] in model?.newInActiveContext() },
             provider: { id in model.terminalView(for: id) }

@@ -2,7 +2,9 @@ import AppKit
 import SwiftUI
 import XCTest
 import CopilotProjectsCore
+import CopilotProjectsProtocol
 @testable import CopilotProjectsHost
+@testable import SwiftTerm
 
 final class WorkspaceLayoutTests: XCTestCase {
     @MainActor
@@ -53,6 +55,12 @@ final class WorkspaceLayoutTests: XCTestCase {
     }
 
     @MainActor
+    private func textEditor(in view: NSView) -> NSTextView? {
+        if let text = view as? NSTextView { return text }
+        return view.subviews.lazy.compactMap { self.textEditor(in: $0) }.first
+    }
+
+    @MainActor
     private func withWorkspace(
         _ body: (AppModel, Navigation, WorkspaceWindow) async throws -> Void
     ) async throws {
@@ -94,6 +102,7 @@ final class WorkspaceLayoutTests: XCTestCase {
             stateRepository: repository, isAppActive: { true },
             kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images")))
         defer { model.detachAllClients() }
+        model.bootstrapIfNeeded()
         _ = try XCTUnwrap(model.controller(for: session.id))
         let navigation = Navigation()
         let window = WorkspaceWindow(
@@ -190,6 +199,128 @@ final class WorkspaceLayoutTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(projects.subviews[0].frame.width, 176)
             XCTAssertTrue(terminal.superview === container)
             XCTAssertEqual(model.activeController?.shellPID, pid)
+        }
+
+    }
+
+    @MainActor
+    func testConversationToggleKeepsTerminalMountedAndDoesNotRefocusIt() async throws {
+        try await withWorkspace { model, _, window in
+            let id = try XCTUnwrap(model.globalSelectedSessionId)
+            let controller = try XCTUnwrap(model.activeController)
+            let terminal = controller.terminalView
+            let container = terminal.superview
+            let pid = controller.shellPID
+            XCTAssertTrue(window.makeFirstResponder(terminal))
+            model.setSessionSurface(.conversation, sessionId: id)
+            try await settle(window)
+            XCTAssertNotNil(textEditor(in: try XCTUnwrap(window.contentView)),
+                            "Conversation mounts an AppKit text editor")
+            XCTAssertNil(model.visibleTerminalSessionId)
+            XCTAssertTrue(terminal.isHidden)
+            XCTAssertFalse(window.firstResponder === terminal)
+            XCTAssertTrue(terminal.superview === container)
+            let before = window.responderChanges
+            model.focusActiveTerminal()
+            XCTAssertEqual(window.responderChanges, before)
+            model.setSessionSurface(.terminal, sessionId: id)
+            try await settle(window)
+            XCTAssertFalse(terminal.isHidden)
+            XCTAssertTrue(terminal.superview === container)
+            XCTAssertTrue(model.activeController === controller)
+            XCTAssertEqual(model.activeController?.shellPID, pid)
+        }
+    }
+
+    @MainActor
+    func testNativeComposerEditingAndCommandReturnUseSDKWithoutTerminalInput() async throws {
+        try await withWorkspace { model, _, window in
+            let id = try XCTUnwrap(model.globalSelectedSessionId)
+            let terminal = try XCTUnwrap(model.activeController?.terminalView)
+            let process = try XCTUnwrap(terminal.process)
+            let sdkID = UUID().uuidString
+            let sessionsDirectory = model.resumeMarkerDirectory
+            try FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
+            try Data(sdkID.utf8).write(to: sessionsDirectory.appendingPathComponent("\(id).copilot-session"))
+            let now = Date()
+            let snapshot = AgentActivitySnapshot(
+                schemaVersion: 1, updatedAt: now.ISO8601Format(.init(includingFractionalSeconds: true)),
+                foregroundTurnActive: false, scheduledTurnActive: false, activeSubagents: [], schedules: [],
+                idleGeneration: 0, lastIdleAborted: false, lastIdleTurnKind: nil, error: nil,
+                pendingPermissionRequestIds: [], copilotSessionId: sdkID, conversationEpoch: "native-ui",
+                operationReceiptVersion: 1, operationReceipts: [],
+                workflow: RemoteSessionWorkflow(
+                    observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1000),
+                    capabilities: ["session-send"], sendReady: true
+                )
+            )
+            try JSONEncoder().encode(snapshot).write(
+                to: sessionsDirectory.appendingPathComponent("\(id).agent-activity.json"))
+            let transcript = TranscriptSnapshot(
+                schemaVersion: 3, updatedAt: now, copilotSessionId: sdkID,
+                turns: [TranscriptTurn(
+                    id: "turn", startedAt: now, endedAt: now, kind: "user",
+                    userContent: "Show me the command to run the focused tests.",
+                    assistantMessages: [TranscriptAssistantMessage(
+                        id: "reply", timestamp: now,
+                        content: "Run the workspace tests:\n\n```sh\nswift test --filter WorkspaceLayoutTests\n```\n\nYour terminal session keeps running when you switch views."
+                    )],
+                    tools: [TranscriptTool(id: "tool", name: "read", title: "Read test configuration", success: true)],
+                    isAborted: false
+                )]
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(transcript).write(
+                to: URL(fileURLWithPath: Paths.transcriptSnapshotPath(sessionId: id)))
+            model.activeTranscriptController?.reload()
+            model.refreshAgentActivitySnapshots()
+            model.setSessionSurface(.conversation, sessionId: id)
+            try await settle(window)
+            let editor = try XCTUnwrap(textEditor(in: try XCTUnwrap(window.contentView)))
+            XCTAssertEqual(model.activeTranscriptController?.snapshot?.turns.count, 1)
+            XCTAssertTrue(window.makeFirstResponder(editor))
+            let originalSends = process.sendCount
+            editor.insertText("first line", replacementRange: NSRange(location: NSNotFound, length: 0))
+            editor.insertNewline(nil)
+            editor.insertText("second line", replacementRange: NSRange(location: NSNotFound, length: 0))
+            try await settle(window)
+            XCTAssertEqual(model.conversationSession(id)?.conversationDraft, "first line\nsecond line")
+            XCTAssertEqual(process.sendCount, originalSends)
+            editor.breakUndoCoalescing()
+            editor.insertText("!", replacementRange: NSRange(location: NSNotFound, length: 0))
+            editor.breakUndoCoalescing()
+            try await settle(window)
+            XCTAssertTrue(editor.allowsUndo)
+            XCTAssertTrue(editor.undoManager?.canUndo == true)
+            XCTAssertTrue(editor.tryToPerform(NSSelectorFromString("undo:"), with: nil))
+            XCTAssertEqual(editor.string, "first line\nsecond line", "Native editor undo")
+            try await settle(window)
+            XCTAssertEqual(model.conversationSession(id)?.conversationDraft, "first line\nsecond line")
+            XCTAssertTrue(editor.tryToPerform(NSSelectorFromString("redo:"), with: nil))
+            try await settle(window)
+            XCTAssertEqual(model.conversationSession(id)?.conversationDraft, "first line\nsecond line!")
+            XCTAssertTrue(editor.tryToPerform(NSSelectorFromString("undo:"), with: nil))
+            try await settle(window)
+
+            window.setContentSize(NSSize(width: 820, height: 520))
+            try await settle(window)
+            XCTAssertGreaterThan(editor.visibleRect.width, 300)
+            XCTAssertGreaterThan(editor.visibleRect.height, 50)
+
+            let commandReturn = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: "\r",
+                charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+            XCTAssertTrue(window.performKeyEquivalent(with: commandReturn))
+            try await settle(window)
+            let pending = try XCTUnwrap(model.conversationSession(id)?.pendingConversationSend)
+            XCTAssertEqual(pending.action.prompt, "first line\nsecond line")
+            XCTAssertEqual(process.sendCount, originalSends)
+            XCTAssertTrue(editor.isEditable, "A pending send must not prevent drafting the next message")
+            editor.insertText(" next", replacementRange: NSRange(location: NSNotFound, length: 0))
+            try await settle(window)
+            XCTAssertTrue(model.conversationSession(id)?.conversationDraft.contains(" next") == true)
         }
     }
 

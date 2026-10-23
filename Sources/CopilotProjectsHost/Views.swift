@@ -75,7 +75,8 @@ struct RootView: View {
 
     private var previewSessionId: String? {
         guard let sessionId = model.globalSelectedSessionId,
-              model.isTranscriptDrawerOpen(sessionId: sessionId) else { return nil }
+              (model.isTranscriptDrawerOpen(sessionId: sessionId)
+               || model.sessionSurface(sessionId: sessionId) == .conversation) else { return nil }
         return sessionId
     }
 
@@ -123,10 +124,24 @@ private struct WorkspaceHeading: View {
                 .truncationMode(.middle)
                 .help(session?.title ?? model.selectedProject?.name ?? "Workspace")
             Spacer(minLength: 0)
-            Image(systemName: "terminal")
+            Image(systemName: session.map { model.sessionSurface(sessionId: $0.id) == .conversation
+                ? "text.bubble" : "terminal" } ?? "terminal")
                 .foregroundStyle(StudioStyle.secondaryText)
                 .accessibilityHidden(true)
-            if let sessionId = model.globalSelectedSessionId,
+            if let sessionId = model.globalSelectedSessionId {
+                Picker("Workspace", selection: Binding(
+                    get: { model.sessionSurface(sessionId: sessionId) },
+                    set: { model.setSessionSurface($0, sessionId: sessionId) }
+                )) {
+                    Text("Conversation").tag(SessionSurface.conversation)
+                    Text("Terminal").tag(SessionSurface.terminal)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .accessibilityIdentifier("workspace-surface")
+            }
+            if let sessionId = model.visibleTerminalSessionId,
                let transcript = model.activeTranscriptController {
                 TranscriptButton(
                     controller: transcript,
@@ -569,14 +584,21 @@ struct DetailView: View {
         ZStack(alignment: .trailing) {
             TerminalsContainer(
                 model: model,
-                activeSessionId: model.globalSelectedSessionId,
+                selectedSessionId: model.globalSelectedSessionId,
+                visibleTerminalId: model.visibleTerminalSessionId,
                 hostedIds: model.hostedTerminals.map(\.id)
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if let sessionId = model.globalSelectedSessionId,
                let transcript = model.activeTranscriptController {
-                TranscriptOverlay(
+                if model.sessionSurface(sessionId: sessionId) == .conversation {
+                    ConversationView(
+                        model: model, sessionId: sessionId, controller: transcript, onPreview: onPreview
+                    )
+                    .id(sessionId)
+                } else {
+                    TranscriptOverlay(
                     controller: transcript,
                     imageCapture: { model.terminalView(for: sessionId)?.kittyImageCapture },
                     isOpen: model.isTranscriptDrawerOpen(sessionId: sessionId),
@@ -591,6 +613,7 @@ struct DetailView: View {
                 .id(sessionId)
                 .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value:
                     model.isTranscriptDrawerOpen(sessionId: sessionId))
+                }
             }
         }
     }
