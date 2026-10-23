@@ -24,13 +24,15 @@ to the right live session.
 
 ## Operating Context
 
-The Mac workspace leads the suite. The live terminal is primary; completed
-turns and session details live in a secondary drawer. Project navigation,
+The Mac workspace leads the suite. New Copilot sessions open in Conversation,
+with native drafts and completed turns. Terminal is one click away for CLI
+interactions and stays mounted while hidden; plain shells open in Terminal.
+The Terminal session-details drawer remains available. Project navigation,
 session navigation, native window controls, and keyboard speed remain central.
 The Two-Level Browser separates project navigation from vertically listed
 sessions, with two-line names, explicit states, and a collapsible Projects rail.
-This navigation change is macOS-only; web and iOS retain their established
-conversation-first workflows rather than reproducing Mac chrome.
+This workspace change is macOS-only; web and iOS retain their established
+conversation workflows rather than reproducing Mac chrome.
 
 ## Capabilities and Constraints
 
@@ -38,9 +40,9 @@ Preserve persistent terminals, project/session identity, keyboard shortcuts,
 drag/reorder, native labels, attention states, creation/context actions, details
 access, and session-ending safeguards. Projects can be hidden from the native
 View menu or session header without restarting the terminal or losing its
-identity; cross-project drops require Projects to be shown. This changes
-navigation and visual hierarchy, not terminal behavior, message delivery,
-control leases, queues, or shared package contracts.
+identity; cross-project drops require Projects to be shown. Native sends use
+existing receipt-bound SDK actions and a persisted intent, not terminal input.
+Control leases, queues, and shared package contracts remain unchanged.
 
 ## Brand Commitments
 
@@ -74,7 +76,7 @@ it is not a new regression or an app-owned styling rule.
 
 ## Product Principles
 
-- Keep the live terminal dominant and details available on demand.
+- Keep the conversation primary for Copilot and the live terminal available on demand.
 - Make selection and actionable status legible without moving the workspace.
 - Preserve expert speed and native controls.
 - Adapt companions to their platform and established workflows.

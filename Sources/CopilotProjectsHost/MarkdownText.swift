@@ -370,11 +370,23 @@ struct MarkdownText: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case let .codeBlock(code):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
-                    .font(.system(.footnote, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(10)
+            VStack(alignment: .trailing, spacing: 0) {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(code, forType: .string)
+                } label: {
+                    Label("Copy code", systemImage: "doc.on.doc").labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .help("Copy code")
+                .padding(.trailing, 8)
+                .padding(.top, 5)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(code)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(10)
+                }
             }
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)

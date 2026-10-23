@@ -68,6 +68,56 @@ final class WorkspaceInputControllerTests: XCTestCase {
         ))
     }
 
+    func testConversationOwnsModifiedReturnAndImagePreviewWithoutDrawer() throws {
+        try withWorkspace { model, input, sessions in
+            let id = sessions[0].id
+            let controller = try XCTUnwrap(model.controller(for: id))
+            let process = try XCTUnwrap(controller.terminalView.process)
+            let originalSends = process.sendCount
+            model.closeTranscriptDrawer(sessionId: id)
+            model.setSessionSurface(.conversation, sessionId: id)
+            XCTAssertNil(model.visibleTerminalSessionId)
+            XCTAssertNotNil(input.handleKeyDown(try key("\r", code: 36, modifiers: .command)),
+                            "The native editor receives Command-Return")
+            XCTAssertEqual(process.sendCount, originalSends)
+            input.presentImage(image(sessions[0]))
+            XCTAssertNotNil(input.imagePreview)
+            input.imagePreview = nil
+            model.setSessionSurface(.terminal, sessionId: id)
+            input.presentImage(image(sessions[0]))
+            XCTAssertNil(input.imagePreview)
+        }
+    }
+
+    func testPerSessionDraftsAndSurfaceSurviveSelectionAndModelRestart() throws {
+        try withWorkspace { model, _, sessions in
+            let first = sessions[0].id
+            let second = sessions[1].id
+            model.setSessionSurface(.conversation, sessionId: first)
+            model.setSessionSurface(.conversation, sessionId: second)
+            model.setConversationDraft("first draft", sessionId: first)
+            let projectId = try XCTUnwrap(model.selectedProjectId)
+            model.selectSession(projectId: projectId, sessionId: second)
+            model.setConversationDraft("second draft", sessionId: second)
+            model.selectSession(projectId: projectId, sessionId: first)
+            XCTAssertEqual(model.conversationSession(first)?.conversationDraft, "first draft")
+            model.save() // The application delegate flushes pending drafts on quit.
+            let root = try XCTUnwrap(ProcessInfo.processInfo.environment["COPILOT_PROJECTS_STATE_DIR"])
+            let rootURL = URL(fileURLWithPath: root)
+            let restored = AppModel(
+                stateRepository: StateRepository(path: rootURL.appendingPathComponent("state.json")),
+                isAppActive: { false },
+                agentActivityDirectory: rootURL,
+                resumeMarkerDirectory: rootURL,
+                kittyImageDiskStore: RemoteKittyImageDiskStore(root: rootURL.appendingPathComponent("other-images"))
+            )
+            XCTAssertEqual(restored.conversationSession(first)?.conversationDraft, "first draft")
+            XCTAssertEqual(restored.conversationSession(second)?.conversationDraft, "second draft")
+            XCTAssertEqual(restored.sessionSurface(sessionId: first), .conversation)
+            XCTAssertEqual(restored.sessionSurface(sessionId: second), .conversation)
+        }
+    }
+
     func testPreviewDispatchConsumesDismissalBeforeWorkspaceOrTerminalActions() throws {
         try withWorkspace { model, input, sessions in
             let terminal = try XCTUnwrap(model.controller(for: sessions[0].id))

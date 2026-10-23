@@ -26,7 +26,8 @@ final class WorkspaceInputController: ObservableObject {
     func presentImage(_ item: TranscriptImagePreviewItem) {
         guard sessionFinder == nil else { return }
         guard model.globalSelectedSessionId == item.id.sessionId,
-              model.isTranscriptDrawerOpen(sessionId: item.id.sessionId) else {
+              (model.isTranscriptDrawerOpen(sessionId: item.id.sessionId)
+                || model.sessionSurface(sessionId: item.id.sessionId) == .conversation) else {
             NSLog("Ignoring an image preview from an inactive session drawer.")
             return
         }
@@ -80,7 +81,7 @@ final class WorkspaceInputController: ObservableObject {
             // selected tab as seen, and that should be the tab being opened.
             model.selectSession(projectId: project.id, sessionId: sessionId)
             if model.selectedProjectId != project.id { model.selectProject(project.id) }
-            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+            DispatchQueue.main.async { [model] in model.focusActiveWorkspace() }
             return
         }
         // Resume an ended Copilot CLI session into its matched project.
@@ -99,7 +100,7 @@ final class WorkspaceInputController: ObservableObject {
             dismissSessionFinder()
             model.selectSession(projectId: projectId, sessionId: resumedSessionId)
             if model.selectedProjectId != projectId { model.selectProject(projectId) }
-            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+            DispatchQueue.main.async { [model] in model.focusActiveWorkspace() }
         case .permanentlyUnavailable(let message):
             sessionFinder?.removeResumableSession(id: sessionId, error: message)
         case .temporarilyUnavailable(let message):
@@ -174,7 +175,7 @@ final class WorkspaceInputController: ObservableObject {
             }
         }
         clearNumberHint()
-        if let controller = model.activeController,
+        if model.visibleTerminalSessionId != nil, let controller = model.activeController,
            controller.terminalView.sendRestoredModifiedReturnIfNeeded(
                for: event,
                restoredAgentLive: controller.reattachedToExistingShell

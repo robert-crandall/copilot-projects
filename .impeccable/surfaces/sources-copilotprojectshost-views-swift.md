@@ -2,7 +2,7 @@
 version: 1
 slug: "sources-copilotprojectshost-views-swift"
 primary_target: "Sources/CopilotProjectsHost/Views.swift"
-related_targets: ["Sources/CopilotProjectsHost/HostLifetime.swift","Sources/CopilotProjectsHost/AppEntry.swift","Sources/CopilotProjectsHost/TranscriptDrawer.swift","Sources/CopilotProjectsHost/TranscriptImageView.swift","Sources/CopilotProjectsHost/SessionFinderView.swift"]
+related_targets: ["Sources/CopilotProjectsHost/HostLifetime.swift","Sources/CopilotProjectsHost/AppEntry.swift","Sources/CopilotProjectsHost/TranscriptDrawer.swift","Sources/CopilotProjectsHost/TranscriptImageView.swift","Sources/CopilotProjectsHost/SessionFinderView.swift","Sources/CopilotProjectsHost/ConversationView.swift"]
 ---
 
 # Two-Level Browser
@@ -20,17 +20,17 @@ OWN-WORLD: Inherit Studio Console's graphite/satin surfaces, steel selection,
 readable ink, system typography, and native controls. No new visual identity.
 
 STORY: Select a project, scan its session names and explicit states, then work
-in the selected terminal. Hide Projects when the task needs more room.
+in the selected conversation or terminal. Hide Projects when the task needs more room.
 
 FIRST VIEWPORT: Keep the 38-point native title strip. Below it, a compact
-project rail and a vertically scrolling session column sit beside the terminal.
+project rail and a vertically scrolling session column sit beside the workspace.
 Aligned column headers establish hierarchy; an active-session heading replaces
 the old tabs. The terminal remains at least half the window width at supported
 capture sizes. The signature interaction collapses only the project column,
 reclaiming width without remounting or restarting the terminal.
 
-The session-details opener sits beside the decorative terminal glyph in the
-active-session heading, not in the native title strip or over terminal output.
+In Terminal, the session-details opener sits beside the decorative terminal
+glyph in the active-session heading, not in the native title strip or over terminal output.
 The user explicitly chose this placement. Retain the existing availability and
 per-session open state; the drawer and its close action remain unchanged.
 The current-session heading contains its title and controls only; retain project
@@ -56,8 +56,18 @@ session across projects. Name, project, folder, and conversation matches are
 instant; Luna (gpt-6-luna through a one-shot, tool-less `copilot -p`) adds
 meaning-based picks after a 0.6s pause, without moving rows already listed. The
 sheet owns the keyboard while open; opening a row selects its project and
-session and returns focus to the terminal.
+session and returns focus to the selected workspace surface.
 
 FORM: a single 640x460pt sheet: 56pt search field, sectioned list, and 32pt
 footer with key legend and Luna status. Code-led; reviewed against rendered
 captures of the real views with synthetic data.
+
+## Extension: Conversation-first sessions
+
+New Copilot sessions open in Conversation. Plain shells open in Terminal; the
+choice persists per session. Conversation reuses the existing transcript turn,
+tool, image, Markdown, and workflow content beside a native multiline composer.
+Return inserts a newline; Command-Return sends through receipt-correlated SDK
+actions. Drafts and exact pending send intent persist before handoff. An uncertain
+outcome requires Terminal inspection and an explicit duplicate-risk unlock.
+The terminal view and process remain mounted while hidden; the editor keeps focus.

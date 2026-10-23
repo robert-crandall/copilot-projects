@@ -2,6 +2,23 @@ import Foundation
 import CopilotProjectsCore
 import CopilotProjectsProtocol
 
+enum SessionSurface: String, Codable {
+    case conversation
+    case terminal
+}
+
+struct PendingConversationSend: Codable, Equatable {
+    let action: RemoteSessionAction
+    let operationId: String
+    let conversationEpoch: String
+    let draftRevision: UInt64
+    var uncertain: Bool = false
+
+    var operation: CLIOperationRequest {
+        CLIOperationRequest(operationId: operationId, conversationEpoch: conversationEpoch)
+    }
+}
+
 /// A terminal session inside a project. Value type; the live terminal NSView lives
 /// elsewhere (AppModel.controllers) and is keyed by `id`.
 struct Session: Identifiable, Codable, Equatable {
@@ -10,6 +27,10 @@ struct Session: Identifiable, Codable, Equatable {
     var cwd: String
     var creationFingerprint: String?
     var pullRequestKeys: [String]?
+    var preferredSurface: SessionSurface?
+    var conversationDraft: String = ""
+    var draftRevision: UInt64 = 0
+    var pendingConversationSend: PendingConversationSend?
     /// Persisted only while set, so unmarked sessions keep their saved shape.
     private var manuallyMarkedUnread: Bool?
 
@@ -70,6 +91,7 @@ struct Session: Identifiable, Codable, Equatable {
 
     var requiresEndConfirmation: Bool {
         status != .idle || hasBackgroundWork || !schedules.isEmpty || hasPendingInput
+            || pendingConversationSend != nil
     }
 
     /// The attention state shown beside a session's name.
@@ -94,6 +116,7 @@ struct Session: Identifiable, Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case id, title, cwd, creationFingerprint, pullRequestKeys
         case manuallyMarkedUnread = "markedUnread"
+        case preferredSurface, conversationDraft, draftRevision, pendingConversationSend
     }
 
     init(
@@ -101,13 +124,31 @@ struct Session: Identifiable, Codable, Equatable {
         title: String,
         cwd: String,
         creationFingerprint: String? = nil,
-        pullRequestKeys: [String]? = nil
+        pullRequestKeys: [String]? = nil,
+        preferredSurface: SessionSurface? = nil
     ) {
         self.id = id
         self.title = title
         self.cwd = cwd
         self.creationFingerprint = creationFingerprint
         self.pullRequestKeys = pullRequestKeys
+        self.preferredSurface = preferredSurface
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        cwd = try values.decode(String.self, forKey: .cwd)
+        creationFingerprint = try values.decodeIfPresent(String.self, forKey: .creationFingerprint)
+        pullRequestKeys = try values.decodeIfPresent([String].self, forKey: .pullRequestKeys)
+        manuallyMarkedUnread = try values.decodeIfPresent(Bool.self, forKey: .manuallyMarkedUnread)
+        preferredSurface = try values.decodeIfPresent(SessionSurface.self, forKey: .preferredSurface)
+        conversationDraft = try values.decodeIfPresent(String.self, forKey: .conversationDraft) ?? ""
+        draftRevision = try values.decodeIfPresent(UInt64.self, forKey: .draftRevision) ?? 0
+        pendingConversationSend = try values.decodeIfPresent(
+            PendingConversationSend.self, forKey: .pendingConversationSend
+        )
     }
 }
 

@@ -1,6 +1,6 @@
 # Copilot Projects
 
-A native macOS terminal workspace for keeping coding-agent sessions organized.
+A native macOS conversation and terminal workspace for keeping coding-agent sessions organized.
 Projects and sessions occupy separate navigation columns, and status indicators tell
 you what is running, what needs input, and what finished while you were away.
 
@@ -56,12 +56,20 @@ it does not reconstruct attachment history after image data has been discarded.
 Images restored from disk without a recorded display origin remain available in
 the terminal but are not guessed into a historical transcript turn.
 An open preview pins the image being inspected, even if the terminal later
-discards it. Closing the drawer or switching sessions dismisses that preview.
+discards it. Leaving the transcript surface or switching sessions dismisses that preview.
 
 ## A workspace for parallel work
 
 - **Projects, sessions, and work.** Choose a project, scan its vertically listed
-  sessions, and work in the terminal beside them. Hide the project column to
+  sessions, and work in the conversation or terminal beside them. New Copilot sessions
+  open in Conversation; plain shells open in Terminal. The per-session choice is remembered.
+  Conversation has a multiline draft (Return inserts a newline; `⌘Return` sends), Markdown
+  turns, and response/code copy controls. Select enqueue or immediate delivery before sending.
+  Drafts survive session switches and relaunches; edits save shortly after typing and flush
+  when the app quits. If delivery cannot be confirmed, inspect
+  Terminal before explicitly unlocking the draft; sending again might duplicate a request.
+  Permissions and unsupported or disconnected trackers also direct you to Terminal.
+  Hide the project column to
   reclaim space; background sessions keep running.
 - **Attention at a glance.** Running and waiting indicators, unread markers,
   failed-request markers, and native notifications help you find the session
@@ -430,11 +438,11 @@ Use `Ctrl-\` to detach without ending the session.
 
 ## Studio Console visual system
 
-Studio Console frames the native terminal workspace with adaptive graphite/satin
+Studio Console frames the native conversation and terminal workspace with adaptive graphite/satin
 surfaces, steel session selection, and readable system type. The Two-Level Browser
-replaces horizontal tabs with Projects | Sessions | Terminal, preserving native
+replaces horizontal tabs with Projects | Sessions | Workspace, preserving native
 controls, keyboard shortcuts, drag/drop, and ending safeguards. The project column
-can collapse without recreating the terminal; session details stay secondary. The source-grounded
+can collapse without recreating the terminal; session details stay secondary in Terminal. The source-grounded
 [design record](DESIGN.md) and [token sidecar](.impeccable/design.json) accompany
 the [product context](PRODUCT.md). Appearance follows macOS rather than a separate
 theme picker.
