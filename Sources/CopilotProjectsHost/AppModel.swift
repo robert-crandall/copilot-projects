@@ -288,6 +288,7 @@ final class AppModel: ObservableObject {
     @Published var numberHint: NumberHint = .none
     @Published private(set) var transcriptOpenSessions: Set<String> = []
     @Published private(set) var conversationErrors: [String: String] = [:]
+    @Published private(set) var workspaceSaveError: String?
     private weak var activeComposer: NSTextView?
     private var activeComposerSessionId: String?
     private var inspectedUncertainSends: Set<String> = []
@@ -6568,11 +6569,17 @@ final class AppModel: ObservableObject {
     }
 
     private func persistWorkspace() throws {
-        if let stateLoadFailure {
-            throw WorkspacePersistenceError(errorDescription: stateLoadFailure)
+        do {
+            if let stateLoadFailure {
+                throw WorkspacePersistenceError(errorDescription: stateLoadFailure)
+            }
+            let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
+            try stateRepository.save(state)
+            if workspaceSaveError != nil { workspaceSaveError = nil }
+        } catch {
+            workspaceSaveError = "Workspace changes, including drafts, could not be saved: \(error.localizedDescription)"
+            throw error
         }
-        let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
-        try stateRepository.save(state)
     }
 
     func save() {

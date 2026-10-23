@@ -65,7 +65,7 @@ struct ConversationView: View {
                         }
                     }
                 }
-                if let error = model.conversationErrors[sessionId] {
+                if let error = model.workspaceSaveError ?? model.conversationErrors[sessionId] {
                     Text(error).font(.callout).foregroundStyle(.red)
                 }
                 ConversationEditor(model: model, sessionId: sessionId, text: Binding(

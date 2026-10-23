@@ -37,6 +37,22 @@ final class SessionWorkflowTests: XCTestCase {
             XCTAssertEqual(saved.projects[0].sessions[0].conversationDraft, "last edit")
             XCTAssertEqual(saved.projects[0].sessions[0].draftRevision, 21)
         } else { XCTFail("Quit save did not flush") }
+        try FileManager.default.removeItem(at: repo.path)
+        try FileManager.default.createDirectory(at: repo.path, withIntermediateDirectories: false)
+        model.setConversationDraft("unsaved edit", sessionId: "benchmark-0")
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertNotNil(model.workspaceSaveError, "Delayed save failures must remain visible")
+        model.setConversationDraft("still unsaved", sessionId: "benchmark-0")
+        XCTAssertNotNil(model.workspaceSaveError, "Typing cannot dismiss a persistence failure")
+        model.save()
+        XCTAssertNotNil(model.workspaceSaveError, "The quit flush must report failure too")
+        XCTAssertEqual(model.conversationSession("benchmark-0")?.conversationDraft, "still unsaved")
+        try FileManager.default.removeItem(at: repo.path)
+        model.save()
+        XCTAssertNil(model.workspaceSaveError)
+        if case .loaded(let saved) = repo.load() {
+            XCTAssertEqual(saved.projects[0].sessions[0].conversationDraft, "still unsaved")
+        } else { XCTFail("Restored storage must save the retained draft") }
     }
     @MainActor
     func testLegacySurfaceDefaultsRequireOwnedNonquarantinedCopilotMarker() throws {
