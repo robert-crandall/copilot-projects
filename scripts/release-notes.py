@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 MAX_BYTES = 256 * 1024
@@ -119,6 +120,13 @@ def generate(root, repository, previous, version, build):
     for line in history.splitlines():
         sha, subject = line.split("\t", 1)
         pr = merged_pull_request(repository, sha)
+        if pr is None and sha == revision and subject.startswith("Merge pull request #"):
+            # GitHub can expose the new merge before its commit-to-PR association.
+            for _ in range(2):
+                time.sleep(5)
+                pr = merged_pull_request(repository, sha)
+                if pr is not None:
+                    break
         if pr:
             title, labels, number = pr
             url = f"https://github.com/{repository}/pull/{number}"

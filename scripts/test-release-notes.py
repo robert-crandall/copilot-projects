@@ -102,6 +102,26 @@ class NotesTests(unittest.TestCase):
         self.commit("fix Array<String> rendering")
         self.assertIn(r"Array\<String\>", self.generate()["markdown"])
 
+    def test_newest_merge_waits_briefly_for_its_authoritative_association(self):
+        self.commit("Merge pull request #12 from feature")
+        with mock.patch.object(notes, "merged_pull_request", side_effect=[None, ("Fix rendering", ["bug"], 12)]) as lookup, \
+                mock.patch.object(notes.time, "sleep") as sleep:
+            result = self.generate()
+        self.assertEqual(lookup.call_count, 2)
+        sleep.assert_called_once_with(5)
+        self.assertIn("Fix rendering", result["markdown"])
+        self.assertIn("/pull/12", result["markdown"])
+
+    def test_missing_merge_association_still_has_a_bounded_commit_fallback(self):
+        self.commit("Merge pull request #12 from feature")
+        with mock.patch.object(notes, "merged_pull_request", return_value=None) as lookup, \
+                mock.patch.object(notes.time, "sleep") as sleep:
+            result = self.generate()
+        self.assertEqual(lookup.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("/commit/", result["markdown"])
+        self.assertNotIn("/pull/", result["markdown"])
+
     def test_divergent_predecessor_is_rejected(self):
         self.git("switch", "-qc", "other")
         other = self.commit("Other branch")
