@@ -1882,7 +1882,7 @@ if (validSessionId && socketPath) {
         }
     }
 
-    async function processWorkflowAction(kind) {
+    async function processWorkflowAction(kind, allowNew = true) {
         if (!ownsSharedFiles()) return;
         const path = workflowPaths.get(kind);
         let encoded;
@@ -1925,6 +1925,7 @@ if (validSessionId && socketPath) {
             removeCapturedHandoff(path, encoded);
             return;
         }
+        if (!allowNew) return;
         const action = request.action;
         const context = operation.context;
         if (activeOperationKeys.has(operationExecutionKey(context.conversationEpoch, context.operationId))) return;
@@ -5323,7 +5324,8 @@ if (validSessionId && socketPath) {
         // tick takes: when it succeeds it publishes once more (at most one
         // extra write per tick), so the workflow it certifies is current.
         publish();
-        reconcileQuestionEvents();
+        const generation = conversationGeneration;
+        const questionRecovery = reconcileQuestionEvents();
         refreshRuntimeActivity(false, { heartbeat: true });
         refreshSchedules();
         refreshModels();
@@ -5332,7 +5334,12 @@ if (validSessionId && socketPath) {
         processElicitationResponse();
         processSetModelRequest();
         processCloseSessionRequest();
-        for (const kind of workflowKinds) processWorkflowAction(kind);
+        // Replay receipts immediately, but let recovery settle before a new bounce.
+        for (const kind of workflowKinds) processWorkflowAction(kind, kind !== "session-bounce");
+        questionRecovery.then(() => {
+            if (!shuttingDown && generation === conversationGeneration
+                    && questionEventStream?.caughtUp === true) processWorkflowAction("session-bounce");
+        });
         scheduleDurableReconcile(0);
     }, DURABLE_RECONCILE_POLL_MS);
     foregroundHandlingReady = true;

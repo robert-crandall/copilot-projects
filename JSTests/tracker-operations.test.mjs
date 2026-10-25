@@ -922,6 +922,47 @@ test("bounce waits for oversized questions that cannot be displayed remotely", {
   }
 });
 
+test("heartbeat bounce waits for question recovery without delaying exact receipt replay", {
+  concurrency: false,
+}, async (t) => {
+  for (const delayed of [false, true]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    });
+    await workflowReady(runtime);
+    const emptyPage = { events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" };
+    let finish;
+    if (delayed) runtime.session.questionEventHandler = () => new Promise(resolve => { finish = resolve; });
+    t.after(() => finish?.(emptyPage));
+    const fields = operationFields(runtime, "session-bounce");
+    const path = join(runtime.sessions, `${runtime.appSessionId}.session-bounce.json`);
+    const payload = {
+      schemaVersion: 1, copilotSessionId: runtime.copilotSessionId,
+      ...fields, action: { kind: "session-bounce" },
+    };
+    writeHandoff(runtime, path, payload);
+    runtime.intervalCallback();
+    if (delayed) {
+      await waitFor(() => finish, "heartbeat question recovery did not start");
+      assert.equal(receipt(runtime, fields.operationId), undefined);
+      assert.deepEqual(runtime.session.workflowCalls, []);
+      finish(emptyPage);
+    }
+    await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, fields.operationId)?.state),
+      "heartbeat did not dispatch bounce after recovery");
+    assert.equal(receipt(runtime, fields.operationId).state, "applied");
+    assert.equal(runtime.session.workflowCalls.length, 1);
+
+    const applied = receipt(runtime, fields.operationId);
+    runtime.session.questionEventHandler = () => new Promise(resolve => { finish = resolve; });
+    writeHandoff(runtime, path, payload);
+    runtime.intervalCallback();
+    await waitFor(() => !realExistsSync(path), "receipt replay waited for question recovery");
+    assert.deepEqual(receipt(runtime, fields.operationId), applied);
+    assert.equal(runtime.session.workflowCalls.length, 1);
+  }
+});
+
 test("bounce rechecks live processing and command registration before dispatch", {
   concurrency: false,
 }, async (t) => {
