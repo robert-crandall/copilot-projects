@@ -527,4 +527,189 @@ final class BackgroundHookTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: fixture.sessions.path),
             [other.lastPathComponent])
     }
+
+    private func spawnSleepProcess() throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["60"]
+        try process.run()
+        return process
+    }
+
+    private func currentKernelBootTime() throws -> String {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/sysctl")
+        process.arguments = ["-n", "kern.boottime"]
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+        return String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func testOtherLiveOwnerProcessBlocksNestedStartAndPermissionNotifications() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+
+        let ownerCLI = try spawnSleepProcess()
+        let ownerTracker = try spawnSleepProcess()
+        defer {
+            ownerCLI.terminate()
+            ownerTracker.terminate()
+        }
+        let bootTime = try currentKernelBootTime()
+        let ownerJSON = """
+        {"appSessionId":"\(fixture.tabId)","copilotSessionId":"\(fixture.ownerId)","pid":\(ownerTracker.processIdentifier),"bootTime":"\(bootTime)","parentPid":\(ownerCLI.processIdentifier),"claimedAt":100}
+        """
+        try Data(ownerJSON.utf8).write(to: fixture.file("transcript-owner.json"))
+
+        let before = try fixture.markerContents()
+        let calls = try Data(contentsOf: fixture.capture)
+        for (action, payload) in [
+            ("start", #"{"sessionId":"\#(fixture.childId)","timestamp":200}"#),
+            ("running", #"{"sessionId":"\#(fixture.childId)","timestamp":201,"prompt":"autofind review"}"#),
+            ("pre", #"{"sessionId":"\#(fixture.childId)","timestamp":202}"#),
+            ("notify", #"{"sessionId":"\#(fixture.childId)","timestamp":203,"notificationType":"permission_prompt"}"#),
+            ("notify", #"{"sessionId":"\#(fixture.childId)","timestamp":204,"notificationType":"elicitation_dialog"}"#),
+            ("post", #"{"sessionId":"\#(fixture.childId)","timestamp":205}"#),
+            ("idle", #"{"sessionId":"\#(fixture.childId)","timestamp":206}"#),
+            ("end", #"{"sessionId":"\#(fixture.childId)","timestamp":207}"#),
+        ] {
+            try fixture.run(action, payload: payload)
+            XCTAssertEqual(try fixture.markerContents(), before, action)
+            XCTAssertEqual(try Data(contentsOf: fixture.capture), calls, action)
+        }
+
+        // Even when the tracker PID has exited or restarted while `parentPid` remains
+        // alive on the same boot, nested start and permission notifications stay blocked.
+        ownerTracker.terminate()
+        ownerTracker.waitUntilExit()
+        for (action, payload) in [
+            ("start", #"{"sessionId":"\#(fixture.childId)","timestamp":208}"#),
+            ("notify", #"{"sessionId":"\#(fixture.childId)","timestamp":209,"notificationType":"permission_prompt"}"#),
+            ("notify", #"{"sessionId":"\#(fixture.childId)","timestamp":210,"notificationType":"elicitation_dialog"}"#),
+        ] {
+            try fixture.run(action, payload: payload)
+            XCTAssertEqual(try fixture.markerContents(), before, "dead-tracker \(action)")
+            XCTAssertEqual(try Data(contentsOf: fixture.capture), calls, "dead-tracker \(action)")
+        }
+
+        // Even when the nested non-wrapper process (`xctest`, standing in for `exec copilot -p`)
+        // is a direct child of `parentPid` (`getppid()`), it is still blocked.
+        let parentOfThisProcess = getppid()
+        if parentOfThisProcess > 1 && Darwin.kill(parentOfThisProcess, 0) == 0 {
+            let directChildOwnerJSON = """
+            {"appSessionId":"\(fixture.tabId)","copilotSessionId":"\(fixture.ownerId)","pid":\(ownerTracker.processIdentifier),"bootTime":"\(bootTime)","parentPid":\(parentOfThisProcess),"claimedAt":100}
+            """
+            try Data(directChildOwnerJSON.utf8).write(to: fixture.file("transcript-owner.json"))
+            let directBefore = try fixture.markerContents()
+            for (action, payload) in [
+                ("start", #"{"sessionId":"\#(fixture.childId)","timestamp":211}"#),
+                ("notify", #"{"sessionId":"\#(fixture.childId)","timestamp":212,"notificationType":"permission_prompt"}"#),
+            ] {
+                try fixture.run(action, payload: payload)
+                XCTAssertEqual(try fixture.markerContents(), directBefore, "direct-child \(action)")
+                XCTAssertEqual(try Data(contentsOf: fixture.capture), calls, "direct-child \(action)")
+            }
+        }
+        let record = try fixture.statusRecord()
+        XCTAssertEqual(record.status, .running)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.file("active-turn").path))
+    }
+
+    func testRecordedOwnerProcessAllowsDirectAndWrappedSubagentNotificationsAndRotation() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let ownerTracker = try spawnSleepProcess()
+        defer { ownerTracker.terminate() }
+        let bootTime = try currentKernelBootTime()
+        let thisPID = ProcessInfo.processInfo.processIdentifier
+        let ownerJSON = """
+        {"appSessionId":"\(fixture.tabId)","copilotSessionId":"\(fixture.ownerId)","pid":\(ownerTracker.processIdentifier),"bootTime":"\(bootTime)","parentPid":\(thisPID),"claimedAt":100}
+        """
+        try Data(ownerJSON.utf8).write(to: fixture.file("transcript-owner.json"))
+
+        try fixture.run("running", payload:
+            #"{"sessionId":"\#(fixture.ownerId)","timestamp":100}"#)
+        XCTAssertEqual(try fixture.statusRecord().status, .running)
+
+        // Wrap through `/bin/sh -c` (with `&& :` so `/bin/sh` cannot `exec` the child)
+        // to exercise the shell-wrapper ancestor walk.
+        let wrapped = Process()
+        wrapped.executableURL = URL(fileURLWithPath: "/bin/sh")
+        wrapped.arguments = ["-c", "/bin/bash \"\(fixture.hook.path)\" notify && :"]
+        wrapped.environment = [
+            "HOME": fixture.root.path,
+            "CFFIXED_USER_HOME": fixture.root.path,
+            "TMPDIR": fixture.root.appendingPathComponent("tmp").path,
+            "PATH": "\(fixture.root.appendingPathComponent("bin").path):/usr/bin:/bin",
+            "COPILOT_PROJECTS_SESSION": fixture.tabId,
+            "COPILOT_PROJECTS_SOCKET": fixture.root.appendingPathComponent("control.sock").path,
+            "CAPTURE_FILE": fixture.capture.path,
+        ]
+        let input = Pipe()
+        wrapped.standardInput = input
+        wrapped.standardOutput = Pipe()
+        wrapped.standardError = Pipe()
+        try wrapped.run()
+        input.fileHandleForWriting.write(
+            Data(#"{"sessionId":"\#(fixture.childId)","timestamp":200,"notificationType":"permission_prompt"}"#.utf8)
+        )
+        try input.fileHandleForWriting.close()
+        wrapped.waitUntilExit()
+        XCTAssertEqual(wrapped.terminationStatus, 0)
+        XCTAssertEqual(try fixture.statusRecord().status, .waiting)
+
+        // `/new` inside the same owner process still resets status to idle.
+        let nextOwner = UUID().uuidString.lowercased()
+        try fixture.run("start", payload:
+            #"{"sessionId":"\#(nextOwner)","timestamp":300}"#)
+        XCTAssertEqual(try fixture.statusRecord().status, .idle)
+    }
+
+    func testDeadOrStaleBootOwnerProcessDoesNotBlockNewSession() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let ownerCLI = try spawnSleepProcess()
+        let ownerTracker = try spawnSleepProcess()
+        defer {
+            ownerCLI.terminate()
+            ownerTracker.terminate()
+        }
+
+        // Mismatched bootTime is treated as a stale owner from a previous boot.
+        let staleBootJSON = """
+        {"appSessionId":"\(fixture.tabId)","copilotSessionId":"\(fixture.ownerId)","pid":\(ownerTracker.processIdentifier),"bootTime":"{ sec = 1, usec = 0 }","parentPid":\(ownerCLI.processIdentifier),"claimedAt":100}
+        """
+        try Data(staleBootJSON.utf8).write(to: fixture.file("transcript-owner.json"))
+        try fixture.run("notify", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":200,"notificationType":"permission_prompt"}"#)
+        XCTAssertEqual(try fixture.statusRecord().status, .waiting)
+
+        // Mismatched appSessionId is treated as a foreign owner record and does not block.
+        let bootTime = try currentKernelBootTime()
+        let mismatchedSessionJSON = """
+        {"appSessionId":"\(UUID().uuidString)","copilotSessionId":"\(fixture.ownerId)","pid":\(ownerTracker.processIdentifier),"bootTime":"\(bootTime)","parentPid":\(ownerCLI.processIdentifier),"claimedAt":100}
+        """
+        try Data(mismatchedSessionJSON.utf8).write(to: fixture.file("transcript-owner.json"))
+        try fixture.run("start", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":250}"#)
+        XCTAssertEqual(try fixture.statusRecord().status, .idle)
+
+        // Dead owner PIDs also fall back to allowing hooks.
+        ownerCLI.terminate()
+        ownerCLI.waitUntilExit()
+        let deadOwnerJSON = """
+        {"appSessionId":"\(fixture.tabId)","copilotSessionId":"\(fixture.ownerId)","pid":\(ownerTracker.processIdentifier),"bootTime":"\(bootTime)","parentPid":\(ownerCLI.processIdentifier),"claimedAt":100}
+        """
+        try Data(deadOwnerJSON.utf8).write(to: fixture.file("transcript-owner.json"))
+        try fixture.run("notify", payload:
+            #"{"sessionId":"\#(fixture.childId)","timestamp":300,"notificationType":"permission_prompt"}"#)
+        XCTAssertEqual(try fixture.statusRecord().status, .waiting)
+    }
 }
