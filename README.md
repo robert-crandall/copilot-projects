@@ -30,9 +30,14 @@ distribution rather than replacing it with the standalone download.
 Remote clients can request `session-bounce` when the tracker discovers a loaded
 client/extension command named `bounce`. The host and tracker require an idle
 session without pending questions, background agents, or schedules. The tracker
-rechecks readiness and command availability, then queues `/bounce` through the
+rechecks readiness, the live schedule list, and command availability, then queues `/bounce` through the
 SDK for the identified session; it never types into the terminal or sends a
 model prompt. The extension itself owns restarting and resuming.
+
+The tracker publishes an explicit pending-bounce marker with its accepted receipt.
+This fences new model switches and automatic prompt delivery, including legacy
+terminal fallback. Older trackers without this marker must be reloaded before
+they can accept a bounce; ordinary commands remain compatible.
 
 The correlated receipt confirms that the command was queued, not that the
 restart finished. An ambiguous dispatch blocks further native actions in that

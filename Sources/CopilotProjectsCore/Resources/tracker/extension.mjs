@@ -1643,12 +1643,13 @@ if (validSessionId && socketPath) {
             observedAtMilliseconds: observation?.observedAtMilliseconds ?? 0,
             capabilities,
             sendReady: fresh === true && !bounceRequested && !workflowHasPendingInput(),
+            bounceRequested,
             imageAttachments: fresh ? availableModels?.find(
                 (model) => model.id === currentModel?.name
             )?.imageAttachments ?? null : null,
-            legacyPromptFallback: workflowRuntime === false || runtimeActivityUnsupported
+            legacyPromptFallback: !bounceRequested && (workflowRuntime === false || runtimeActivityUnsupported
                 || observation?.legacyPromptFallback === true
-                || unavailableWorkflowActions.has("session-send"),
+                || unavailableWorkflowActions.has("session-send")),
             totalAiCredits: observation?.totalAiCredits ?? null,
             contextTokens: workflowContext?.currentTokens ?? null,
             contextTokenLimit: workflowContext?.tokenLimit ?? null,
@@ -1850,10 +1851,6 @@ if (validSessionId && socketPath) {
         case "session-abort":
             return rpcReceiptOutcome(await workflowRPC("session.abort", {}, context));
         case "session-bounce": {
-            // Keep this conversation closed to new actions even if the RPC
-            // disconnects while the extension is restarting its owner.
-            bounceRequested = true;
-            publish();
             const result = await workflowRPC("session.commands.enqueue", { command: "/bounce" }, context);
             if (result?.queued === false) {
                 if (operationAuthorityCurrent(context)) bounceRequested = false;
@@ -1946,8 +1943,10 @@ if (validSessionId && socketPath) {
             let ready = false;
             try {
                 const available = await hasBounceCommand(context);
+                const scheduled = await workflowRead("session.schedule.list", {}, context);
                 const processing = await workflowRead("session.metadata.isProcessing", {}, context);
-                ready = available && processing?.processing === false;
+                ready = available && Array.isArray(scheduled?.entries) && scheduled.entries.length === 0
+                    && processing?.processing === false;
             } catch (error) {
                 console.error("[copilot-projects] bounce preflight failed:", error);
             } finally {
@@ -1980,7 +1979,13 @@ if (validSessionId && socketPath) {
                 return;
             }
         }
-        if (!publishAcceptedReceipt(context)) return;
+        // Publish the mutation fence atomically with acceptance, before the
+        // command can run or another host path can fall back to the terminal.
+        if (kind === "session-bounce") bounceRequested = true;
+        if (!publishAcceptedReceipt(context)) {
+            if (kind === "session-bounce") bounceRequested = false;
+            return;
+        }
         const key = operationExecutionKey(context.conversationEpoch, context.operationId);
         activeOperationKeys.add(key);
         const timeout = setTimeout(() => {
@@ -2132,7 +2137,7 @@ if (validSessionId && socketPath) {
             // extension from an older build that cannot validate prompts.
             pendingPermissionRequestIds: [...pendingPermissionRequests.keys()],
             ...(currentModel ? { model: currentModel } : {}),
-            ...(availableModels ? { availableModels } : {}),
+            ...(availableModels && !bounceRequested ? { availableModels } : {}),
             copilotSessionId,
             conversationEpoch,
             operationReceiptVersion: OPERATION_RECEIPT_VERSION,
@@ -4728,6 +4733,7 @@ if (validSessionId && socketPath) {
     }
 
     function validatedModelSwitch(request, requireAdvertisedTarget) {
+        if (bounceRequested) return null;
         if (typeof request.modelId !== "string"
                 || request.modelId.length === 0
                 || request.modelId.length > 200
@@ -4840,7 +4846,7 @@ if (validSessionId && socketPath) {
             } else {
                 publishRejectedPreflight(
                     operation.context,
-                    "invalid-request",
+                    bounceRequested ? "target-unavailable" : "invalid-request",
                     setModelRequestPath,
                     encoded
                 );

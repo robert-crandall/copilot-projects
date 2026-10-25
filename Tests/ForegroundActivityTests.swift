@@ -939,12 +939,20 @@ final class ForegroundActivityTests: XCTestCase {
 
     @MainActor
     func testRuntimeLossDoesNotBecomeLegacyIdle() throws {
-        let fixture = try Fixture()
-        defer { fixture.cleanup() }
-        try fixture.publish(fixture.snapshot())
-        try FileManager.default.removeItem(at: fixture.snapshotURL)
-        fixture.model.refreshAgentActivitySnapshots()
-        XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .busy)
+        for bouncing in [false, true] {
+            let fixture = try Fixture()
+            defer { fixture.cleanup() }
+            var snapshot = fixture.snapshot()
+            snapshot.workflow = RemoteSessionWorkflow(
+                observedAtMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000),
+                capabilities: [], sendReady: false, bounceRequested: bouncing
+            )
+            try fixture.publish(snapshot)
+            try FileManager.default.removeItem(at: fixture.snapshotURL)
+            fixture.model.refreshAgentActivitySnapshots()
+            XCTAssertEqual(fixture.model.sendRemotePrompt(sessionId: fixture.session.id, value: "next"), .busy)
+            XCTAssertEqual(fixture.sends.count, 0)
+        }
     }
 
     @MainActor

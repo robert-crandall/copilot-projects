@@ -151,6 +151,7 @@ class FakeSession {
     this.abortHandler = async () => this.emit("session.idle", { aborted: true });
     this.enqueueHandler = async () => ({ queued: true });
     this.commandListHandler = async () => ({ commands: [] });
+    this.scheduleListHandler = async () => ({ entries: [] });
     this.userInputHandler = async () => ({ success: true });
     this.elicitationHandler = async () => ({ success: true });
     this.modelSwitchHandler = async (request) => ({
@@ -184,7 +185,7 @@ class FakeSession {
         },
       },
       schedule: {
-        list: async () => ({ entries: [] }),
+        list: async () => this.scheduleListHandler({ sessionId: this.sessionId }),
       },
       permissions: {
         getMode: async () => ({ mode: "manual" }),
@@ -220,6 +221,7 @@ class FakeSession {
         if (method === "session.model.getCurrent") return { modelId: "gpt-5.6-sol" };
         if (method === "session.model.list") return this.modelListHandler();
         if (method === "session.commands.list") return this.commandListHandler(params);
+        if (method === "session.schedule.list") return this.scheduleListHandler(params);
         this.workflowCalls.push({ method, ...params });
         if (method === "session.commands.enqueue") return this.enqueueHandler(params);
         if (method === "session.send") return this.sendHandler(params);
@@ -753,6 +755,16 @@ test("bounce enqueues the registered command for its owner once without sending 
   }]);
   assert.deepEqual(runtime.session.closeCalls, []);
   assert.deepEqual(readSnapshot(runtime).workflow.capabilities, []);
+  assert.equal(readSnapshot(runtime).workflow.bounceRequested, true);
+  assert.equal(readSnapshot(runtime).availableModels, undefined);
+  const acceptedSnapshots = runtime.activityWrites.filter(snapshot =>
+    snapshot.operationReceipts.some(item => item.operationId === request.operationId && item.state === "accepted")
+  );
+  assert.ok(acceptedSnapshots.length > 0);
+  assert.ok(acceptedSnapshots.every(snapshot =>
+    snapshot.workflow.bounceRequested === true && snapshot.availableModels === undefined
+      && snapshot.workflow.capabilities.length === 0
+  ));
   writeHandoff(runtime, request.path, request.payload);
   trigger(runtime, `${runtime.appSessionId}.session-bounce.json`);
   const second = workflowHandoff(runtime, "session-bounce", {});
@@ -832,6 +844,7 @@ test("a definitive bounce refusal leaves the conversation usable", {
   const request = workflowHandoff(runtime, "session-bounce", {});
   await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "bounce refusal not reported");
   assert.ok((await workflowReady(runtime)).capabilities.includes("session-bounce"));
+  assert.equal(readSnapshot(runtime).workflow.bounceRequested, false);
 });
 
 test("duplicate bounce watcher events during preflight neither reject nor execute twice", {
@@ -863,6 +876,105 @@ test("an unsupported enqueue RPC does not latch unrelated session controls off",
   const request = workflowHandoff(runtime, "session-bounce", {});
   await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "unsupported RPC not rejected");
   assert.equal((await workflowReady(runtime)).capabilities.includes("session-bounce"), false);
+  assert.equal(readSnapshot(runtime).workflow.bounceRequested, false);
+});
+
+test("bounce waits for live schedules instead of trusting the empty startup cache", {
+  concurrency: false,
+}, async (t) => {
+  let release;
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    session.rpc.schedule.list = async () => new Promise(() => {});
+    session.scheduleListHandler = () => new Promise(resolve => { release = resolve; });
+  });
+  await workflowReady(runtime);
+  assert.deepEqual(readSnapshot(runtime).schedules, []);
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => release, "bounce did not request live schedules");
+  assert.equal(receipt(runtime, request.operationId), undefined);
+  assert.deepEqual(runtime.session.workflowCalls, []);
+  const read = runtime.session.runtimeCalls.find(call => call.method === "session.schedule.list");
+  assert.equal(read.sessionId, runtime.copilotSessionId);
+  release({ entries: [{ id: "scheduled-work" }] });
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "scheduled bounce was not rejected");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+});
+
+test("unavailable or malformed schedule observations cannot admit bounce", {
+  concurrency: false,
+}, async (t) => {
+  for (const result of [null, {}, { entries: "unknown" }, new Error("schedule query failed")]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+      session.rpc.schedule.list = async () => ({ entries: [] });
+      session.scheduleListHandler = async () => {
+        if (result instanceof Error) throw result;
+        return result;
+      };
+    });
+    await workflowReady(runtime);
+    const request = workflowHandoff(runtime, "session-bounce", {});
+    await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "unknown schedules were accepted");
+    assert.deepEqual(runtime.session.workflowCalls, []);
+  }
+});
+
+test("failed acceptance publication rolls back the bounce fence without invoking RPC", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  await workflowReady(runtime);
+  let failedWrites = 0;
+  runtime.failWrite = path => {
+    if (!path.includes(".agent-activity.json")) return false;
+    failedWrites++;
+    return true;
+  };
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => failedWrites > 0, "acceptance write did not fail");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+  assert.equal(realExistsSync(request.path), true);
+  runtime.failWrite = null;
+  await runtime.session.emit("session.usage_info", { currentTokens: 1, tokenLimit: 10 });
+  assert.equal(readSnapshot(runtime).workflow.bounceRequested, false);
+  assert.ok(readSnapshot(runtime).availableModels.length > 0);
+});
+
+test("bounce fences new model switches, including legacy, but preserves exact replay", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  await workflowReady(runtime);
+  const fields = operationFields(runtime, "set-model");
+  const payload = {
+    schemaVersion: 1, copilotSessionId: runtime.copilotSessionId,
+    modelId: "gpt-5.6-sol", ...fields,
+  };
+  writeHandoff(runtime, runtime.modelPath, payload);
+  trigger(runtime, `${runtime.appSessionId}.set-model-request.json`);
+  await waitFor(() => receipt(runtime, fields.operationId)?.state === "applied", "initial model switch failed");
+  const bounce = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, bounce.operationId)?.state === "applied", "bounce not queued");
+  writeHandoff(runtime, runtime.modelPath, payload);
+  trigger(runtime, `${runtime.appSessionId}.set-model-request.json`);
+  await waitFor(() => !realExistsSync(runtime.modelPath), "exact replay was not consumed");
+  assert.equal(receipt(runtime, fields.operationId).state, "applied");
+  const next = operationFields(runtime, "set-model");
+  writeHandoff(runtime, runtime.modelPath, { ...payload, ...next });
+  trigger(runtime, `${runtime.appSessionId}.set-model-request.json`);
+  await waitFor(() => receipt(runtime, next.operationId)?.state === "rejected", "new model switch escaped fence");
+  assert.equal(receipt(runtime, next.operationId).errorCode, "target-unavailable");
+  writeHandoff(runtime, runtime.modelPath, {
+    schemaVersion: 1, copilotSessionId: runtime.copilotSessionId, modelId: "gpt-5.6-sol",
+  });
+  trigger(runtime, `${runtime.appSessionId}.set-model-request.json`);
+  await waitFor(() => !realExistsSync(runtime.modelPath), "legacy switch was not refused");
+  assert.equal(runtime.session.modelSwitchCalls.length, 1);
 });
 
 test("native send uses explicit owner and mode, and exact replay cannot submit twice", {
