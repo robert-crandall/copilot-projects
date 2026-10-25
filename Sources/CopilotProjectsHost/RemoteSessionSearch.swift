@@ -155,12 +155,13 @@ actor SessionSearchIndex {
     func resumableEntries(
         projects: [SessionFinderProjectTarget],
         selectedProjectId: String?,
-        excludedCopilotSessionIds: Set<String> = [],
+        excludedCopilotSessionIds: @Sendable () -> Set<String> = { [] },
         defaultStartupDir: String = Paths.defaultStartupDir,
-        load: @Sendable () -> [SessionFinderEntry]
+        load: @Sendable (Set<String>) -> [SessionFinderEntry]
     ) -> [SessionFinderEntry]? {
         scheduleExpiry()
         let current = now()
+        let excluded = excludedCopilotSessionIds()
         if let cached = cachedResumable,
            current.timeIntervalSince(cached.loadedAt) < Self.resumableCacheInterval {
             guard !Task.isCancelled else { return nil }
@@ -168,18 +169,18 @@ actor SessionSearchIndex {
                 cached.entries,
                 projects: projects,
                 selectedProjectId: selectedProjectId,
-                excludedCopilotSessionIds: excludedCopilotSessionIds,
+                excludedCopilotSessionIds: excluded,
                 defaultStartupDir: defaultStartupDir
             )
         }
-        let loaded = load()
+        let loaded = load(excluded)
         guard !Task.isCancelled else { return nil }
         cachedResumable = (loaded, current)
         return Self.rebindResumableEntries(
             loaded,
             projects: projects,
             selectedProjectId: selectedProjectId,
-            excludedCopilotSessionIds: excludedCopilotSessionIds,
+            excludedCopilotSessionIds: excluded,
             defaultStartupDir: defaultStartupDir
         )
     }
@@ -384,18 +385,20 @@ final class RemoteSessionSearch {
             return await index.resumableEntries(
                 projects: projects,
                 selectedProjectId: selectedProjectId,
-                excludedCopilotSessionIds: inMemoryIds,
+                excludedCopilotSessionIds: {
+                    let markerIds = AppModel.validatedMarkerCopilotSessionIds(
+                        sessionIds: liveSessionIds,
+                        directory: markerDirectory
+                    )
+                    return inMemoryIds.union(markerIds)
+                },
                 defaultStartupDir: defaultStartupDir
-            ) {
-                let markerIds = AppModel.validatedMarkerCopilotSessionIds(
-                    sessionIds: liveSessionIds,
-                    directory: markerDirectory
-                )
-                return SessionFinderResumableLoader.load(
+            ) { excluded in
+                SessionFinderResumableLoader.load(
                     store: storeProvider(),
                     projects: projects,
                     selectedProjectId: selectedProjectId,
-                    liveCopilotSessionIds: inMemoryIds.union(markerIds),
+                    liveCopilotSessionIds: excluded,
                     defaultStartupDir: defaultStartupDir
                 )
             }

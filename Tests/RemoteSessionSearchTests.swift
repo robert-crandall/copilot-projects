@@ -869,6 +869,17 @@ final class RemoteSessionSearchTests: XCTestCase {
             "p1"
         )
 
+        // Newly written resume markers are excluded on cache hits before the cache expires.
+        let markerFile = root.appendingPathComponent("live-1.copilot-session")
+        try recentEndedId.write(to: markerFile, atomically: true, encoding: .utf8)
+        let instantWhileMarked = await bridge.searchSessions(.init(
+            query: "webhook backoff",
+            mode: .instant,
+            includeResumable: true
+        ))
+        XCTAssertEqual(matches(instantWhileMarked, mode: .instant), [])
+        try FileManager.default.removeItem(at: markerFile)
+
         let replayed = bridge.resumeSearchSession(resumeRequest)
         XCTAssertEqual(
             replayed,
