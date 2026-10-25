@@ -689,6 +689,238 @@ final class RemoteSessionSearchTests: XCTestCase {
         let released = await bridge.searchSessions(.init(query: "payments", mode: .instant))
         XCTAssertEqual(released, .failed("Copilot Projects is closing."))
     }
+
+    func testRemoteSearchIncludesResumableSessionsSearchesHistoryAndResumesWithoutStealingMacSelection() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let repoWork = root.appendingPathComponent("payments-service")
+        try FileManager.default.createDirectory(at: repoWork, withIntermediateDirectories: true)
+        let previousHome = ProcessInfo.processInfo.environment["COPILOT_HOME"]
+        setenv("COPILOT_HOME", root.appendingPathComponent("copilot").path, 1)
+        defer {
+            if let previousHome { setenv("COPILOT_HOME", previousHome, 1) } else { unsetenv("COPILOT_HOME") }
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
+        let recentEndedId = try home.addSession(
+            cwd: repoWork.path,
+            name: "Audit webhook retries",
+            updated: Date(timeIntervalSince1970: 1_800_000_500),
+            transcript: #"{"type":"user.message","data":{"content":"investigate webhook backoff"}}"#
+        )
+        let deepHistoryId = try home.addSession(
+            cwd: repoWork.path,
+            name: "Migrate legacy schema",
+            updated: Date(timeIntervalSince1970: 1_700_000_000),
+            transcript: #"{"type":"user.message","data":{"content":"alter legacy schema table"}}"#
+        )
+        for index in 0..<SessionFinderResumableLoader.defaultLimit {
+            _ = try home.addSession(
+                cwd: root.path,
+                name: "Routine session \(index)",
+                updated: Date(timeIntervalSince1970: TimeInterval(1_800_000_000 + index)),
+                transcript: #"{"type":"user.message","data":{"content":"routine check"}}"#
+            )
+        }
+
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        let liveSession = Session(id: "live-1", title: "Docs shell", cwd: root.path)
+        let paymentsSession = Session(id: "live-2", title: "Payments shell", cwd: repoWork.path)
+        try repository.save(PersistedState(
+            projects: [
+                Project(id: "p1", name: "Docs", cwd: root.path, sessions: [liveSession], selectedSessionId: liveSession.id),
+                Project(id: "p2", name: "Payments", cwd: repoWork.path, sessions: [paymentsSession], selectedSessionId: paymentsSession.id),
+            ],
+            selectedProjectId: "p1"
+        ))
+
+        var launches: [(id: String, executable: String?, prompt: String?)] = []
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
+            remoteReposDirectory: { root.path },
+            remoteSessionBackendAvailable: { true },
+            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        defer {
+            model.forcePendingSessionDestroys()
+            model.detachAllClients()
+        }
+
+        let recentEndedRowId = SessionFinderSource.resumableSessionId(for: recentEndedId)
+        let deepRowId = SessionFinderSource.resumableSessionId(for: deepHistoryId)
+        let ranker = GatedRanker(.success([
+            LunaMatch(sessionId: recentEndedRowId, reason: "analyzed webhook backoff"),
+        ]))
+        ranker.ungated = ["backoff"]
+        let historySearcher = StubRemoteHistorySearcher(matches: [
+            LunaMatch(sessionId: deepRowId, reason: "altered legacy schema table"),
+        ])
+        model.remoteSessionSearch = RemoteSessionSearch(
+            index: FakeTranscripts().index(),
+            ranker: ranker,
+            historySearcher: historySearcher,
+            copilotSessionStore: { home.store }
+        )
+
+        let bridge: any SessionHost = RemoteModelBridge(model: model)
+        XCTAssertEqual(
+            bridge.sessionSearchCapabilities,
+            [
+                RemoteSessionSearchContract.capability,
+                RemoteSessionSearchContract.recentCapability,
+                RemoteSessionSearchContract.historyCapability,
+            ]
+        )
+
+        // 1. Legacy requests without `includeResumable` omit ended sessions so older clients
+        // never lose live matches or Luna slots to rows they cannot render.
+        let legacyInstant = await bridge.searchSessions(.init(query: "webhook backoff", mode: .instant))
+        XCTAssertEqual(matches(legacyInstant, mode: .instant), [])
+
+        // Opt-in `includeResumable: true` surfaces the recent ended session with its resumable metadata.
+        let instant = await bridge.searchSessions(.init(query: "webhook backoff", mode: .instant, includeResumable: true))
+        let instantFound = try XCTUnwrap(matches(instant, mode: .instant))
+        XCTAssertEqual(instantFound.first?.sessionId, recentEndedRowId)
+        XCTAssertEqual(instantFound.first?.projectId, "p2")
+        XCTAssertEqual(instantFound.first?.resumableCopilotSessionId, recentEndedId)
+        XCTAssertEqual(instantFound.first?.title, "Audit webhook retries")
+        XCTAssertEqual(instantFound.first?.folderName, "payments-service")
+
+        // 2. Luna fast pass with `includeResumable: true` ranks the recent ended session.
+        let luna = await bridge.searchSessions(.init(query: "backoff", mode: .luna, includeResumable: true))
+        let lunaFound = try XCTUnwrap(matches(luna, mode: .luna))
+        XCTAssertEqual(lunaFound.first?.sessionId, recentEndedRowId)
+        XCTAssertEqual(lunaFound.first?.reason, "analyzed webhook backoff")
+
+        // 3. History mode searches beyond the initial 30-session cap and hydrates the older session.
+        let history = await bridge.searchSessions(.init(
+            query: "legacy schema",
+            mode: .history,
+            excludedCopilotSessionIds: [recentEndedId]
+        ))
+        let historyFound = try XCTUnwrap(matches(history, mode: .history))
+        XCTAssertEqual(historyFound.count, 1)
+        XCTAssertEqual(historyFound.first?.sessionId, deepRowId)
+        XCTAssertEqual(historyFound.first?.projectId, "p2")
+        XCTAssertEqual(historyFound.first?.resumableCopilotSessionId, deepHistoryId)
+        XCTAssertEqual(historyFound.first?.title, "Migrate legacy schema")
+        XCTAssertEqual(historyFound.first?.reason, "altered legacy schema table")
+
+        // 4. Resuming from remote search sanitizes long/tabbed titles, opens the tab in p2
+        // without changing Mac selection ("p1" / "live-1"), and replaying the same requestId
+        // returns `.existing` even after the tab moves to p1 and p2 is closed.
+        let resumeRequestId = UUID()
+        let rawTabbedLongTitle = "Migrate\tlegacy\nschema " + String(repeating: "x", count: 140)
+        let resumeRequest = RemoteResumeSearchSessionRequest(
+            requestId: resumeRequestId,
+            projectId: "p2",
+            copilotSessionId: deepHistoryId,
+            title: rawTabbedLongTitle
+        )
+        let created = bridge.resumeSearchSession(resumeRequest)
+        let expectedResponse = RemoteResumeSearchSessionResponse(
+            requestId: resumeRequestId,
+            projectId: "p2",
+            sessionId: resumeRequestId.uuidString
+        )
+        XCTAssertEqual(created, .created(expectedResponse))
+        XCTAssertEqual(model.selectedProjectId, "p1", "Remote resume must not steal Mac project selection")
+        XCTAssertEqual(model.project("p2")?.selectedSessionId, "live-2", "Remote resume must not steal Mac tab selection")
+        XCTAssertEqual(model.capturedResumeLaunches[resumeRequestId.uuidString], deepHistoryId)
+
+        model.moveSession(toProjectId: "p1", draggedId: resumeRequestId.uuidString)
+        model.closeProject("p2")
+
+        // Cached resumable entries originally bound to "p2" rebind to the remaining open project
+        // ("p1") immediately, without waiting for the 15-second resumable cache to expire.
+        let instantAfterClose = await bridge.searchSessions(.init(
+            query: "webhook backoff",
+            mode: .instant,
+            includeResumable: true
+        ))
+        let instantAfterCloseFound = try XCTUnwrap(matches(instantAfterClose, mode: .instant))
+        XCTAssertEqual(instantAfterCloseFound.first?.sessionId, recentEndedRowId)
+        XCTAssertEqual(instantAfterCloseFound.first?.projectId, "p1")
+
+        let lunaAfterClose = await bridge.searchSessions(.init(
+            query: "backoff",
+            mode: .luna,
+            includeResumable: true
+        ))
+        let lunaAfterCloseFound = try XCTUnwrap(matches(lunaAfterClose, mode: .luna))
+        XCTAssertEqual(lunaAfterCloseFound.first?.sessionId, recentEndedRowId)
+        XCTAssertEqual(lunaAfterCloseFound.first?.projectId, "p1")
+
+        let recentAfterClose = await bridge.searchSessions(.init(
+            query: "",
+            mode: .recent,
+            includeResumable: true
+        ))
+        let recentAfterCloseFound = try XCTUnwrap(matches(recentAfterClose, mode: .recent))
+        XCTAssertEqual(
+            recentAfterCloseFound.first(where: { $0.sessionId == recentEndedRowId })?.projectId,
+            "p1"
+        )
+
+        // Newly written resume markers are excluded on cache hits before the cache expires.
+        let markerFile = root.appendingPathComponent("live-1.copilot-session")
+        try recentEndedId.write(to: markerFile, atomically: true, encoding: .utf8)
+        let instantWhileMarked = await bridge.searchSessions(.init(
+            query: "webhook backoff",
+            mode: .instant,
+            includeResumable: true
+        ))
+        XCTAssertEqual(matches(instantWhileMarked, mode: .instant), [])
+        try FileManager.default.removeItem(at: markerFile)
+
+        let replayed = bridge.resumeSearchSession(resumeRequest)
+        XCTAssertEqual(
+            replayed,
+            .existing(RemoteResumeSearchSessionResponse(
+                requestId: resumeRequestId,
+                projectId: "p1",
+                sessionId: resumeRequestId.uuidString
+            ))
+        )
+        XCTAssertEqual(launches.count, 1)
+
+        // 5. Resuming when the requested project ("p-closed") is already closed before the first call
+        // falls back to "p1", and replaying the identical request returns `.existing` instead of `.conflict`.
+        let fallbackRequestId = UUID()
+        let fallbackRequest = RemoteResumeSearchSessionRequest(
+            requestId: fallbackRequestId,
+            projectId: "p-closed",
+            copilotSessionId: recentEndedId,
+            title: "Audit webhook retries"
+        )
+        let fallbackCreated = bridge.resumeSearchSession(fallbackRequest)
+        let fallbackExpected = RemoteResumeSearchSessionResponse(
+            requestId: fallbackRequestId,
+            projectId: "p1",
+            sessionId: fallbackRequestId.uuidString
+        )
+        XCTAssertEqual(fallbackCreated, .created(fallbackExpected))
+        XCTAssertEqual(bridge.resumeSearchSession(fallbackRequest), .existing(fallbackExpected))
+        XCTAssertEqual(launches.count, 2)
+    }
+}
+
+private struct StubRemoteHistorySearcher: SessionHistorySearching {
+    let matches: [LunaMatch]
+
+    func searchHistory(
+        query: String,
+        excludedCopilotSessionIds: Set<String>
+    ) async throws -> [LunaMatch] {
+        matches
+    }
 }
 
 @MainActor
