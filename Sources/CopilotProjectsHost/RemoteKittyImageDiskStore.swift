@@ -39,6 +39,14 @@ struct RemoteKittyRestoredImageEntry: Equatable {
     let imageId: UInt32
     let version: UInt64
     let data: Data
+    let displayedAt: Date?
+
+    init(imageId: UInt32, version: UInt64, data: Data, displayedAt: Date? = nil) {
+        self.imageId = imageId
+        self.version = version
+        self.data = data
+        self.displayedAt = displayedAt
+    }
 }
 
 /// One current-selection record restored from disk, matched against an
@@ -116,6 +124,21 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         let imageId: UInt32
         let version: UInt64
         let byteCount: Int
+        let displayedAt: Date?
+
+        init(
+            sessionId: String,
+            imageId: UInt32,
+            version: UInt64,
+            byteCount: Int,
+            displayedAt: Date? = nil
+        ) {
+            self.sessionId = sessionId
+            self.imageId = imageId
+            self.version = version
+            self.byteCount = byteCount
+            self.displayedAt = displayedAt
+        }
     }
 
     private struct ManifestSelectionRecord: Codable, Equatable {
@@ -390,6 +413,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         imageId: UInt32,
         version: UInt64,
         data: Data,
+        displayedAt: Date? = nil,
         currentSelections: [RemoteKittyPersistedPlacementSelection] = []
     ) {
         enqueueMutation(
@@ -402,6 +426,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                 imageId: imageId,
                 version: version,
                 data: data,
+                displayedAt: displayedAt,
                 currentSelections: currentSelections
             )
         }
@@ -434,10 +459,18 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
     func replaceCurrentSelections(
         sessionId: String,
         imageId: UInt32,
+        version: UInt64? = nil,
+        displayedAt: Date? = nil,
         selections: [RemoteKittyPersistedPlacementSelection]
     ) {
         enqueueMutation(sessionId: sessionId, failClosedOnDrop: true) { [self] in
-            performReplaceCurrentSelections(sessionId: sessionId, imageId: imageId, selections: selections)
+            performReplaceCurrentSelections(
+                sessionId: sessionId,
+                imageId: imageId,
+                version: version,
+                displayedAt: displayedAt,
+                selections: selections
+            )
         }
     }
 
@@ -588,6 +621,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         imageId: UInt32,
         version: UInt64,
         data: Data,
+        displayedAt: Date?,
         currentSelections: [RemoteKittyPersistedPlacementSelection]
     ) {
         guard !isTombstoned(sessionId: sessionId) else { return }
@@ -622,7 +656,11 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
             return
         }
         manifest.entries.append(ManifestEntryRecord(
-            sessionId: sessionId, imageId: imageId, version: version, byteCount: data.count
+            sessionId: sessionId,
+            imageId: imageId,
+            version: version,
+            byteCount: data.count,
+            displayedAt: displayedAt
         ))
         manifest.selections.removeAll { $0.sessionId == sessionId && $0.imageId == imageId }
         for selection in normalizedSelections {
@@ -718,10 +756,27 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
     private func performReplaceCurrentSelections(
         sessionId: String,
         imageId: UInt32,
+        version: UInt64?,
+        displayedAt: Date?,
         selections: [RemoteKittyPersistedPlacementSelection]
     ) {
         guard !isTombstoned(sessionId: sessionId) else { return }
         let originalManifest = manifest
+        if let version,
+           let displayedAt,
+           let index = manifest.entries.firstIndex(where: {
+               $0.sessionId == sessionId && $0.imageId == imageId && $0.version == version
+           }),
+           manifest.entries[index].displayedAt == nil {
+            let existing = manifest.entries[index]
+            manifest.entries[index] = ManifestEntryRecord(
+                sessionId: existing.sessionId,
+                imageId: existing.imageId,
+                version: existing.version,
+                byteCount: existing.byteCount,
+                displayedAt: displayedAt
+            )
+        }
         manifest.selections.removeAll { $0.sessionId == sessionId && $0.imageId == imageId }
         for selection in selections {
             // Only persist a selection whose exact (imageId, version) is
@@ -798,7 +853,12 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                 continue
             }
             keptEntries.append(entry)
-            restoredEntries.append(RemoteKittyRestoredImageEntry(imageId: entry.imageId, version: entry.version, data: data))
+            restoredEntries.append(RemoteKittyRestoredImageEntry(
+                imageId: entry.imageId,
+                version: entry.version,
+                data: data,
+                displayedAt: entry.displayedAt
+            ))
             validKeys.insert(EntryKey(sessionId: sessionId, imageId: entry.imageId, version: entry.version))
         }
         if manifestChanged { manifest.entries = keptEntries }

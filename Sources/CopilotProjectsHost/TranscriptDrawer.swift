@@ -197,32 +197,34 @@ private struct TranscriptTurnCard: View {
                     )
             }
 
-            ForEach(turn.assistantMessages) { message in
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Copilot")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(StudioStyle.secondaryText)
-                    transcriptText(message.content)
+            ForEach(turn.timelineItems(includingBlankAssistantMessages: true)) { item in
+                switch item {
+                case .assistant(let message):
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Copilot")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(StudioStyle.secondaryText)
+                        transcriptText(message.content)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+                case .image(let image):
+                    if let imageCapture {
+                        TranscriptImageView(
+                            identity: TranscriptImageIdentity(
+                                sessionId: imageCapture.sessionId,
+                                imageId: image.imageId,
+                                version: image.contentVersion
+                            ),
+                            data: imageCapture.imageData(imageId: image.imageId, version: image.contentVersion),
+                            onPreview: onPreview
+                        )
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 6)
             }
 
             if !turn.tools.isEmpty {
                 TranscriptTools(tools: turn.tools)
-            }
-            if let imageCapture, let images = turn.images {
-                ForEach(images, id: \.imageId) { image in
-                    TranscriptImageView(
-                        identity: TranscriptImageIdentity(
-                            sessionId: imageCapture.sessionId,
-                            imageId: image.imageId,
-                            version: image.contentVersion
-                        ),
-                        data: imageCapture.imageData(imageId: image.imageId, version: image.contentVersion),
-                        onPreview: onPreview
-                    )
-                }
             }
             if let error = turn.error {
                 TranscriptTurnFailure(error: error)
