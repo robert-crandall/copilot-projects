@@ -1968,9 +1968,10 @@ if (validSessionId && socketPath) {
                 const available = await hasBounceCommand(context);
                 const scheduled = await workflowRead("session.schedule.list", {}, context);
                 const processing = await workflowRead("session.metadata.isProcessing", {}, context);
+                const activity = await workflowRead("session.metadata.activity", {}, context);
                 await recoverQuestionsForBounce();
                 ready = available && Array.isArray(scheduled?.entries) && scheduled.entries.length === 0
-                    && processing?.processing === false;
+                    && processing?.processing === false && activity?.hasActiveWork === false;
             } catch (error) {
                 console.error("[copilot-projects] bounce preflight failed:", error);
             } finally {

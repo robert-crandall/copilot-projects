@@ -148,6 +148,7 @@ class FakeSession {
     });
     this.budgetHandler = async () => ({ success: true });
     this.processingHandler = async () => ({ processing: this.processing });
+    this.activityHandler = async () => ({ abortable: this.processing, hasActiveWork: this.processing });
     this.abortHandler = async () => this.emit("session.idle", { aborted: true });
     this.enqueueHandler = async () => ({ queued: true });
     this.commandListHandler = async () => ({ commands: [] });
@@ -216,6 +217,7 @@ class FakeSession {
         this.runtimeCalls.push({ method, ...params });
         if (method === "session.metadata.snapshot") return this.metadataHandler(params);
         if (method === "session.metadata.isProcessing") return this.processingHandler(params);
+        if (method === "session.metadata.activity") return this.activityHandler(params);
         if (method === "session.usage.getMetrics") return this.usageHandler(params);
         if (method === "session.workspaces.diff") return this.diffHandler(params);
         if (method === "session.model.getCurrent") return { modelId: "gpt-5.6-sol" };
@@ -1080,6 +1082,56 @@ test("a completed native send invalidates bounce preflight before a delayed turn
     "bounce did not settle after the intervening send");
   assert.equal(receipt(runtime, bounce.operationId).state, "rejected");
   assert.deepEqual(runtime.session.workflowCalls.map(call => call.method), ["session.send"]);
+});
+
+test("a reloaded tracker rejects bounce over unfinished child work reported by the runtime", {
+  concurrency: false,
+}, async (t) => {
+  const child = uuid();
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    session.history = [{
+      id: uuid(), type: "subagent.started", timestamp: new Date().toISOString(), agentId: child,
+      data: { toolCallId: "unfinished-child", agentName: "explore", agentDisplayName: "Child" },
+    }];
+    session.activityHandler = async () => ({ abortable: false, hasActiveWork: true });
+  });
+  await workflowReady(runtime);
+  assert.equal(runtime.session.processing, false);
+  assert.deepEqual(readSnapshot(runtime).activeSubagents, [], "Reload must not have a live child notification");
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, request.operationId)?.state),
+    "bounce did not settle for unfinished child work");
+  assert.equal(receipt(runtime, request.operationId).state, "rejected");
+  assert.deepEqual(runtime.session.runtimeCalls
+    .filter(call => call.method === "session.metadata.activity")
+    .map(call => call.sessionId), [runtime.copilotSessionId]);
+  assert.deepEqual(runtime.session.workflowCalls, []);
+  runtime.session.activityHandler = async () => ({ abortable: false, hasActiveWork: false });
+  const idle = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, idle.operationId)?.state === "applied",
+    "authoritatively idle child work kept bounce blocked");
+  assert.equal(runtime.session.workflowCalls.length, 1);
+});
+
+test("bounce rejects unknown or unavailable session-wide activity", {
+  concurrency: false,
+}, async (t) => {
+  for (const activity of [undefined, {}, {hasActiveWork: null}, {hasActiveWork: "false"}, new Error("unavailable")]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+      session.activityHandler = async () => {
+        if (activity instanceof Error) throw Object.assign(activity, { code: -32601 });
+        return activity;
+      };
+    });
+    await workflowReady(runtime);
+    const request = workflowHandoff(runtime, "session-bounce", {});
+    await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, request.operationId)?.state),
+      "bounce did not settle with unknown background work");
+    assert.equal(receipt(runtime, request.operationId).state, "rejected");
+    assert.deepEqual(runtime.session.workflowCalls, []);
+  }
 });
 
 test("bounce rechecks live processing and command registration before dispatch", {
