@@ -150,6 +150,7 @@ class FakeSession {
     this.processingHandler = async () => ({ processing: this.processing });
     this.abortHandler = async () => this.emit("session.idle", { aborted: true });
     this.enqueueHandler = async () => ({ queued: true });
+    this.commandListHandler = async () => ({ commands: [] });
     this.userInputHandler = async () => ({ success: true });
     this.elicitationHandler = async () => ({ success: true });
     this.modelSwitchHandler = async (request) => ({
@@ -218,7 +219,9 @@ class FakeSession {
         if (method === "session.workspaces.diff") return this.diffHandler(params);
         if (method === "session.model.getCurrent") return { modelId: "gpt-5.6-sol" };
         if (method === "session.model.list") return this.modelListHandler();
+        if (method === "session.commands.list") return this.commandListHandler(params);
         this.workflowCalls.push({ method, ...params });
+        if (method === "session.commands.enqueue") return this.enqueueHandler(params);
         if (method === "session.send") return this.sendHandler(params);
         if (method === "session.abort") {
           await this.abortHandler();
@@ -735,6 +738,132 @@ function workflowHandoff(runtime, kind, action, fields = operationFields(runtime
   trigger(runtime, `${runtime.appSessionId}.${kind}.json`);
   return { path, payload, operationId: fields.operationId };
 }
+
+test("bounce enqueues the registered command for its owner once without sending a prompt", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  assert.ok((await workflowReady(runtime)).capabilities.includes("session-bounce"));
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "applied", "bounce not queued");
+  assert.deepEqual(runtime.session.workflowCalls, [{
+    method: "session.commands.enqueue", sessionId: runtime.copilotSessionId, command: "/bounce",
+  }]);
+  assert.deepEqual(runtime.session.closeCalls, []);
+  assert.deepEqual(readSnapshot(runtime).workflow.capabilities, []);
+  writeHandoff(runtime, request.path, request.payload);
+  trigger(runtime, `${runtime.appSessionId}.session-bounce.json`);
+  const second = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, second.operationId)?.state === "rejected", "second bounce not rejected");
+  assert.equal(runtime.session.workflowCalls.length, 1);
+});
+
+test("bounce discovery fails closed without disabling existing native workflows", {
+  concurrency: false,
+}, async (t) => {
+  for (const catalog of [null, {}, { commands: [] }, { commands: [{ name: "restart" }] },
+    { commands: [{ name: "bounce", kind: "skill" }] }]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => catalog;
+    });
+    assert.equal((await workflowReady(runtime)).capabilities.includes("session-bounce"), false);
+    const request = workflowHandoff(runtime, "session-bounce", {});
+    await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "unsupported bounce not rejected");
+    assert.deepEqual(runtime.session.workflowCalls, []);
+  }
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => { throw Object.assign(new Error("unsupported"), { code: -32601 }); };
+  });
+  assert.equal((await workflowReady(runtime)).capabilities.includes("session-bounce"), false);
+});
+
+test("bounce rechecks live processing and command registration before dispatch", {
+  concurrency: false,
+}, async (t) => {
+  for (const change of ["processing", "removed", "question"]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    });
+    await workflowReady(runtime);
+    if (change === "processing") runtime.session.processing = true;
+    if (change === "removed") runtime.session.commandListHandler = async () => ({ commands: [] });
+    if (change === "question") {
+      runtime.session.commandListHandler = async () => {
+        runtime.session.emit("session_limits_exhausted.requested", {
+          requestId: "budget", maxAiCredits: 30, usedAiCredits: 30,
+        });
+        return { commands: [{ name: "bounce", kind: "client" }] };
+      };
+    }
+    const request = workflowHandoff(runtime, "session-bounce", {});
+    await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "unsafe bounce not rejected");
+    assert.deepEqual(runtime.session.workflowCalls, []);
+  }
+});
+
+test("bounce rejects payloads and keeps an ambiguous dispatch from executing again", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    session.enqueueHandler = async () => { throw new Error("connection closed after enqueue"); };
+  });
+  await workflowReady(runtime);
+  const invalid = workflowHandoff(runtime, "session-bounce", { prompt: "/quit" });
+  await waitFor(() => receipt(runtime, invalid.operationId)?.state === "rejected", "payload not rejected");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "indeterminate", "unknown bounce not retained");
+  const retry = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, retry.operationId)?.state === "rejected", "ambiguous bounce retried");
+  assert.equal(runtime.session.workflowCalls.length, 1);
+});
+
+test("a definitive bounce refusal leaves the conversation usable", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    session.enqueueHandler = async () => ({ queued: false });
+  });
+  await workflowReady(runtime);
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "bounce refusal not reported");
+  assert.ok((await workflowReady(runtime)).capabilities.includes("session-bounce"));
+});
+
+test("duplicate bounce watcher events during preflight neither reject nor execute twice", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  await workflowReady(runtime);
+  let release;
+  runtime.session.commandListHandler = () => new Promise((resolve) => { release = resolve; });
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => release, "preflight did not start");
+  trigger(runtime, `${runtime.appSessionId}.session-bounce.json`);
+  assert.equal(receipt(runtime, request.operationId), undefined);
+  release({ commands: [{ name: "bounce", kind: "client" }] });
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "applied", "bounce not queued");
+  assert.equal(runtime.session.workflowCalls.length, 1);
+});
+
+test("an unsupported enqueue RPC does not latch unrelated session controls off", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    session.enqueueHandler = async () => { throw Object.assign(new Error("unsupported"), { code: -32601 }); };
+  });
+  await workflowReady(runtime);
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, request.operationId)?.state === "rejected", "unsupported RPC not rejected");
+  assert.equal((await workflowReady(runtime)).capabilities.includes("session-bounce"), false);
+});
 
 test("native send uses explicit owner and mode, and exact replay cannot submit twice", {
   concurrency: false,

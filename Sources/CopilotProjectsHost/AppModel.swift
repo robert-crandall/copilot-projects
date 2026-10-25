@@ -3055,6 +3055,14 @@ final class AppModel: ObservableObject {
                     return workflow.sendReady && !snapshot.hasPendingInput
                 case .abort:
                     return true
+                case .bounce:
+                    return workflow.sendReady && !snapshot.hasPendingInput
+                        && !snapshot.foregroundTurnActive && !snapshot.scheduledTurnActive
+                        && snapshot.activeSubagents.isEmpty && snapshot.schedules.isEmpty
+                        && snapshot.runtimeForegroundActivity(
+                            expectedSessionId: snapshot.copilotSessionId,
+                            now: clock(), minimumObservationMilliseconds: nil
+                        ) == .idle
                 case .setBudget:
                     return workflow.limitsKnown && workflow.budgetRequest == nil
                 case .answerBudget:

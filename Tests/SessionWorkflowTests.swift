@@ -9,6 +9,10 @@ final class SessionWorkflowTests: XCTestCase {
         XCTAssertTrue(RemoteSessionAction(kind: .send, prompt: "hello", mode: .enqueue).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .send, prompt: "hello").isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .abort, prompt: "unexpected").isValid)
+        XCTAssertTrue(RemoteSessionAction(kind: .bounce).isValid)
+        XCTAssertFalse(RemoteSessionAction(kind: .bounce, prompt: "/quit").isValid)
+        XCTAssertFalse(RemoteSessionAction(kind: .bounce, mode: .immediate).isValid)
+        XCTAssertFalse(RemoteSessionAction(kind: .bounce, attachmentIds: [UUID().uuidString]).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .setBudget, maxAiCredits: 29).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .setBudget, maxAiCredits: .infinity).isValid)
         XCTAssertTrue(RemoteSessionAction(kind: .setBudget, maxAiCredits: 30).isValid)
@@ -127,6 +131,32 @@ final class SessionWorkflowTests: XCTestCase {
             operation: CLIOperationRequest(operationId: "old", conversationEpoch: "epoch-0")
         ), .conflict)
         try FileManager.default.removeItem(at: sessions.appendingPathComponent("\(session.id).session-send.json"))
+        let bounce = RemoteSessionAction(kind: .bounce)
+        let bounceID = CLIOperationRequest(operationId: "bounce", conversationEpoch: "epoch-1")
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce, operation: bounceID
+        ), .invalid)
+        snapshot.runtimeActivity = RuntimeActivitySnapshot(
+            processing: false, observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000)
+        )
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce, operation: bounceID
+        ), .accepted)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: sessions.appendingPathComponent("\(session.id).session-bounce.json").path
+        ))
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce, operation: bounceID
+        ), .accepted)
+        try FileManager.default.removeItem(at: sessions.appendingPathComponent("\(session.id).session-bounce.json"))
+        snapshot.scheduledTurnActive = true
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce,
+            operation: CLIOperationRequest(operationId: "busy-bounce", conversationEpoch: "epoch-1")
+        ), .invalid)
+        snapshot.scheduledTurnActive = false
         snapshot.pendingPermissionRequestIds = ["pending"]
         try JSONEncoder().encode(snapshot).write(to: snapshotURL)
         XCTAssertEqual(model.performSessionAction(

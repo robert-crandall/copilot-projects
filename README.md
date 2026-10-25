@@ -25,6 +25,21 @@ built separately; they are not included in the public desktop distribution.
 If you already use a remote-enabled installation, keep using its integrated
 distribution rather than replacing it with the standalone download.
 
+## Remote bounce
+
+Remote clients can request `session-bounce` when the tracker discovers a loaded
+client/extension command named `bounce`. The host and tracker require an idle
+session without pending questions, background agents, or schedules. The tracker
+rechecks readiness and command availability, then queues `/bounce` through the
+SDK for the identified session; it never types into the terminal or sends a
+model prompt. The extension itself owns restarting and resuming.
+
+The correlated receipt confirms that the command was queued, not that the
+restart finished. An ambiguous dispatch blocks further native actions in that
+conversation rather than replaying the command. Check Terminal and recover on
+the Mac if it does not resume. Save unsent desktop text before restarting.
+Older clients remain compatible; the bounce extension is not installed by the host.
+
 ## Remote screenshot attachments
 
 Remote integrations can stage PNG/JPEG screenshots privately and attach them to

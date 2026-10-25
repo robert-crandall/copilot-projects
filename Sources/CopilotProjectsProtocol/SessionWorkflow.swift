@@ -3,6 +3,7 @@ import Foundation
 public enum RemoteSessionActionKind: String, Codable, Sendable, CaseIterable {
     case send = "session-send"
     case abort = "session-abort"
+    case bounce = "session-bounce"
     case setBudget = "set-session-budget"
     case answerBudget = "answer-session-budget"
 }
@@ -71,7 +72,7 @@ public struct RemoteSessionAction: Codable, Equatable, Sendable {
             guard let prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   prompt.utf8.count <= 8_192, mode != nil else { return false }
             return maxAiCredits == nil && requestId == nil && additionalAiCredits == nil
-        case .abort:
+        case .abort, .bounce:
             return prompt == nil && mode == nil && maxAiCredits == nil
                 && requestId == nil && additionalAiCredits == nil
         case .setBudget:
