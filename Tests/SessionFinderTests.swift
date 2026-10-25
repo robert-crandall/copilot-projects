@@ -1275,4 +1275,62 @@ final class SessionFinderModelTests: XCTestCase {
         finder.openHighlighted()
         XCTAssertEqual(opened, [olderEntry.id])
     }
+
+    func testDeepHistorySearchDebouncesRapidQueryChangesWhenAvailableEntriesAreEmpty() async throws {
+        let olderCopilotId = "0f1e2d3c-4b5a-4000-8000-0000000000cc"
+        let olderEntry = SessionFinderEntry(
+            source: SessionFinderSource(
+                sessionId: SessionFinderSource.resumableSessionId(for: olderCopilotId),
+                projectId: "p1",
+                projectName: "Core",
+                title: "Archived session with empty workspace",
+                cwd: "/r/core",
+                resumableCopilotSessionId: olderCopilotId
+            ),
+            requests: ["historical migration details"],
+            replies: ["completed"]
+        )
+
+        let ranker = FakeRanker(.success([]))
+        let historySearcher = FakeHistorySearcher(.success([
+            LunaMatch(sessionId: olderEntry.id, reason: "matched historical migration"),
+        ]))
+
+        let finder = SessionFinderModel(
+            sources: [],
+            ranker: ranker,
+            historySearcher: historySearcher,
+            lunaDelay: 0.15,
+            loadTranscript: { _ in nil },
+            loadResumableEntries: { [] },
+            loadResumableEntriesByIds: { ids in
+                ids.contains(olderCopilotId) ? [olderEntry] : []
+            },
+            onOpen: { _ in }
+        )
+        try await waitUntil { !finder.isIndexing && !finder.isLoadingResumable }
+
+        finder.query = "m"
+        XCTAssertEqual(finder.deepSearch, .pending)
+        XCTAssertTrue(historySearcher.calls.isEmpty)
+
+        try await Task.sleep(nanoseconds: 30_000_000)
+        finder.query = "mi"
+        XCTAssertEqual(finder.deepSearch, .pending)
+        XCTAssertTrue(historySearcher.calls.isEmpty)
+
+        try await Task.sleep(nanoseconds: 30_000_000)
+        finder.query = "migration"
+        XCTAssertEqual(finder.deepSearch, .pending)
+        XCTAssertTrue(historySearcher.calls.isEmpty)
+
+        try await waitUntil {
+            if case .finished = finder.deepSearch { return true }
+            return false
+        }
+        XCTAssertTrue(ranker.queries.isEmpty)
+        XCTAssertEqual(historySearcher.calls.map(\.query), ["migration"])
+        XCTAssertEqual(finder.rows.map(\.id), [olderEntry.id])
+        XCTAssertEqual(finder.highlightedId, olderEntry.id)
+    }
 }

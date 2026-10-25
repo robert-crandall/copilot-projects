@@ -19,6 +19,8 @@ final class SessionFinderModel: ObservableObject, Identifiable {
 
     enum DeepSearchPhase: Equatable {
         case idle
+        /// Waiting for the user to pause before searching history when no initial entries are loaded.
+        case pending
         case searching
         case finished([LunaMatch])
         case failed(String)
@@ -363,6 +365,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             return
         }
         let lunaReady: Bool
+        var needsDebounce = false
         switch luna {
         case .finished:
             lunaReady = true
@@ -370,6 +373,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             lunaReady = !lunaFailedWithNonRecoverableError
         case .idle where availableEntries.isEmpty:
             lunaReady = true
+            needsDebounce = true
         default:
             lunaReady = false
         }
@@ -382,27 +386,43 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             return
         }
 
-        deepSearch = .searching
+        let delay = needsDebounce ? lunaDelay : 0
+        deepSearch = needsDebounce ? .pending : .searching
         rebuildRows()
 
-        let excluded = activeCopilotSessionIds.union(
-            rows.compactMap { $0.entry.source.resumableCopilotSessionId?.lowercased() }
-        )
         let loadByIds = loadResumableEntriesByIds
-        let knownIds = Set(entries.map(\.id)).union(deepEntriesById.keys)
         deepTask = Task { [weak self] in
+            if needsDebounce {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+            }
+            let preflight: (excluded: Set<String>, knownIds: Set<String>)? = {
+                guard !Task.isCancelled, let self, !self.isIndexing, !self.isLoadingResumable else { return nil }
+                let currentKey = SessionFinderSearch.fold(SessionFinderSearch.collapseWhitespace(self.query))
+                guard currentKey == key else { return nil }
+                if needsDebounce {
+                    self.deepSearch = .searching
+                    self.rebuildRows()
+                }
+                let excluded = self.activeCopilotSessionIds.union(
+                    self.rows.compactMap { $0.entry.source.resumableCopilotSessionId?.lowercased() }
+                )
+                let knownIds = Set(self.entries.map(\.id)).union(self.deepEntriesById.keys)
+                return (excluded, knownIds)
+            }()
+            guard let preflight else { return }
             let phase: DeepSearchPhase
             do {
                 let matches = try await historySearcher.searchHistory(
                     query: text,
-                    excludedCopilotSessionIds: excluded
+                    excludedCopilotSessionIds: preflight.excluded
                 )
                 guard !Task.isCancelled, let self else { return }
                 let currentKey = SessionFinderSearch.fold(SessionFinderSearch.collapseWhitespace(self.query))
                 guard currentKey == key else { return }
 
                 let missingCopilotIds: [String] = matches.compactMap { match in
-                    guard !knownIds.contains(match.sessionId),
+                    guard !preflight.knownIds.contains(match.sessionId),
                           match.sessionId.hasPrefix("resumable:") else {
                         return nil
                     }
@@ -664,7 +684,8 @@ struct SessionFinderView: View {
         let rows = finder.rows
         let searching = !SessionFinderSearch.tokens(finder.query).isEmpty
         let isReadingConversations = finder.isIndexing || finder.isLoadingResumable
-        if live.isEmpty && !finder.hasResumableSessions && !isReadingConversations && finder.deepSearch != .searching {
+        if live.isEmpty && !finder.hasResumableSessions && !isReadingConversations
+            && finder.deepSearch != .pending && finder.deepSearch != .searching {
             ContentUnavailableView(
                 "No Sessions Yet", systemImage: "terminal",
                 description: Text("Start a Copilot session with ⌘T, then find it here.")
@@ -674,7 +695,7 @@ struct SessionFinderView: View {
                 title: searching ? SessionFinderModel.Section.matches.title : SessionFinderModel.Section.recent.title,
                 message: "Reading conversations…"
             )
-        } else if rows.isEmpty && finder.luna == .pending {
+        } else if rows.isEmpty && (finder.luna == .pending || finder.deepSearch == .pending) {
             statusList(title: SessionFinderModel.Section.luna.title, message: "Luna searches when you pause typing.")
         } else if rows.isEmpty && finder.luna == .searching {
             statusList(title: SessionFinderModel.Section.luna.title, message: "Luna is looking through your conversations…")
@@ -818,7 +839,7 @@ struct SessionFinderView: View {
                 return .suggestions(count)
             case .failed(let message):
                 return .warning(message)
-            case .idle, .searching:
+            case .idle, .pending, .searching:
                 return .waitingForPause
             }
         case .finished:
