@@ -157,12 +157,15 @@ search or close the finder.
 When you pause typing, Luna (`gpt-6-luna`, always) also suggests sessions that
 match what you described rather than the exact words, with a short reason.
 Its picks never reorder the instant matches; extra picks appear below them.
-Luna runs through the Copilot CLI you're signed in to, with no tools, in a
-temporary Copilot home that is deleted afterwards, so these lookups don't add
-sessions to your Copilot history or load your MCP servers. It sees each
+First, Luna runs a fast pass with no tools over each live and recent ended
 session's name, project, folder, and short excerpts of its first and recent
-requests and latest reply. If the Copilot CLI is missing or signed out, the
-instant results still work and the finder says why Luna couldn't help.
+requests and latest reply. Once that pass finishes, Luna searches your full
+local `session-store.db` history using `session_store_sql` against a disposable
+snapshot of the database, surfacing older ended sessions that can be resumed
+with Return. Both runs execute in a temporary Copilot home that is deleted
+afterwards, so these lookups don't add sessions to your Copilot history or load
+your MCP servers. If the Copilot CLI is missing or signed out, the instant
+results still work and the finder says why Luna couldn't help.
 
 ### Pull requests by goal
 

@@ -8,15 +8,18 @@ final class WorkspaceInputController: ObservableObject {
     @Published private(set) var sessionFinder: SessionFinderModel?
     private let model: AppModel
     private let sessionRanker: SessionRanking
+    private let sessionHistorySearcher: SessionHistorySearching?
     private let copilotSessionStore: @Sendable () -> CopilotSessionStore
 
     init(
         model: AppModel,
         sessionRanker: SessionRanking = LunaSessionRanker(),
+        sessionHistorySearcher: SessionHistorySearching? = nil,
         copilotSessionStore: @escaping @Sendable () -> CopilotSessionStore = { CopilotSessionStore() }
     ) {
         self.model = model
         self.sessionRanker = sessionRanker
+        self.sessionHistorySearcher = sessionHistorySearcher ?? (sessionRanker as? SessionHistorySearching)
         self.copilotSessionStore = copilotSessionStore
     }
 
@@ -48,11 +51,25 @@ final class WorkspaceInputController: ObservableObject {
             currentSessionId: model.globalSelectedSessionId,
             activeCopilotSessionIds: inMemoryCopilotIds,
             ranker: sessionRanker,
+            historySearcher: sessionHistorySearcher,
             loadResumableEntries: {
                 let markerIds = AppModel.validatedMarkerCopilotSessionIds(
                     sessionIds: initialSessionIds, directory: markerDirectory
                 )
                 return SessionFinderResumableLoader.load(
+                    store: storeProvider(),
+                    projects: projects,
+                    selectedProjectId: selectedProjectId,
+                    liveCopilotSessionIds: inMemoryCopilotIds.union(markerIds),
+                    defaultStartupDir: defaultStartupDir
+                )
+            },
+            loadResumableEntriesByIds: { candidateIds in
+                let markerIds = AppModel.validatedMarkerCopilotSessionIds(
+                    sessionIds: initialSessionIds, directory: markerDirectory
+                )
+                return SessionFinderResumableLoader.loadEntries(
+                    forCopilotSessionIds: candidateIds,
                     store: storeProvider(),
                     projects: projects,
                     selectedProjectId: selectedProjectId,
@@ -93,7 +110,8 @@ final class WorkspaceInputController: ObservableObject {
             preferredProjectId: source.projectId,
             cwd: source.cwd,
             repository: source.repository,
-            title: source.title
+            title: source.title,
+            store: copilotSessionStore()
         ) {
         case .opened(let projectId, let resumedSessionId):
             dismissSessionFinder()
