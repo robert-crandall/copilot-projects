@@ -837,6 +837,38 @@ final class RemoteSessionSearchTests: XCTestCase {
 
         model.moveSession(toProjectId: "p1", draggedId: resumeRequestId.uuidString)
         model.closeProject("p2")
+
+        // Cached resumable entries originally bound to "p2" rebind to the remaining open project
+        // ("p1") immediately, without waiting for the 15-second resumable cache to expire.
+        let instantAfterClose = await bridge.searchSessions(.init(
+            query: "webhook backoff",
+            mode: .instant,
+            includeResumable: true
+        ))
+        let instantAfterCloseFound = try XCTUnwrap(matches(instantAfterClose, mode: .instant))
+        XCTAssertEqual(instantAfterCloseFound.first?.sessionId, recentEndedRowId)
+        XCTAssertEqual(instantAfterCloseFound.first?.projectId, "p1")
+
+        let lunaAfterClose = await bridge.searchSessions(.init(
+            query: "backoff",
+            mode: .luna,
+            includeResumable: true
+        ))
+        let lunaAfterCloseFound = try XCTUnwrap(matches(lunaAfterClose, mode: .luna))
+        XCTAssertEqual(lunaAfterCloseFound.first?.sessionId, recentEndedRowId)
+        XCTAssertEqual(lunaAfterCloseFound.first?.projectId, "p1")
+
+        let recentAfterClose = await bridge.searchSessions(.init(
+            query: "",
+            mode: .recent,
+            includeResumable: true
+        ))
+        let recentAfterCloseFound = try XCTUnwrap(matches(recentAfterClose, mode: .recent))
+        XCTAssertEqual(
+            recentAfterCloseFound.first(where: { $0.sessionId == recentEndedRowId })?.projectId,
+            "p1"
+        )
+
         let replayed = bridge.resumeSearchSession(resumeRequest)
         XCTAssertEqual(
             replayed,

@@ -150,20 +150,76 @@ actor SessionSearchIndex {
         return Task.isCancelled ? nil : matches
     }
 
-    /// Cached recent ended resumable sessions, refreshed after `resumableCacheInterval`.
+    /// Cached recent ended resumable sessions, refreshed after `resumableCacheInterval`
+    /// and rebound to the current project targets on each lookup.
     func resumableEntries(
+        projects: [SessionFinderProjectTarget],
+        selectedProjectId: String?,
+        excludedCopilotSessionIds: Set<String> = [],
+        defaultStartupDir: String = Paths.defaultStartupDir,
         load: @Sendable () -> [SessionFinderEntry]
     ) -> [SessionFinderEntry]? {
         scheduleExpiry()
         let current = now()
         if let cached = cachedResumable,
            current.timeIntervalSince(cached.loadedAt) < Self.resumableCacheInterval {
-            return Task.isCancelled ? nil : cached.entries
+            guard !Task.isCancelled else { return nil }
+            return Self.rebindResumableEntries(
+                cached.entries,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                excludedCopilotSessionIds: excludedCopilotSessionIds,
+                defaultStartupDir: defaultStartupDir
+            )
         }
         let loaded = load()
         guard !Task.isCancelled else { return nil }
         cachedResumable = (loaded, current)
-        return loaded
+        return Self.rebindResumableEntries(
+            loaded,
+            projects: projects,
+            selectedProjectId: selectedProjectId,
+            excludedCopilotSessionIds: excludedCopilotSessionIds,
+            defaultStartupDir: defaultStartupDir
+        )
+    }
+
+    private static func rebindResumableEntries(
+        _ entries: [SessionFinderEntry],
+        projects: [SessionFinderProjectTarget],
+        selectedProjectId: String?,
+        excludedCopilotSessionIds: Set<String>,
+        defaultStartupDir: String
+    ) -> [SessionFinderEntry] {
+        guard !projects.isEmpty else { return [] }
+        return entries.compactMap { entry in
+            if let copilotId = entry.source.resumableCopilotSessionId?.lowercased(),
+               excludedCopilotSessionIds.contains(copilotId) {
+                return nil
+            }
+            guard let targetProject = SessionFinderSearch.targetProject(
+                forCwd: entry.source.cwd,
+                repository: entry.source.repository,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                defaultStartupDir: defaultStartupDir
+            ) else { return nil }
+            guard entry.source.projectId != targetProject.id || entry.source.projectName != targetProject.name else {
+                return entry
+            }
+            return entry.rebound(
+                to: SessionFinderSource(
+                    sessionId: entry.source.sessionId,
+                    projectId: targetProject.id,
+                    projectName: targetProject.name,
+                    title: entry.source.title,
+                    cwd: entry.source.cwd,
+                    lastActivity: entry.source.lastActivity,
+                    resumableCopilotSessionId: entry.source.resumableCopilotSessionId,
+                    repository: entry.source.repository
+                )
+            )
+        }
     }
 
     private func needsRetry(_ cached: Cached, now: Date) -> Bool {
@@ -325,7 +381,12 @@ final class RemoteSessionSearch {
         guard includeResumable, let storeProvider = copilotSessionStore, !projects.isEmpty else { return [] }
         if let candidateIds, candidateIds.isEmpty { return [] }
         if candidateIds == nil {
-            return await index.resumableEntries {
+            return await index.resumableEntries(
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                excludedCopilotSessionIds: inMemoryIds,
+                defaultStartupDir: defaultStartupDir
+            ) {
                 let markerIds = AppModel.validatedMarkerCopilotSessionIds(
                     sessionIds: liveSessionIds,
                     directory: markerDirectory
