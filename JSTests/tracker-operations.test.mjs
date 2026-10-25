@@ -888,6 +888,40 @@ test("bounce cannot reuse question recovery from a previous conversation", {
   assert.equal(runtime.session.workflowCalls[0].sessionId, nextID);
 });
 
+test("bounce waits for oversized questions that cannot be displayed remotely", {
+  concurrency: false,
+}, async (t) => {
+  for (const kind of ["elicitation", "user_input"]) {
+    for (const recovered of [false, true]) {
+      const data = kind === "elicitation"
+        ? { ...pendingURLQuestion("oversized"), message: "x".repeat(16_385) }
+        : { requestId: "oversized", question: "x".repeat(16_385), choices: ["Continue"] };
+      const runtime = await createRuntime(t, (session) => {
+        session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+        if (recovered) session.questionEvents.push(questionEvent(`${kind}.requested`, data));
+      });
+      await workflowReady(runtime);
+      if (!recovered) await runtime.session.emit(`${kind}.requested`, data);
+      assert.equal(runtime.session.processing, false);
+      const field = kind === "elicitation" ? "trackedElicitations" : "trackedUserInputs";
+      assert.deepEqual(readSnapshot(runtime)[field], []);
+      const pending = workflowHandoff(runtime, "session-bounce", {});
+      await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, pending.operationId)?.state),
+        "bounce did not settle with a terminal-only question");
+      assert.equal(receipt(runtime, pending.operationId).state, "rejected", `${kind} recovered=${recovered}`);
+      assert.deepEqual(runtime.session.workflowCalls, []);
+
+      await runtime.session.emit(`${kind}.completed`, { requestId: "oversized" }, {}, !recovered);
+      if (recovered) runtime.intervalCallback();
+      await new Promise(resolve => setImmediate(resolve));
+      const ready = workflowHandoff(runtime, "session-bounce", {});
+      await waitFor(() => receipt(runtime, ready.operationId)?.state === "applied",
+        "completed terminal-only question kept bounce blocked");
+      assert.equal(runtime.session.workflowCalls.length, 1);
+    }
+  }
+});
+
 test("bounce rechecks live processing and command registration before dispatch", {
   concurrency: false,
 }, async (t) => {

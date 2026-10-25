@@ -303,6 +303,7 @@ if (validSessionId && socketPath) {
     const pendingElicitations = new Map();
     const recoveredQuestionToolCallIds = new Set();
     const completedQuestionRequests = new Set();
+    const pendingQuestionRequestIds = new Set();
     let questionEventStream = null;
     const inFlightElicitationResponses = new Set();
     const operationReceipts = new Map();
@@ -1621,6 +1622,7 @@ if (validSessionId && socketPath) {
             && !bounceRequested && runtimeActivity?.processing === false
             && !foregroundTurnActive && !scheduledTurnActive
             && activeSubagents.size === 0 && schedules.length === 0
+            && pendingQuestionRequestIds.size === 0
             && !workflowHasPendingInput();
     }
 
@@ -2526,6 +2528,7 @@ if (validSessionId && socketPath) {
     }
 
     function noteQuestionCompleted(requestId) {
+        pendingQuestionRequestIds.delete(requestId);
         questionEventStream?.inputs.delete(requestId);
         questionEventStream?.elicitations.delete(requestId);
         // Runtime request IDs are unique; a delayed notification must not reopen an answered form.
@@ -2554,6 +2557,7 @@ if (validSessionId && socketPath) {
             return Boolean(entry) || cleared;
         }
         if (completedQuestionRequests.has(requestId)) return false;
+        pendingQuestionRequestIds.add(requestId);
         const entry = elicitation ? elicitationEntry(event) : userInputEntry(event);
         const maximum = elicitation ? MAX_ELICITATIONS : MAX_USER_INPUTS;
         if (recovered) {
@@ -2663,6 +2667,7 @@ if (validSessionId && socketPath) {
                             stream.completed.delete(stream.completed.keys().next().value);
                         }
                     } else if (!stream.completed.has(requestId) && !completedQuestionRequests.has(requestId)) {
+                        if (!requestId.startsWith(DURABLE_ASK_USER_PREFIX)) pendingQuestionRequestIds.add(requestId);
                         const entry = event.type === "elicitation.requested"
                             ? elicitationEntry(event) : userInputEntry(event);
                         if (!entry) continue;
@@ -4485,6 +4490,7 @@ if (validSessionId && socketPath) {
         pendingElicitations.clear();
         recoveredQuestionToolCallIds.clear();
         completedQuestionRequests.clear();
+        pendingQuestionRequestIds.clear();
         questionEventStream = null;
         inFlightElicitationResponses.clear();
         pendingPermissionRequests.clear();
