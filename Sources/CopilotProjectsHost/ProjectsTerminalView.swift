@@ -205,7 +205,13 @@ final class ProjectsTerminalView: ProcessTerminalView {
         guard !result.entries.isEmpty else { return }
         kittyImageCapture.beginRestoring()
         for entry in result.entries {
-            kittyImageCapture.restoreEntry(imageId: entry.imageId, version: entry.version, data: entry.data)
+            kittyImageCapture.restoreEntry(
+                imageId: entry.imageId,
+                version: entry.version,
+                data: entry.data,
+                displayedAt: entry.displayedAt,
+                awaitingFirstDisplay: entry.awaitingFirstDisplay
+            )
         }
         for selection in result.currentSelections {
             kittyImageCapture.restoreCurrentSelection(
