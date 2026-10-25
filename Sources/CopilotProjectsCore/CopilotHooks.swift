@@ -88,6 +88,10 @@ public enum CopilotHooks {
       if [ "$1" = "waiting" ]; then
         waiting_context="$(input_wait_context "${4:-}")"
       fi
+      case "$waiting_context" in
+        null|\{*\}) ;;
+        *) waiting_context=null ;;
+      esac
       (
         umask 077
         printf '{"schemaVersion":1,"status":"%s","statusTimestamp":%s,"promptStatusTimestamp":%s,"inputWait":%s}\n' \
@@ -228,6 +232,64 @@ public enum CopilotHooks {
       [ "$(printf '%s' "$caller" | tr '[:upper:]' '[:lower:]')" \
         != "$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')" ]
     }
+
+    # A nested `copilot` process (e.g. `copilot -p` or an SDK-spawned `copilot --server`
+    # child) shares the tab's dtach ancestry, so `resolve-session` maps it to this tab.
+    # While the tab's recorded owner CLI (`parentPid` in `transcript-owner.json`) is
+    # alive on this boot, only hooks spawned by that owner CLI (directly or through
+    # shell/sandbox wrappers) belong to this tab. In-process `task` subagents and `/new`
+    # rotations still run inside `owner_parent_pid` and pass.
+    hook_has_other_owner_process() {
+      local owner_file owner_parent_pid owner_session owner_boot current_boot current_pid depth comm
+      owner_file="$state_dir/sessions/$session_id.transcript-owner.json"
+      [ -f "$owner_file" ] || return 1
+      owner_parent_pid="$(sed -n \
+        's/.*"parentPid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$owner_file" 2>/dev/null | head -1)"
+      case "$owner_parent_pid" in
+        ""|0|1|*[!0-9]*) return 1 ;;
+      esac
+      [ "$PPID" -eq "$owner_parent_pid" ] && return 1
+      kill -0 "$owner_parent_pid" 2>/dev/null || return 1
+      owner_session="$(sed -n \
+        's/.*"appSessionId":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$owner_file" 2>/dev/null | head -1)"
+      if [ -n "$owner_session" ] \
+        && [ "$(printf '%s' "$owner_session" | tr '[:upper:]' '[:lower:]')" \
+          != "$(printf '%s' "$session_id" | tr '[:upper:]' '[:lower:]')" ]; then
+        return 1
+      fi
+      owner_boot="$(sed -n \
+        's/.*"bootTime":[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$owner_file" 2>/dev/null | head -1)"
+      if [ -n "$owner_boot" ]; then
+        current_boot="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null || true)"
+        [ -z "$current_boot" ] || [ "$owner_boot" = "$current_boot" ] || return 1
+      fi
+      current_pid="$PPID"
+      depth=0
+      while [ "$depth" -lt 6 ]; do
+        case "$current_pid" in
+          ""|0|1|*[!0-9]*) return 1 ;;
+        esac
+        [ "$current_pid" -eq "$owner_parent_pid" ] && return 1
+        comm="$(ps -o comm= -p "$current_pid" 2>/dev/null)" || return 1
+        comm="${comm##*/}"
+        comm="${comm#-}"
+        case "$comm" in
+          sh|bash|zsh|dash|ksh|fish|env|sandbox-exec)
+            current_pid="$(ps -o ppid= -p "$current_pid" 2>/dev/null | tr -d '[:space:]')" || return 1
+            depth=$((depth + 1))
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+      return 0
+    }
+
+    if hook_has_other_owner_process; then emit; exit 0; fi
 
     case "${1:-}" in
       start)
