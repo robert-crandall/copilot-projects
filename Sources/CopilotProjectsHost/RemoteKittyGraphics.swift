@@ -548,15 +548,18 @@ final class RemoteKittyImageCapture: ObservableObject {
     // version so a scan can tell whether an id's data is still fetchable.
     private var order: [StoredKey] = []
     private var dataByKey: [StoredKey: Data] = [:]
+    private var pixelSizeByKey: [StoredKey: (width: Int, height: Int)] = [:]
     private var totalBytes = 0
     private var latestVersion: [UInt32: UInt64] = [:]
     /// Origin time for each retained `(imageId, version)`. An unchanged redraw
-    /// of an advertised image keeps its earlier origin so it stays with the
-    /// same transcript turn (see `retainedImageMetadata`). In-memory only and intentionally
-    /// NOT persisted to the disk store: after a relaunch a restored image has no
-    /// display time, so it simply isn't associated to any turn (it still renders
-    /// in Terminal mode). Kept in lockstep with `dataByKey`.
+    /// of an image keeps its earlier origin so it stays with the same
+    /// transcript turn (see `retainedImageMetadata`). Kept in lockstep with
+    /// `dataByKey`.
     private var displayedAt: [StoredKey: Date] = [:]
+    /// Keys restored from a legacy on-disk manifest that had no `displayedAt`.
+    /// Placement updates on these keys must not fabricate a fresh `now()`
+    /// origin time (which would misattribute an old image to a newer turn).
+    private var restoredWithoutOrigin: Set<StoredKey> = []
     private let now: () -> Date
 
     // Ids with a currently *active* Unicode-placeholder placement — tracked
@@ -786,13 +789,29 @@ final class RemoteKittyImageCapture: ObservableObject {
         let imageId: UInt32
         let version: UInt64
         let displayedAt: Date
+        let pixelWidth: Int?
+        let pixelHeight: Int?
+
+        init(
+            imageId: UInt32,
+            version: UInt64,
+            displayedAt: Date,
+            pixelWidth: Int? = nil,
+            pixelHeight: Int? = nil
+        ) {
+            self.imageId = imageId
+            self.version = version
+            self.displayedAt = displayedAt
+            self.pixelWidth = pixelWidth
+            self.pixelHeight = pixelHeight
+        }
     }
 
     /// Snapshot of every image this session currently advertises (retained data
     /// + an active placement, exactly what `/terminal-image` can still serve)
-    /// paired with the time it was displayed. Restored-from-disk images have no
-    /// display time and are omitted, so a caller can only ever associate an
-    /// image whose bytes are guaranteed fetchable. Bounded by the per-session
+    /// paired with the time it was displayed. Restored-from-disk images without
+    /// a persisted display time are omitted, so a caller can only ever associate
+    /// an image whose origin time and bytes are known. Bounded by the per-session
     /// retention caps (`remoteKittyMaxRetainedEntries`), so this is always small.
     func retainedImageMetadata() -> [RetainedImageInfo] {
         var result: [RetainedImageInfo] = []
@@ -804,8 +823,15 @@ final class RemoteKittyImageCapture: ObservableObject {
             guard latestVersion[key.imageId] == key.version else { continue }
             guard isAnyPlacementActive(imageId: key.imageId) else { continue }
             guard let when = displayedAt[key] else { continue }
+            let dims = pixelSizeByKey[key]
             result.append(
-                RetainedImageInfo(imageId: key.imageId, version: key.version, displayedAt: when)
+                RetainedImageInfo(
+                    imageId: key.imageId,
+                    version: key.version,
+                    displayedAt: when,
+                    pixelWidth: dims?.width,
+                    pixelHeight: dims?.height
+                )
             )
         }
         return result
@@ -1309,6 +1335,12 @@ final class RemoteKittyImageCapture: ObservableObject {
             )
         }
         activatePlacement(imageId: imageId, explicitPlacementId: explicitPlacementId)
+        if let currentVersion = latestVersion[imageId] {
+            let currentKey = StoredKey(imageId: imageId, version: currentVersion)
+            if displayedAt[currentKey] == nil, !restoredWithoutOrigin.contains(currentKey) {
+                displayedAt[currentKey] = now()
+            }
+        }
         // Bump iff this re-placement could change what a fresh scan
         // currently discovers: it does exactly when the id wasn't already
         // fully advertised before (an already wildcard-active id gaining a
@@ -1347,9 +1379,15 @@ final class RemoteKittyImageCapture: ObservableObject {
         guard let imageId = pendingImageId,
               let decoded = Data(base64Encoded: Data(pendingBase64)),
               decoded.count <= remoteKittyMaxDecodedImageBytes,
-              RemoteKittyPNGValidation.isStructurallyValid(decoded)
+              let pixelSize = RemoteKittyPNGValidation.pixelSize(decoded)
         else { return }
-        retain(imageId: imageId, data: decoded, activates: pendingActivates, explicitPlacementId: pendingPlacementId)
+        retain(
+            imageId: imageId,
+            data: decoded,
+            pixelSize: pixelSize,
+            activates: pendingActivates,
+            explicitPlacementId: pendingPlacementId
+        )
     }
 
     /// Ends whatever in-flight transmission is currently buffered — on
@@ -1413,19 +1451,28 @@ final class RemoteKittyImageCapture: ObservableObject {
         return version
     }
 
-    private func retain(imageId: UInt32, data: Data, activates: Bool, explicitPlacementId: UInt32?) {
+    private func retain(
+        imageId: UInt32,
+        data: Data,
+        pixelSize: CGSize,
+        activates: Bool,
+        explicitPlacementId: UInt32?
+    ) {
         // Capture before either the retained version or placement state changes.
         let hadAdvertisedVersion = latestVersion[imageId] != nil && isAnyPlacementActive(imageId: imageId)
         let originalDisplayTime = latestVersion[imageId].flatMap { previousVersion -> Date? in
             let previousKey = StoredKey(imageId: imageId, version: previousVersion)
-            guard hadAdvertisedVersion, dataByKey[previousKey] == data else { return nil }
+            guard dataByKey[previousKey] == data else { return nil }
             return displayedAt[previousKey]
         }
+        let isDisplayedNow = activates || isAnyPlacementActive(imageId: imageId)
+        let resolvedDisplayTime = originalDisplayTime ?? (isDisplayedNow ? now() : nil)
         let version = nextVersion()
         let key = StoredKey(imageId: imageId, version: version)
         order.append(key)
         dataByKey[key] = data
-        displayedAt[key] = originalDisplayTime ?? now()
+        pixelSizeByKey[key] = (Int(pixelSize.width), Int(pixelSize.height))
+        displayedAt[key] = resolvedDisplayTime
         totalBytes += data.count
         if activates, let rows = pendingRows, let columns = pendingColumns {
             let geometryKey = PlacementGeometryKey(
@@ -1464,6 +1511,8 @@ final class RemoteKittyImageCapture: ObservableObject {
             imageId: imageId,
             version: version,
             data: data,
+            displayedAt: resolvedDisplayTime,
+            awaitingFirstDisplay: resolvedDisplayTime == nil && !restoredWithoutOrigin.contains(key),
             selections: persistedSelections(imageId: imageId)
         )
         budget.register(owner: self, imageId: imageId, version: version, bytes: data.count)
@@ -1477,7 +1526,9 @@ final class RemoteKittyImageCapture: ObservableObject {
     private func removeStoredKey(_ key: StoredKey, notifyBudget: Bool) {
         guard let data = dataByKey.removeValue(forKey: key) else { return }
         totalBytes -= data.count
+        pixelSizeByKey.removeValue(forKey: key)
         displayedAt.removeValue(forKey: key)
+        restoredWithoutOrigin.remove(key)
         if let index = order.firstIndex(of: key) { order.remove(at: index) }
         if latestVersion[key.imageId] == key.version {
             latestVersion.removeValue(forKey: key.imageId)
@@ -1735,7 +1786,9 @@ final class RemoteKittyImageCapture: ObservableObject {
         }
         order.removeAll()
         dataByKey.removeAll()
+        pixelSizeByKey.removeAll()
         displayedAt.removeAll()
+        restoredWithoutOrigin.removeAll()
         latestVersion.removeAll()
         wildcardActiveImageIds.removeAll()
         exactActivePlacements.removeAll()
@@ -1753,7 +1806,9 @@ final class RemoteKittyImageCapture: ObservableObject {
         for key in order {
             if key.imageId == imageId {
                 if let data = dataByKey.removeValue(forKey: key) { totalBytes -= data.count }
+                pixelSizeByKey.removeValue(forKey: key)
                 displayedAt.removeValue(forKey: key)
+                restoredWithoutOrigin.remove(key)
                 budget.unregister(owner: self, imageId: key.imageId, version: key.version)
                 persistEvictionToDisk(imageId: key.imageId, version: key.version)
             } else {
@@ -1794,6 +1849,8 @@ final class RemoteKittyImageCapture: ObservableObject {
         imageId: UInt32,
         version: UInt64,
         data: Data,
+        displayedAt: Date?,
+        awaitingFirstDisplay: Bool,
         selections: [RemoteKittyPersistedPlacementSelection]
     ) {
         guard !suppressPersistToDisk, let diskStore else { return }
@@ -1802,6 +1859,8 @@ final class RemoteKittyImageCapture: ObservableObject {
             imageId: imageId,
             version: version,
             data: data,
+            displayedAt: displayedAt,
+            awaitingFirstDisplay: awaitingFirstDisplay,
             currentSelections: selections
         )
     }
@@ -1830,9 +1889,15 @@ final class RemoteKittyImageCapture: ObservableObject {
     /// `c=`/`r=` cell-span metadata to faithfully replay.
     private func syncPersistedSelections(imageId: UInt32) {
         guard !suppressPersistToDisk, let diskStore else { return }
+        let currentVersion = latestVersion[imageId]
+        let currentDisplayedAt = currentVersion.flatMap {
+            displayedAt[StoredKey(imageId: imageId, version: $0)]
+        }
         diskStore.replaceCurrentSelections(
             sessionId: sessionId,
             imageId: imageId,
+            version: currentVersion,
+            displayedAt: currentDisplayedAt,
             selections: persistedSelections(imageId: imageId)
         )
     }
@@ -1935,15 +2000,30 @@ final class RemoteKittyImageCapture: ObservableObject {
     /// process-wide budget or enforce local bounds yet: see
     /// `pendingBudgetRegistrations`.
     @discardableResult
-    func restoreEntry(imageId: UInt32, version: UInt64, data: Data) -> Bool {
+    func restoreEntry(
+        imageId: UInt32,
+        version: UInt64,
+        data: Data,
+        displayedAt restoredDisplayedAt: Date? = nil,
+        awaitingFirstDisplay: Bool = false
+    ) -> Bool {
         guard isRestoring else { return false }
         guard imageId >= 1, imageId <= 0xFFFFFF,
-              RemoteKittyPNGValidation.isStructurallyValid(data)
+              let pixelSize = RemoteKittyPNGValidation.pixelSize(data)
         else { return false }
         let key = StoredKey(imageId: imageId, version: version)
         guard dataByKey[key] == nil else { return false }
         order.append(key)
         dataByKey[key] = data
+        pixelSizeByKey[key] = (Int(pixelSize.width), Int(pixelSize.height))
+        if let restoredDisplayedAt {
+            displayedAt[key] = restoredDisplayedAt
+            restoredWithoutOrigin.remove(key)
+        } else if awaitingFirstDisplay {
+            restoredWithoutOrigin.remove(key)
+        } else {
+            restoredWithoutOrigin.insert(key)
+        }
         totalBytes += data.count
         latestVersion[imageId] = version
         pendingBudgetRegistrations.append(key)
