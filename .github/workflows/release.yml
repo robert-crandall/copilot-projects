@@ -152,6 +152,7 @@ jobs:
         if: steps.release.outputs.should_release == 'true'
         run: |
           python3 scripts/test-release.py
+          python3 scripts/test-release-notes.py
           swift test
 
   release:
@@ -163,6 +164,7 @@ jobs:
     environment: release
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
         with:

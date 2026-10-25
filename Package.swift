@@ -115,6 +115,7 @@ let package = Package(
                 "CopilotProjectsProtocol",
                 "CopilotProjectsProtocolFixtures",
                 "CopilotProjectsHost",
+                "CopilotProjectsUI",
                 "CopilotProjectsPullRequests",
                 "CopilotProjectsStyle",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),

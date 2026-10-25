@@ -97,6 +97,10 @@ private struct WorkspaceCommands: Commands {
             Toggle("Keep Running When Window Closes", isOn: $keepRunning)
             Toggle("Start Notifications with Copilot Projects", isOn: $startsNotifications)
         }
+        CommandGroup(after: .help) {
+            Button("What's New") { input.presentReleaseNotes() }
+                .disabled(input.hasWorkspaceSheet)
+        }
         CommandGroup(before: .sidebar) {
             Toggle("Show Projects", isOn: $showsProjects)
                 .keyboardShortcut("0", modifiers: .command)

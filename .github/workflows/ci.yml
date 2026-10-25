@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Release entrypoint contracts
-        run: python3 scripts/test-release.py
+        run: |
+          python3 scripts/test-release.py
+          python3 scripts/test-release-notes.py
       - name: Terminal reattachment under backpressure
         run: python3 scripts/test-dtach.py
       - name: Pure session rules

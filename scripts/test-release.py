@@ -47,7 +47,9 @@ if command == "git":
         wanted = [arg[len("refs/tags/"):] for arg in args if arg.startswith("refs/tags/")]
         for tag in tags + ([latest] if latest else []):
             if not wanted or tag in wanted:
-                print((os.environ["MOCK_LATEST_SHA"] if tag == latest else "1" * 40) + "\trefs/tags/" + tag)
+                sha = os.environ.get("MOCK_LATEST_SHA") or subprocess.check_output(
+                    [os.environ["REAL_GIT"], "rev-parse", "HEAD"], text=True).strip()
+                print((sha if tag == latest else "1" * 40) + "\trefs/tags/" + tag)
         sys.exit(0)
     sys.exit(subprocess.call([os.environ["REAL_GIT"]] + args))
 if command == "date":
@@ -119,6 +121,10 @@ set -euo pipefail
 printf '%s\\n' "$PWD|$VERSION|$CODESIGN_IDENTITY|$*" > dist-build.txt
 printf '%s' "${CODESIGN_KEYCHAIN:-}" > dist-keychain.txt
 mkdir -p 'dist/Copilot Projects.app'
+if [ -n "${RELEASE_NOTES_FILE:-}" ]; then
+  mkdir -p 'dist/Copilot Projects.app/Contents/Resources'
+  cp "$RELEASE_NOTES_FILE" 'dist/Copilot Projects.app/Contents/Resources/release-notes.json'
+fi
 case "${BUILD_CHANGE:-}" in
   dirty) echo changed >> tracked ;;
   head) git commit --allow-empty -qm 'changed during build' ;;
@@ -184,7 +190,8 @@ class ReleaseTests(unittest.TestCase):
         self.public = self.project("public", "https://github.com/sirfergy/copilot-projects.git")
         shutil.copyfile(RELEASE, self.public / "scripts/release.sh")
         shutil.copyfile(RELEASE_VERSION, self.public / "scripts/release-version.sh")
-        self.git(self.public, "add", "scripts/release.sh", "scripts/release-version.sh")
+        shutil.copyfile(RELEASE.with_name("release-notes.py"), self.public / "scripts/release-notes.py")
+        self.git(self.public, "add", "scripts/release.sh", "scripts/release-version.sh", "scripts/release-notes.py")
         self.git(self.public, "commit", "-qm", "release entrypoint")
         self.git(self.public, "update-ref", "refs/remotes/origin/main", "HEAD")
         self.project_root = self.project("integration with spaces", "git@github.com:example/integration.git")
@@ -267,6 +274,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any("sirfergy/copilot-projects" in arg for arg in api_args))
         for command in ("codesign", "spctl", "xcrun", "curl"):
             self.assertTrue(any(cmd == command for _, cmd, _ in self.calls))
+        snapshot = json.loads(
+            (self.project_root / "dist/Copilot Projects.app/Contents/Resources/release-notes.json").read_text()
+        )
+        self.assertEqual(snapshot["sourceRevision"], self.git(self.project_root, "rev-parse", "HEAD"))
+        self.assertEqual(snapshot["repository"], "example/integration")
+        published_body = next(
+            arg[5:] for _, cmd, args in self.calls if cmd == "gh"
+            for arg in args if arg.startswith("body=")
+        )
+        self.assertTrue(published_body.startswith(snapshot["markdown"]))
+        self.assertIn("## Install", published_body)
 
     def test_default_root_and_repository_remain_public(self):
         del self.env["GITHUB_REPOSITORY"]

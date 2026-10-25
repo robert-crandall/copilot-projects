@@ -254,6 +254,11 @@ if [ -n "$EXTRA_RESOURCES" ]; then
   fi
   cp -R "$EXTRA_RESOURCES/." "$RES/"
 fi
+if [ -n "${RELEASE_NOTES_FILE:-}" ]; then
+  python3 "$ROOT/scripts/release-notes.py" validate \
+    --file "$RELEASE_NOTES_FILE" --version "$SHORT_VERSION" --build "$BUILD_VERSION"
+  cp "$RELEASE_NOTES_FILE" "$RES/release-notes.json"
+fi
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

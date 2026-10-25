@@ -5,6 +5,7 @@ import CopilotProjectsCore
 @MainActor
 final class WorkspaceInputController: ObservableObject {
     @Published var imagePreview: TranscriptImagePreviewItem?
+    @Published var showsReleaseNotes = false
     @Published private(set) var sessionFinder: SessionFinderModel?
     private let model: AppModel
     private let sessionRanker: SessionRanking
@@ -24,10 +25,16 @@ final class WorkspaceInputController: ObservableObject {
     }
 
     /// A workspace sheet owns the keyboard, so workspace commands stay disabled.
-    var hasWorkspaceSheet: Bool { imagePreview != nil || sessionFinder != nil }
+    var hasWorkspaceSheet: Bool { imagePreview != nil || sessionFinder != nil || showsReleaseNotes }
+
+    func presentReleaseNotes() {
+        guard !hasWorkspaceSheet, NSApp.modalWindow == nil else { return }
+        model.setNumberHint(.none)
+        showsReleaseNotes = true
+    }
 
     func presentImage(_ item: TranscriptImagePreviewItem) {
-        guard sessionFinder == nil else { return }
+        guard sessionFinder == nil, !showsReleaseNotes else { return }
         guard model.globalSelectedSessionId == item.id.sessionId,
               model.isTranscriptDrawerOpen(sessionId: item.id.sessionId) else {
             NSLog("Ignoring an image preview from an inactive session drawer.")
@@ -126,7 +133,7 @@ final class WorkspaceInputController: ObservableObject {
     }
 
     func allowsWorkspaceEvents(_ event: NSEvent) -> Bool {
-        imagePreview == nil && NSApp.modalWindow == nil
+        imagePreview == nil && !showsReleaseNotes && NSApp.modalWindow == nil
             && event.window?.sheetParent == nil && event.window?.attachedSheet == nil
             && NSApp.keyWindow?.sheetParent == nil && NSApp.keyWindow?.attachedSheet == nil
     }
@@ -163,11 +170,12 @@ final class WorkspaceInputController: ObservableObject {
             clearNumberHint()
             return handleSessionFinderKey(event, finder: finder, mods: mods)
         }
-        if imagePreview != nil {
+        if imagePreview != nil || showsReleaseNotes {
             clearNumberHint()
             if (mods == .command && event.charactersIgnoringModifiers == "w")
                 || (mods.isEmpty && event.keyCode == 53) {
                 imagePreview = nil
+                showsReleaseNotes = false
                 return nil
             }
             // Native preview controls keep their own keyboard handling. Events
