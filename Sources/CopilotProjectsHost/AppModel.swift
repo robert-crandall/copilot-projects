@@ -1220,8 +1220,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    @discardableResult
-    func copilotSessionExecutable(toProjectId pid: String) throws -> String {
+    private func copilotSessionExecutable(toProjectId pid: String) throws -> String {
         guard !isTerminating else { throw CopilotSessionStartError.shuttingDown }
         guard projectIndex(pid) != nil else { throw CopilotSessionStartError.projectUnavailable }
         guard remoteSessionBackendAvailable() else { throw CopilotSessionStartError.backendUnavailable }
@@ -5639,27 +5638,6 @@ final class AppModel: ObservableObject {
             )?.id
         }
         guard let projectId else {
-            return .temporarilyUnavailable(CopilotSessionStartError.projectUnavailable.localizedDescription)
-        }
-        return resumeEndedSessionInProject(
-            copilotSessionId: copilotSessionId,
-            projectId: projectId,
-            title: title,
-            store: store,
-            now: now
-        )
-    }
-
-    /// Reopens an ended Copilot session explicitly into `projectId` without falling
-    /// back to another project when `projectId` is no longer present.
-    func resumeEndedSessionInProject(
-        copilotSessionId: String,
-        projectId: String,
-        title: String,
-        store: CopilotSessionStore = CopilotSessionStore(),
-        now: Date = Date()
-    ) -> ResumeFinderOutcome {
-        guard projects.contains(where: { $0.id == projectId }) else {
             return .temporarilyUnavailable(CopilotSessionStartError.projectUnavailable.localizedDescription)
         }
         let requestId = UUID()

@@ -133,12 +133,15 @@ search or close the finder.
 When you pause typing, Luna (`gpt-6-luna`, always) also suggests sessions that
 match what you described rather than the exact words, with a short reason.
 Its picks never reorder the instant matches; extra picks appear below them.
-Luna runs through the Copilot CLI you're signed in to, with no tools, in a
-temporary Copilot home that is deleted afterwards, so these lookups don't add
-sessions to your Copilot history or load your MCP servers. It sees each
+First, Luna runs a fast pass with no tools over each live and recent ended
 session's name, project, folder, and short excerpts of its first and recent
-requests and latest reply. If the Copilot CLI is missing or signed out, the
-instant results still work and the finder says why Luna couldn't help.
+requests and latest reply. Once that pass finishes, Luna searches your full
+local `session-store.db` history using `session_store_sql` against a disposable
+snapshot of the database, surfacing older ended sessions that can be resumed
+with Return. Both runs execute in a temporary Copilot home that is deleted
+afterwards, so these lookups don't add sessions to your Copilot history or load
+your MCP servers. If the Copilot CLI is missing or signed out, the instant
+results still work and the finder says why Luna couldn't help.
 
 ### Pull requests by goal
 
@@ -322,14 +325,10 @@ sliding when Reduce Motion is enabled.
 
 The **+** side of the split button starts an interactive Copilot CLI session immediately,
 inheriting the current session's working directory. Its dropdown offers
-**Start with Prompt…** (a multiline composer), **New Terminal** (just a shell),
-**Review Pull Request…** (a GitHub pull request URL dialog), and
-**Resume Session…** (a multiline prompt that searches your ended Copilot CLI
-sessions in an isolated background CLI run, resumes a single match into the
-project immediately, and offers a picker or prompt edit when multiple or none
-match).
+**Start with Prompt…** (a multiline composer), **New Terminal** (just a shell), and
+**Review Pull Request…** (a GitHub pull request URL dialog).
 The Session menu and project context menus also offer Copilot, starting-prompt,
-plain-terminal, and **Resume Session…** actions. New projects
+and plain-terminal creation. New projects
 created with `⌘N` also start with Copilot. Copilot Projects never adds `--allow-all`;
 tool approvals follow your normal Copilot CLI permission settings.
 

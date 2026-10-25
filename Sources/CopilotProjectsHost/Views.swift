@@ -25,7 +25,7 @@ struct RootView: View {
                     .padding(.horizontal, 14)
                     .frame(height: 56)
                     Divider()
-                    SidebarView(model: model, input: input)
+                    SidebarView(model: model)
                 }
                 .background(StudioStyle.sidebar)
                 .disabled(!showsProjects)
@@ -33,7 +33,7 @@ struct RootView: View {
                 .accessibilityHidden(!showsProjects)
             } content: {
                 HSplitView {
-                    SessionBrowser(model: model, input: input, showsProjects: $showsProjects)
+                    SessionBrowser(model: model, showsProjects: $showsProjects)
                         .frame(minWidth: 200, idealWidth: 224, maxWidth: 280)
                         .background(SplitViewAutosaver(name: "copilot-projects.sessions"))
                     VStack(spacing: 0) {
@@ -63,7 +63,6 @@ struct RootView: View {
         .onDisappear {
             input.imagePreview = nil
             input.dismissSessionFinder()
-            input.cancelResumeSessionSearch()
         }
     }
 
@@ -347,7 +346,6 @@ struct SplitViewAutosaver: NSViewRepresentable {
 
 struct SidebarView: View {
     @ObservedObject var model: AppModel
-    @ObservedObject var input: WorkspaceInputController
     @State private var dropTargetProjectId: String?
 
     var body: some View {
@@ -373,11 +371,6 @@ struct SidebarView: View {
                             model.addCopilotSessionInteractive(toProjectId: project.id, withPrompt: true)
                         }
                         Button("New Terminal") { model.addSession(toProjectId: project.id) }
-                        Divider()
-                        Button("Resume Session…") {
-                            input.resumeSessionInteractive(toProjectId: project.id)
-                        }
-                        .disabled(input.isResumingSessionWithPrompt)
                         Divider()
                         Button("Rename…") { model.renameProjectInteractive(project.id) }
                         Divider()
@@ -657,7 +650,6 @@ struct DetailView: View {
 
 struct SessionBrowser: View {
     @ObservedObject var model: AppModel
-    @ObservedObject var input: WorkspaceInputController
     @Binding var showsProjects: Bool
 
     var body: some View {
@@ -683,31 +675,12 @@ struct SessionBrowser: View {
                 }
                 Spacer(minLength: 0)
                 if let project = model.selectedProject {
-                    SessionCreationButtons(model: model, input: input, project: project)
+                    SessionCreationButtons(model: model, project: project)
                 }
             }
             .padding(.horizontal, 10)
             .frame(height: 56)
             Divider()
-            if input.isResumingSessionWithPrompt {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Finding session to resume…")
-                        .font(.caption)
-                        .foregroundStyle(StudioStyle.secondaryText)
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    Button("Cancel") {
-                        input.cancelResumeSessionSearch()
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(StudioStyle.raised)
-                Divider()
-            }
             if let project = model.selectedProject {
                 SessionList(model: model, project: project)
                     .id(project.id)
@@ -804,7 +777,6 @@ private struct SessionList: View {
 
 private struct SessionCreationButtons: View {
     @ObservedObject var model: AppModel
-    @ObservedObject var input: WorkspaceInputController
     let project: Project
 
     var body: some View {
@@ -828,11 +800,6 @@ private struct SessionCreationButtons: View {
                 Button("Review Pull Request…", systemImage: "checkmark.shield") {
                     model.addAdversarialReviewSessionInteractive(toProjectId: project.id)
                 }
-                Divider()
-                Button("Resume Session…", systemImage: "clock.arrow.circlepath") {
-                    input.resumeSessionInteractive(toProjectId: project.id)
-                }
-                .disabled(input.isResumingSessionWithPrompt)
             } label: {
                 Image(systemName: "chevron.down")
                     .font(.caption2)

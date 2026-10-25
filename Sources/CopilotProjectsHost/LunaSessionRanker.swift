@@ -1,23 +1,16 @@
 import Foundation
+import SQLite3
 import CopilotProjectsCore
 
 protocol SessionRanking: Sendable {
     func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch]
-    func rank(
-        query: String,
-        entries: [SessionFinderEntry],
-        options: LunaSessionPrompt.Options
-    ) async throws -> [LunaMatch]
 }
 
-extension SessionRanking {
-    func rank(
+protocol SessionHistorySearching: Sendable {
+    func searchHistory(
         query: String,
-        entries: [SessionFinderEntry],
-        options: LunaSessionPrompt.Options
-    ) async throws -> [LunaMatch] {
-        try await rank(query: query, entries: entries)
-    }
+        excludedCopilotSessionIds: Set<String>
+    ) async throws -> [LunaMatch]
 }
 
 enum LunaSearchError: Error, Equatable {
@@ -46,7 +39,7 @@ enum LunaSearchError: Error, Equatable {
 /// extensions, which also makes startup several seconds faster. Copilot Projects
 /// session variables are never passed through, so neither the tracker nor the
 /// hooks can mistake a run for a tab.
-struct LunaSessionRanker: SessionRanking {
+struct LunaSessionRanker: SessionRanking, SessionHistorySearching {
     static let model = "gpt-6-luna"
     /// Run directories left by a crash are reclaimed once they are this old.
     static let staleRunAge: TimeInterval = 600
@@ -55,33 +48,22 @@ struct LunaSessionRanker: SessionRanking {
     var workRoot: URL = Paths.stateDir.appendingPathComponent("session-finder", isDirectory: true)
     var environment: [String: String] = ProcessInfo.processInfo.environment
     var timeout: TimeInterval = 45
+    var historyTimeout: TimeInterval = 60
     /// How long a stopped run gets to exit before it and its subprocesses are killed.
     var terminationGrace: TimeInterval = 2
 
     func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch] {
-        try await rank(query: query, entries: entries, options: .finder)
-    }
-
-    func rank(
-        query: String,
-        entries: [SessionFinderEntry],
-        options: LunaSessionPrompt.Options
-    ) async throws -> [LunaMatch] {
         guard let executable = copilotExecutable() else { throw LunaSearchError.copilotUnavailable }
-        let built = LunaSessionPrompt.build(query: query, entries: entries, options: options)
+        let built = LunaSessionPrompt.build(query: query, entries: entries)
         guard !built.aliases.isEmpty else { return [] }
         let home = try prepareRunHome()
         defer { try? FileManager.default.removeItem(at: home) }
-        let result = try await LunaProcess.run(
+        let reply = try await runPrompt(
             executable: executable,
             arguments: Self.arguments(prompt: built.prompt),
-            environment: Self.childEnvironment(from: environment, copilotHome: home.path),
-            directory: home,
-            timeout: timeout,
-            terminationGrace: terminationGrace
+            home: home,
+            timeout: timeout
         )
-        guard result.status == 0 else { throw Self.failure(from: result) }
-        let reply = Self.assistantReply(fromJSONL: result.output) ?? result.output
         do {
             return try LunaSessionPrompt.parse(reply, aliases: built.aliases)
         } catch {
@@ -89,7 +71,74 @@ struct LunaSessionRanker: SessionRanking {
         }
     }
 
+    /// Searches the full local `session-store.db` via a one-shot `copilot -p` run in an
+    /// isolated throwaway `COPILOT_HOME` containing a snapshot of the database. The
+    /// temporary home (and the session opened inside it to run the search) is removed
+    /// when the run completes or is cancelled.
+    func searchHistory(
+        query: String,
+        excludedCopilotSessionIds: Set<String> = []
+    ) async throws -> [LunaMatch] {
+        guard let executable = copilotExecutable() else { throw LunaSearchError.copilotUnavailable }
+        let trimmed = SessionFinderSearch.collapseWhitespace(query)
+        guard !trimmed.isEmpty else { return [] }
+        let sourceDB = userSessionStoreURL
+        guard FileManager.default.fileExists(atPath: sourceDB.path) else { return [] }
+        try Task.checkCancellation()
+        let home = try prepareRunHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try Self.copySessionStoreDatabase(
+            from: sourceDB.path,
+            to: home.appendingPathComponent("session-store.db").path
+        )
+        try Task.checkCancellation()
+        let prompt = LunaDeepSessionPrompt.build(
+            query: trimmed,
+            excludedCopilotSessionIds: excludedCopilotSessionIds
+        )
+        let reply = try await runPrompt(
+            executable: executable,
+            arguments: Self.historySearchArguments(prompt: prompt),
+            home: home,
+            timeout: historyTimeout
+        )
+        do {
+            return try LunaDeepSessionPrompt.parse(
+                reply,
+                excludedCopilotSessionIds: excludedCopilotSessionIds
+            )
+        } catch {
+            throw LunaSearchError.unreadableResponse
+        }
+    }
+
+    private func runPrompt(
+        executable: String,
+        arguments: [String],
+        home: URL,
+        timeout: TimeInterval
+    ) async throws -> String {
+        let result = try await LunaProcess.run(
+            executable: executable,
+            arguments: arguments,
+            environment: Self.childEnvironment(from: environment, copilotHome: home.path),
+            directory: home,
+            timeout: timeout,
+            terminationGrace: terminationGrace
+        )
+        guard result.status == 0 else { throw Self.failure(from: result) }
+        return Self.assistantReply(fromJSONL: result.output) ?? result.output
+    }
+
     static func arguments(prompt: String) -> [String] {
+        arguments(prompt: prompt, availableTools: "none")
+    }
+
+    static func historySearchArguments(prompt: String) -> [String] {
+        arguments(prompt: prompt, availableTools: "session_store_sql,sql")
+    }
+
+    private static func arguments(prompt: String, availableTools: String) -> [String] {
         [
             "-p", prompt,
             "--model", model,
@@ -101,7 +150,7 @@ struct LunaSessionRanker: SessionRanking {
             "--no-ask-user",
             // An allowlist naming no real tool. An empty `--available-tools=` is
             // ignored by Copilot CLI 1.0.92, which then still offers its shell tool.
-            "--available-tools=none",
+            "--available-tools=\(availableTools)",
             "--stream", "off",
             "--no-auto-update",
             "--reasoning-effort", "low",
@@ -162,13 +211,61 @@ struct LunaSessionRanker: SessionRanking {
         return (try? JSONSerialization.data(withJSONObject: seed)) ?? empty
     }
 
-    private var userConfigURL: URL {
+    private var userCopilotHomeURL: URL {
         if let home = environment["COPILOT_HOME"], !home.isEmpty {
-            return URL(fileURLWithPath: (home as NSString).expandingTildeInPath)
-                .appendingPathComponent("config.json")
+            return URL(fileURLWithPath: (home as NSString).expandingTildeInPath, isDirectory: true)
         }
         return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".copilot/config.json")
+            .appendingPathComponent(".copilot", isDirectory: true)
+    }
+
+    private var userConfigURL: URL {
+        userCopilotHomeURL.appendingPathComponent("config.json")
+    }
+
+    private var userSessionStoreURL: URL {
+        userCopilotHomeURL.appendingPathComponent("session-store.db")
+    }
+
+    /// Snapshots `sourcePath` (opened strictly read-only) into a writable SQLite
+    /// database at `destinationPath` so the isolated CLI run can query — and, if
+    /// needed, migrate — its disposable copy without touching the user's store.
+    static func copySessionStoreDatabase(from sourcePath: String, to destinationPath: String) throws {
+        var sourceDB: OpaquePointer?
+        let sourceURI = URL(fileURLWithPath: sourcePath).absoluteString + "?mode=ro"
+        guard sqlite3_open_v2(sourceURI, &sourceDB, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
+              let sourceDB else {
+            let detail = sourceDB.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "open source failed"
+            sqlite3_close(sourceDB)
+            throw LunaSearchError.failed(detail)
+        }
+        defer { sqlite3_close(sourceDB) }
+        sqlite3_busy_timeout(sourceDB, 250)
+
+        var destinationDB: OpaquePointer?
+        guard sqlite3_open_v2(
+            destinationPath,
+            &destinationDB,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+            nil
+        ) == SQLITE_OK, let destinationDB else {
+            let detail = destinationDB.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "open copy failed"
+            sqlite3_close(destinationDB)
+            throw LunaSearchError.failed(detail)
+        }
+        defer { sqlite3_close(destinationDB) }
+        sqlite3_busy_timeout(destinationDB, 250)
+
+        guard let backup = sqlite3_backup_init(destinationDB, "main", sourceDB, "main") else {
+            let detail = sqlite3_errmsg(destinationDB).map { String(cString: $0) } ?? "backup init failed"
+            throw LunaSearchError.failed(detail)
+        }
+        let stepResult = sqlite3_backup_step(backup, -1)
+        let finishResult = sqlite3_backup_finish(backup)
+        guard stepResult == SQLITE_DONE, finishResult == SQLITE_OK else {
+            let detail = sqlite3_errmsg(destinationDB).map { String(cString: $0) } ?? "backup failed"
+            throw LunaSearchError.failed(detail)
+        }
     }
 
     private func prepareRunHome() throws -> URL {

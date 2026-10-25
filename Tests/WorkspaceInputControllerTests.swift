@@ -9,6 +9,17 @@ private struct OfflineRanker: SessionRanking {
     func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch] { [] }
 }
 
+private struct StubHistorySearcher: SessionHistorySearching {
+    let matches: [LunaMatch]
+
+    func searchHistory(
+        query: String,
+        excludedCopilotSessionIds: Set<String>
+    ) async throws -> [LunaMatch] {
+        matches
+    }
+}
+
 @MainActor
 final class WorkspaceInputControllerTests: XCTestCase {
     private func withWorkspace(
@@ -328,6 +339,87 @@ final class WorkspaceInputControllerTests: XCTestCase {
         XCTAssertEqual(model.project("p2")?.selectedSessionId, resumedTabId)
     }
 
+    func testSessionFinderDeepHistorySearchSurfacesAndResumesSessionBeyondInitialLimit() async throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let repoWork = root.appendingPathComponent("deep-work")
+        try FileManager.default.createDirectory(at: repoWork, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
+        let olderCopilotId = try home.addSession(
+            cwd: repoWork.path,
+            name: "Deep archived migration",
+            updated: Date(timeIntervalSince1970: 1_700_000_000),
+            transcript: #"{"type":"user.message","data":{"content":"migrate legacy schema"}}"#
+        )
+        for index in 0..<SessionFinderResumableLoader.defaultLimit {
+            _ = try home.addSession(
+                cwd: root.path,
+                name: "Recent session \(index)",
+                updated: Date(timeIntervalSince1970: TimeInterval(1_800_000_000 + index)),
+                transcript: #"{"type":"user.message","data":{"content":"routine work"}}"#
+            )
+        }
+
+        let p1Session = Session(title: "first", cwd: root.path)
+        let p2Session = Session(title: "second", cwd: repoWork.path)
+        let p1 = Project(id: "p1", name: "First", cwd: root.path, sessions: [p1Session], selectedSessionId: p1Session.id)
+        let p2 = Project(id: "p2", name: "Second", cwd: repoWork.path, sessions: [p2Session], selectedSessionId: p2Session.id)
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
+
+        var launches: [(id: String, executable: String?, prompt: String?)] = []
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root,
+            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
+            remoteReposDirectory: { root.path },
+            remoteSessionBackendAvailable: { true },
+            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
+            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+        )
+        defer {
+            model.forcePendingSessionDestroys()
+            model.detachAllClients()
+        }
+
+        let deepRowId = SessionFinderSource.resumableSessionId(for: olderCopilotId)
+        let input = WorkspaceInputController(
+            model: model,
+            sessionRanker: OfflineRanker(),
+            sessionHistorySearcher: StubHistorySearcher(matches: [
+                LunaMatch(sessionId: deepRowId, reason: "migrated legacy schema"),
+            ]),
+            copilotSessionStore: { home.store }
+        )
+        input.presentSessionFinder()
+        let finder = try XCTUnwrap(input.sessionFinder)
+        for _ in 0..<200 where finder.isIndexing || finder.isLoadingResumable {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        // The older session is past the initial 30-session cap, so it is not in entries yet.
+        XCTAssertFalse(finder.entries.contains { $0.id == deepRowId })
+
+        finder.query = "legacy schema"
+        for _ in 0..<200 {
+            if case .finished = finder.deepSearch { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(finder.rows.map(\.id), [deepRowId])
+        XCTAssertEqual(finder.rows.first?.lunaReason, "migrated legacy schema")
+
+        input.openFromSessionFinder(deepRowId)
+        XCTAssertNil(input.sessionFinder)
+        XCTAssertEqual(model.selectedProjectId, "p2")
+        XCTAssertEqual(launches.count, 1)
+        let resumedTabId = launches[0].id
+        XCTAssertEqual(model.capturedResumeLaunches[resumedTabId], olderCopilotId)
+    }
+
     func testStalePreviewIsRejectedAndBusinessCloseIsNotGatedByUIState() throws {
         try withWorkspace { model, input, sessions in
             input.presentImage(image(sessions[1]))
@@ -568,297 +660,5 @@ final class WorkspaceInputControllerTests: XCTestCase {
         XCTAssertEqual(bound, 0)
         XCTAssertEqual(listen(listener, 4), 0)
         return listener
-    }
-
-    func testResumeSessionWithPromptAutoResumesSingleMatchIntoRequestedProject() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let repoWork = root.appendingPathComponent("repo")
-        try FileManager.default.createDirectory(at: repoWork, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
-        let copilotId = try home.addSession(
-            cwd: repoWork.path,
-            name: "Fix oauth token refresh",
-            transcript: #"{"type":"user.message","data":{"content":"debug the oauth token refresh bug"}}"#
-        )
-        let otherId = try home.addSession(
-            cwd: repoWork.path,
-            name: "Unrelated CSS tweak",
-            transcript: #"{"type":"user.message","data":{"content":"adjust button padding"}}"#
-        )
-        _ = otherId
-
-        let p1Session = Session(title: "first", cwd: root.path)
-        let p2Session = Session(title: "second", cwd: repoWork.path)
-        let p1 = Project(id: "p1", name: "First", cwd: root.path, sessions: [p1Session], selectedSessionId: p1Session.id)
-        let p2 = Project(id: "p2", name: "Second", cwd: repoWork.path, sessions: [p2Session], selectedSessionId: p2Session.id)
-        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
-        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p2.id))
-
-        var launches: [(id: String, executable: String?, prompt: String?)] = []
-        let model = AppModel(
-            stateRepository: repository,
-            isAppActive: { false },
-            agentActivityDirectory: root,
-            resumeMarkerDirectory: root,
-            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
-            remoteReposDirectory: { root.path },
-            remoteSessionBackendAvailable: { true },
-            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
-            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
-            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
-        )
-        defer {
-            model.forcePendingSessionDestroys()
-            model.detachAllClients()
-        }
-
-        let resumableEntryId = SessionFinderSource.resumableSessionId(for: copilotId)
-        let ranker = ScriptedResumeRanker { query, entries, options in
-            XCTAssertEqual(query, "find the oauth token refresh session\nfrom yesterday")
-            XCTAssertEqual(options, .resumePrompt)
-            XCTAssertTrue(entries.contains { $0.id == resumableEntryId })
-            return [LunaMatch(sessionId: resumableEntryId, reason: "debugged oauth token refresh")]
-        }
-        var alerts: [String] = []
-        let input = WorkspaceInputController(
-            model: model,
-            sessionRanker: ranker,
-            copilotSessionStore: { home.store },
-            alertPresenter: { alert in
-                alerts.append(alert.messageText)
-                return .alertFirstButtonReturn
-            }
-        )
-
-        await input.startResumeSessionSearch(
-            toProjectId: "p1",
-            prompt: "find the oauth token refresh session\nfrom yesterday"
-        ).value
-
-        XCTAssertTrue(alerts.isEmpty, "A single match should auto-resume without showing a picker or error alert")
-        XCTAssertFalse(input.isResumingSessionWithPrompt)
-        XCTAssertEqual(model.selectedProjectId, "p1", "Even though the session cwd matches p2, it must resume into the requested project p1")
-        XCTAssertEqual(launches.count, 1)
-        let resumedTabId = launches[0].id
-        XCTAssertEqual(model.capturedResumeLaunches[resumedTabId], copilotId)
-        let resumedSession = try XCTUnwrap(model.project("p1")?.sessions.first { $0.id == resumedTabId })
-        XCTAssertEqual(resumedSession.title, "Fix oauth token refresh")
-        XCTAssertEqual(resumedSession.cwd, repoWork.path)
-        XCTAssertEqual(model.project("p1")?.selectedSessionId, resumedTabId)
-    }
-
-    func testResumeSessionWithPromptMultipleMatchesPresentsPickerAndSupportsEditPrompt() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let repoWork = root.appendingPathComponent("repo")
-        try FileManager.default.createDirectory(at: repoWork, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
-        let firstCopilotId = try home.addSession(
-            cwd: repoWork.path,
-            name: "Webhook retry logic",
-            transcript: #"{"type":"user.message","data":{"content":"webhook retry backoff"}}"#
-        )
-        let secondCopilotId = try home.addSession(
-            cwd: repoWork.path,
-            name: "Webhook signature verification",
-            transcript: #"{"type":"user.message","data":{"content":"verify webhook hmac"}}"#
-        )
-
-        let p1Session = Session(title: "first", cwd: root.path)
-        let p1 = Project(id: "p1", name: "First", cwd: root.path, sessions: [p1Session], selectedSessionId: p1Session.id)
-        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
-        try repository.save(PersistedState(projects: [p1], selectedProjectId: p1.id))
-
-        var launches: [(id: String, executable: String?, prompt: String?)] = []
-        let model = AppModel(
-            stateRepository: repository,
-            isAppActive: { false },
-            agentActivityDirectory: root,
-            resumeMarkerDirectory: root,
-            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
-            remoteReposDirectory: { root.path },
-            remoteSessionBackendAvailable: { true },
-            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
-            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
-            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
-        )
-        defer {
-            model.forcePendingSessionDestroys()
-            model.detachAllClients()
-        }
-
-        let firstEntryId = SessionFinderSource.resumableSessionId(for: firstCopilotId)
-        let secondEntryId = SessionFinderSource.resumableSessionId(for: secondCopilotId)
-        let ranker = ScriptedResumeRanker { _, _, options in
-            XCTAssertEqual(options, .resumePrompt)
-            return [
-                LunaMatch(sessionId: firstEntryId, reason: "webhook retry backoff"),
-                LunaMatch(sessionId: secondEntryId, reason: "webhook hmac verification"),
-            ]
-        }
-
-        var composerInitialTexts: [String] = []
-        var step = 0
-        let input = WorkspaceInputController(
-            model: model,
-            sessionRanker: ranker,
-            copilotSessionStore: { home.store },
-            alertPresenter: { alert in
-                defer { step += 1 }
-                switch step {
-                case 0:
-                    // First presentation is the multiline picker; click "Edit Prompt…".
-                    XCTAssertEqual(alert.messageText, "Multiple Matching Sessions")
-                    return .alertThirdButtonReturn
-                case 1:
-                    // Second presentation is the re-opened composer with the draft preserved; cancel it.
-                    XCTAssertEqual(alert.messageText, "Resume Copilot Session")
-                    if let scroll = alert.accessoryView as? NSScrollView,
-                       let textView = scroll.documentView as? NSTextView {
-                        composerInitialTexts.append(textView.string)
-                    }
-                    return .alertSecondButtonReturn
-                case 2:
-                    // Third presentation: select the second radio button in the picker and click "Resume Session".
-                    XCTAssertEqual(alert.messageText, "Multiple Matching Sessions")
-                    if let container = alert.accessoryView,
-                       let stack = container.subviews.first as? NSStackView,
-                       stack.arrangedSubviews.count > 1,
-                       let secondRow = stack.arrangedSubviews[1] as? NSStackView,
-                       let radio = secondRow.arrangedSubviews.first as? NSButton {
-                        _ = radio.target?.perform(radio.action, with: radio)
-                    }
-                    return .alertFirstButtonReturn
-                default:
-                    XCTFail("Unexpected alert: \(alert.messageText)")
-                    return .alertSecondButtonReturn
-                }
-            }
-        )
-
-        await input.startResumeSessionSearch(toProjectId: "p1", prompt: "webhook work").value
-        XCTAssertTrue(launches.isEmpty, "Choosing Edit Prompt must not resume a session")
-        XCTAssertEqual(composerInitialTexts, ["webhook work"])
-
-        await input.startResumeSessionSearch(toProjectId: "p1", prompt: "webhook work").value
-        XCTAssertEqual(launches.count, 1)
-        let resumedTabId = launches[0].id
-        XCTAssertEqual(model.capturedResumeLaunches[resumedTabId], secondCopilotId)
-        XCTAssertEqual(model.project("p1")?.selectedSessionId, resumedTabId)
-    }
-
-    func testResumeSessionWithPromptZeroMatchesAndErrorsPreserveDraftAndNeverFallbackWhenProjectDeleted() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let repoWork = root.appendingPathComponent("repo")
-        try FileManager.default.createDirectory(at: repoWork, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        let home = try CopilotHomeFixture(root: root.appendingPathComponent("copilot"))
-        let copilotId = try home.addSession(
-            cwd: repoWork.path,
-            name: "Database migration",
-            transcript: #"{"type":"user.message","data":{"content":"add index to users table"}}"#
-        )
-        let entryId = SessionFinderSource.resumableSessionId(for: copilotId)
-
-        let p1Session = Session(title: "first", cwd: root.path)
-        let p2Session = Session(title: "second", cwd: repoWork.path)
-        let p1 = Project(id: "p1", name: "First", cwd: root.path, sessions: [p1Session], selectedSessionId: p1Session.id)
-        let p2 = Project(id: "p2", name: "Second", cwd: repoWork.path, sessions: [p2Session], selectedSessionId: p2Session.id)
-        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
-        try repository.save(PersistedState(projects: [p1, p2], selectedProjectId: p1.id))
-
-        var launches: [(id: String, executable: String?, prompt: String?)] = []
-        let model = AppModel(
-            stateRepository: repository,
-            isAppActive: { false },
-            agentActivityDirectory: root,
-            resumeMarkerDirectory: root,
-            remoteCopilotExecutable: { "/opt/copilot/bin/copilot" },
-            remoteReposDirectory: { root.path },
-            remoteSessionBackendAvailable: { true },
-            remoteSessionLauncher: { launches.append(($0, $1, $2)) },
-            sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
-            kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
-        )
-        defer {
-            model.forcePendingSessionDestroys()
-            model.detachAllClients()
-        }
-
-        var rankOutcome: Result<[LunaMatch], Error> = .success([])
-        var onRank: (@Sendable () async -> Void)?
-        let ranker = ScriptedResumeRanker { _, _, options in
-            XCTAssertEqual(options, .resumePrompt)
-            await onRank?()
-            return try rankOutcome.get()
-        }
-
-        var alerts: [(title: String, body: String)] = []
-        var reopenedDrafts: [String] = []
-        let input = WorkspaceInputController(
-            model: model,
-            sessionRanker: ranker,
-            copilotSessionStore: { home.store },
-            alertPresenter: { alert in
-                if alert.messageText == "Resume Copilot Session" {
-                    if let scroll = alert.accessoryView as? NSScrollView,
-                       let textView = scroll.documentView as? NSTextView {
-                        reopenedDrafts.append(textView.string)
-                    }
-                    return .alertSecondButtonReturn
-                }
-                alerts.append((alert.messageText, alert.informativeText))
-                return .alertFirstButtonReturn
-            }
-        )
-
-        // 1. Zero matches offers Edit Prompt and preserves draft.
-        await input.startResumeSessionSearch(toProjectId: "p1", prompt: "nonexistent session").value
-        XCTAssertEqual(alerts.last?.title, "No Matching Session Found")
-        XCTAssertEqual(reopenedDrafts.last, "nonexistent session")
-        XCTAssertTrue(launches.isEmpty)
-
-        // 2. Ranker error uses dialog-specific copy (not "Keep typing to try again") and preserves draft.
-        rankOutcome = .failure(LunaSearchError.timedOut)
-        await input.startResumeSessionSearch(toProjectId: "p1", prompt: "slow search prompt").value
-        XCTAssertEqual(alerts.last?.title, "Could Not Find Session")
-        XCTAssertFalse(alerts.last?.body.contains("Keep typing") ?? true)
-        XCTAssertEqual(reopenedDrafts.last, "slow search prompt")
-        XCTAssertTrue(launches.isEmpty)
-
-        // 3. Removing the target project while the search is in flight does NOT fall back to p2.
-        rankOutcome = .success([LunaMatch(sessionId: entryId, reason: "migration")])
-        onRank = {
-            await MainActor.run {
-                model.closeProject("p1")
-            }
-        }
-        await input.startResumeSessionSearch(toProjectId: "p1", prompt: "database migration").value
-        XCTAssertEqual(alerts.last?.title, "Could Not Resume Copilot Session")
-        XCTAssertTrue(launches.isEmpty, "Deleting target project p1 mid-search must not fall back to resuming in p2")
-    }
-}
-
-private final class ScriptedResumeRanker: SessionRanking, @unchecked Sendable {
-    private let handler: @Sendable (String, [SessionFinderEntry], LunaSessionPrompt.Options) async throws -> [LunaMatch]
-
-    init(_ handler: @escaping @Sendable (String, [SessionFinderEntry], LunaSessionPrompt.Options) async throws -> [LunaMatch]) {
-        self.handler = handler
-    }
-
-    func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch] {
-        try await handler(query, entries, .finder)
-    }
-
-    func rank(
-        query: String,
-        entries: [SessionFinderEntry],
-        options: LunaSessionPrompt.Options
-    ) async throws -> [LunaMatch] {
-        try await handler(query, entries, options)
     }
 }

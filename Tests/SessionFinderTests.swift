@@ -182,104 +182,6 @@ final class SessionFinderTests: XCTestCase {
         XCTAssertLessThan(built.prompt.count, LunaSessionPrompt.maximumSessionCharacters + 2_000)
     }
 
-    func testPromptPreservesMultilineQueryDetailsPastThreeHundredCharactersAndPromotesMatchingOlderSessions() {
-        let now = Date()
-        let sharedPrefix = String(repeating: "context line about general refactoring work\n", count: 8)
-        XCTAssertGreaterThan(sharedPrefix.count, 300)
-        let queryA = sharedPrefix + "distinguishing detail: oauth-pkce-refresh-token"
-        let queryB = sharedPrefix + "distinguishing detail: websocket-frame-backpressure"
-
-        let noiseEntries = (0..<115).map { index in
-            SessionFinderEntry(
-                source: SessionFinderSource(
-                    sessionId: "resumable:noise-\(index)",
-                    projectId: "p1",
-                    projectName: "Alpha",
-                    title: "Routine task \(index)",
-                    cwd: "/tmp/alpha",
-                    lastActivity: now.addingTimeInterval(TimeInterval(-index)),
-                    resumableCopilotSessionId: String(format: "00000000-0000-0000-0000-%012d", index)
-                ),
-                requests: [String(repeating: "filler ", count: 160)],
-                replies: [String(repeating: "response ", count: 160)],
-                lastActivity: now.addingTimeInterval(TimeInterval(-index))
-            )
-        }
-        let olderMatch = SessionFinderEntry(
-            source: SessionFinderSource(
-                sessionId: "resumable:older-match",
-                projectId: "p2",
-                projectName: "Beta",
-                title: "Auth token flow",
-                cwd: "/tmp/beta",
-                lastActivity: now.addingTimeInterval(-10_000),
-                resumableCopilotSessionId: "11111111-2222-3333-4444-555555555555"
-            ),
-            requests: ["fix oauth-pkce-refresh-token rotation"],
-            replies: ["updated token refresh handler"],
-            lastActivity: now.addingTimeInterval(-10_000)
-        )
-        let olderPreferredProject = SessionFinderEntry(
-            source: SessionFinderSource(
-                sessionId: "resumable:older-preferred",
-                projectId: "p-target",
-                projectName: "Target",
-                title: "Target project session",
-                cwd: "/tmp/target",
-                lastActivity: now.addingTimeInterval(-20_000),
-                resumableCopilotSessionId: "22222222-3333-4444-5555-666666666666"
-            ),
-            requests: ["investigate deployment"],
-            replies: ["resolved deployment issue"],
-            lastActivity: now.addingTimeInterval(-20_000)
-        )
-        let allEntries = noiseEntries + [olderMatch, olderPreferredProject]
-
-        // Default finder options keep the 300-character clip and recency ordering unchanged,
-        // so entries past the 60,000-character budget cutoff are excluded.
-        let finderBuilt = LunaSessionPrompt.build(query: queryA, entries: allEntries, now: now, options: .finder)
-        XCTAssertFalse(finderBuilt.prompt.contains("distinguishing detail: oauth-pkce-refresh-token"))
-        XCTAssertFalse(finderBuilt.aliases.values.contains(olderMatch.id))
-        XCTAssertFalse(finderBuilt.aliases.values.contains(olderPreferredProject.id))
-        XCTAssertEqual(finderBuilt.aliases["S1"], noiseEntries[0].id)
-
-        let prioritizedA = SessionFinderSearch.prioritizedForRanking(
-            query: queryA,
-            in: allEntries,
-            preferredProjectId: "p-target"
-        )
-        let prioritizedB = SessionFinderSearch.prioritizedForRanking(
-            query: queryB,
-            in: allEntries,
-            preferredProjectId: "p-target"
-        )
-        let builtA = LunaSessionPrompt.build(
-            query: queryA,
-            entries: prioritizedA,
-            now: now,
-            options: .resumePrompt
-        )
-        let builtB = LunaSessionPrompt.build(
-            query: queryB,
-            entries: prioritizedB,
-            now: now,
-            options: .resumePrompt
-        )
-        XCTAssertNotEqual(builtA.prompt, builtB.prompt)
-        XCTAssertTrue(builtA.prompt.contains("oauth-pkce-refresh-token"))
-        XCTAssertTrue(builtB.prompt.contains("websocket-frame-backpressure"))
-        XCTAssertEqual(
-            builtA.aliases["S1"],
-            olderMatch.id,
-            "An older session beyond the first 30 that matches query tokens must be promoted into the prompt window"
-        )
-        XCTAssertEqual(
-            builtA.aliases["S2"],
-            olderPreferredProject.id,
-            "An older target-project session must remain promoted ahead of unrelated noise when building the prompt"
-        )
-    }
-
     func testParseAcceptsWrappedJSONAndDropsUnknownOrRepeatedIds() throws {
         let aliases = ["S1": "one", "S2": "two", "S3": "three"]
         let output = """
@@ -323,6 +225,48 @@ final class SessionFinderTests: XCTestCase {
         XCTAssertEqual(try LunaSessionPrompt.parse(json, aliases: aliases).map(\.sessionId), ["id1", "id2", "id3", "id4", "id5"])
     }
 
+    func testDeepSessionPromptAndParserValidateUUIDsAndExclusions() throws {
+        let excludedId = "11111111-2222-3333-4444-555555555555"
+        let validIdA = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        let validIdB = "99999999-8888-4777-8666-555555555555"
+        let prompt = LunaDeepSessionPrompt.build(
+            query: "find the   beachball\nfix",
+            excludedCopilotSessionIds: [excludedId.uppercased(), "not-a-uuid"]
+        )
+        XCTAssertTrue(prompt.contains("Looking for: find the beachball fix"))
+        XCTAssertTrue(prompt.contains(excludedId))
+        XCTAssertFalse(prompt.contains("not-a-uuid"))
+
+        let output = """
+        ```json
+        {"matches":[
+          {"id":"\(excludedId.uppercased())","reason":"already shown"},
+          {"id":"not-a-valid-uuid","reason":"bad id"},
+          {"id":"\(validIdA.uppercased())","reason":"Fixed the   beachball\\nhang"},
+          {"id":"\(validIdA)","reason":"duplicate"},
+          {"id":"\(validIdB)","reason":"profiled main thread"}
+        ]}
+        ```
+        """
+        let parsed = try LunaDeepSessionPrompt.parse(
+            output,
+            excludedCopilotSessionIds: [excludedId]
+        )
+        XCTAssertEqual(
+            parsed,
+            [
+                LunaMatch(
+                    sessionId: SessionFinderSource.resumableSessionId(for: validIdA),
+                    reason: "Fixed the beachball hang"
+                ),
+                LunaMatch(
+                    sessionId: SessionFinderSource.resumableSessionId(for: validIdB),
+                    reason: "profiled main thread"
+                ),
+            ]
+        )
+    }
+
     // MARK: - Luna process
 
     func testArgumentsAlwaysUseLunaWithoutTools() {
@@ -339,6 +283,10 @@ final class SessionFinderTests: XCTestCase {
         XCTAssertTrue(arguments.contains("--disable-builtin-mcps"))
         XCTAssertTrue(arguments.contains("--no-ask-user"))
         XCTAssertFalse(arguments.contains { $0.hasPrefix("--allow") })
+
+        let historyArguments = LunaSessionRanker.historySearchArguments(prompt: "search history")
+        XCTAssertTrue(historyArguments.contains("--available-tools=session_store_sql,sql"))
+        XCTAssertFalse(historyArguments.contains { $0.hasPrefix("--allow") })
     }
 
     func testChildEnvironmentIsAnAllowlistWithAnIsolatedHome() {
@@ -417,6 +365,50 @@ final class SessionFinderTests: XCTestCase {
 
         XCTAssertEqual(matches, [LunaMatch(sessionId: target.id, reason: "names the webhook")])
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("runs").path), [])
+    }
+
+    func testSearchHistorySnapshotsDatabaseIntoIsolatedHomeAndRemovesIt() async throws {
+        let targetId = "59ff5130-adeb-4f0d-b713-d12e7a729c7e"
+        let (ranker, root) = try fakeCopilot("""
+        test -z "$COPILOT_PROJECTS_SESSION" || { echo leaked >&2; exit 3; }
+        case "$*" in
+          *--available-tools=session_store_sql,sql*) ;;
+          *) echo missing-tools-flag >&2; exit 5 ;;
+        esac
+        test -s "$COPILOT_HOME/session-store.db" || { echo missing-db >&2; exit 4; }
+        copied_id=$(/usr/bin/sqlite3 "$COPILOT_HOME/session-store.db" "SELECT id FROM sessions LIMIT 1")
+        [ "$copied_id" = "\(targetId)" ] || { echo "wrong-db-contents:$copied_id" >&2; exit 6; }
+        mkdir -p "$COPILOT_HOME/session-state/temp-finder-session"
+        echo '{"type":"assistant.message","data":{"content":"{\\"matches\\":[{\\"id\\":\\"\(targetId)\\",\\"reason\\":\\"fixed the beachball issue\\"}]}"}}'
+        """)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let userHome = root.appendingPathComponent("user-copilot")
+        _ = try CopilotHomeFixture(root: userHome).addSession(
+            targetId,
+            cwd: root.path,
+            name: "Fix Beachball Issue",
+            transcript: #"{"type":"user.message","data":{"content":"beachball"}}"#
+        )
+
+        let matches = try await ranker.searchHistory(
+            query: "beachball",
+            excludedCopilotSessionIds: []
+        )
+
+        XCTAssertEqual(
+            matches,
+            [
+                LunaMatch(
+                    sessionId: SessionFinderSource.resumableSessionId(for: targetId),
+                    reason: "fixed the beachball issue"
+                )
+            ]
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("runs").path),
+            [],
+            "The temporary COPILOT_HOME and the session opened to search history must be removed on completion"
+        )
     }
 
     func testRankReportsSignInAndOtherFailures() async throws {
@@ -614,6 +606,28 @@ private final class FakeRanker: SessionRanking, @unchecked Sendable {
             calls.append(query)
             seenEntryIds.append(entries.map(\.id))
         }
+        return try result.get()
+    }
+}
+
+private final class FakeHistorySearcher: SessionHistorySearching, @unchecked Sendable {
+    private let lock = NSLock()
+    private var queriesWithExcluded: [(query: String, excluded: Set<String>)] = []
+    var onSearch: (@Sendable () async -> Void)?
+    var result: Result<[LunaMatch], Error>
+
+    init(_ result: Result<[LunaMatch], Error>) { self.result = result }
+
+    var calls: [(query: String, excluded: Set<String>)] { lock.withLock { queriesWithExcluded } }
+
+    func searchHistory(
+        query: String,
+        excludedCopilotSessionIds: Set<String>
+    ) async throws -> [LunaMatch] {
+        lock.withLock {
+            queriesWithExcluded.append((query, excludedCopilotSessionIds))
+        }
+        await onSearch?()
         return try result.get()
     }
 }
@@ -1154,5 +1168,111 @@ final class SessionFinderModelTests: XCTestCase {
         XCTAssertEqual(entry.source.title, "Fix beachball in sidebar")
         XCTAssertEqual(entry.requests, ["investigate the main-thread beachball"])
         XCTAssertEqual(entry.replies, ["cached the file signature on background queue"])
+
+        // Specific ID loading validates and preserves caller ranking order while excluding live/locked/invalid IDs.
+        let byIds = SessionFinderResumableLoader.loadEntries(
+            forCopilotSessionIds: [resumableId, liveId, lockedId, missingWorkspaceCwdId, unindexedId],
+            store: home.store,
+            projects: projects,
+            selectedProjectId: "p1",
+            liveCopilotSessionIds: [liveId],
+            defaultStartupDir: root.path
+        )
+        XCTAssertEqual(byIds.map(\.source.resumableCopilotSessionId), [resumableId, unindexedId])
+    }
+
+    func testDeepHistorySearchRunsOnlyAfterLunaFinishesAndPreservesHighlight() async throws {
+        let recentCopilotId = "0f1e2d3c-4b5a-4000-8000-0000000000aa"
+        let olderCopilotId = "0f1e2d3c-4b5a-4000-8000-0000000000bb"
+        let recentEntry = SessionFinderEntry(
+            source: SessionFinderSource(
+                sessionId: SessionFinderSource.resumableSessionId(for: recentCopilotId),
+                projectId: "p1",
+                projectName: "Core",
+                title: "Recent ended session",
+                cwd: "/r/core",
+                resumableCopilotSessionId: recentCopilotId
+            ),
+            requests: ["recent work"],
+            replies: ["done"]
+        )
+        let olderEntry = SessionFinderEntry(
+            source: SessionFinderSource(
+                sessionId: SessionFinderSource.resumableSessionId(for: olderCopilotId),
+                projectId: "p2",
+                projectName: "Docs",
+                title: "Older archived session",
+                cwd: "/r/docs",
+                resumableCopilotSessionId: olderCopilotId
+            ),
+            requests: ["deep archive topic"],
+            replies: ["resolved months ago"]
+        )
+
+        let ranker = FakeRanker(.success([
+            LunaMatch(sessionId: "beta", reason: "fast pass match"),
+        ]))
+        let deepGate = DispatchSemaphore(value: 0)
+        let historySearcher = FakeHistorySearcher(.success([
+            LunaMatch(sessionId: olderEntry.id, reason: "found in full session history"),
+        ]))
+        historySearcher.onSearch = {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    deepGate.wait()
+                    continuation.resume()
+                }
+            }
+        }
+
+        var opened: [String] = []
+        let finder = SessionFinderModel(
+            sources: [alpha, beta],
+            currentSessionId: "alpha",
+            activeCopilotSessionIds: ["live-copilot-id"],
+            ranker: ranker,
+            historySearcher: historySearcher,
+            lunaDelay: 0.15,
+            loadTranscript: { _ in nil },
+            loadResumableEntries: { [recentEntry] },
+            loadResumableEntriesByIds: { ids in
+                ids.contains(olderCopilotId) ? [olderEntry] : []
+            },
+            onOpen: { opened.append($0) }
+        )
+        try await waitUntil { !finder.isIndexing && !finder.isLoadingResumable }
+
+        finder.query = "archive topic"
+        // While Luna is pending, deep search has not started.
+        XCTAssertEqual(finder.luna, .pending)
+        XCTAssertEqual(finder.deepSearch, .idle)
+        XCTAssertTrue(historySearcher.calls.isEmpty)
+
+        // Once Luna finishes, deep search starts with active + already-displayed resumable IDs excluded,
+        // while keeping unlisted indexed sessions eligible so deep SQL search can match their middle turns.
+        try await waitUntil { finder.deepSearch == .searching }
+        XCTAssertEqual(finder.luna, .finished([LunaMatch(sessionId: "beta", reason: "fast pass match")]))
+        XCTAssertEqual(finder.rows.map(\.id), ["beta"])
+        XCTAssertEqual(finder.highlightedId, "beta")
+        XCTAssertEqual(historySearcher.calls.count, 1)
+        XCTAssertEqual(historySearcher.calls.first?.query, "archive topic")
+        XCTAssertEqual(historySearcher.calls.first?.excluded, ["live-copilot-id"])
+
+        // Completing deep search appends the older session without moving the highlight off "beta".
+        deepGate.signal()
+        try await waitUntil {
+            if case .finished = finder.deepSearch { return true }
+            return false
+        }
+        XCTAssertEqual(finder.rows.map(\.id), ["beta", olderEntry.id])
+        XCTAssertEqual(finder.highlightedId, "beta", "Late deep-history arrivals must not jump the highlight")
+        XCTAssertEqual(finder.source(for: olderEntry.id)?.resumableCopilotSessionId, olderCopilotId)
+
+        // Moving down highlights the deep-history resumable session and Return opens it.
+        finder.moveHighlight(1)
+        XCTAssertEqual(finder.highlightedId, olderEntry.id)
+        XCTAssertTrue(finder.highlightedIsResumable)
+        finder.openHighlighted()
+        XCTAssertEqual(opened, [olderEntry.id])
     }
 }

@@ -83,12 +83,6 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
 - **Local PR reviews:** choose **Review Pull Request…** from the **+** split button's
   dropdown, paste a GitHub pull request URL, and open a new Copilot CLI session with a
   local adversarial-review prompt in the current project.
-- **Resume by prompt:** choose **Resume Session…** from a project's context menu, the
-  **+** split button's dropdown, or the Session menu. Describe the ended Copilot
-  session in the multiline composer and press `⌘Return` to search your ended sessions
-  with the Copilot CLI in an isolated temporary home that is removed when the search
-  finishes. A single matching session resumes into that project immediately; multiple
-  matches open a picker, and zero matches or errors let you edit and retry your prompt.
 - **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
   labeled symbol counts appear in the project column; a blue dot on the session row marks work that finished
   while you were away, and a red exclamation with **Request failed** marks a session whose latest
