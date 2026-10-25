@@ -48,6 +48,8 @@ actor SessionSearchIndex {
     /// even when its files are unchanged: an owner check can turn on whether
     /// another process is still running.
     static let emptyRetryInterval: TimeInterval = 30
+    /// Resumable ended sessions are cached across rapid remote keystrokes for this long.
+    static let resumableCacheInterval: TimeInterval = 15
     /// Conversations are dropped from memory after this long without a search.
     static let defaultIdleLifetime: TimeInterval = 600
 
@@ -56,6 +58,7 @@ actor SessionSearchIndex {
     private let idleLifetime: TimeInterval
     private let now: @Sendable () -> Date
     private var cache: [String: Cached] = [:]
+    private var cachedResumable: (entries: [SessionFinderEntry], loadedAt: Date)?
     private var useCount = 0
     private var expiry: Task<Void, Never>?
 
@@ -130,15 +133,37 @@ actor SessionSearchIndex {
         return SessionFinderSearch.recent(entries)
     }
 
-    /// `SessionFinderSearch.localMatches` over the live sessions, or nil once cancelled.
+    /// `SessionFinderSearch.localMatches` over the live sessions and any additional
+    /// resumable entries, or nil once cancelled.
     func instantMatches(
         for query: String,
         in sources: [SessionFinderSource],
+        additionalEntries: [SessionFinderEntry] = [],
         limit: Int
     ) -> [SessionFinderSearch.LocalMatch]? {
         guard let entries = entries(for: sources) else { return nil }
-        let matches = SessionFinderSearch.localMatches(for: query, in: entries, limit: limit)
+        let matches = SessionFinderSearch.localMatches(
+            for: query,
+            in: entries + additionalEntries,
+            limit: limit
+        )
         return Task.isCancelled ? nil : matches
+    }
+
+    /// Cached recent ended resumable sessions, refreshed after `resumableCacheInterval`.
+    func resumableEntries(
+        load: @Sendable () -> [SessionFinderEntry]
+    ) -> [SessionFinderEntry]? {
+        scheduleExpiry()
+        let current = now()
+        if let cached = cachedResumable,
+           current.timeIntervalSince(cached.loadedAt) < Self.resumableCacheInterval {
+            return Task.isCancelled ? nil : cached.entries
+        }
+        let loaded = load()
+        guard !Task.isCancelled else { return nil }
+        cachedResumable = (loaded, current)
+        return loaded
     }
 
     private func needsRetry(_ cached: Cached, now: Date) -> Bool {
@@ -162,6 +187,7 @@ actor SessionSearchIndex {
     private func expire(after use: Int) {
         guard use == useCount else { return }
         cache.removeAll()
+        cachedResumable = nil
         expiry = nil
     }
 }
@@ -175,11 +201,31 @@ final class RemoteSessionSearch {
 
     private let index: SessionSearchIndex
     private let ranker: SessionRanking
+    private let historySearcher: SessionHistorySearching?
+    private let copilotSessionStore: (@Sendable () -> CopilotSessionStore)?
     private(set) var activeLunaRuns = 0
 
-    init(index: SessionSearchIndex = SessionSearchIndex(), ranker: SessionRanking = LunaSessionRanker()) {
+    init(
+        index: SessionSearchIndex = SessionSearchIndex(),
+        ranker: SessionRanking = LunaSessionRanker(),
+        historySearcher: SessionHistorySearching? = nil,
+        copilotSessionStore: (@Sendable () -> CopilotSessionStore)? = nil
+    ) {
         self.index = index
         self.ranker = ranker
+        self.historySearcher = historySearcher ?? (ranker as? SessionHistorySearching)
+        self.copilotSessionStore = copilotSessionStore
+    }
+
+    var capabilities: [String] {
+        var list = [
+            RemoteSessionSearchContract.capability,
+            RemoteSessionSearchContract.recentCapability,
+        ]
+        if historySearcher != nil {
+            list.append(RemoteSessionSearchContract.historyCapability)
+        }
+        return list
     }
 
     /// `liveSources` lists the live sessions. It is read again once the search
@@ -189,13 +235,74 @@ final class RemoteSessionSearch {
         _ request: RemoteSessionSearchRequest,
         liveSources: () -> [SessionFinderSource]
     ) async -> RemoteSessionSearchOutcome {
+        await search(
+            request,
+            liveSources: liveSources,
+            projects: { [] },
+            selectedProjectId: { nil },
+            inMemoryActiveCopilotIds: { [] },
+            markerDirectory: Paths.sessionsDir,
+            defaultStartupDir: Paths.defaultStartupDir
+        )
+    }
+
+    func search(
+        _ request: RemoteSessionSearchRequest,
+        liveSources: () -> [SessionFinderSource],
+        projects: () -> [SessionFinderProjectTarget],
+        selectedProjectId: () -> String?,
+        inMemoryActiveCopilotIds: () -> Set<String>,
+        markerDirectory: URL = Paths.sessionsDir,
+        defaultStartupDir: String = Paths.defaultStartupDir
+    ) async -> RemoteSessionSearchOutcome {
         guard let query = RemoteSessionSearchContract.normalizedQuery(request.query, mode: request.mode) else {
             return .invalid(Self.invalidMessage(for: request.query))
         }
+        let includeResumable = request.includeResumable == true
         switch request.mode {
-        case .instant: return await instant(query, liveSources: liveSources)
-        case .luna: return await luna(query, liveSources: liveSources)
-        case .recent: return await recent(liveSources: liveSources)
+        case .instant:
+            return await instant(
+                query,
+                includeResumable: includeResumable,
+                liveSources: liveSources,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                inMemoryActiveCopilotIds: inMemoryActiveCopilotIds,
+                markerDirectory: markerDirectory,
+                defaultStartupDir: defaultStartupDir
+            )
+        case .luna:
+            return await luna(
+                query,
+                includeResumable: includeResumable,
+                liveSources: liveSources,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                inMemoryActiveCopilotIds: inMemoryActiveCopilotIds,
+                markerDirectory: markerDirectory,
+                defaultStartupDir: defaultStartupDir
+            )
+        case .recent:
+            return await recent(
+                includeResumable: includeResumable,
+                liveSources: liveSources,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                inMemoryActiveCopilotIds: inMemoryActiveCopilotIds,
+                markerDirectory: markerDirectory,
+                defaultStartupDir: defaultStartupDir
+            )
+        case .history:
+            return await history(
+                query,
+                excludedCopilotSessionIds: request.excludedCopilotSessionIds ?? [],
+                liveSources: liveSources,
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                inMemoryActiveCopilotIds: inMemoryActiveCopilotIds,
+                markerDirectory: markerDirectory,
+                defaultStartupDir: defaultStartupDir
+            )
         }
     }
 
@@ -205,37 +312,190 @@ final class RemoteSessionSearch {
             : "Searches can be at most \(RemoteSessionSearchContract.maximumQueryLength) characters."
     }
 
+    private func loadResumableEntries(
+        includeResumable: Bool = true,
+        candidateIds: [String]? = nil,
+        projects: [SessionFinderProjectTarget],
+        selectedProjectId: String?,
+        inMemoryIds: Set<String>,
+        liveSessionIds: [String],
+        markerDirectory: URL,
+        defaultStartupDir: String
+    ) async -> [SessionFinderEntry]? {
+        guard includeResumable, let storeProvider = copilotSessionStore, !projects.isEmpty else { return [] }
+        if let candidateIds, candidateIds.isEmpty { return [] }
+        if candidateIds == nil {
+            return await index.resumableEntries {
+                let markerIds = AppModel.validatedMarkerCopilotSessionIds(
+                    sessionIds: liveSessionIds,
+                    directory: markerDirectory
+                )
+                return SessionFinderResumableLoader.load(
+                    store: storeProvider(),
+                    projects: projects,
+                    selectedProjectId: selectedProjectId,
+                    liveCopilotSessionIds: inMemoryIds.union(markerIds),
+                    defaultStartupDir: defaultStartupDir
+                )
+            }
+        }
+        let ids = candidateIds ?? []
+        let task = Task.detached(priority: .userInitiated) {
+            let markerIds = AppModel.validatedMarkerCopilotSessionIds(
+                sessionIds: liveSessionIds,
+                directory: markerDirectory
+            )
+            return SessionFinderResumableLoader.loadEntries(
+                forCopilotSessionIds: ids,
+                store: storeProvider(),
+                projects: projects,
+                selectedProjectId: selectedProjectId,
+                liveCopilotSessionIds: inMemoryIds.union(markerIds),
+                defaultStartupDir: defaultStartupDir
+            )
+        }
+        let entries = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        return Task.isCancelled ? nil : entries
+    }
+
+    private static func makeMatch(
+        for entry: SessionFinderEntry,
+        liveProjects: [String: String],
+        validProjectIds: Set<String>,
+        activeCopilotIds: Set<String>,
+        snippet: String? = nil,
+        reason: String? = nil
+    ) -> RemoteSessionSearchMatch? {
+        let cleanedReason = reason.flatMap { $0.isEmpty ? nil : $0 }
+        if let copilotId = entry.source.resumableCopilotSessionId?.lowercased() {
+            guard !activeCopilotIds.contains(copilotId),
+                  validProjectIds.contains(entry.source.projectId) else {
+                return nil
+            }
+            let folder = entry.folderName
+            return RemoteSessionSearchMatch(
+                sessionId: entry.id,
+                projectId: entry.source.projectId,
+                snippet: snippet,
+                reason: cleanedReason,
+                lastActivityAt: entry.lastActivity,
+                resumableCopilotSessionId: copilotId,
+                title: RemoteSessionSearchContract.sanitizedTitle(entry.source.title) ?? "Copilot session",
+                folderName: folder.isEmpty || folder == "/" ? nil : folder
+            )
+        }
+        guard let projectId = liveProjects[entry.id] else { return nil }
+        return RemoteSessionSearchMatch(
+            sessionId: entry.id,
+            projectId: projectId,
+            snippet: snippet,
+            reason: cleanedReason,
+            lastActivityAt: entry.lastActivity
+        )
+    }
+
+    private static func rankedMatches(
+        from picks: [LunaMatch],
+        entries: [SessionFinderEntry],
+        liveProjects: [String: String],
+        validProjectIds: Set<String>,
+        activeCopilotIds: Set<String>
+    ) -> [RemoteSessionSearchMatch] {
+        let entriesById = Dictionary(entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var seen = Set<String>()
+        let matches = picks.compactMap { pick -> RemoteSessionSearchMatch? in
+            guard seen.insert(pick.sessionId).inserted,
+                  let entry = entriesById[pick.sessionId] else {
+                return nil
+            }
+            return makeMatch(
+                for: entry,
+                liveProjects: liveProjects,
+                validProjectIds: validProjectIds,
+                activeCopilotIds: activeCopilotIds,
+                reason: pick.reason
+            )
+        }
+        return Array(matches.prefix(RemoteSessionSearchContract.maximumMatches))
+    }
+
     private func instant(
         _ query: String,
-        liveSources: () -> [SessionFinderSource]
+        includeResumable: Bool,
+        liveSources: () -> [SessionFinderSource],
+        projects: () -> [SessionFinderProjectTarget],
+        selectedProjectId: () -> String?,
+        inMemoryActiveCopilotIds: () -> Set<String>,
+        markerDirectory: URL,
+        defaultStartupDir: String
     ) async -> RemoteSessionSearchOutcome {
-        guard let found = await index.instantMatches(
-            for: query, in: liveSources(), limit: RemoteSessionSearchContract.maximumMatches
+        let initialSources = liveSources()
+        guard let resumable = await loadResumableEntries(
+            includeResumable: includeResumable,
+            projects: projects(),
+            selectedProjectId: selectedProjectId(),
+            inMemoryIds: inMemoryActiveCopilotIds(),
+            liveSessionIds: initialSources.map(\.sessionId),
+            markerDirectory: markerDirectory,
+            defaultStartupDir: defaultStartupDir
         ), !Task.isCancelled else {
             return .failed(Self.cancelledMessage)
         }
-        let projects = Self.projectIds(liveSources())
+        guard let found = await index.instantMatches(
+            for: query,
+            in: initialSources,
+            additionalEntries: resumable,
+            limit: RemoteSessionSearchContract.maximumMatches
+        ), !Task.isCancelled else {
+            return .failed(Self.cancelledMessage)
+        }
+        let liveProjects = Self.projectIds(liveSources())
+        let validProjectIds = Set(projects().map(\.id)).union(liveProjects.values)
+        let activeCopilotIds = inMemoryActiveCopilotIds()
         let matches = found.compactMap { match in
-            projects[match.entry.id].map {
-                RemoteSessionSearchMatch(
-                    sessionId: match.entry.id, projectId: $0, snippet: match.snippet,
-                    lastActivityAt: match.entry.lastActivity
-                )
-            }
+            Self.makeMatch(
+                for: match.entry,
+                liveProjects: liveProjects,
+                validProjectIds: validProjectIds,
+                activeCopilotIds: activeCopilotIds,
+                snippet: match.snippet
+            )
         }
         return .results(RemoteSessionSearchResponse(mode: .instant, matches: matches))
     }
 
     private func luna(
         _ query: String,
-        liveSources: () -> [SessionFinderSource]
+        includeResumable: Bool,
+        liveSources: () -> [SessionFinderSource],
+        projects: () -> [SessionFinderProjectTarget],
+        selectedProjectId: () -> String?,
+        inMemoryActiveCopilotIds: () -> Set<String>,
+        markerDirectory: URL,
+        defaultStartupDir: String
     ) async -> RemoteSessionSearchOutcome {
         guard activeLunaRuns < Self.maximumConcurrentLunaRuns else { return .busy }
         activeLunaRuns += 1
         defer { activeLunaRuns -= 1 }
-        guard let entries = await index.entries(for: liveSources()), !Task.isCancelled else {
+        let initialSources = liveSources()
+        guard let liveEntries = await index.entries(for: initialSources),
+              let resumable = await loadResumableEntries(
+                  includeResumable: includeResumable,
+                  projects: projects(),
+                  selectedProjectId: selectedProjectId(),
+                  inMemoryIds: inMemoryActiveCopilotIds(),
+                  liveSessionIds: initialSources.map(\.sessionId),
+                  markerDirectory: markerDirectory,
+                  defaultStartupDir: defaultStartupDir
+              ),
+              !Task.isCancelled else {
             return .failed(Self.cancelledMessage)
         }
+        let entries = liveEntries + resumable
         guard !entries.isEmpty else {
             return .results(RemoteSessionSearchResponse(mode: .luna, matches: []))
         }
@@ -249,38 +509,140 @@ final class RemoteSessionSearch {
             return .failed((error as? LunaSearchError)?.message ?? error.localizedDescription)
         }
         guard !Task.isCancelled else { return .failed(Self.cancelledMessage) }
-        let projects = Self.projectIds(liveSources())
-        let activity = Dictionary(
-            entries.compactMap { entry in entry.lastActivity.map { (entry.id, $0) } },
-            uniquingKeysWith: { first, _ in first }
-        )
-        var seen = Set<String>()
-        let matches = picks.compactMap { pick -> RemoteSessionSearchMatch? in
-            guard let projectId = projects[pick.sessionId], seen.insert(pick.sessionId).inserted else {
-                return nil
-            }
-            return RemoteSessionSearchMatch(
-                sessionId: pick.sessionId, projectId: projectId,
-                reason: pick.reason.isEmpty ? nil : pick.reason,
-                lastActivityAt: activity[pick.sessionId]
-            )
-        }
+        let liveProjects = Self.projectIds(liveSources())
+        let validProjectIds = Set(projects().map(\.id)).union(liveProjects.values)
         return .results(RemoteSessionSearchResponse(
-            mode: .luna, matches: Array(matches.prefix(RemoteSessionSearchContract.maximumMatches))
+            mode: .luna,
+            matches: Self.rankedMatches(
+                from: picks,
+                entries: entries,
+                liveProjects: liveProjects,
+                validProjectIds: validProjectIds,
+                activeCopilotIds: inMemoryActiveCopilotIds()
+            )
         ))
     }
 
-    private func recent(liveSources: () -> [SessionFinderSource]) async -> RemoteSessionSearchOutcome {
-        guard let ordered = await index.recent(liveSources()), !Task.isCancelled else {
+    private func history(
+        _ query: String,
+        excludedCopilotSessionIds: [String],
+        liveSources: () -> [SessionFinderSource],
+        projects: () -> [SessionFinderProjectTarget],
+        selectedProjectId: () -> String?,
+        inMemoryActiveCopilotIds: () -> Set<String>,
+        markerDirectory: URL,
+        defaultStartupDir: String
+    ) async -> RemoteSessionSearchOutcome {
+        guard let historySearcher else { return .unsupported }
+        guard activeLunaRuns < Self.maximumConcurrentLunaRuns else { return .busy }
+        activeLunaRuns += 1
+        defer { activeLunaRuns -= 1 }
+
+        let liveSessionIds = liveSources().map(\.sessionId)
+        let inMemoryIds = inMemoryActiveCopilotIds()
+        let markerTask = Task.detached(priority: .userInitiated) {
+            AppModel.validatedMarkerCopilotSessionIds(sessionIds: liveSessionIds, directory: markerDirectory)
+        }
+        let markerIds = await withTaskCancellationHandler {
+            await markerTask.value
+        } onCancel: {
+            markerTask.cancel()
+        }
+        guard !Task.isCancelled else { return .failed(Self.cancelledMessage) }
+
+        let clientExcluded = Set(
+            excludedCopilotSessionIds
+                .prefix(RemoteSessionSearchContract.maximumExcludedSessionIds)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter(CopilotSessionStore.isValidSessionId)
+        )
+        let excluded = inMemoryIds.union(markerIds).union(clientExcluded)
+
+        let picks: [LunaMatch]
+        do {
+            picks = try await historySearcher.searchHistory(
+                query: SessionFinderSearch.collapseWhitespace(query),
+                excludedCopilotSessionIds: excluded
+            )
+        } catch {
+            if Task.isCancelled || error is CancellationError { return .failed(Self.cancelledMessage) }
+            return .failed((error as? LunaSearchError)?.message ?? error.localizedDescription)
+        }
+        guard !Task.isCancelled else { return .failed(Self.cancelledMessage) }
+
+        let candidateIds: [String] = picks.compactMap { pick in
+            guard pick.sessionId.hasPrefix("resumable:") else { return nil }
+            return String(pick.sessionId.dropFirst("resumable:".count))
+        }
+        guard let loadedEntries = await loadResumableEntries(
+            candidateIds: candidateIds,
+            projects: projects(),
+            selectedProjectId: selectedProjectId(),
+            inMemoryIds: inMemoryActiveCopilotIds(),
+            liveSessionIds: liveSources().map(\.sessionId),
+            markerDirectory: markerDirectory,
+            defaultStartupDir: defaultStartupDir
+        ), !Task.isCancelled else {
             return .failed(Self.cancelledMessage)
         }
-        let projects = Self.projectIds(liveSources())
-        let matches = ordered.lazy.compactMap { entry in
-            projects[entry.id].map {
+
+        let liveProjects = Self.projectIds(liveSources())
+        let validProjectIds = Set(projects().map(\.id)).union(liveProjects.values)
+        return .results(RemoteSessionSearchResponse(
+            mode: .history,
+            matches: Self.rankedMatches(
+                from: picks,
+                entries: loadedEntries,
+                liveProjects: liveProjects,
+                validProjectIds: validProjectIds,
+                activeCopilotIds: inMemoryActiveCopilotIds()
+            )
+        ))
+    }
+
+    private func recent(
+        includeResumable: Bool,
+        liveSources: () -> [SessionFinderSource],
+        projects: () -> [SessionFinderProjectTarget],
+        selectedProjectId: () -> String?,
+        inMemoryActiveCopilotIds: () -> Set<String>,
+        markerDirectory: URL,
+        defaultStartupDir: String
+    ) async -> RemoteSessionSearchOutcome {
+        let initialSources = liveSources()
+        guard let ordered = await index.recent(initialSources),
+              let resumable = await loadResumableEntries(
+                  includeResumable: includeResumable,
+                  projects: projects(),
+                  selectedProjectId: selectedProjectId(),
+                  inMemoryIds: inMemoryActiveCopilotIds(),
+                  liveSessionIds: initialSources.map(\.sessionId),
+                  markerDirectory: markerDirectory,
+                  defaultStartupDir: defaultStartupDir
+              ),
+              !Task.isCancelled else {
+            return .failed(Self.cancelledMessage)
+        }
+        let liveProjects = Self.projectIds(liveSources())
+        let validProjectIds = Set(projects().map(\.id)).union(liveProjects.values)
+        let activeCopilotIds = inMemoryActiveCopilotIds()
+        let liveMatches = ordered.compactMap { entry in
+            liveProjects[entry.id].map {
                 RemoteSessionSearchMatch(sessionId: entry.id, projectId: $0, lastActivityAt: entry.lastActivity)
             }
-        }.prefix(RemoteSessionSearchContract.maximumMatches)
-        return .results(RemoteSessionSearchResponse(mode: .recent, matches: Array(matches)))
+        }
+        let endedMatches = SessionFinderSearch.recent(resumable)
+            .prefix(SessionFinderModel.maximumRecentEndedRows)
+            .compactMap { entry in
+                Self.makeMatch(
+                    for: entry,
+                    liveProjects: liveProjects,
+                    validProjectIds: validProjectIds,
+                    activeCopilotIds: activeCopilotIds
+                )
+            }
+        let combined = Array((liveMatches + endedMatches).prefix(RemoteSessionSearchContract.maximumMatches))
+        return .results(RemoteSessionSearchResponse(mode: .recent, matches: combined))
     }
 
     private static func projectIds(_ sources: [SessionFinderSource]) -> [String: String] {
@@ -303,6 +665,14 @@ extension AppModel {
     }
 
     func searchRemoteSessions(_ request: RemoteSessionSearchRequest) async -> RemoteSessionSearchOutcome {
-        await remoteSessionSearch.search(request) { sessionSearchSources }
+        await remoteSessionSearch.search(
+            request,
+            liveSources: { sessionSearchSources },
+            projects: { sessionFinderProjectTargets },
+            selectedProjectId: { selectedProjectId },
+            inMemoryActiveCopilotIds: { inMemoryActiveCopilotSessionIds() },
+            markerDirectory: resumeMarkerDirectory,
+            defaultStartupDir: Paths.defaultStartupDir
+        )
     }
 }

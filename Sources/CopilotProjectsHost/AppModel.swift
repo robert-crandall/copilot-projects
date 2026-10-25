@@ -620,7 +620,7 @@ final class AppModel: ObservableObject {
     private let sessionCreationLedger: SessionCreationLedger
     private let projectCreationLedger: ProjectCreationLedger
     /// Remote session search; tests swap in a fake ranker or transcript reader.
-    var remoteSessionSearch = RemoteSessionSearch()
+    var remoteSessionSearch = RemoteSessionSearch(copilotSessionStore: { CopilotSessionStore() })
     var pullRequestsOverviewProvider: PullRequestsOverviewProvider?
     private var pendingPullRequestBindings: [UUID: SessionCreationRecord] = [:]
 
@@ -5660,6 +5660,119 @@ final class AppModel: ObservableObject {
             return .permanentlyUnavailable(message)
         default:
             return .temporarilyUnavailable(message)
+        }
+    }
+
+    /// Resumes an ended Copilot CLI session selected in remote session search (Web / iOS)
+    /// without changing the Mac's selected project or tab.
+    func resumeRemoteSearchSession(
+        _ input: RemoteResumeSearchSessionRequest,
+        store: CopilotSessionStore = CopilotSessionStore(),
+        now: Date = Date()
+    ) -> RemoteResumeSearchSessionOutcome {
+        guard let request = input.normalized() else {
+            return .invalid("Invalid session resume request.")
+        }
+        guard !isTerminating else {
+            return .unavailable(CopilotSessionStartError.shuttingDown.localizedDescription)
+        }
+        guard !didFailToLoadWorkspaceState else {
+            return .persistenceUnavailable
+        }
+        let fingerprint = SessionCreationRecord.resumeFingerprint(
+            projectId: request.projectId,
+            copilotSessionId: request.copilotSessionId
+        )
+        do {
+            if let existingRecord = try sessionCreationLedger.record(for: request.requestId, now: now) {
+                guard existingRecord.creationFingerprint == fingerprint else {
+                    return .conflict
+                }
+                guard let loc = locateIndex(existingRecord.sessionId) else {
+                    return .gone("That resumed session has since ended.")
+                }
+                return .existing(RemoteResumeSearchSessionResponse(
+                    requestId: request.requestId,
+                    projectId: projects[loc.p].id,
+                    sessionId: existingRecord.sessionId
+                ))
+            }
+        } catch {
+            return .persistenceUnavailable
+        }
+        let tabId = request.requestId.uuidString
+        if let loc = locateIndex(tabId) {
+            guard projects[loc.p].sessions[loc.s].creationFingerprint == fingerprint else {
+                return .conflict
+            }
+            guard rememberPullRequestsResume(
+                request.requestId,
+                projectId: projects[loc.p].id,
+                sessionId: tabId,
+                fingerprint: fingerprint,
+                now: now
+            ) else {
+                return .persistenceUnavailable
+            }
+            return .existing(RemoteResumeSearchSessionResponse(
+                requestId: request.requestId,
+                projectId: projects[loc.p].id,
+                sessionId: tabId
+            ))
+        }
+
+        let record = store.record(for: request.copilotSessionId)
+        let projectId: String
+        if projects.contains(where: { $0.id == request.projectId }) {
+            projectId = request.projectId
+        } else if let cwd = record?.cwd,
+                  let fallback = SessionFinderSearch.targetProject(
+                      forCwd: cwd,
+                      projects: sessionFinderProjectTargets,
+                      selectedProjectId: selectedProjectId,
+                      defaultStartupDir: remoteReposDirectory() ?? Paths.defaultStartupDir
+                  )?.id {
+            projectId = fallback
+        } else {
+            return .unknownProject
+        }
+        let resolvedTitle = request.title
+            ?? RemoteSessionSearchContract.sanitizedTitle(record?.displayName)
+            ?? "Copilot"
+        let result = resumePullRequestsSession(
+            requestId: request.requestId,
+            projectId: projectId,
+            copilotSessionId: request.copilotSessionId,
+            selectOnMac: false,
+            initialTitle: resolvedTitle,
+            fingerprintOverride: fingerprint,
+            store: store,
+            now: now
+        )
+        if result.ok, let sessionId = result.text, let loc = locateIndex(sessionId) {
+            let response = RemoteResumeSearchSessionResponse(
+                requestId: request.requestId,
+                projectId: projects[loc.p].id,
+                sessionId: sessionId
+            )
+            return result.code == "created" ? .created(response) : .existing(response)
+        }
+        let message = result.error ?? "That Copilot session could not be resumed."
+        switch result.code {
+        case "conflict":
+            return .conflict
+        case "gone":
+            return .gone(message)
+        case "in-use":
+            return .inUse(message)
+        case "unknown-project":
+            return .unknownProject
+        case "persistence-unavailable":
+            return .persistenceUnavailable
+        case "invalid", "bad-request":
+            return .invalid(message)
+        default:
+            return .unavailable(message)
         }
     }
 

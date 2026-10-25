@@ -277,12 +277,20 @@ final class RemoteModelBridge: SessionHost {
     }
 
     var sessionSearchCapabilities: [String] {
-        [RemoteSessionSearchContract.capability, RemoteSessionSearchContract.recentCapability]
+        model?.remoteSessionSearch.capabilities ?? [
+            RemoteSessionSearchContract.capability,
+            RemoteSessionSearchContract.recentCapability,
+        ]
     }
 
     func searchSessions(_ request: RemoteSessionSearchRequest) async -> RemoteSessionSearchOutcome {
         guard let model else { return .failed("Copilot Projects is closing.") }
         return await model.searchRemoteSessions(request)
+    }
+
+    func resumeSearchSession(_ request: RemoteResumeSearchSessionRequest) -> RemoteResumeSearchSessionOutcome {
+        guard let model else { return .unavailable("Copilot Projects is closing.") }
+        return model.resumeRemoteSearchSession(request)
     }
 
     /// The exact retained PNG bytes for `(imageId, version)` in `sessionId`'s

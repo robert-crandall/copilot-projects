@@ -496,20 +496,26 @@ loses all creation evidence and the terminal master.
 
 `SessionHost.searchSessions` answers a `RemoteSessionSearchRequest` with the Find
 Session ranking: `instant` matches names, projects, folders, and conversation text,
-`luna` asks Luna (`gpt-6-luna`), and `recent` lists every live session, most recently
-active first, as Find Session does before you type. Results cover live sessions only
-and carry each session's current project and, when known, `lastActivityAt`: when its
-transcript last changed, sent as `lastActivityAtMilliseconds` since 1970. Queries are
-trimmed and limited to `RemoteSessionSearchContract.maximumQueryLength` characters;
-only `recent`, which ignores its query, accepts an empty one. At most two remote Luna
-searches run at once; another returns `busy`. Cancelling the calling task stops the
-search and its Luna process. The host keeps the index between searches and rereads
-only transcripts that changed; `recent` reads only file times.
+`luna` asks Luna (`gpt-6-luna`), `history` runs the second-stage CLI `session-store.db`
+search after `luna` finishes, and `recent` lists every live session, most recently
+active first, as Find Session does before you type. Requests with `includeResumable`
+omitted or `false` cover live sessions only; requests with `includeResumable: true`
+also include ended resumable Copilot CLI sessions (cached for 15 seconds across rapid
+keystrokes), and `SessionHost.resumeSearchSession` (`RemoteSessionSearchContract.resumePath`)
+resumes a chosen ended session without changing Mac selection. Results carry each
+session's project and, when known, `lastActivityAt`: when its transcript last changed,
+sent as `lastActivityAtMilliseconds` since 1970. Queries are trimmed and limited to
+`RemoteSessionSearchContract.maximumQueryLength` characters; only `recent`, which
+ignores its query, accepts an empty one. At most two remote Luna or history searches
+run at once; another returns `busy`. Cancelling the calling task stops the search and
+its CLI process. The host keeps the index between searches and rereads only live
+transcripts that changed.
 
 Hosts report `supportsSessionSearch` and the `sessionSearchCapabilities` they
 implement; other conformers default to `unsupported` and none. `RemoteProtocolInfo.current`
-omits `session-search-v1` and `session-search-recent-v1`: a gateway advertises each
-only when it serves `RemoteSessionSearchContract.path` for a host that declares it.
+omits `session-search-v1`, `session-search-recent-v1`, and `session-search-history-v1`:
+a gateway advertises each only when it serves `RemoteSessionSearchContract.path` (and
+`resumePath` for `session-search-history-v1`) for a host that declares it.
 
 #### Remote mark as unread
 
