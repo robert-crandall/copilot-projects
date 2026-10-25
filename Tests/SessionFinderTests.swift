@@ -182,6 +182,104 @@ final class SessionFinderTests: XCTestCase {
         XCTAssertLessThan(built.prompt.count, LunaSessionPrompt.maximumSessionCharacters + 2_000)
     }
 
+    func testPromptPreservesMultilineQueryDetailsPastThreeHundredCharactersAndPromotesMatchingOlderSessions() {
+        let now = Date()
+        let sharedPrefix = String(repeating: "context line about general refactoring work\n", count: 8)
+        XCTAssertGreaterThan(sharedPrefix.count, 300)
+        let queryA = sharedPrefix + "distinguishing detail: oauth-pkce-refresh-token"
+        let queryB = sharedPrefix + "distinguishing detail: websocket-frame-backpressure"
+
+        let noiseEntries = (0..<115).map { index in
+            SessionFinderEntry(
+                source: SessionFinderSource(
+                    sessionId: "resumable:noise-\(index)",
+                    projectId: "p1",
+                    projectName: "Alpha",
+                    title: "Routine task \(index)",
+                    cwd: "/tmp/alpha",
+                    lastActivity: now.addingTimeInterval(TimeInterval(-index)),
+                    resumableCopilotSessionId: String(format: "00000000-0000-0000-0000-%012d", index)
+                ),
+                requests: [String(repeating: "filler ", count: 160)],
+                replies: [String(repeating: "response ", count: 160)],
+                lastActivity: now.addingTimeInterval(TimeInterval(-index))
+            )
+        }
+        let olderMatch = SessionFinderEntry(
+            source: SessionFinderSource(
+                sessionId: "resumable:older-match",
+                projectId: "p2",
+                projectName: "Beta",
+                title: "Auth token flow",
+                cwd: "/tmp/beta",
+                lastActivity: now.addingTimeInterval(-10_000),
+                resumableCopilotSessionId: "11111111-2222-3333-4444-555555555555"
+            ),
+            requests: ["fix oauth-pkce-refresh-token rotation"],
+            replies: ["updated token refresh handler"],
+            lastActivity: now.addingTimeInterval(-10_000)
+        )
+        let olderPreferredProject = SessionFinderEntry(
+            source: SessionFinderSource(
+                sessionId: "resumable:older-preferred",
+                projectId: "p-target",
+                projectName: "Target",
+                title: "Target project session",
+                cwd: "/tmp/target",
+                lastActivity: now.addingTimeInterval(-20_000),
+                resumableCopilotSessionId: "22222222-3333-4444-5555-666666666666"
+            ),
+            requests: ["investigate deployment"],
+            replies: ["resolved deployment issue"],
+            lastActivity: now.addingTimeInterval(-20_000)
+        )
+        let allEntries = noiseEntries + [olderMatch, olderPreferredProject]
+
+        // Default finder options keep the 300-character clip and recency ordering unchanged,
+        // so entries past the 60,000-character budget cutoff are excluded.
+        let finderBuilt = LunaSessionPrompt.build(query: queryA, entries: allEntries, now: now, options: .finder)
+        XCTAssertFalse(finderBuilt.prompt.contains("distinguishing detail: oauth-pkce-refresh-token"))
+        XCTAssertFalse(finderBuilt.aliases.values.contains(olderMatch.id))
+        XCTAssertFalse(finderBuilt.aliases.values.contains(olderPreferredProject.id))
+        XCTAssertEqual(finderBuilt.aliases["S1"], noiseEntries[0].id)
+
+        let prioritizedA = SessionFinderSearch.prioritizedForRanking(
+            query: queryA,
+            in: allEntries,
+            preferredProjectId: "p-target"
+        )
+        let prioritizedB = SessionFinderSearch.prioritizedForRanking(
+            query: queryB,
+            in: allEntries,
+            preferredProjectId: "p-target"
+        )
+        let builtA = LunaSessionPrompt.build(
+            query: queryA,
+            entries: prioritizedA,
+            now: now,
+            options: .resumePrompt
+        )
+        let builtB = LunaSessionPrompt.build(
+            query: queryB,
+            entries: prioritizedB,
+            now: now,
+            options: .resumePrompt
+        )
+        XCTAssertNotEqual(builtA.prompt, builtB.prompt)
+        XCTAssertTrue(builtA.prompt.contains("oauth-pkce-refresh-token"))
+        XCTAssertTrue(builtB.prompt.contains("websocket-frame-backpressure"))
+        XCTAssertEqual(
+            builtA.aliases["S1"],
+            olderMatch.id,
+            "An older session beyond the first 30 that matches query tokens must be promoted into the prompt window"
+        )
+        XCTAssertEqual(
+            builtA.aliases["S2"],
+            olderPreferredProject.id,
+            "An older target-project session must remain promoted ahead of unrelated noise when building the prompt"
+        )
+    }
+
     func testParseAcceptsWrappedJSONAndDropsUnknownOrRepeatedIds() throws {
         let aliases = ["S1": "one", "S2": "two", "S3": "three"]
         let output = """

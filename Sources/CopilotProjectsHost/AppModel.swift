@@ -1220,7 +1220,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func copilotSessionExecutable(toProjectId pid: String) throws -> String {
+    @discardableResult
+    func copilotSessionExecutable(toProjectId pid: String) throws -> String {
         guard !isTerminating else { throw CopilotSessionStartError.shuttingDown }
         guard projectIndex(pid) != nil else { throw CopilotSessionStartError.projectUnavailable }
         guard remoteSessionBackendAvailable() else { throw CopilotSessionStartError.backendUnavailable }
@@ -5412,7 +5413,9 @@ final class AppModel: ObservableObject {
     func resumePullRequestsSession(
         requestId: UUID, projectId: String, copilotSessionId: String, selectOnMac: Bool = true,
         initialTitle: String = "Copilot",
-        fingerprintOverride: String? = nil, pullRequestKeys: [String]? = nil, now: Date = Date()
+        fingerprintOverride: String? = nil, pullRequestKeys: [String]? = nil,
+        store: CopilotSessionStore = CopilotSessionStore(),
+        now: Date = Date()
     ) -> ControlResponse {
         guard !isTerminating else {
             return .failure(CopilotSessionStartError.shuttingDown.localizedDescription, code: "unavailable")
@@ -5453,7 +5456,6 @@ final class AppModel: ObservableObject {
                                              fingerprint: fingerprint, now: now) else { return unsaved }
             return .success(tabId, code: "existing")
         }
-        let store = CopilotSessionStore()
         if let sessionId = tabHoldingCopilotSession(copilotId, now: now) {
             guard rememberPullRequestsResume(requestId, projectId: projectId, sessionId: sessionId,
                                              fingerprint: fingerprint, now: now) else { return unsaved }
@@ -5622,6 +5624,7 @@ final class AppModel: ObservableObject {
         cwd: String,
         repository: String? = nil,
         title: String,
+        store: CopilotSessionStore = CopilotSessionStore(),
         now: Date = Date()
     ) -> ResumeFinderOutcome {
         let projectId: String?
@@ -5638,6 +5641,27 @@ final class AppModel: ObservableObject {
         guard let projectId else {
             return .temporarilyUnavailable(CopilotSessionStartError.projectUnavailable.localizedDescription)
         }
+        return resumeEndedSessionInProject(
+            copilotSessionId: copilotSessionId,
+            projectId: projectId,
+            title: title,
+            store: store,
+            now: now
+        )
+    }
+
+    /// Reopens an ended Copilot session explicitly into `projectId` without falling
+    /// back to another project when `projectId` is no longer present.
+    func resumeEndedSessionInProject(
+        copilotSessionId: String,
+        projectId: String,
+        title: String,
+        store: CopilotSessionStore = CopilotSessionStore(),
+        now: Date = Date()
+    ) -> ResumeFinderOutcome {
+        guard projects.contains(where: { $0.id == projectId }) else {
+            return .temporarilyUnavailable(CopilotSessionStartError.projectUnavailable.localizedDescription)
+        }
         let requestId = UUID()
         let response = resumePullRequestsSession(
             requestId: requestId,
@@ -5645,6 +5669,7 @@ final class AppModel: ObservableObject {
             copilotSessionId: copilotSessionId,
             selectOnMac: true,
             initialTitle: title,
+            store: store,
             now: now
         )
         let candidateSessionId = response.text ?? requestId.uuidString

@@ -3,6 +3,21 @@ import CopilotProjectsCore
 
 protocol SessionRanking: Sendable {
     func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch]
+    func rank(
+        query: String,
+        entries: [SessionFinderEntry],
+        options: LunaSessionPrompt.Options
+    ) async throws -> [LunaMatch]
+}
+
+extension SessionRanking {
+    func rank(
+        query: String,
+        entries: [SessionFinderEntry],
+        options: LunaSessionPrompt.Options
+    ) async throws -> [LunaMatch] {
+        try await rank(query: query, entries: entries)
+    }
 }
 
 enum LunaSearchError: Error, Equatable {
@@ -44,8 +59,16 @@ struct LunaSessionRanker: SessionRanking {
     var terminationGrace: TimeInterval = 2
 
     func rank(query: String, entries: [SessionFinderEntry]) async throws -> [LunaMatch] {
+        try await rank(query: query, entries: entries, options: .finder)
+    }
+
+    func rank(
+        query: String,
+        entries: [SessionFinderEntry],
+        options: LunaSessionPrompt.Options
+    ) async throws -> [LunaMatch] {
         guard let executable = copilotExecutable() else { throw LunaSearchError.copilotUnavailable }
-        let built = LunaSessionPrompt.build(query: query, entries: entries)
+        let built = LunaSessionPrompt.build(query: query, entries: entries, options: options)
         guard !built.aliases.isEmpty else { return [] }
         let home = try prepareRunHome()
         defer { try? FileManager.default.removeItem(at: home) }

@@ -322,10 +322,14 @@ sliding when Reduce Motion is enabled.
 
 The **+** side of the split button starts an interactive Copilot CLI session immediately,
 inheriting the current session's working directory. Its dropdown offers
-**Start with Prompt…** (a multiline composer), **New Terminal** (just a shell), and
-**Review Pull Request…** (a GitHub pull request URL dialog).
+**Start with Prompt…** (a multiline composer), **New Terminal** (just a shell),
+**Review Pull Request…** (a GitHub pull request URL dialog), and
+**Resume Session…** (a multiline prompt that searches your ended Copilot CLI
+sessions in an isolated background CLI run, resumes a single match into the
+project immediately, and offers a picker or prompt edit when multiple or none
+match).
 The Session menu and project context menus also offer Copilot, starting-prompt,
-and plain-terminal creation. New projects
+plain-terminal, and **Resume Session…** actions. New projects
 created with `⌘N` also start with Copilot. Copilot Projects never adds `--allow-all`;
 tool approvals follow your normal Copilot CLI permission settings.
 

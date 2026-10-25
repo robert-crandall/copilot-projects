@@ -6,18 +6,26 @@ import CopilotProjectsCore
 final class WorkspaceInputController: ObservableObject {
     @Published var imagePreview: TranscriptImagePreviewItem?
     @Published private(set) var sessionFinder: SessionFinderModel?
+    @Published private(set) var resumingSessionProjectId: String?
     private let model: AppModel
     private let sessionRanker: SessionRanking
     private let copilotSessionStore: @Sendable () -> CopilotSessionStore
+    private let alertPresenter: (NSAlert) -> NSApplication.ModalResponse
+    private var resumeSearchTask: Task<Void, Never>?
+    private var resumeSearchGeneration: UInt64 = 0
+
+    var isResumingSessionWithPrompt: Bool { resumingSessionProjectId != nil }
 
     init(
         model: AppModel,
         sessionRanker: SessionRanking = LunaSessionRanker(),
-        copilotSessionStore: @escaping @Sendable () -> CopilotSessionStore = { CopilotSessionStore() }
+        copilotSessionStore: @escaping @Sendable () -> CopilotSessionStore = { CopilotSessionStore() },
+        alertPresenter: @escaping (NSAlert) -> NSApplication.ModalResponse = { $0.runModal() }
     ) {
         self.model = model
         self.sessionRanker = sessionRanker
         self.copilotSessionStore = copilotSessionStore
+        self.alertPresenter = alertPresenter
     }
 
     /// A workspace sheet owns the keyboard, so workspace commands stay disabled.
@@ -70,6 +78,298 @@ final class WorkspaceInputController: ObservableObject {
         sessionFinder = nil
     }
 
+    func resumeSessionInSelectedProjectInteractive() {
+        guard let projectId = model.selectedProjectId else { return }
+        resumeSessionInteractive(toProjectId: projectId)
+    }
+
+    func resumeSessionInteractive(toProjectId projectId: String, initialPrompt: String = "") {
+        guard !isResumingSessionWithPrompt else { return }
+        do {
+            _ = try model.copilotSessionExecutable(toProjectId: projectId)
+        } catch {
+            presentResumeErrorAlert(
+                title: "Could Not Resume Copilot Session",
+                message: error.localizedDescription
+            )
+            return
+        }
+        let projectName = model.project(projectId)?.name ?? "Project"
+        let composer = CopilotPromptComposer(
+            configuration: .resumeSession(projectName: projectName, initialText: initialPrompt)
+        )
+        _ = composer.run(present: alertPresenter) { prompt in
+            _ = self.startResumeSessionSearch(toProjectId: projectId, prompt: prompt)
+        }
+    }
+
+    @discardableResult
+    func startResumeSessionSearch(toProjectId projectId: String, prompt: String) -> Task<Void, Never> {
+        resumeSearchTask?.cancel()
+        resumeSearchGeneration &+= 1
+        let generation = resumeSearchGeneration
+        resumingSessionProjectId = projectId
+        let task = Task<Void, Never> { [weak self] in
+            await self?.performResumeSessionSearch(
+                toProjectId: projectId,
+                prompt: prompt,
+                generation: generation
+            )
+        }
+        resumeSearchTask = task
+        return task
+    }
+
+    func cancelResumeSessionSearch() {
+        resumeSearchTask?.cancel()
+        resumeSearchTask = nil
+        resumeSearchGeneration &+= 1
+        resumingSessionProjectId = nil
+    }
+
+    private func clearResumeSearchState(generation: UInt64) {
+        guard resumeSearchGeneration == generation else { return }
+        resumingSessionProjectId = nil
+        resumeSearchTask = nil
+    }
+
+    private func performResumeSessionSearch(
+        toProjectId projectId: String,
+        prompt: String,
+        generation: UInt64
+    ) async {
+        defer { clearResumeSearchState(generation: generation) }
+        guard SessionInputValidation.isValidPrompt(prompt) else {
+            clearResumeSearchState(generation: generation)
+            presentResumeErrorAlert(
+                title: "Could Not Resume Copilot Session",
+                message: AppModel.CopilotSessionStartError.invalidPrompt.localizedDescription
+            )
+            return
+        }
+        do {
+            _ = try model.copilotSessionExecutable(toProjectId: projectId)
+        } catch {
+            clearResumeSearchState(generation: generation)
+            presentResumeErrorAlert(
+                title: "Could Not Resume Copilot Session",
+                message: error.localizedDescription
+            )
+            return
+        }
+
+        let projects = model.sessionFinderProjectTargets
+        let inMemoryCopilotIds = model.inMemoryActiveCopilotSessionIds()
+        let initialSessionIds = model.projects.flatMap { $0.sessions.map(\.id) }
+        let markerDirectory = model.resumeMarkerDirectory
+        let storeProvider = copilotSessionStore
+        let defaultStartupDir = Paths.defaultStartupDir
+        let resumableScan = Task.detached(priority: .userInitiated) {
+            let markerIds = AppModel.validatedMarkerCopilotSessionIds(
+                sessionIds: initialSessionIds,
+                directory: markerDirectory
+            )
+            let loaded = SessionFinderResumableLoader.load(
+                store: storeProvider(),
+                projects: projects,
+                selectedProjectId: projectId,
+                liveCopilotSessionIds: inMemoryCopilotIds.union(markerIds),
+                defaultStartupDir: defaultStartupDir,
+                limit: SessionFinderResumableLoader.resumePromptLimit
+            )
+            guard !Task.isCancelled else { return [SessionFinderEntry]() }
+            return SessionFinderSearch.prioritizedForRanking(
+                query: prompt,
+                in: loaded,
+                preferredProjectId: projectId
+            )
+        }
+        let loadedEntries = await withTaskCancellationHandler {
+            await resumableScan.value
+        } onCancel: {
+            resumableScan.cancel()
+        }
+        guard !Task.isCancelled, resumeSearchGeneration == generation else { return }
+        guard model.projects.contains(where: { $0.id == projectId }) else {
+            clearResumeSearchState(generation: generation)
+            presentResumeErrorAlert(
+                title: "Could Not Resume Copilot Session",
+                message: AppModel.CopilotSessionStartError.projectUnavailable.localizedDescription
+            )
+            return
+        }
+
+        let currentLiveIds = model.inMemoryActiveCopilotSessionIds()
+        let availableEntries = loadedEntries.filter { entry in
+            guard let copilotId = entry.source.resumableCopilotSessionId?.lowercased() else { return false }
+            return !currentLiveIds.contains(copilotId)
+        }
+        guard !availableEntries.isEmpty else {
+            clearResumeSearchState(generation: generation)
+            presentResumeErrorAlert(
+                title: "No Ended Sessions to Resume",
+                message: "No ended Copilot CLI sessions were found in your session history."
+            )
+            return
+        }
+
+        let matches: [LunaMatch]
+        do {
+            matches = try await sessionRanker.rank(
+                query: prompt,
+                entries: availableEntries,
+                options: .resumePrompt
+            )
+        } catch {
+            guard !Task.isCancelled, !(error is CancellationError),
+                  resumeSearchGeneration == generation else { return }
+            clearResumeSearchState(generation: generation)
+            guard model.projects.contains(where: { $0.id == projectId }) else {
+                presentResumeErrorAlert(
+                    title: "Could Not Resume Copilot Session",
+                    message: AppModel.CopilotSessionStartError.projectUnavailable.localizedDescription
+                )
+                return
+            }
+            if presentRecoverableResumeAlert(
+                title: "Could Not Find Session",
+                message: Self.resumeSearchErrorMessage(for: error)
+            ) {
+                resumeSessionInteractive(toProjectId: projectId, initialPrompt: prompt)
+            }
+            return
+        }
+
+        guard !Task.isCancelled, resumeSearchGeneration == generation else { return }
+        guard let projectName = model.project(projectId)?.name else {
+            clearResumeSearchState(generation: generation)
+            presentResumeErrorAlert(
+                title: "Could Not Resume Copilot Session",
+                message: AppModel.CopilotSessionStartError.projectUnavailable.localizedDescription
+            )
+            return
+        }
+
+        let postRankLiveIds = model.inMemoryActiveCopilotSessionIds()
+        let entriesById = Dictionary(
+            availableEntries.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var seenIds = Set<String>()
+        let candidates: [ResumableSessionCandidate] = matches.compactMap { match in
+            guard seenIds.insert(match.sessionId).inserted,
+                  let entry = entriesById[match.sessionId],
+                  let copilotId = entry.source.resumableCopilotSessionId?.lowercased(),
+                  !postRankLiveIds.contains(copilotId) else {
+                return nil
+            }
+            return ResumableSessionCandidate(entry: entry, reason: match.reason)
+        }
+
+        clearResumeSearchState(generation: generation)
+        dismissSessionFinder()
+        imagePreview = nil
+
+        if candidates.isEmpty {
+            if presentRecoverableResumeAlert(
+                title: "No Matching Session Found",
+                message: "No ended Copilot session matched your prompt."
+            ) {
+                resumeSessionInteractive(toProjectId: projectId, initialPrompt: prompt)
+            }
+            return
+        }
+
+        if candidates.count == 1 {
+            completeResumeCandidate(candidates[0], inProjectId: projectId, prompt: prompt)
+            return
+        }
+
+        let picker = SessionResumeMatchPicker(projectName: projectName, matches: candidates)
+        switch picker.run(present: alertPresenter) {
+        case .resume(let chosen):
+            completeResumeCandidate(chosen, inProjectId: projectId, prompt: prompt)
+        case .editPrompt:
+            resumeSessionInteractive(toProjectId: projectId, initialPrompt: prompt)
+        case .cancelled:
+            break
+        }
+    }
+
+    private func completeResumeCandidate(
+        _ candidate: ResumableSessionCandidate,
+        inProjectId projectId: String,
+        prompt: String
+    ) {
+        guard let copilotSessionId = candidate.copilotSessionId else { return }
+        switch model.resumeEndedSessionInProject(
+            copilotSessionId: copilotSessionId,
+            projectId: projectId,
+            title: candidate.title,
+            store: copilotSessionStore()
+        ) {
+        case .opened(let openedProjectId, let resumedSessionId):
+            model.selectSession(projectId: openedProjectId, sessionId: resumedSessionId)
+            if model.selectedProjectId != openedProjectId {
+                model.selectProject(openedProjectId)
+            }
+            DispatchQueue.main.async { [model] in model.focusActiveTerminal() }
+        case .permanentlyUnavailable(let message), .temporarilyUnavailable(let message):
+            guard model.projects.contains(where: { $0.id == projectId }) else {
+                presentResumeErrorAlert(
+                    title: "Could Not Resume Copilot Session",
+                    message: message
+                )
+                return
+            }
+            if presentRecoverableResumeAlert(
+                title: "Could Not Resume Copilot Session",
+                message: message
+            ) {
+                resumeSessionInteractive(toProjectId: projectId, initialPrompt: prompt)
+            }
+        }
+    }
+
+    static func resumeSearchErrorMessage(for error: Error) -> String {
+        guard let lunaError = error as? LunaSearchError else {
+            return error.localizedDescription
+        }
+        switch lunaError {
+        case .copilotUnavailable:
+            return "The Copilot CLI wasn't found. Install or configure it to search ended sessions."
+        case .notSignedIn:
+            return "Sign in to the Copilot CLI to search your ended sessions."
+        case .timedOut:
+            return "The Copilot CLI took too long to search your sessions. Try again or refine your prompt."
+        case .failed(let detail):
+            return "The Copilot CLI couldn't search your sessions: \(detail)"
+        case .unreadableResponse:
+            return "The Copilot CLI returned an unreadable search response. Try again."
+        }
+    }
+
+    private func presentResumeErrorAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        _ = alertPresenter(alert)
+    }
+
+    /// Presents an alert with "Edit Prompt…" and "Cancel"; returns `true` when the
+    /// user chooses "Edit Prompt…".
+    private func presentRecoverableResumeAlert(title: String, message: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Edit Prompt…")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].keyEquivalent = "\r"
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+        return alertPresenter(alert) == .alertFirstButtonReturn
+    }
+
     func openFromSessionFinder(_ sessionId: String) {
         // Select a live session directly when it is open in the workspace.
         if let project = model.projects.first(where: { project in
@@ -93,7 +393,8 @@ final class WorkspaceInputController: ObservableObject {
             preferredProjectId: source.projectId,
             cwd: source.cwd,
             repository: source.repository,
-            title: source.title
+            title: source.title,
+            store: copilotSessionStore()
         ) {
         case .opened(let projectId, let resumedSessionId):
             dismissSessionFinder()

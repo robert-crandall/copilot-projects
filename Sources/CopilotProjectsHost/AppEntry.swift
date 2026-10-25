@@ -115,6 +115,9 @@ private struct WorkspaceCommands: Commands {
                 Button("New Terminal") { model.addTerminalToSelected() }
                     .keyboardShortcut("t", modifiers: [.command, .option])
                 Divider()
+                Button("Resume Session…") { input.resumeSessionInSelectedProjectInteractive() }
+                    .disabled(model.selectedProjectId == nil || input.isResumingSessionWithPrompt)
+                Divider()
                 SessionReadStateButton(model: model)
                 Divider()
                 Button("End Session") { model.closeSelectedSession() }
