@@ -153,7 +153,8 @@ final class TranscriptImageReplayTests: XCTestCase {
                 imageId: entry.imageId,
                 version: entry.version,
                 data: entry.data,
-                displayedAt: entry.displayedAt
+                displayedAt: entry.displayedAt,
+                awaitingFirstDisplay: entry.awaitingFirstDisplay
             ))
         }
         XCTAssertTrue(reader.restoreCurrentSelection(imageId: 42, version: restored.entries[0].version, placementId: nil))
@@ -164,19 +165,51 @@ final class TranscriptImageReplayTests: XCTestCase {
         XCTAssertEqual(meta.pixelWidth, 5)
         XCTAssertEqual(meta.pixelHeight, 3)
 
-        // Preload (`a=t`) followed by later placement (`a=p`) also persists the first display timestamp.
+        // Preload (`a=t`) followed by restart and then first placement (`a=p`)
+        // preserves awaitingFirstDisplay across the restart and stamps displayedAt on placement.
         clock.value = Date(timeIntervalSince1970: 500)
         reader.ingest(remoteKittyFrameBytes(
             control: "a=t,f=100,t=d,U=1,i=77",
             base64Payload: png.base64EncodedString()
         )[...])
+        await store.barrierForTesting()
+
+        let restoredPreload = await store.restore(sessionId: "s1")
+        let preloadEntry = try XCTUnwrap(restoredPreload.entries.first { $0.imageId == 77 })
+        XCTAssertNil(preloadEntry.displayedAt)
+        XCTAssertTrue(preloadEntry.awaitingFirstDisplay)
+
+        clock.value = Date(timeIntervalSince1970: 525)
+        let postRestartReader = RemoteKittyImageCapture(
+            sessionId: "s1",
+            epoch: 2,
+            budget: RemoteKittyImageCaptureBudget(),
+            diskStore: store,
+            now: { clock.value }
+        )
+        postRestartReader.beginRestoring()
+        for entry in restoredPreload.entries {
+            XCTAssertTrue(postRestartReader.restoreEntry(
+                imageId: entry.imageId,
+                version: entry.version,
+                data: entry.data,
+                displayedAt: entry.displayedAt,
+                awaitingFirstDisplay: entry.awaitingFirstDisplay
+            ))
+        }
+        postRestartReader.finishRestoring()
+        XCTAssertFalse(postRestartReader.retainedImageMetadata().contains { $0.imageId == 77 })
+
         clock.value = Date(timeIntervalSince1970: 555)
-        reader.ingest(remoteKittyFrameBytes(control: "a=p,U=1,i=77,c=4,r=3")[...])
+        postRestartReader.ingest(remoteKittyFrameBytes(control: "a=p,U=1,i=77,c=4,r=3")[...])
+        let placedMeta = try XCTUnwrap(postRestartReader.retainedImageMetadata().first { $0.imageId == 77 })
+        XCTAssertEqual(placedMeta.displayedAt, Date(timeIntervalSince1970: 555))
         await store.barrierForTesting()
 
         let restoredAfterPlacement = await store.restore(sessionId: "s1")
         let placedEntry = try XCTUnwrap(restoredAfterPlacement.entries.first { $0.imageId == 77 })
         XCTAssertEqual(placedEntry.displayedAt, Date(timeIntervalSince1970: 555))
+        XCTAssertFalse(placedEntry.awaitingFirstDisplay)
     }
 
     func testResumeAndPostTurnReplayDoNotAttachToEndedOrResumeTurns() {

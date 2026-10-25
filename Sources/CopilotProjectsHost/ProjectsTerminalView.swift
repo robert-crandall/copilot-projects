@@ -209,7 +209,8 @@ final class ProjectsTerminalView: ProcessTerminalView {
                 imageId: entry.imageId,
                 version: entry.version,
                 data: entry.data,
-                displayedAt: entry.displayedAt
+                displayedAt: entry.displayedAt,
+                awaitingFirstDisplay: entry.awaitingFirstDisplay
             )
         }
         for selection in result.currentSelections {

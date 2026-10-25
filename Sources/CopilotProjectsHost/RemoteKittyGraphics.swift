@@ -1512,6 +1512,7 @@ final class RemoteKittyImageCapture: ObservableObject {
             version: version,
             data: data,
             displayedAt: resolvedDisplayTime,
+            awaitingFirstDisplay: resolvedDisplayTime == nil && !restoredWithoutOrigin.contains(key),
             selections: persistedSelections(imageId: imageId)
         )
         budget.register(owner: self, imageId: imageId, version: version, bytes: data.count)
@@ -1849,6 +1850,7 @@ final class RemoteKittyImageCapture: ObservableObject {
         version: UInt64,
         data: Data,
         displayedAt: Date?,
+        awaitingFirstDisplay: Bool,
         selections: [RemoteKittyPersistedPlacementSelection]
     ) {
         guard !suppressPersistToDisk, let diskStore else { return }
@@ -1858,6 +1860,7 @@ final class RemoteKittyImageCapture: ObservableObject {
             version: version,
             data: data,
             displayedAt: displayedAt,
+            awaitingFirstDisplay: awaitingFirstDisplay,
             currentSelections: selections
         )
     }
@@ -2001,7 +2004,8 @@ final class RemoteKittyImageCapture: ObservableObject {
         imageId: UInt32,
         version: UInt64,
         data: Data,
-        displayedAt restoredDisplayedAt: Date? = nil
+        displayedAt restoredDisplayedAt: Date? = nil,
+        awaitingFirstDisplay: Bool = false
     ) -> Bool {
         guard isRestoring else { return false }
         guard imageId >= 1, imageId <= 0xFFFFFF,
@@ -2014,6 +2018,8 @@ final class RemoteKittyImageCapture: ObservableObject {
         pixelSizeByKey[key] = (Int(pixelSize.width), Int(pixelSize.height))
         if let restoredDisplayedAt {
             displayedAt[key] = restoredDisplayedAt
+            restoredWithoutOrigin.remove(key)
+        } else if awaitingFirstDisplay {
             restoredWithoutOrigin.remove(key)
         } else {
             restoredWithoutOrigin.insert(key)

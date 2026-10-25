@@ -40,12 +40,20 @@ struct RemoteKittyRestoredImageEntry: Equatable {
     let version: UInt64
     let data: Data
     let displayedAt: Date?
+    let awaitingFirstDisplay: Bool
 
-    init(imageId: UInt32, version: UInt64, data: Data, displayedAt: Date? = nil) {
+    init(
+        imageId: UInt32,
+        version: UInt64,
+        data: Data,
+        displayedAt: Date? = nil,
+        awaitingFirstDisplay: Bool = false
+    ) {
         self.imageId = imageId
         self.version = version
         self.data = data
         self.displayedAt = displayedAt
+        self.awaitingFirstDisplay = awaitingFirstDisplay
     }
 }
 
@@ -125,19 +133,22 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         let version: UInt64
         let byteCount: Int
         let displayedAt: Date?
+        let awaitingFirstDisplay: Bool?
 
         init(
             sessionId: String,
             imageId: UInt32,
             version: UInt64,
             byteCount: Int,
-            displayedAt: Date? = nil
+            displayedAt: Date? = nil,
+            awaitingFirstDisplay: Bool? = nil
         ) {
             self.sessionId = sessionId
             self.imageId = imageId
             self.version = version
             self.byteCount = byteCount
             self.displayedAt = displayedAt
+            self.awaitingFirstDisplay = (awaitingFirstDisplay == true && displayedAt == nil) ? true : nil
         }
     }
 
@@ -414,6 +425,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         version: UInt64,
         data: Data,
         displayedAt: Date? = nil,
+        awaitingFirstDisplay: Bool = false,
         currentSelections: [RemoteKittyPersistedPlacementSelection] = []
     ) {
         enqueueMutation(
@@ -427,6 +439,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                 version: version,
                 data: data,
                 displayedAt: displayedAt,
+                awaitingFirstDisplay: awaitingFirstDisplay,
                 currentSelections: currentSelections
             )
         }
@@ -622,6 +635,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         version: UInt64,
         data: Data,
         displayedAt: Date?,
+        awaitingFirstDisplay: Bool,
         currentSelections: [RemoteKittyPersistedPlacementSelection]
     ) {
         guard !isTombstoned(sessionId: sessionId) else { return }
@@ -660,7 +674,8 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
             imageId: imageId,
             version: version,
             byteCount: data.count,
-            displayedAt: displayedAt
+            displayedAt: displayedAt,
+            awaitingFirstDisplay: awaitingFirstDisplay
         ))
         manifest.selections.removeAll { $0.sessionId == sessionId && $0.imageId == imageId }
         for selection in normalizedSelections {
@@ -857,7 +872,8 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                 imageId: entry.imageId,
                 version: entry.version,
                 data: data,
-                displayedAt: entry.displayedAt
+                displayedAt: entry.displayedAt,
+                awaitingFirstDisplay: entry.awaitingFirstDisplay == true
             ))
             validKeys.insert(EntryKey(sessionId: sessionId, imageId: entry.imageId, version: entry.version))
         }
