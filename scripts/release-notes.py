@@ -10,7 +10,6 @@ import sys
 
 
 MAX_BYTES = 256 * 1024
-PR_NUMBER = re.compile(r"^merge pull request #?(\d+)\b|\(#(\d+)\)$", re.IGNORECASE)
 
 
 def git(root, *args):
@@ -20,7 +19,7 @@ def git(root, *args):
 
 
 def escape(text):
-    return re.sub(r"([\\`*\[\]()_~])", r"\\\1", " ".join(text.split()))
+    return re.sub(r"([\\`*\[\]()_~<>])", r"\\\1", " ".join(text.split()))
 
 
 def category(title, labels):
@@ -38,17 +37,27 @@ def category(title, labels):
     return "Other changes"
 
 
-def pull_request(repository, number, revision):
+def merged_pull_request(repository, revision):
     raw = subprocess.check_output(
-        ["gh", "api", f"repos/{repository}/pulls/{number}"], text=True
+        ["gh", "api", "--paginate", "--slurp",
+         f"repos/{repository}/commits/{revision}/pulls?per_page=100"], text=True
     )
-    pr = json.loads(raw)
-    if not pr.get("merged_at") or pr.get("merge_commit_sha") != revision:
-        raise ValueError(f"PR {number} does not identify merged commit {revision}")
+    matches = [
+        pr for page in json.loads(raw) for pr in page
+        if pr.get("merged_at") and pr.get("merge_commit_sha") == revision
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError(f"Multiple merged pull requests identify commit {revision}")
+    pr = matches[0]
     title = pr.get("title")
     if not isinstance(title, str) or not title.strip():
-        raise ValueError(f"PR {number} has no title")
-    return title, [label["name"] for label in pr.get("labels", [])]
+        raise ValueError(f"Merged PR for {revision} has no title")
+    number = pr.get("number")
+    if type(number) is not int or number <= 0:
+        raise ValueError(f"Merged PR for {revision} has no valid number")
+    return title, [label["name"] for label in pr.get("labels", [])], number
 
 
 def host_pin(root, revision):
@@ -109,10 +118,9 @@ def generate(root, repository, previous, version, build):
     sections = {"Features and improvements": [], "Fixes": [], "Other changes": []}
     for line in history.splitlines():
         sha, subject = line.split("\t", 1)
-        match = PR_NUMBER.search(subject)
-        if match:
-            number = next(value for value in match.groups() if value)
-            title, labels = pull_request(repository, number, sha)
+        pr = merged_pull_request(repository, sha)
+        if pr:
+            title, labels, number = pr
             url = f"https://github.com/{repository}/pull/{number}"
         else:
             title, labels = subject, []

@@ -241,6 +241,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any(command != "git" or "fetch" in args for _, command, args in self.calls))
         self.assertFalse((self.project_root / "dist-build.txt").exists())
 
+    def assert_only_note_metadata_reads(self):
+        for _, command, args in self.calls:
+            if command == "gh":
+                self.assertEqual(args[:3], ["api", "--paginate", "--slurp"])
+                self.assertEqual(len(args), 4)
+                self.assertRegex(args[3], r"^repos/[^/]+/[^/]+/commits/[0-9a-f]{40}/pulls\?per_page=100$")
+
     def test_publish_refuses_a_version_dated_after_today(self):
         self.env["MOCK_DATE"] = "2026 10 08 PDT"
         result = self.run_release(version="2026.10.9.1")
@@ -649,7 +656,7 @@ class ReleaseTests(unittest.TestCase):
                 self.log.unlink(missing_ok=True)
                 result = self.run_release()
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertFalse(any(cmd == "gh" for _, cmd, _ in self.calls))
+                self.assert_only_note_metadata_reads()
 
     def notary_calls(self, subcommand):
         return [args for _, cmd, args in self.calls if cmd == "xcrun" and args[:2] == ["notarytool", subcommand]]
@@ -706,7 +713,7 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(len(self.notary_calls("log")), logs)
                 self.assertEqual(self.notary_wait_timeouts(), waits)
                 self.assertFalse(any(cmd == "xcrun" and args[:1] == ["stapler"] for _, cmd, args in self.calls))
-                self.assertFalse(any(cmd == "gh" for _, cmd, _ in self.calls))
+                self.assert_only_note_metadata_reads()
 
     def test_rejects_non_numeric_notary_wait_settings(self):
         for name in ("NOTARY_WAIT_MINUTES", "NOTARY_POLL_SECONDS"):

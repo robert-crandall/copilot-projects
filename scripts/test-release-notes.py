@@ -28,6 +28,16 @@ class NotesTests(unittest.TestCase):
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        real_output = subprocess.check_output
+
+        def offline_output(args, **kwargs):
+            if args[0] == "gh":
+                return "[[]]"
+            return real_output(args, **kwargs)
+
+        commands = mock.patch.object(subprocess, "check_output", side_effect=offline_output)
+        commands.start()
+        self.addCleanup(commands.stop)
         self.git("init", "-q", "--initial-branch=main")
         self.commit("Already shipped")
         self.previous = self.git("rev-parse", "HEAD")
@@ -60,32 +70,37 @@ class NotesTests(unittest.TestCase):
         self.commit("Internal implementation")
         self.git("switch", "-q", "main")
         self.git("merge", "--no-ff", "-qm", "Merge pull request #12 from feature\n\nCo-authored-by: Bot", "feature")
-        with mock.patch.object(notes, "pull_request", return_value=("Prevent [stale] *notes*", ["bug"])) as request:
+        with mock.patch.object(notes, "merged_pull_request", return_value=("Prevent [stale] *notes*", ["bug"], 12)) as request:
             result = self.generate()
-        request.assert_called_once_with("example/app", "12", self.git("rev-parse", "HEAD"))
+        request.assert_called_once_with("example/app", self.git("rev-parse", "HEAD"))
         self.assertNotIn("Co-authored-by", result["markdown"])
         self.assertNotIn("Internal implementation", result["markdown"])
         self.assertIn(r"Prevent \[stale\] \*notes\* ([#12](https://github.com/example/app/pull/12))", result["markdown"])
         self.assertEqual(result["plainText"], "Fixes\n- Prevent [stale] *notes*")
 
-    def test_squash_and_lowercase_merge_subjects(self):
+    def test_subjects_are_not_mistaken_for_pull_request_identity(self):
         self.commit("Feature (#13)")
         self.commit("merge pull request 14: headline")
-        with mock.patch.object(notes, "pull_request", return_value=("Feature", ["enhancement"])) as request:
+        with mock.patch.object(notes, "merged_pull_request", return_value=None) as request:
             result = self.generate()
-        self.assertEqual([call.args[1] for call in request.call_args_list], ["13", "14"])
-        self.assertIn("## Features", result["markdown"])
+        self.assertEqual(request.call_count, 2)
+        self.assertNotIn("/pull/", result["markdown"])
+        self.assertIn(r"Feature \(#13\)", result["markdown"])
+        self.assertIn("merge pull request 14", result["markdown"])
 
     def test_api_must_identify_exact_merged_change(self):
-        pr = {"title": "Fix", "merged_at": "2026-10-25", "merge_commit_sha": "a" * 40, "labels": []}
-        with mock.patch.object(subprocess, "check_output", return_value=json.dumps(pr)):
-            self.assertEqual(notes.pull_request("example/app", "12", "a" * 40), ("Fix", []))
-            with self.assertRaises(ValueError):
-                notes.pull_request("example/app", "12", "b" * 40)
-        with mock.patch.object(notes, "pull_request", side_effect=ValueError("API denied")):
+        pr = {"number": 12, "title": "Fix", "merged_at": "2026-10-25", "merge_commit_sha": "a" * 40, "labels": []}
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps([[], [pr]])):
+            self.assertEqual(notes.merged_pull_request("example/app", "a" * 40), ("Fix", [], 12))
+            self.assertIsNone(notes.merged_pull_request("example/app", "b" * 40))
+        with mock.patch.object(notes, "merged_pull_request", side_effect=ValueError("API denied")):
             self.commit("Merge pull request #12 from feature")
             with self.assertRaisesRegex(ValueError, "API denied"):
                 self.generate()
+
+    def test_angle_brackets_remain_literal_markdown(self):
+        self.commit("fix Array<String> rendering")
+        self.assertIn(r"Array\<String\>", self.generate()["markdown"])
 
     def test_divergent_predecessor_is_rejected(self):
         self.git("switch", "-qc", "other")

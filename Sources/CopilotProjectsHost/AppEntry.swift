@@ -81,6 +81,7 @@ private struct SessionHistoryMenuButtons: View {
 }
 
 private struct WorkspaceCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
     let model: AppModel
     @ObservedObject var input: WorkspaceInputController
     @Binding var keepRunning: Bool
@@ -98,8 +99,11 @@ private struct WorkspaceCommands: Commands {
             Toggle("Start Notifications with Copilot Projects", isOn: $startsNotifications)
         }
         CommandGroup(after: .help) {
-            Button("What's New") { input.presentReleaseNotes() }
-                .disabled(input.hasWorkspaceSheet)
+            Button("What's New") {
+                openWindow(id: "main")
+                input.presentReleaseNotes()
+            }
+            .disabled(input.hasWorkspaceSheet)
         }
         CommandGroup(before: .sidebar) {
             Toggle("Show Projects", isOn: $showsProjects)
