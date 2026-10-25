@@ -1617,7 +1617,8 @@ if (validSessionId && socketPath) {
     }
 
     function bounceIsIdle() {
-        return !bounceRequested && runtimeActivity?.processing === false
+        return questionEventStream?.sessionId === copilotSessionId && questionEventStream.caughtUp === true
+            && !bounceRequested && runtimeActivity?.processing === false
             && !foregroundTurnActive && !scheduledTurnActive
             && activeSubagents.size === 0 && schedules.length === 0
             && !workflowHasPendingInput();
@@ -2588,11 +2589,13 @@ if (validSessionId && socketPath) {
             elicitations: new Map(),
             completed: new Map(),
             inFlight: false,
+            caughtUp: false,
             unsupported: false,
             error: null,
         };
         if (stream.inFlight || stream.unsupported) return;
         stream.inFlight = true;
+        stream.caughtUp = false;
         const current = () => !shuttingDown && questionEventStream === stream
             && generation === conversationGeneration && stream.sessionId === copilotSessionId;
         const report = (message) => {
@@ -2699,6 +2702,7 @@ if (validSessionId && socketPath) {
                     stream.inputsOverflowed = false;
                     stream.elicitationsOverflowed = false;
                     stream.error = null;
+                    stream.caughtUp = true;
                     if (changed) publish();
                     return;
                 }

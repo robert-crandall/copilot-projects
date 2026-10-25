@@ -791,6 +791,103 @@ test("bounce discovery fails closed without disabling existing native workflows"
   assert.equal((await workflowReady(runtime)).capabilities.includes("session-bounce"), false);
 });
 
+test("bounce rejects while initial question recovery is pending and until the recovered question completes", {
+  concurrency: false,
+}, async (t) => {
+  let release;
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    session.questionEvents.push(questionEvent("elicitation.requested", pendingURLQuestion("recovering")));
+    const read = session.questionEventHandler;
+    session.questionEventHandler = (params) => session.questionEventCalls.length === 1
+      ? new Promise(resolve => { release = () => resolve(read(params)); })
+      : read(params);
+  });
+  t.after(() => release?.());
+  await workflowReady(runtime);
+  assert.equal(runtime.session.processing, false);
+  assert.equal(runtime.session.questionEventCalls[0].sessionId, runtime.copilotSessionId);
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  const pending = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, pending.operationId)?.state),
+    "bounce did not settle while question recovery was pending");
+  assert.equal(receipt(runtime, pending.operationId).state, "rejected");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+
+  release();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 1, "question was not recovered");
+  const unanswered = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, unanswered.operationId)?.state === "rejected",
+    "unanswered recovered question did not block bounce");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+
+  await runtime.session.emit("elicitation.completed", { requestId: "recovering" }, {}, false);
+  runtime.intervalCallback();
+  await waitFor(() => readSnapshot(runtime).trackedElicitations.length === 0, "completion was not recovered");
+  const ready = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, ready.operationId)?.state === "applied", "completed recovery kept bounce blocked");
+  assert.equal(runtime.session.workflowCalls.length, 1);
+});
+
+test("bounce rejects failed, unavailable, malformed, and incomplete question recovery", {
+  concurrency: false,
+}, async (t) => {
+  for (const failure of ["failed", "unavailable", "malformed", "incomplete"]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+      session.questionEventHandler = async () => {
+        if (failure === "failed") throw new Error("question recovery failed");
+        if (failure === "unavailable") throw Object.assign(new Error("unavailable"), { code: -32601 });
+        if (failure === "malformed") return { events: [] };
+        return { events: [], cursor: String(session.questionEventCalls.length), hasMore: true, cursorStatus: "ok" };
+      };
+    });
+    await workflowReady(runtime);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(runtime.session.processing, false);
+    const request = workflowHandoff(runtime, "session-bounce", {});
+    await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, request.operationId)?.state),
+      "bounce did not settle after question recovery failed");
+    assert.equal(receipt(runtime, request.operationId).state, "rejected", failure);
+    assert.deepEqual(runtime.session.workflowCalls, [], failure);
+  }
+});
+
+test("bounce cannot reuse question recovery from a previous conversation", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  await workflowReady(runtime);
+  const oldID = runtime.session.sessionId;
+  const nextID = uuid();
+  let finishOld;
+  let finishNew;
+  const emptyPage = { events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" };
+  runtime.session.questionEventHandler = ({ sessionId }) => new Promise(resolve => {
+    if (sessionId === oldID) finishOld = resolve;
+    else finishNew = resolve;
+  });
+  t.after(() => { finishOld?.(emptyPage); finishNew?.(emptyPage); });
+  runtime.intervalCallback();
+  await waitFor(() => finishOld, "old question recovery did not start");
+  runtime.session.sessionId = nextID;
+  await runtime.session.emit("session.start", { sessionId: nextID });
+  await waitFor(() => finishNew, "current question recovery did not start");
+  finishOld(emptyPage);
+  await workflowReady(runtime);
+  const pending = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, pending.operationId)?.state === "rejected",
+    "old recovery admitted bounce into the new conversation");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+  finishNew(emptyPage);
+  await new Promise(resolve => setImmediate(resolve));
+  const ready = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => receipt(runtime, ready.operationId)?.state === "applied", "current recovery did not admit bounce");
+  assert.equal(runtime.session.workflowCalls[0].sessionId, nextID);
+});
+
 test("bounce rechecks live processing and command registration before dispatch", {
   concurrency: false,
 }, async (t) => {
