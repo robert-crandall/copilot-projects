@@ -1949,6 +1949,7 @@ if (validSessionId && socketPath) {
                 const available = await hasBounceCommand(context);
                 const scheduled = await workflowRead("session.schedule.list", {}, context);
                 const processing = await workflowRead("session.metadata.isProcessing", {}, context);
+                await reconcileQuestionEvents();
                 ready = available && Array.isArray(scheduled?.entries) && scheduled.entries.length === 0
                     && processing?.processing === false;
             } catch (error) {
@@ -5338,7 +5339,7 @@ if (validSessionId && socketPath) {
         for (const kind of workflowKinds) processWorkflowAction(kind, kind !== "session-bounce");
         questionRecovery.then(() => {
             if (!shuttingDown && generation === conversationGeneration
-                    && questionEventStream?.caughtUp === true) processWorkflowAction("session-bounce");
+                    && questionEventStream?.inFlight === false) processWorkflowAction("session-bounce");
         });
         scheduleDurableReconcile(0);
     }, DURABLE_RECONCILE_POLL_MS);

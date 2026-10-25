@@ -865,10 +865,11 @@ test("bounce cannot reuse question recovery from a previous conversation", {
   let finishOld;
   let finishNew;
   const emptyPage = { events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" };
-  runtime.session.questionEventHandler = ({ sessionId }) => new Promise(resolve => {
-    if (sessionId === oldID) finishOld = resolve;
-    else finishNew = resolve;
-  });
+  runtime.session.questionEventHandler = ({ sessionId }) => {
+    if (sessionId === oldID && !finishOld) return new Promise(resolve => { finishOld = resolve; });
+    if (sessionId !== oldID && !finishNew) return new Promise(resolve => { finishNew = resolve; });
+    return Promise.resolve(emptyPage);
+  };
   t.after(() => { finishOld?.(emptyPage); finishNew?.(emptyPage); });
   runtime.intervalCallback();
   await waitFor(() => finishOld, "old question recovery did not start");
@@ -932,7 +933,9 @@ test("heartbeat bounce waits for question recovery without delaying exact receip
     await workflowReady(runtime);
     const emptyPage = { events: [], cursor: "tail", hasMore: false, cursorStatus: "ok" };
     let finish;
-    if (delayed) runtime.session.questionEventHandler = () => new Promise(resolve => { finish = resolve; });
+    if (delayed) runtime.session.questionEventHandler = () => finish
+      ? Promise.resolve(emptyPage)
+      : new Promise(resolve => { finish = resolve; });
     t.after(() => finish?.(emptyPage));
     const fields = operationFields(runtime, "session-bounce");
     const path = join(runtime.sessions, `${runtime.appSessionId}.session-bounce.json`);
@@ -960,6 +963,50 @@ test("heartbeat bounce waits for question recovery without delaying exact receip
     await waitFor(() => !realExistsSync(path), "receipt replay waited for question recovery");
     assert.deepEqual(receipt(runtime, fields.operationId), applied);
     assert.equal(runtime.session.workflowCalls.length, 1);
+  }
+});
+
+test("watcher bounce refreshes questions missed after startup without a heartbeat", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  await workflowReady(runtime);
+  const reads = runtime.session.questionEventCalls.length;
+  await runtime.session.emit("elicitation.requested", pendingURLQuestion("missed"), {}, false);
+  assert.deepEqual(readSnapshot(runtime).trackedElicitations, []);
+  const request = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, request.operationId)?.state),
+    "watcher bounce did not settle");
+  assert.equal(receipt(runtime, request.operationId).state, "rejected");
+  assert.ok(runtime.session.questionEventCalls.length > reads);
+  assert.equal(readSnapshot(runtime).trackedElicitations[0].requestId, "missed");
+  assert.deepEqual(runtime.session.workflowCalls, []);
+});
+
+test("heartbeat rejects bounce after failed or unsupported question recovery", {
+  concurrency: false,
+}, async (t) => {
+  for (const code of [undefined, -32601]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    });
+    await workflowReady(runtime);
+    runtime.session.questionEventHandler = async () => {
+      throw Object.assign(new Error("question recovery failed"), { code });
+    };
+    const fields = operationFields(runtime, "session-bounce");
+    const path = join(runtime.sessions, `${runtime.appSessionId}.session-bounce.json`);
+    writeHandoff(runtime, path, {
+      schemaVersion: 1, copilotSessionId: runtime.copilotSessionId,
+      ...fields, action: { kind: "session-bounce" },
+    });
+    runtime.intervalCallback();
+    await waitFor(() => receipt(runtime, fields.operationId)?.state === "rejected",
+      "failed question recovery left the bounce handoff outstanding");
+    assert.equal(realExistsSync(path), false);
+    assert.deepEqual(runtime.session.workflowCalls, []);
   }
 });
 

@@ -34,7 +34,7 @@ must finish recovering questions for the current conversation before accepting a
 incomplete or unavailable recovery blocks it.
 Questions that are too large to display remotely still block bounce until they are
 answered in Terminal.
-It rechecks readiness, the live schedule list, and command availability, then queues `/bounce` through the
+It rechecks readiness, question history, the live schedule list, and command availability, then queues `/bounce` through the
 SDK for the identified session; it never types into the terminal or sends a
 model prompt. The extension itself owns restarting and resuming.
 
