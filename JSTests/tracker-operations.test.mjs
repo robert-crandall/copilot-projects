@@ -1010,6 +1010,53 @@ test("heartbeat rejects bounce after failed or unsupported question recovery", {
   }
 });
 
+test("stalled question reads reject watcher and polling bounce without releasing recovery ownership", {
+  concurrency: false,
+}, async (t) => {
+  for (const watcher of [false, true]) {
+    const runtime = await createRuntime(t, (session) => {
+      session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+    });
+    await workflowReady(runtime);
+    const read = runtime.session.questionEventHandler;
+    const reads = runtime.session.questionEventCalls.length;
+    const emptyPage = { events: [], cursor: "0", hasMore: false, cursorStatus: "ok" };
+    let finish;
+    runtime.session.questionEventHandler = () => new Promise(resolve => { finish = resolve; });
+    t.after(() => finish?.(emptyPage));
+    const fields = operationFields(runtime, "session-bounce");
+    const path = join(runtime.sessions, `${runtime.appSessionId}.session-bounce.json`);
+    const payload = {
+      schemaVersion: 1, copilotSessionId: runtime.copilotSessionId,
+      ...fields, action: { kind: "session-bounce" },
+    };
+    writeHandoff(runtime, path, payload);
+    if (watcher) trigger(runtime, `${runtime.appSessionId}.session-bounce.json`);
+    else runtime.intervalCallback();
+    await waitFor(() => finish, "question read did not stall");
+    await waitFor(() => receipt(runtime, fields.operationId)?.state === "rejected",
+      "stalled recovery did not reject bounce within the existing recovery deadline", 4_000);
+    assert.equal(realExistsSync(path), false);
+    assert.deepEqual(runtime.session.workflowCalls, []);
+    runtime.intervalCallback();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(runtime.session.questionEventCalls.length, reads + 1, "Recovery single-flight ownership was released");
+    finish(emptyPage);
+    runtime.session.questionEventHandler = read;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(runtime.session.workflowCalls, [], "Late recovery executed an expired bounce");
+    writeHandoff(runtime, path, payload);
+    trigger(runtime, `${runtime.appSessionId}.session-bounce.json`);
+    await waitFor(() => !realExistsSync(path), "expired bounce receipt did not replay");
+    assert.equal(receipt(runtime, fields.operationId).state, "rejected");
+    assert.deepEqual(runtime.session.workflowCalls, []);
+    const ready = workflowHandoff(runtime, "session-bounce", {});
+    await waitFor(() => receipt(runtime, ready.operationId)?.state === "applied",
+      "expired preflight kept a new request reserved after recovery");
+    assert.equal(runtime.session.workflowCalls.length, 1);
+  }
+});
+
 test("bounce rechecks live processing and command registration before dispatch", {
   concurrency: false,
 }, async (t) => {

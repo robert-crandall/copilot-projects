@@ -1634,6 +1634,21 @@ if (validSessionId && socketPath) {
             && catalog.commands.some((command) => command.name === "bounce" && command.kind === "client");
     }
 
+    async function recoverQuestionsForBounce() {
+        let timeout;
+        try {
+            // Bound admission without cancelling or releasing the shared recovery.
+            await Promise.race([
+                reconcileQuestionEvents(),
+                new Promise(resolve => {
+                    timeout = setTimeout(resolve, PENDING_QUESTIONS_TIMEOUT_MS);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
     function workflowSnapshot() {
         const observation = workflowObservation;
         const fresh = observation && runtimeActivity?.error == null
@@ -1949,7 +1964,7 @@ if (validSessionId && socketPath) {
                 const available = await hasBounceCommand(context);
                 const scheduled = await workflowRead("session.schedule.list", {}, context);
                 const processing = await workflowRead("session.metadata.isProcessing", {}, context);
-                await reconcileQuestionEvents();
+                await recoverQuestionsForBounce();
                 ready = available && Array.isArray(scheduled?.entries) && scheduled.entries.length === 0
                     && processing?.processing === false;
             } catch (error) {
@@ -5326,7 +5341,7 @@ if (validSessionId && socketPath) {
         // extra write per tick), so the workflow it certifies is current.
         publish();
         const generation = conversationGeneration;
-        const questionRecovery = reconcileQuestionEvents();
+        const questionRecovery = recoverQuestionsForBounce();
         refreshRuntimeActivity(false, { heartbeat: true });
         refreshSchedules();
         refreshModels();
@@ -5338,8 +5353,7 @@ if (validSessionId && socketPath) {
         // Replay receipts immediately, but let recovery settle before a new bounce.
         for (const kind of workflowKinds) processWorkflowAction(kind, kind !== "session-bounce");
         questionRecovery.then(() => {
-            if (!shuttingDown && generation === conversationGeneration
-                    && questionEventStream?.inFlight === false) processWorkflowAction("session-bounce");
+            if (!shuttingDown && generation === conversationGeneration) processWorkflowAction("session-bounce");
         });
         scheduleDurableReconcile(0);
     }, DURABLE_RECONCILE_POLL_MS);

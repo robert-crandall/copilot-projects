@@ -2399,11 +2399,9 @@ final class AppModel: ObservableObject {
             activityDirectory: agentActivityDirectory,
             resumeMarkerDirectory: resumeMarkerDirectory
         )
-        if session.agentActivity?.workflow?.bounceRequested == true
-            || adapter.loadFreshSnapshot(sessionId: sessionId, now: { Date() })?
-                .workflow?.bounceRequested == true
-            || FileManager.default.fileExists(atPath: agentActivityDirectory
-                .appendingPathComponent("\(sessionId).session-bounce.json").path) {
+        if adapter.bounceBlocksAutomaticPrompts(
+            sessionId: sessionId, cachedSnapshot: session.agentActivity, now: { Date() }
+        ) {
             return .busy
         }
         let liveSessions = remotePromptLiveSessions?(agentProcessNames)

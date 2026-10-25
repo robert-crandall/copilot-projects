@@ -116,6 +116,18 @@ struct CLIOperationAdapter {
     let activityDirectory: URL
     let resumeMarkerDirectory: URL
 
+    func bounceBlocksAutomaticPrompts(
+        sessionId: String,
+        cachedSnapshot: AgentActivitySnapshot?,
+        now: () -> Date
+    ) -> Bool {
+        // The tracker publishes the snapshot fence before removing the handoff.
+        cachedSnapshot?.workflow?.bounceRequested == true
+            || FileManager.default.fileExists(atPath: activityDirectory
+                .appendingPathComponent("\(sessionId).session-bounce.json").path)
+            || loadFreshSnapshot(sessionId: sessionId, now: now)?.workflow?.bounceRequested == true
+    }
+
     /// The snapshot if it is fresh when read. `now` is consulted only after the
     /// read, so a snapshot published after the caller first took the time
     /// isn't judged future-dated.

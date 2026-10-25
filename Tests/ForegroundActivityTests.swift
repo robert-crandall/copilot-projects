@@ -956,6 +956,43 @@ final class ForegroundActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testBounceHandoffIsCheckedBeforeSnapshotPublicationCanRemoveIt() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/bounce-fence-\(UUID())")
+        let fixture = try Fixture(root: root)
+        defer { fixture.cleanup() }
+        var snapshot = fixture.snapshot(background: false)
+        snapshot.workflow = RemoteSessionWorkflow(
+            observedAtMilliseconds: fixture.baseMs, capabilities: [], sendReady: true, bounceRequested: false
+        )
+        try fixture.publish(snapshot)
+        let handoff = fixture.directory.appendingPathComponent("\(fixture.session.id).session-bounce.json")
+        try Data("{}".utf8).write(to: handoff)
+        let adapter = CLIOperationAdapter(
+            activityDirectory: fixture.directory, resumeMarkerDirectory: fixture.directory
+        )
+        var snapshotReads = 0
+        let blocked = adapter.bounceBlocksAutomaticPrompts(
+            sessionId: fixture.session.id, cachedSnapshot: nil,
+            now: {
+                snapshotReads += 1
+                snapshot.workflow = RemoteSessionWorkflow(
+                    observedAtMilliseconds: fixture.baseMs, capabilities: [], sendReady: false, bounceRequested: true
+                )
+                do {
+                    try JSONEncoder().encode(snapshot).write(to: fixture.snapshotURL, options: .atomic)
+                    try FileManager.default.removeItem(at: handoff)
+                } catch {
+                    XCTFail("Could not simulate tracker publication: \(error)")
+                }
+                return fixture.base
+            }
+        )
+        XCTAssertTrue(blocked)
+        XCTAssertEqual(snapshotReads, 0, "An existing handoff must block before the snapshot is read")
+    }
+
+    @MainActor
     func testLegacyTrackerKeepsTheExistingPromptPath() throws {
         let fixture = try Fixture()
         defer { fixture.cleanup() }
