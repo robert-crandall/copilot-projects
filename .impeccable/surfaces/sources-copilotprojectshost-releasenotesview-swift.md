@@ -26,8 +26,8 @@ below in secondary text. A single scrollable reading column contains grouped
 headings and linked changes. Missing notes have an explicit explanation. Native
 Dynamic Type and narrow web layouts wrap rather than truncate the content.
 
-FORM: Narrow, code-led utility extension, not a new visual world; seed not
-applicable. Platform sheets/dialogs protect reading and keyboard focus from the
+FORM: Narrow, code-led utility extension of Studio Console, inherited seed
+`207346d7`; no new concept roll. Platform sheets/dialogs protect reading and keyboard focus from the
 live terminal underneath. Native dismissal is the only added motion.
 
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
