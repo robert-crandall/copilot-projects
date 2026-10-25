@@ -33,6 +33,7 @@ session without pending questions, background agents, or schedules. The tracker
 must finish recovering questions for the current conversation before accepting a bounce;
 incomplete or unavailable recovery blocks it.
 Stalled question reads reject the bounce request without cancelling shared recovery.
+A native message submitted during preflight cancels the bounce rather than being overtaken by it.
 Questions that are too large to display remotely still block bounce until they are
 answered in Terminal.
 It rechecks readiness, question history, the live schedule list, and command availability, then queues `/bounce` through the

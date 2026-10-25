@@ -1057,6 +1057,31 @@ test("stalled question reads reject watcher and polling bounce without releasing
   }
 });
 
+test("a completed native send invalidates bounce preflight before a delayed turn-start event", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t, (session) => {
+    session.commandListHandler = async () => ({ commands: [{ name: "bounce", kind: "client" }] });
+  });
+  await workflowReady(runtime);
+  const emptyPage = { events: [], cursor: "0", hasMore: false, cursorStatus: "ok" };
+  let finishRecovery;
+  runtime.session.questionEventHandler = () => new Promise(resolve => { finishRecovery = resolve; });
+  t.after(() => finishRecovery?.(emptyPage));
+  const bounce = workflowHandoff(runtime, "session-bounce", {});
+  await waitFor(() => finishRecovery, "bounce preflight did not wait for question recovery");
+  const send = workflowHandoff(runtime, "session-send", { prompt: "new work", mode: "enqueue" });
+  await waitFor(() => receipt(runtime, send.operationId)?.state === "applied", "native send did not complete");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(runtime.session.processing, false, "The turn-start notification must still be delayed");
+  assert.equal(receipt(runtime, bounce.operationId), undefined, "The race must finish before preflight expiry");
+  finishRecovery(emptyPage);
+  await waitFor(() => ["applied", "rejected"].includes(receipt(runtime, bounce.operationId)?.state),
+    "bounce did not settle after the intervening send");
+  assert.equal(receipt(runtime, bounce.operationId).state, "rejected");
+  assert.deepEqual(runtime.session.workflowCalls.map(call => call.method), ["session.send"]);
+});
+
 test("bounce rechecks live processing and command registration before dispatch", {
   concurrency: false,
 }, async (t) => {

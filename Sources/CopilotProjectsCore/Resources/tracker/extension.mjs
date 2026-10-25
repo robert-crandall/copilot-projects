@@ -438,6 +438,7 @@ if (validSessionId && socketPath) {
     let conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
     let workflowRuntime = null;
     let bounceRequested = false;
+    let nativeSendRevision = 0;
     let workflowRefresh = null;
     let workflowRefreshAt = 0;
     let workflowObservation = null;
@@ -1859,6 +1860,7 @@ if (validSessionId && socketPath) {
     async function invokeWorkflowAction(action, context, attachments) {
         switch (action.kind) {
         case "session-send": {
+            nativeSendRevision += 1;
             const result = await workflowRPC("session.send", {
                 prompt: action.prompt, mode: action.mode,
                 ...(attachments ? { attachments } : {}),
@@ -1957,6 +1959,8 @@ if (validSessionId && socketPath) {
             return;
         }
         if (kind === "session-bounce") {
+            // A send RPC can finish before its turn-start notification arrives.
+            const sendRevision = nativeSendRevision;
             const preparingKey = operationExecutionKey(context.conversationEpoch, context.operationId);
             activeOperationKeys.add(preparingKey);
             let ready = false;
@@ -1973,7 +1977,7 @@ if (validSessionId && socketPath) {
                 activeOperationKeys.delete(preparingKey);
             }
             if (!ready || !operationAuthorityCurrent(context) || !bounceIsIdle()
-                    || activeOperationKeys.size !== 0) {
+                    || nativeSendRevision !== sendRevision || activeOperationKeys.size !== 0) {
                 publishRejectedPreflight(context, "target-unavailable", path, encoded);
                 return;
             }
@@ -4492,6 +4496,7 @@ if (validSessionId && socketPath) {
         conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
         workflowObservation = null;
         bounceRequested = false;
+        nativeSendRevision = 0;
         workflowContext = null;
         pendingBudgetRequest = null;
         pendingBudgetIds.clear();
