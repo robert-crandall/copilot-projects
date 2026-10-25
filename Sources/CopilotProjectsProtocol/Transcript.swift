@@ -265,6 +265,71 @@ public struct TranscriptTurn: Codable, Equatable, Sendable, Identifiable {
         self.images = images
         self.error = error
     }
+    /// Assistant messages and inline images interleaved in chronological
+    /// order. Images with a known `displayedAt` precede any assistant message
+    /// whose `timestamp` is strictly later (`displayedAt < message.timestamp`),
+    /// so a user prompt attachment appears before the first reply while a
+    /// tool image emitted during the same second as its triggering message
+    /// appears after that message and before later replies. Images without a
+    /// `displayedAt` (e.g. from an older host) stay at the end in their
+    /// original order.
+    public func timelineItems(
+        includingBlankAssistantMessages: Bool = false
+    ) -> [TranscriptTurnTimelineItem] {
+        let messages = includingBlankAssistantMessages
+            ? assistantMessages
+            : assistantMessages.filter {
+                !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        guard let images, !images.isEmpty else {
+            return messages.map(TranscriptTurnTimelineItem.assistant)
+        }
+        let datedImages = images.filter { $0.displayedAt != nil }
+        let undatedImages = images.filter { $0.displayedAt == nil }
+        let messageIDs = Set(messages.map(\.id))
+        var result: [TranscriptTurnTimelineItem] = []
+        result.reserveCapacity(messages.count + images.count)
+        var imageIndex = 0
+        for message in messages {
+            while imageIndex < datedImages.count {
+                let image = datedImages[imageIndex]
+                if let anchorID = image.afterAssistantMessageId,
+                   messageIDs.contains(anchorID) {
+                    break
+                }
+                guard image.displayedAt! < message.timestamp else { break }
+                result.append(.image(image))
+                imageIndex += 1
+            }
+            result.append(.assistant(message))
+            while imageIndex < datedImages.count {
+                let image = datedImages[imageIndex]
+                guard image.afterAssistantMessageId == message.id else { break }
+                result.append(.image(image))
+                imageIndex += 1
+            }
+        }
+        while imageIndex < datedImages.count {
+            result.append(.image(datedImages[imageIndex]))
+            imageIndex += 1
+        }
+        result.append(contentsOf: undatedImages.map(TranscriptTurnTimelineItem.image))
+        return result
+    }
+}
+
+public enum TranscriptTurnTimelineItem: Equatable, Sendable, Identifiable {
+    case assistant(TranscriptAssistantMessage)
+    case image(TranscriptImageRef)
+
+    public var id: String {
+        switch self {
+        case .assistant(let message):
+            "assistant-\(message.id)"
+        case .image(let image):
+            "image-\(image.imageId)"
+        }
+    }
 }
 
 /// A request failure as the CLI reported it. `message` is the CLI's own
@@ -296,11 +361,26 @@ public struct TranscriptImageRef: Codable, Equatable, Sendable {
     public let imageId: UInt32
     public let contentVersion: UInt64
     public let contentVersionText: String
+    public let displayedAt: Date?
+    public let afterAssistantMessageId: String?
+    public let pixelWidth: Int?
+    public let pixelHeight: Int?
 
-    public init(imageId: UInt32, contentVersion: UInt64) {
+    public init(
+        imageId: UInt32,
+        contentVersion: UInt64,
+        displayedAt: Date? = nil,
+        afterAssistantMessageId: String? = nil,
+        pixelWidth: Int? = nil,
+        pixelHeight: Int? = nil
+    ) {
         self.imageId = imageId
         self.contentVersion = contentVersion
         self.contentVersionText = String(contentVersion)
+        self.displayedAt = displayedAt
+        self.afterAssistantMessageId = afterAssistantMessageId
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
     }
 }
 

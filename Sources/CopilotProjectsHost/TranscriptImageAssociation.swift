@@ -64,7 +64,21 @@ enum TranscriptImageAssociation {
                         if $0.displayedAt != $1.displayedAt { return $0.displayedAt < $1.displayedAt }
                         return $0.imageId < $1.imageId
                     }
-                    .map { TranscriptImageRef(imageId: $0.imageId, contentVersion: $0.version) }
+                    .map {
+                        let afterMessageId = Self.precedingAssistantMessageId($0.displayedAt, in: turn)
+                        return TranscriptImageRef(
+                            imageId: $0.imageId,
+                            contentVersion: $0.version,
+                            displayedAt: Self.wireSafeDisplayedAt(
+                                $0.displayedAt,
+                                afterAssistantMessageId: afterMessageId,
+                                in: turn
+                            ),
+                            afterAssistantMessageId: afterMessageId,
+                            pixelWidth: $0.pixelWidth,
+                            pixelHeight: $0.pixelHeight
+                        )
+                    }
             }
             let rebuilt = TranscriptTurn(
                 id: turn.id,
@@ -94,12 +108,56 @@ enum TranscriptImageAssociation {
         )
     }
 
+    private static func precedingAssistantMessageId(
+        _ displayedAt: Date,
+        in turn: TranscriptTurn
+    ) -> String? {
+        turn.assistantMessages.last { message in
+            !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && message.timestamp <= displayedAt
+        }?.id
+    }
+
+    /// Preserves sub-second ordering (`displayedAt < message.timestamp`) across
+    /// whole-second ISO-8601 wire encoding when an image precedes every
+    /// non-blank assistant message in the turn (`afterAssistantMessageId == nil`),
+    /// while leaving mid-turn images untouched so they never step back past a
+    /// preceding message.
+    private static func wireSafeDisplayedAt(
+        _ displayedAt: Date,
+        afterAssistantMessageId: String?,
+        in turn: TranscriptTurn
+    ) -> Date {
+        guard afterAssistantMessageId == nil else { return displayedAt }
+        let wholeSecond = displayedAt.timeIntervalSince1970.rounded(.down)
+        let precedesSameSecondMessage = turn.assistantMessages.contains { message in
+            displayedAt < message.timestamp
+                && message.timestamp.timeIntervalSince1970.rounded(.down) == wholeSecond
+        }
+        guard precedesSameSecondMessage else { return displayedAt }
+        return Date(timeIntervalSince1970: wholeSecond - 1)
+    }
+
+    /// Grace window after a turn's `endedAt` during which a multi-chunk Kitty
+    /// PNG still flushing through the PTY at `session.idle` time (or whole-second
+    /// ISO-8601 rounding) still counts as belonging to that turn.
+    private static let postTurnEndGraceSeconds: TimeInterval = 2
+
     /// Index of the turn active at `time` — the last (chronologically latest)
-    /// turn whose `startedAt <= time`, or `nil` if no turn had started yet.
-    /// Transcript turns are appended in start order, so `lastIndex` yields the
-    /// greatest `startedAt <= time` and resolves identical `startedAt` ties to
-    /// the later turn.
+    /// turn whose `startedAt <= time`, provided that turn is not a synthetic
+    /// `session-resume-` marker and had not already ended before `time`.
     static func activeTurnIndex(_ turns: [TranscriptTurn], at time: Date) -> Int? {
-        turns.lastIndex { $0.startedAt <= time }
+        guard let index = turns.lastIndex(where: { $0.startedAt <= time }) else {
+            return nil
+        }
+        let turn = turns[index]
+        guard !turn.id.hasPrefix("session-resume-") else {
+            return nil
+        }
+        if let endedAt = turn.endedAt,
+           time > endedAt.addingTimeInterval(Self.postTurnEndGraceSeconds) {
+            return nil
+        }
+        return index
     }
 }
