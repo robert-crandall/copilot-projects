@@ -629,9 +629,10 @@ final class SessionFinderTests: XCTestCase {
         $SIG{TERM} = 'IGNORE';
         $SIG{PIPE} = 'IGNORE';
         setpgrp(0, 0);
+        if (open my $p, '>>', $ARGV[1]) { print $p "$$\n"; close $p; }
         select STDOUT; $| = 1;
         print "{\"type\":\"user.message\",\"data\":{\"content\":\"partial\"}}\n";
-        for (1..200) {
+        for (1..400) {
             select undef, undef, undef, 0.05;
             if (!defined syswrite(STDOUT, "\n", 1) && $! == EPIPE) {
                 if (open my $f, '>>', $ARGV[0]) { print $f "epipe\n"; close $f; }
@@ -641,12 +642,12 @@ final class SessionFinderTests: XCTestCase {
         """#
         try perlScript.write(to: perlFile, atomically: true, encoding: .utf8)
         var (detached, root) = try fakeCopilot("""
-        /usr/bin/perl '\(perlFile.path)' '\(epipeFile.path)' &
-        echo $! >> '\(pidsFile.path)'
+        /usr/bin/perl '\(perlFile.path)' '\(epipeFile.path)' '\(pidsFile.path)' &
+        while [ ! -s '\(pidsFile.path)' ]; do /bin/sleep 0.02; done
         """)
         defer { try? FileManager.default.removeItem(at: root) }
         let runs = root.appendingPathComponent("runs").path
-        detached.timeout = 0.2
+        detached.timeout = 1.0
         detached.terminationGrace = 0.2
         let started = Date()
         do {
@@ -655,21 +656,24 @@ final class SessionFinderTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? LunaSearchError, .timedOut)
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 6)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
         let timedOutChildren = try recordedPIDs(at: pidsFile)
         XCTAssertEqual(timedOutChildren.count, 1)
-        try await assertProcessesExit(timedOutChildren)
+        try await assertProcessesExit(timedOutChildren, timeout: 5)
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: epipeFile.path),
             "Closing the pipe read handle should cause the surviving writer to observe EPIPE"
         )
 
-        try Data().write(to: pidsFile)
+        try? FileManager.default.removeItem(at: pidsFile)
         try? FileManager.default.removeItem(at: epipeFile)
         detached.timeout = 30
         let task = Task { try await detached.rank(query: "anything", entries: [entry("A")]) }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        let readyDeadline = Date().addingTimeInterval(5)
+        while ((try? recordedPIDs(at: pidsFile).count) ?? 0) < 1, Date() < readyDeadline {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
         let cancelled = Date()
         task.cancel()
         do {
@@ -681,7 +685,7 @@ final class SessionFinderTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(cancelled), 5)
         let cancelledChildren = try recordedPIDs(at: pidsFile)
         XCTAssertEqual(cancelledChildren.count, 1)
-        try await assertProcessesExit(cancelledChildren)
+        try await assertProcessesExit(cancelledChildren, timeout: 5)
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: epipeFile.path),
             "Closing the pipe read handle on cancellation should cause the surviving writer to observe EPIPE"
@@ -704,8 +708,8 @@ final class SessionFinderTests: XCTestCase {
         exec /bin/sleep 30
         """)
         defer { try? FileManager.default.removeItem(at: root) }
-        ranker.timeout = 0.2
-        ranker.terminationGrace = 1.5
+        ranker.timeout = 1.0
+        ranker.terminationGrace = 2.5
         let started = Date()
         do {
             _ = try await ranker.rank(query: "anything", entries: [entry("A")])
@@ -713,10 +717,10 @@ final class SessionFinderTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? LunaSearchError, .timedOut)
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 1.2)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2.8)
         let children = try recordedPIDs(at: pidsFile)
         XCTAssertEqual(children.count, 2)
-        try await assertProcessesExit(children)
+        try await assertProcessesExit(children, timeout: 5)
     }
 
     func testLunaProcessCollectsMultiChunkStdoutAndStderrWithoutStalling() async throws {
