@@ -9,6 +9,10 @@ final class SessionWorkflowTests: XCTestCase {
         XCTAssertTrue(RemoteSessionAction(kind: .send, prompt: "hello", mode: .enqueue).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .send, prompt: "hello").isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .abort, prompt: "unexpected").isValid)
+        XCTAssertTrue(RemoteSessionAction(kind: .bounce).isValid)
+        XCTAssertFalse(RemoteSessionAction(kind: .bounce, prompt: "/quit").isValid)
+        XCTAssertFalse(RemoteSessionAction(kind: .bounce, mode: .immediate).isValid)
+        XCTAssertFalse(RemoteSessionAction(kind: .bounce, attachmentIds: [UUID().uuidString]).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .setBudget, maxAiCredits: 29).isValid)
         XCTAssertFalse(RemoteSessionAction(kind: .setBudget, maxAiCredits: .infinity).isValid)
         XCTAssertTrue(RemoteSessionAction(kind: .setBudget, maxAiCredits: 30).isValid)
@@ -70,6 +74,26 @@ final class SessionWorkflowTests: XCTestCase {
         XCTAssertTrue(current.isFresh(servedAtMilliseconds: nil, receivedAt: .now))
     }
 
+    func testBounceRequiresExplicitStateAndPendingBounceDisablesAllActions() {
+        let now = Date()
+        let observed = Int64(now.timeIntervalSince1970 * 1_000)
+        let received = ContinuousClock.now
+        for marker in [nil, false, true] as [Bool?] {
+            let workflow = RemoteSessionWorkflow(
+                observedAtMilliseconds: observed,
+                capabilities: RemoteSessionActionKind.allCases.map(\.rawValue),
+                sendReady: true, bounceRequested: marker
+            )
+            for kind in RemoteSessionActionKind.allCases {
+                let expected = kind == .bounce ? marker == false : marker != true
+                XCTAssertEqual(workflow.supports(kind, at: now), expected)
+                XCTAssertEqual(workflow.supports(
+                    kind, servedAtMilliseconds: observed, receivedAt: received, now: received, at: now
+                ), expected)
+            }
+        }
+    }
+
     @MainActor
     func testNativeHostActionsUseDistinctHandoffsAndNeverInjectTerminalInput() throws {
         _ = NSApplication.shared
@@ -85,6 +109,7 @@ final class SessionWorkflowTests: XCTestCase {
         let model = AppModel(
             stateRepository: repository, persistPermissionStatus: { _, _, _, _ in },
             isAppActive: { false }, agentActivityDirectory: sessions, resumeMarkerDirectory: sessions,
+            remotePromptLiveSessions: { _ in [session.id] },
             remotePromptTarget: { _ in
                 RemotePromptTarget(activity: .idle, send: { _ in
                     XCTFail("Native actions must not touch the terminal draft")
@@ -104,6 +129,7 @@ final class SessionWorkflowTests: XCTestCase {
             workflow: RemoteSessionWorkflow(
                 observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1000),
                 capabilities: RemoteSessionActionKind.allCases.map(\.rawValue), sendReady: true,
+                bounceRequested: false,
                 limitsKnown: true
             )
         )
@@ -127,6 +153,64 @@ final class SessionWorkflowTests: XCTestCase {
             operation: CLIOperationRequest(operationId: "old", conversationEpoch: "epoch-0")
         ), .conflict)
         try FileManager.default.removeItem(at: sessions.appendingPathComponent("\(session.id).session-send.json"))
+        let bounce = RemoteSessionAction(kind: .bounce)
+        let bounceID = CLIOperationRequest(operationId: "bounce", conversationEpoch: "epoch-1")
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce, operation: bounceID
+        ), .invalid)
+        snapshot.runtimeActivity = RuntimeActivitySnapshot(
+            processing: false, observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000)
+        )
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce, operation: bounceID
+        ), .accepted)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: sessions.appendingPathComponent("\(session.id).session-bounce.json").path
+        ))
+        XCTAssertEqual(model.sendRemotePrompt(sessionId: session.id, value: "pending handoff"), .busy)
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce, operation: bounceID
+        ), .accepted)
+        try FileManager.default.removeItem(at: sessions.appendingPathComponent("\(session.id).session-bounce.json"))
+        let readyWorkflow = snapshot.workflow
+        let selection = RemoteModelSelection(modelId: "gpt-5.6-sol")
+        let modelOperation = CLIOperationRequest(operationId: "model", conversationEpoch: "epoch-1")
+        snapshot.availableModels = [TrackedAvailableModel(id: selection.modelId, name: "Model")]
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        XCTAssertEqual(model.setModel(
+            sessionId: session.id, selection: selection, operation: modelOperation
+        ), .accepted)
+        let modelHandoff = sessions.appendingPathComponent("\(session.id).set-model-request.json")
+        try FileManager.default.removeItem(at: modelHandoff)
+        snapshot.operationReceipts = [TrackedOperationReceipt(
+            operationId: modelOperation.operationId, conversationEpoch: "epoch-1",
+            kind: "set-model", state: .applied,
+            updatedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+            payloadFingerprint: CLIOperationAdapter.payloadFingerprint(kind: .setModel, payload: selection)
+        )]
+        snapshot.workflow = RemoteSessionWorkflow(
+            observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+            capabilities: [], sendReady: false, bounceRequested: true
+        )
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        XCTAssertEqual(model.sendRemotePrompt(sessionId: session.id, value: "pending bounce"), .busy)
+        XCTAssertEqual(model.setModel(
+            sessionId: session.id, selection: selection,
+            operation: CLIOperationRequest(operationId: "new-model", conversationEpoch: "epoch-1")
+        ), .invalid)
+        XCTAssertEqual(model.setModel(
+            sessionId: session.id, selection: selection, operation: modelOperation
+        ), .accepted)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: modelHandoff.path))
+        snapshot.workflow = readyWorkflow
+        snapshot.scheduledTurnActive = true
+        try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id, action: bounce,
+            operation: CLIOperationRequest(operationId: "busy-bounce", conversationEpoch: "epoch-1")
+        ), .invalid)
+        snapshot.scheduledTurnActive = false
         snapshot.pendingPermissionRequestIds = ["pending"]
         try JSONEncoder().encode(snapshot).write(to: snapshotURL)
         XCTAssertEqual(model.performSessionAction(

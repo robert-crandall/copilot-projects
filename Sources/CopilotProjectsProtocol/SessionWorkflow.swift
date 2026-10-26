@@ -3,6 +3,7 @@ import Foundation
 public enum RemoteSessionActionKind: String, Codable, Sendable, CaseIterable {
     case send = "session-send"
     case abort = "session-abort"
+    case bounce = "session-bounce"
     case setBudget = "set-session-budget"
     case answerBudget = "answer-session-budget"
 }
@@ -71,7 +72,7 @@ public struct RemoteSessionAction: Codable, Equatable, Sendable {
             guard let prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   prompt.utf8.count <= 8_192, mode != nil else { return false }
             return maxAiCredits == nil && requestId == nil && additionalAiCredits == nil
-        case .abort:
+        case .abort, .bounce:
             return prompt == nil && mode == nil && maxAiCredits == nil
                 && requestId == nil && additionalAiCredits == nil
         case .setBudget:
@@ -117,6 +118,8 @@ public struct RemoteSessionWorkflow: Codable, Equatable, Sendable {
     public let capabilities: [String]
     public let sendReady: Bool
     public let legacyPromptFallback: Bool?
+    /// Older trackers omit this field; only an explicit false admits a bounce.
+    public let bounceRequested: Bool?
     public let totalAiCredits: Double?
     public let contextTokens: Int?
     public let contextTokenLimit: Int?
@@ -134,6 +137,7 @@ public struct RemoteSessionWorkflow: Codable, Equatable, Sendable {
         capabilities: [String],
         sendReady: Bool,
         legacyPromptFallback: Bool? = nil,
+        bounceRequested: Bool? = nil,
         totalAiCredits: Double? = nil,
         contextTokens: Int? = nil,
         contextTokenLimit: Int? = nil,
@@ -150,6 +154,7 @@ public struct RemoteSessionWorkflow: Codable, Equatable, Sendable {
         self.capabilities = capabilities
         self.sendReady = sendReady
         self.legacyPromptFallback = legacyPromptFallback
+        self.bounceRequested = bounceRequested
         self.totalAiCredits = totalAiCredits
         self.contextTokens = contextTokens
         self.contextTokenLimit = contextTokenLimit
@@ -171,6 +176,7 @@ public struct RemoteSessionWorkflow: Codable, Equatable, Sendable {
 
     public func supports(_ kind: RemoteSessionActionKind, at date: Date = Date()) -> Bool {
         isFresh(at: date) && capabilities.contains(kind.rawValue)
+            && bounceRequested != true && (kind != .bounce || bounceRequested == false)
     }
 }
 
@@ -271,6 +277,7 @@ extension RemoteSessionWorkflow {
             now: now,
             at: date
         ) && capabilities.contains(kind.rawValue)
+            && bounceRequested != true && (kind != .bounce || bounceRequested == false)
     }
 }
 

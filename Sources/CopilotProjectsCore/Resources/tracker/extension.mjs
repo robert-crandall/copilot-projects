@@ -283,7 +283,7 @@ if (validSessionId && socketPath) {
     );
     const setModelRequestName = `${appSessionId}.set-model-request.json`;
     const workflowKinds = [
-        "session-send", "session-abort", "set-session-budget", "answer-session-budget",
+        "session-send", "session-abort", "session-bounce", "set-session-budget", "answer-session-budget",
     ];
     const workflowPaths = new Map(workflowKinds.map((kind) => [
         kind, join(sessionsDir, `${appSessionId}.${kind}.json`),
@@ -303,6 +303,7 @@ if (validSessionId && socketPath) {
     const pendingElicitations = new Map();
     const recoveredQuestionToolCallIds = new Set();
     const completedQuestionRequests = new Set();
+    const pendingQuestionRequestIds = new Set();
     let questionEventStream = null;
     const inFlightElicitationResponses = new Set();
     const operationReceipts = new Map();
@@ -436,6 +437,8 @@ if (validSessionId && socketPath) {
     const trackerInstanceId = randomUUID();
     let conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
     let workflowRuntime = null;
+    let bounceRequested = false;
+    let nativeSendRevision = 0;
     let workflowRefresh = null;
     let workflowRefreshAt = 0;
     let workflowObservation = null;
@@ -1615,24 +1618,57 @@ if (validSessionId && socketPath) {
             || pendingBudgetIds.size > 0;
     }
 
+    function bounceIsIdle() {
+        return questionEventStream?.sessionId === copilotSessionId && questionEventStream.caughtUp === true
+            && !bounceRequested && runtimeActivity?.processing === false
+            && !foregroundTurnActive && !scheduledTurnActive
+            && activeSubagents.size === 0 && schedules.length === 0
+            && pendingQuestionRequestIds.size === 0
+            && !workflowHasPendingInput();
+    }
+
+    async function hasBounceCommand(context) {
+        const catalog = await workflowRead("session.commands.list", {
+            includeBuiltins: false, includeSkills: false, includeClientCommands: true,
+        }, context);
+        return Array.isArray(catalog?.commands)
+            && catalog.commands.some((command) => command.name === "bounce" && command.kind === "client");
+    }
+
+    async function recoverQuestionsForBounce() {
+        let timeout;
+        try {
+            // Bound admission without cancelling or releasing the shared recovery.
+            await Promise.race([
+                reconcileQuestionEvents(),
+                new Promise(resolve => {
+                    timeout = setTimeout(resolve, PENDING_QUESTIONS_TIMEOUT_MS);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
     function workflowSnapshot() {
         const observation = workflowObservation;
         const fresh = observation && runtimeActivity?.error == null
             && !terminalDisconnectError && Date.now() - observation.observedAtMilliseconds <= 15_000;
-        const capabilities = fresh ? observation.capabilities.filter(
+        const capabilities = fresh && !bounceRequested ? observation.capabilities.filter(
             (kind) => !unavailableWorkflowActions.has(kind)
         ) : [];
         return {
             version: 1,
             observedAtMilliseconds: observation?.observedAtMilliseconds ?? 0,
             capabilities,
-            sendReady: fresh === true && !workflowHasPendingInput(),
+            sendReady: fresh === true && !bounceRequested && !workflowHasPendingInput(),
+            bounceRequested,
             imageAttachments: fresh ? availableModels?.find(
                 (model) => model.id === currentModel?.name
             )?.imageAttachments ?? null : null,
-            legacyPromptFallback: workflowRuntime === false || runtimeActivityUnsupported
+            legacyPromptFallback: !bounceRequested && (workflowRuntime === false || runtimeActivityUnsupported
                 || observation?.legacyPromptFallback === true
-                || unavailableWorkflowActions.has("session-send"),
+                || unavailableWorkflowActions.has("session-send")),
             totalAiCredits: observation?.totalAiCredits ?? null,
             contextTokens: workflowContext?.currentTokens ?? null,
             contextTokenLimit: workflowContext?.tokenLimit ?? null,
@@ -1690,12 +1726,19 @@ if (validSessionId && socketPath) {
                 usageError = "Session credit usage is unavailable";
                 console.error("[copilot-projects] workflow usage query failed:", error);
             }
+            let bounceAvailable = false;
+            try {
+                bounceAvailable = await hasBounceCommand(context);
+            } catch (error) {
+                console.error("[copilot-projects] bounce command discovery failed:", error);
+            }
             if (!operationAuthorityCurrent(context)) return;
             workflowObservation = {
                 observedAtMilliseconds,
                 capabilities: [
                     "session-send", "session-abort", "answer-session-budget", "image-attachments-v1",
                     ...(limitsKnown ? ["set-session-budget"] : []),
+                    ...(bounceAvailable ? ["session-bounce"] : []),
                 ],
                 totalAiCredits, limitsKnown,
                 maxAiCredits: metadata.sessionLimits?.maxAiCredits ?? null,
@@ -1735,6 +1778,7 @@ if (validSessionId && socketPath) {
                 && ["enqueue", "immediate"].includes(action.mode)
                 && absent("maxAiCredits", "requestId", "additionalAiCredits");
         case "session-abort":
+        case "session-bounce":
             return absent("prompt", "mode", "maxAiCredits", "requestId", "additionalAiCredits");
         case "set-session-budget":
             return absent("prompt", "mode", "requestId", "additionalAiCredits")
@@ -1816,6 +1860,7 @@ if (validSessionId && socketPath) {
     async function invokeWorkflowAction(action, context, attachments) {
         switch (action.kind) {
         case "session-send": {
+            nativeSendRevision += 1;
             const result = await workflowRPC("session.send", {
                 prompt: action.prompt, mode: action.mode,
                 ...(attachments ? { attachments } : {}),
@@ -1825,6 +1870,15 @@ if (validSessionId && socketPath) {
         }
         case "session-abort":
             return rpcReceiptOutcome(await workflowRPC("session.abort", {}, context));
+        case "session-bounce": {
+            const result = await workflowRPC("session.commands.enqueue", { command: "/bounce" }, context);
+            if (result?.queued === false) {
+                if (operationAuthorityCurrent(context)) bounceRequested = false;
+                return { state: "rejected", errorCode: "bounce-unavailable" };
+            }
+            return result?.queued === true
+                ? { state: "applied" } : { state: "indeterminate", errorCode: "rpc-indeterminate" };
+        }
         case "set-session-budget": {
             await workflowRPC("session.options.update", {
                 sessionLimits: action.maxAiCredits == null ? null : { maxAiCredits: action.maxAiCredits },
@@ -1845,7 +1899,7 @@ if (validSessionId && socketPath) {
         }
     }
 
-    async function processWorkflowAction(kind) {
+    async function processWorkflowAction(kind, allowNew = true) {
         if (!ownsSharedFiles()) return;
         const path = workflowPaths.get(kind);
         let encoded;
@@ -1888,18 +1942,46 @@ if (validSessionId && socketPath) {
             removeCapturedHandoff(path, encoded);
             return;
         }
+        if (!allowNew) return;
         const action = request.action;
         const context = operation.context;
+        if (activeOperationKeys.has(operationExecutionKey(context.conversationEpoch, context.operationId))) return;
         const workflow = workflowSnapshot();
         const valid = request.schemaVersion === 1 && validWorkflowAction(action, kind)
             && workflow.capabilities.includes(kind)
             && (kind !== "session-send" || workflow.sendReady)
+            && (kind !== "session-bounce" || (bounceIsIdle() && activeOperationKeys.size === 0))
             && (kind !== "set-session-budget" || pendingBudgetRequest === null)
             && (kind !== "answer-session-budget"
                 || pendingBudgetRequest?.requestId === action.requestId);
         if (!valid || !operationAuthorityCurrent(context)) {
             publishRejectedPreflight(context, "target-unavailable", path, encoded);
             return;
+        }
+        if (kind === "session-bounce") {
+            // A send RPC can finish before its turn-start notification arrives.
+            const sendRevision = nativeSendRevision;
+            const preparingKey = operationExecutionKey(context.conversationEpoch, context.operationId);
+            activeOperationKeys.add(preparingKey);
+            let ready = false;
+            try {
+                const available = await hasBounceCommand(context);
+                const scheduled = await workflowRead("session.schedule.list", {}, context);
+                const processing = await workflowRead("session.metadata.isProcessing", {}, context);
+                const activity = await workflowRead("session.metadata.activity", {}, context);
+                await recoverQuestionsForBounce();
+                ready = available && Array.isArray(scheduled?.entries) && scheduled.entries.length === 0
+                    && processing?.processing === false && activity?.hasActiveWork === false;
+            } catch (error) {
+                console.error("[copilot-projects] bounce preflight failed:", error);
+            } finally {
+                activeOperationKeys.delete(preparingKey);
+            }
+            if (!ready || !operationAuthorityCurrent(context) || !bounceIsIdle()
+                    || nativeSendRevision !== sendRevision || activeOperationKeys.size !== 0) {
+                publishRejectedPreflight(context, "target-unavailable", path, encoded);
+                return;
+            }
         }
         let attachments;
         if (kind === "session-send" && action.attachmentIds) {
@@ -1922,7 +2004,13 @@ if (validSessionId && socketPath) {
                 return;
             }
         }
-        if (!publishAcceptedReceipt(context)) return;
+        // Publish the mutation fence atomically with acceptance, before the
+        // command can run or another host path can fall back to the terminal.
+        if (kind === "session-bounce") bounceRequested = true;
+        if (!publishAcceptedReceipt(context)) {
+            if (kind === "session-bounce") bounceRequested = false;
+            return;
+        }
         const key = operationExecutionKey(context.conversationEpoch, context.operationId);
         activeOperationKeys.add(key);
         const timeout = setTimeout(() => {
@@ -1945,6 +2033,7 @@ if (validSessionId && socketPath) {
         } catch (error) {
             if (!operationAuthorityCurrent(context)) return;
             const unsupported = error?.code === -32601;
+            if (unsupported && kind === "session-bounce") bounceRequested = false;
             if (unsupported) unavailableWorkflowActions.add(kind);
             console.error("[copilot-projects] native session action failed:", error);
             if (publishTerminalReceipt(
@@ -2013,7 +2102,7 @@ if (validSessionId && socketPath) {
             publish();
             refreshWorkflow(true);
         }
-        if (root && ["session.usage_checkpoint", "session.session_limits_changed"].includes(event.type)) {
+        if (root && ["session.usage_checkpoint", "session.session_limits_changed", "commands.changed"].includes(event.type)) {
             refreshWorkflow(true);
         }
         if (root && event.type === "session.idle") {
@@ -2073,7 +2162,7 @@ if (validSessionId && socketPath) {
             // extension from an older build that cannot validate prompts.
             pendingPermissionRequestIds: [...pendingPermissionRequests.keys()],
             ...(currentModel ? { model: currentModel } : {}),
-            ...(availableModels ? { availableModels } : {}),
+            ...(availableModels && !bounceRequested ? { availableModels } : {}),
             copilotSessionId,
             conversationEpoch,
             operationReceiptVersion: OPERATION_RECEIPT_VERSION,
@@ -2461,6 +2550,7 @@ if (validSessionId && socketPath) {
     }
 
     function noteQuestionCompleted(requestId) {
+        pendingQuestionRequestIds.delete(requestId);
         questionEventStream?.inputs.delete(requestId);
         questionEventStream?.elicitations.delete(requestId);
         // Runtime request IDs are unique; a delayed notification must not reopen an answered form.
@@ -2489,6 +2579,7 @@ if (validSessionId && socketPath) {
             return Boolean(entry) || cleared;
         }
         if (completedQuestionRequests.has(requestId)) return false;
+        pendingQuestionRequestIds.add(requestId);
         const entry = elicitation ? elicitationEntry(event) : userInputEntry(event);
         const maximum = elicitation ? MAX_ELICITATIONS : MAX_USER_INPUTS;
         if (recovered) {
@@ -2524,11 +2615,13 @@ if (validSessionId && socketPath) {
             elicitations: new Map(),
             completed: new Map(),
             inFlight: false,
+            caughtUp: false,
             unsupported: false,
             error: null,
         };
         if (stream.inFlight || stream.unsupported) return;
         stream.inFlight = true;
+        stream.caughtUp = false;
         const current = () => !shuttingDown && questionEventStream === stream
             && generation === conversationGeneration && stream.sessionId === copilotSessionId;
         const report = (message) => {
@@ -2596,6 +2689,7 @@ if (validSessionId && socketPath) {
                             stream.completed.delete(stream.completed.keys().next().value);
                         }
                     } else if (!stream.completed.has(requestId) && !completedQuestionRequests.has(requestId)) {
+                        if (!requestId.startsWith(DURABLE_ASK_USER_PREFIX)) pendingQuestionRequestIds.add(requestId);
                         const entry = event.type === "elicitation.requested"
                             ? elicitationEntry(event) : userInputEntry(event);
                         if (!entry) continue;
@@ -2635,6 +2729,7 @@ if (validSessionId && socketPath) {
                     stream.inputsOverflowed = false;
                     stream.elicitationsOverflowed = false;
                     stream.error = null;
+                    stream.caughtUp = true;
                     if (changed) publish();
                     return;
                 }
@@ -4401,6 +4496,8 @@ if (validSessionId && socketPath) {
         transcriptDeltaPublishTimer = null;
         conversationEpoch = `${trackerInstanceId}:${conversationGeneration}`;
         workflowObservation = null;
+        bounceRequested = false;
+        nativeSendRevision = 0;
         workflowContext = null;
         pendingBudgetRequest = null;
         pendingBudgetIds.clear();
@@ -4416,6 +4513,7 @@ if (validSessionId && socketPath) {
         pendingElicitations.clear();
         recoveredQuestionToolCallIds.clear();
         completedQuestionRequests.clear();
+        pendingQuestionRequestIds.clear();
         questionEventStream = null;
         inFlightElicitationResponses.clear();
         pendingPermissionRequests.clear();
@@ -4668,6 +4766,7 @@ if (validSessionId && socketPath) {
     }
 
     function validatedModelSwitch(request, requireAdvertisedTarget) {
+        if (bounceRequested) return null;
         if (typeof request.modelId !== "string"
                 || request.modelId.length === 0
                 || request.modelId.length > 200
@@ -4780,7 +4879,7 @@ if (validSessionId && socketPath) {
             } else {
                 publishRejectedPreflight(
                     operation.context,
-                    "invalid-request",
+                    bounceRequested ? "target-unavailable" : "invalid-request",
                     setModelRequestPath,
                     encoded
                 );
@@ -5247,7 +5346,8 @@ if (validSessionId && socketPath) {
         // tick takes: when it succeeds it publishes once more (at most one
         // extra write per tick), so the workflow it certifies is current.
         publish();
-        reconcileQuestionEvents();
+        const generation = conversationGeneration;
+        const questionRecovery = recoverQuestionsForBounce();
         refreshRuntimeActivity(false, { heartbeat: true });
         refreshSchedules();
         refreshModels();
@@ -5256,7 +5356,11 @@ if (validSessionId && socketPath) {
         processElicitationResponse();
         processSetModelRequest();
         processCloseSessionRequest();
-        for (const kind of workflowKinds) processWorkflowAction(kind);
+        // Replay receipts immediately, but let recovery settle before a new bounce.
+        for (const kind of workflowKinds) processWorkflowAction(kind, kind !== "session-bounce");
+        questionRecovery.then(() => {
+            if (!shuttingDown && generation === conversationGeneration) processWorkflowAction("session-bounce");
+        });
         scheduleDurableReconcile(0);
     }, DURABLE_RECONCILE_POLL_MS);
     foregroundHandlingReady = true;

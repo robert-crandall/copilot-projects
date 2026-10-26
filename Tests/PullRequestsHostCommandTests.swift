@@ -726,6 +726,18 @@ final class PullRequestsHostCommandTests: XCTestCase {
             // Native workflow `.send` writes `session-send.json` and returns `queued` without
             // falling back to terminal injection.
             snapshot.pendingPermissionRequestIds = []
+            let readyWorkflow = snapshot.workflow
+            snapshot.workflow = RemoteSessionWorkflow(
+                observedAtMilliseconds: Int64(now.timeIntervalSince1970 * 1_000),
+                capabilities: [], sendReady: false, bounceRequested: true
+            )
+            try JSONEncoder().encode(snapshot).write(to: snapshotURL)
+            let bouncedPromptId = UUID().uuidString
+            XCTAssertEqual(send(bouncedPromptId).code, "busy")
+            XCTAssertEqual(model.sendRemotePrompt(sessionId: "a1", value: "No terminal fallback"), .busy)
+            XCTAssertEqual(send().code, "existing", "historical terminal replay remains idempotent")
+            XCTAssertEqual(host.resuming.deliveredPrompts.count, expectedDeliveredCount)
+            snapshot.workflow = readyWorkflow
             try JSONEncoder().encode(snapshot).write(to: snapshotURL)
             let nativeReqId = UUID().uuidString
             let queued = send(nativeReqId, project: nil, session: "a1", prompt: "Queue via SDK")

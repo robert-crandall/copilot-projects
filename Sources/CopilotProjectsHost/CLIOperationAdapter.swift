@@ -9,6 +9,7 @@ enum CLISDKOperationKind: String, Codable {
     case setModel = "set-model"
     case sessionSend = "session-send"
     case sessionAbort = "session-abort"
+    case sessionBounce = "session-bounce"
     case setSessionBudget = "set-session-budget"
     case answerSessionBudget = "answer-session-budget"
 }
@@ -78,6 +79,7 @@ struct CLIOperationAdapter {
         "set-model-request.json",
         "session-send.json",
         "session-abort.json",
+        "session-bounce.json",
         "set-session-budget.json",
         "answer-session-budget.json",
     ]
@@ -113,6 +115,18 @@ struct CLIOperationAdapter {
 
     let activityDirectory: URL
     let resumeMarkerDirectory: URL
+
+    func bounceBlocksAutomaticPrompts(
+        sessionId: String,
+        cachedSnapshot: AgentActivitySnapshot?,
+        now: () -> Date
+    ) -> Bool {
+        // The tracker publishes the snapshot fence before removing the handoff.
+        cachedSnapshot?.workflow?.bounceRequested == true
+            || FileManager.default.fileExists(atPath: activityDirectory
+                .appendingPathComponent("\(sessionId).session-bounce.json").path)
+            || loadFreshSnapshot(sessionId: sessionId, now: now)?.workflow?.bounceRequested == true
+    }
 
     /// The snapshot if it is fresh when read. `now` is consulted only after the
     /// read, so a snapshot published after the caller first took the time
