@@ -261,13 +261,12 @@ class NotesTests(unittest.TestCase):
 
     def test_manifest_code_changes_are_not_hidden_as_pin_updates(self):
         self.write_host_pin("a" * 40)
-        previous = self.commit("Old desktop")
+        self.commit("Old desktop")
         self.write_host_pin("b" * 40)
         manifest = self.root / "Package.swift"
         manifest.write_text(manifest.read_text() + "newTarget()\n")
         mixed = self.commit("update host and add a target")
         self.assertFalse(notes.pure_host_update(self.root, mixed, self.root))
-        self.assertNotEqual(previous, mixed)
 
     def test_independent_dependency_updates_remain_visible_alongside_host_changes(self):
         self.write_host_pin("a" * 40)
@@ -373,6 +372,18 @@ class NotesTests(unittest.TestCase):
                 self.assertIn("rolled back" if status == "behind" else "different history", result["plainText"])
                 direction = f"{new}...{old}" if status == "behind" else f"{old}...{new}"
                 self.assertIn(direction, result["markdown"])
+
+    def test_shallow_history_with_both_pins_is_not_mislabeled_as_divergence(self):
+        old = self.previous
+        self.commit("Intermediate change")
+        new = self.commit("Latest change")
+        shallow = self.root / "shallow"
+        subprocess.run(["git", "clone", "--quiet", "--depth", "1", self.root.as_uri(), str(shallow)], check=True)
+        notes.git(shallow, "fetch", "--quiet", "--depth", "1", "origin", old)
+        self.assertEqual(notes.git(shallow, "rev-parse", f"{old}^{{commit}}"), old)
+        self.assertEqual(notes.git(shallow, "rev-parse", f"{new}^{{commit}}"), new)
+        with self.assertRaisesRegex(ValueError, "history is shallow"):
+            notes.host_changes(shallow, old, new)
 
     def test_host_dependency_lookup_uses_the_exact_committed_lock_not_the_working_copy(self):
         self.write_host_pin("a" * 40, shared="1")

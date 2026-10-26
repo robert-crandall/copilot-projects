@@ -152,6 +152,9 @@ def host_pin(root, revision):
 
 
 def host_changes(root, previous, revision):
+    if git(root, "rev-parse", "--is-shallow-repository") == "true":
+        raise ValueError("Desktop host history is shallow; provide a complete checkout")
+
     def contains(older, newer):
         result = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", older, newer])
         if result.returncode not in (0, 1):
