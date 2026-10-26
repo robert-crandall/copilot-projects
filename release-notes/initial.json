@@ -1,6 +1,10 @@
 {
   "Highlights from October 18-25, 2026": [
     [
+      "Loaded bounce extensions can now receive a native restart request for an idle session, without typing into the terminal.",
+      "https://github.com/sirfergy/copilot-projects/pull/227"
+    ],
+    [
       "Find and resume older sessions. Find Session now searches deeper conversation history after the initial matches, rather than stopping at recently ended sessions.",
       "https://github.com/sirfergy/copilot-projects/pull/230"
     ],
