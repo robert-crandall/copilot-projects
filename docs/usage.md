@@ -758,6 +758,52 @@ return to automatic notes. Each section contains `[text, GitHub-link-or-null]`
 entries; malformed content fails generation rather than silently replacing it.
 Links stay within this repository or the public host.
 
+### App-focused notes for integrated builds
+
+The integrated desktop publisher passes `--include-host-changes` to the shared
+generator. It combines its own changes with the public desktop changes between
+the previous release's host pin and the new pin, including skipped desktop
+versions. This comparison uses immutable commit IDs, not the latest release.
+Incomplete comparisons and GitHub errors stop generation rather than silently
+omitting desktop changes.
+
+Pure host updates are replaced by the changes they bring in. A commit must change
+only `Package.swift` and `Package.resolved`, with the manifest changing only the
+host revision; shared dependency lock updates may accompany it. Mixed feature
+commits remain visible. Identical entries are combined while retaining all source
+links, and desktop PR links name their repository to distinguish them from
+companion PRs. Rollbacks and divergent host history are named explicitly rather
+than presented as new fixes.
+
+This is opt-in: iOS and other direct generator callers retain the public-host
+compare link instead of listing Mac-only changes as their own. Bundling, version
+validation, signing, and the shared GitHub/in-app snapshot remain unchanged.
+The integrated build adopts generator updates through its existing automated
+published-host update flow.
+
+### Writing a user-facing summary
+
+Add a short plain-text paragraph under `## Release notes` in a pull request body:
+
+```markdown
+## Release notes
+
+Paste screenshots directly into the session composer without switching apps.
+```
+
+The generator uses that paragraph instead of the PR title. Titles and labels
+still determine the category. It ignores HTML comments and headings inside fenced
+examples, takes only the first paragraph, and falls back to the title for an
+absent/empty section, placeholders such as `N/A`, or non-paragraph content.
+Summaries longer than 600 characters produce a warning and use the title.
+Keep summaries self-contained and free of Markdown, mentions, and relative issue
+references; the generator attaches the originating PR link automatically.
+No model rewrites or invents release-note claims.
+
+Like PR titles, summaries are read when the release is generated. Once generated,
+the snapshot is frozen; later edits to a PR body do not change an installed app's
+notes or retroactively update a published release.
+
 Subsequent published builds generate notes from first-parent commits since the previous
 complete release. Merged pull requests use their GitHub titles and labels;
 direct commits use their subjects. Features, fixes, and other changes are grouped

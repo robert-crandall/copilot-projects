@@ -70,7 +70,7 @@ class NotesTests(unittest.TestCase):
         self.commit("Internal implementation")
         self.git("switch", "-q", "main")
         self.git("merge", "--no-ff", "-qm", "Merge pull request #12 from feature\n\nCo-authored-by: Bot", "feature")
-        with mock.patch.object(notes, "merged_pull_request", return_value=("Prevent [stale] *notes*", ["bug"], 12)) as request:
+        with mock.patch.object(notes, "merged_pull_request", return_value=("Prevent [stale] *notes*", ["bug"], 12, None)) as request:
             result = self.generate()
         request.assert_called_once_with("example/app", self.git("rev-parse", "HEAD"))
         self.assertNotIn("Co-authored-by", result["markdown"])
@@ -91,7 +91,7 @@ class NotesTests(unittest.TestCase):
     def test_api_must_identify_exact_merged_change(self):
         pr = {"number": 12, "title": "Fix", "merged_at": "2026-10-25", "merge_commit_sha": "a" * 40, "labels": []}
         with mock.patch.object(subprocess, "check_output", return_value=json.dumps([[], [pr]])):
-            self.assertEqual(notes.merged_pull_request("example/app", "a" * 40), ("Fix", [], 12))
+            self.assertEqual(notes.merged_pull_request("example/app", "a" * 40), ("Fix", [], 12, None))
             self.assertIsNone(notes.merged_pull_request("example/app", "b" * 40))
         with mock.patch.object(notes, "merged_pull_request", side_effect=ValueError("API denied")):
             self.commit("Merge pull request #12 from feature")
@@ -104,7 +104,7 @@ class NotesTests(unittest.TestCase):
 
     def test_newest_merge_waits_briefly_for_its_authoritative_association(self):
         self.commit("Merge pull request #12 from feature")
-        with mock.patch.object(notes, "merged_pull_request", side_effect=[None, ("Fix rendering", ["bug"], 12)]) as lookup, \
+        with mock.patch.object(notes, "merged_pull_request", side_effect=[None, ("Fix rendering", ["bug"], 12, None)]) as lookup, \
                 mock.patch.object(notes.time, "sleep") as sleep:
             result = self.generate()
         self.assertEqual(lookup.call_count, 2)
@@ -167,6 +167,8 @@ class NotesTests(unittest.TestCase):
         (self.root / notes.INITIAL_NOTES).write_text(json.dumps({"Uncommitted": [["Do not publish", None]]}))
         with mock.patch.object(notes, "merged_pull_request", side_effect=AssertionError("Unexpected API lookup")):
             result = self.generate()
+            integrated = self.generate_integrated(self.previous)
+        self.assertEqual(result["markdown"], integrated["markdown"])
         self.assertIn("October 18-25 highlights", result["markdown"])
         self.assertIn("Find and resume older sessions.", result["plainText"])
         self.assertNotIn("Do not publish", result["markdown"])
@@ -204,6 +206,177 @@ class NotesTests(unittest.TestCase):
         for key, value in [("schemaVersion", 2), ("markdown", ""), ("repository", "../x"), ("sourceRevision", "main")]:
             with self.subTest(key=key), self.assertRaises(ValueError):
                 notes.validate({**document, key: value}, document["version"], document["build"])
+
+    def write_host_pin(self, revision, shared="1"):
+        (self.root / "Package.swift").write_text(
+            f'.package(url: "https://github.com/sirfergy/copilot-projects.git", revision: "{revision}")\n'
+        )
+        (self.root / "Package.resolved").write_text(json.dumps({"pins": [
+            {"location": "https://github.com/sirfergy/copilot-projects.git", "state": {"revision": revision}},
+            {"location": "https://github.com/example/shared.git", "state": {"revision": shared}},
+        ]}))
+
+    def generate_integrated(self, previous):
+        return notes.generate(
+            self.root, "example/app", previous, "2026.10.26.1", "2026.10.26.1", include_host_changes=True
+        )
+
+    def test_integrated_notes_expand_skipped_versions_and_suppress_only_pure_pin_updates(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40)
+        self.commit("update desktop host to v1")
+        self.write_host_pin("c" * 40, shared="2")
+        self.commit("update desktop host to v2")
+        self.commit("fix a web issue")
+        with mock.patch.object(notes, "host_changes", return_value=("ahead", [
+            ("d" * 40, "add screenshot paste"),
+            ("e" * 40, "fix desktop search"),
+        ])) as compare:
+            result = self.generate_integrated(previous)
+        compare.assert_called_once_with("a" * 40, "c" * 40)
+        self.assertIn("add screenshot paste", result["markdown"])
+        self.assertIn("fix desktop search", result["plainText"])
+        self.assertIn("fix a web issue", result["plainText"])
+        self.assertNotIn("update desktop host", result["markdown"])
+        self.assertNotIn("No source changes", result["markdown"])
+        self.assertNotIn("View the desktop host changes", result["markdown"])
+
+    def test_mixed_feature_and_pin_changes_remain_visible(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40)
+        (self.root / "feature.txt").write_text("New feature")
+        mixed = self.commit("add a web feature and update host")
+        self.assertFalse(notes.pure_host_update(self.root, mixed))
+        with mock.patch.object(notes, "host_changes", return_value=("ahead", [("c" * 40, "fix desktop")])):
+            self.assertIn("add a web feature", self.generate_integrated(previous)["markdown"])
+
+    def test_manifest_code_changes_are_not_hidden_as_pin_updates(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40)
+        manifest = self.root / "Package.swift"
+        manifest.write_text(manifest.read_text() + "newTarget()\n")
+        mixed = self.commit("update host and add a target")
+        self.assertFalse(notes.pure_host_update(self.root, mixed))
+        self.assertNotEqual(previous, mixed)
+
+    def test_default_consumer_keeps_compare_link_and_unchanged_pin_never_calls_compare(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40)
+        current = self.commit("update desktop")
+        with mock.patch.object(notes, "host_changes", side_effect=AssertionError("Unexpected expansion")):
+            legacy = self.generate(previous)
+            self.assertIn("View the desktop host changes", legacy["markdown"])
+            self.commit("fix web only")
+            self.assertIn("fix web only", self.generate_integrated(current)["markdown"])
+
+    def test_same_summary_combines_links_but_same_pr_number_in_different_repos_survives(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40)
+        self.commit("update desktop")
+        self.commit("fix shared issue")
+        with mock.patch.object(notes, "host_changes", return_value=("ahead", [("c" * 40, "fix shared issue")])), \
+                mock.patch.object(notes, "merged_pull_request", return_value=(
+                    "fix shared issue", ["bug"], 12, "Sessions reconnect reliably."
+                )):
+            result = self.generate_integrated(previous)
+        self.assertEqual(result["markdown"].count("Sessions reconnect reliably."), 1)
+        self.assertIn("[#12](https://github.com/example/app/pull/12)", result["markdown"])
+        self.assertIn("[copilot-projects#12](https://github.com/sirfergy/copilot-projects/pull/12)", result["markdown"])
+        self.assertEqual(result["plainText"], "Fixes\n- Sessions reconnect reliably.")
+
+    def test_summary_uses_explicit_paragraph_and_keeps_title_classification(self):
+        examples = [
+            ("## Release notes\r\n\r\nSessions reconnect\r\nwithout losing your draft.\r\n\r\nMore text", "Sessions reconnect without losing your draft."),
+            ("```\n## Release notes\nNot a note\n```\n## Release note\n<!-- template -->\nA real note.\n## Tests\nNope", "A real note."),
+            ("~~~markdown\n## Release notes\nNope\n~~~\n# Release notes\nA note.\n- More details", "A note."),
+            ("## Release notes\n<!-- fill this in -->\n## Tests\nAll pass", None),
+            ("## Release notes\nN/A", None),
+            ("## Release notes\n- A list is not a paragraph", None),
+            (None, None),
+        ]
+        for body, expected in examples:
+            with self.subTest(body=body):
+                self.assertEqual(notes.release_summary(body), expected)
+        with mock.patch("sys.stderr") as stderr:
+            self.assertIsNone(notes.release_summary("## Release notes\n" + "x" * 601))
+            self.assertTrue(stderr.write.called)
+        pr = {"number": 12, "title": "fix reconnect", "merged_at": "now", "merge_commit_sha": "a" * 40,
+              "labels": [], "body": "## Release notes\nSessions reconnect reliably."}
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps([[pr]])):
+            self.assertEqual(notes.merged_pull_request("example/app", "a" * 40),
+                             ("fix reconnect", [], 12, "Sessions reconnect reliably."))
+
+    def test_paginated_compare_selects_first_parent_history_without_side_branch_duplicates(self):
+        old, side, merged, new = (letter * 40 for letter in "abcd")
+        def commit(sha, parents, title):
+            return {"sha": sha, "parents": [{"sha": parent} for parent in parents], "commit": {"message": title}}
+        metadata = {"base_commit": {"sha": old}, "merge_base_commit": {"sha": old}, "status": "ahead", "total_commits": 3}
+        pages = [
+            {**metadata, "commits": [commit(side, [old], "Internal implementation")]},
+            {**metadata, "commits": [commit(merged, [old, side], "Merge feature"), commit(new, [merged], "fix later")]},
+        ]
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps(pages)) as request:
+            self.assertEqual(notes.host_changes(old, new), ("ahead", [(merged, "Merge feature"), (new, "fix later")]))
+        self.assertIn("--paginate", request.call_args.args[0])
+        self.assertIn(f"{old}...{new}?per_page=100", request.call_args.args[0][-1])
+
+    def test_old_pin_can_be_a_merged_branch_head_outside_the_new_first_parent_chain(self):
+        old, main, new = (letter * 40 for letter in "abc")
+        page = {"base_commit": {"sha": old}, "merge_base_commit": {"sha": old}, "status": "ahead", "total_commits": 1,
+                "commits": [{"sha": new, "parents": [{"sha": main}, {"sha": old}], "commit": {"message": "Merge host"}}]}
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps([page])):
+            self.assertEqual(notes.host_changes(old, new), ("ahead", [(new, "Merge host")]))
+
+    def test_incomplete_or_wrong_base_compare_fails_without_hiding_changes(self):
+        old, new = "a" * 40, "b" * 40
+        page = {"base_commit": {"sha": old}, "merge_base_commit": {"sha": old}, "status": "ahead", "total_commits": 2,
+                "commits": [{"sha": new, "parents": [{"sha": old}], "commit": {"message": "fix"}}]}
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps([page])):
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                notes.host_changes(old, new)
+        page["base_commit"]["sha"] = new
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps([page])):
+            with self.assertRaisesRegex(ValueError, "previous pin"):
+                notes.host_changes(old, new)
+
+    def test_rollback_and_divergence_are_explicit_and_do_not_hide_pin_change(self):
+        old, new = "a" * 40, "b" * 40
+        self.write_host_pin(old)
+        previous = self.commit("Old desktop")
+        self.write_host_pin(new)
+        self.commit("update desktop")
+        for status in ("behind", "diverged"):
+            with self.subTest(status=status):
+                page = {"base_commit": {"sha": old}, "status": status, "commits": []}
+                with mock.patch.object(subprocess, "check_output", return_value=json.dumps([page])):
+                    self.assertEqual(notes.host_changes(old, new), (status, []))
+                with mock.patch.object(notes, "host_changes", return_value=(status, [])):
+                    result = self.generate_integrated(previous)
+                self.assertIn("update desktop", result["plainText"])
+                self.assertIn("rolled back" if status == "behind" else "different history", result["plainText"])
+                direction = f"{new}...{old}" if status == "behind" else f"{old}...{new}"
+                self.assertIn(direction, result["markdown"])
+
+    def test_host_compare_api_failure_propagates(self):
+        with mock.patch.object(subprocess, "check_output", side_effect=subprocess.CalledProcessError(1, "gh")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                notes.host_changes("a" * 40, "b" * 40)
+
+    def test_pin_only_release_gets_desktop_notes_not_a_false_empty_message(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40)
+        self.commit("update desktop host")
+        with mock.patch.object(notes, "host_changes", return_value=("ahead", [("c" * 40, "fix the desktop")])), \
+                mock.patch.object(notes, "merged_pull_request", return_value=None) as lookup:
+            result = self.generate_integrated(previous)
+        lookup.assert_called_once_with(notes.HOST_REPOSITORY, "c" * 40)
+        self.assertEqual(result["plainText"], "Fixes\n- fix the desktop")
 
 
 if __name__ == "__main__":

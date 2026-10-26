@@ -12,6 +12,7 @@ import time
 
 MAX_BYTES = 256 * 1024
 INITIAL_NOTES = "release-notes/initial.json"
+HOST_REPOSITORY = "sirfergy/copilot-projects"
 
 
 def git(root, *args):
@@ -39,6 +40,50 @@ def category(title, labels):
     return "Other changes"
 
 
+def release_summary(body):
+    if not body:
+        return None
+    body = re.sub(r"<!--.*?(?:-->|$)", "", body, flags=re.DOTALL)
+    active = False
+    fence = None
+    paragraph = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        marker = re.match(r"^(`{3,}|~{3,})", stripped)
+        if marker:
+            if fence is None:
+                if active:
+                    break
+                fence = marker[1]
+            elif stripped[0] == fence[0] and len(stripped) >= len(fence):
+                fence = None
+            continue
+        if fence:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", stripped)
+        if heading:
+            if active:
+                break
+            active = heading[1].casefold() in {"release notes", "release note"}
+            continue
+        if not active:
+            continue
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        if re.match(r"^(?:[-+*]\s|\d+[.)]\s|>|[|]|[-*_]{3,}$)", stripped):
+            break
+        paragraph.append(stripped)
+    summary = " ".join(paragraph)
+    if summary.casefold() in {"", "n/a", "none", "tbd", "-"}:
+        return None
+    if len(summary) > 600:
+        print("warning: Release notes summary exceeds 600 characters; using the PR title", file=sys.stderr)
+        return None
+    return summary
+
+
 def merged_pull_request(repository, revision):
     raw = subprocess.check_output(
         ["gh", "api", "--paginate", "--slurp",
@@ -59,7 +104,7 @@ def merged_pull_request(repository, revision):
     number = pr.get("number")
     if type(number) is not int or number <= 0:
         raise ValueError(f"Merged PR for {revision} has no valid number")
-    return title, [label["name"] for label in pr.get("labels", [])], number
+    return title, [label["name"] for label in pr.get("labels", [])], number, release_summary(pr.get("body"))
 
 
 def host_pin(root, revision):
@@ -77,6 +122,55 @@ def host_pin(root, revision):
     return None
 
 
+def host_changes(previous, revision):
+    pages = json.loads(subprocess.check_output([
+        "gh", "api", "--paginate", "--slurp",
+        f"repos/{HOST_REPOSITORY}/compare/{previous}...{revision}?per_page=100",
+    ], text=True))
+    if not pages or any(page["base_commit"]["sha"] != previous for page in pages):
+        raise ValueError("Desktop host comparison does not match the previous pin")
+    comparison = pages[0]
+    status = comparison["status"]
+    if status in {"behind", "diverged"}:
+        return status, []
+    if status != "ahead" or comparison["merge_base_commit"]["sha"] != previous:
+        raise ValueError("Desktop host comparison is not a forward pin update")
+    commits = {commit["sha"]: commit for page in pages for commit in page["commits"]}
+    if len(commits) != comparison["total_commits"] or revision not in commits:
+        raise ValueError("Desktop host comparison is incomplete")
+    # Compare includes side-branch work. Follow only first parents, just like the
+    # local release range; a prior pin need not itself be on the first-parent path.
+    history = []
+    seen = set()
+    current = revision
+    while current in commits:
+        if current in seen:
+            raise ValueError("Desktop host comparison contains a parent cycle")
+        seen.add(current)
+        commit = commits[current]
+        if not commit["parents"]:
+            raise ValueError("Desktop host comparison omitted a commit's parents")
+        history.append((current, commit["commit"]["message"].splitlines()[0]))
+        current = commit["parents"][0]["sha"]
+    return status, list(reversed(history))
+
+
+def pure_host_update(root, revision):
+    parents = git(root, "rev-list", "--parents", "-n", "1", revision).split()[1:]
+    if not parents:
+        return False
+    previous = parents[0]
+    paths = set(git(root, "diff", "--name-only", previous, revision).splitlines())
+    if paths != {"Package.swift", "Package.resolved"}:
+        return False
+    old_pin, new_pin = host_pin(root, previous), host_pin(root, revision)
+    if not old_pin or not new_pin or old_pin == new_pin:
+        return False
+    before = git(root, "show", f"{previous}:Package.swift")
+    after = git(root, "show", f"{revision}:Package.swift")
+    return old_pin in before and before.replace(old_pin, new_pin) == after
+
+
 def plain_text(sections):
     text = "\n\n".join(
         heading + "\n" + "\n".join("- " + title for title, _ in changes)
@@ -90,15 +184,51 @@ def plain_text(sections):
     return prefix.rsplit("\n", 1)[0] + suffix
 
 
-def markdown_change(title, url):
+def markdown_change(title, urls, repository=None):
     text = "- " + escape(title)
-    if not url:
+    if not urls:
         return text
-    reference = (
-        "#" + url.rsplit("/", 1)[1] if "/pull/" in url else
-        "View changes" if "/compare/" in url else url.rsplit("/", 1)[1][:7]
-    )
-    return f"{text} ([{reference}]({url}))"
+    if isinstance(urls, str):
+        urls = [urls]
+    links = []
+    for url in urls:
+        source = "/".join(url.split("/")[3:5])
+        reference = (
+            (source.rsplit("/", 1)[1] if repository and source != repository else "")
+            + "#" + url.rsplit("/", 1)[1] if "/pull/" in url else
+            "View changes" if "/compare/" in url else url.rsplit("/", 1)[1][:7]
+        )
+        links.append(f"[{reference}]({url})")
+    return f"{text} ({', '.join(links)})"
+
+
+def collect_changes(repository, history, sections, seen):
+    for sha, subject in history:
+        pr = merged_pull_request(repository, sha)
+        if pr is None and sha == history[-1][0] and subject.startswith("Merge pull request #"):
+            for _ in range(2):
+                time.sleep(5)
+                pr = merged_pull_request(repository, sha)
+                if pr is not None:
+                    break
+        if pr:
+            title, labels, number, summary = pr
+            url = f"https://github.com/{repository}/pull/{number}"
+            text = summary or title
+        else:
+            title, labels, text = subject, [], subject
+            url = f"https://github.com/{repository}/commit/{sha}"
+        text = " ".join(text.split())
+        if not text or re.match(r"^(co-authored-by|copilot-session|signed-off-by):", text, re.I):
+            raise ValueError(f"Commit {sha} has no usable change title")
+        key = text.casefold()
+        if key in seen:
+            if url not in seen[key][1]:
+                seen[key][1].append(url)
+        else:
+            entry = (text, [url])
+            seen[key] = entry
+            sections[category(title, labels)].append(entry)
 
 
 def initial_sections(root, repository, previous, revision):
@@ -128,7 +258,7 @@ def initial_sections(root, repository, previous, revision):
     return sections
 
 
-def generate(root, repository, previous, version, build):
+def generate(root, repository, previous, version, build, include_host_changes=False):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", repository):
         raise ValueError("Repository must be owner/name")
     if not version or not build:
@@ -148,38 +278,37 @@ def generate(root, repository, previous, version, build):
     sections = initial if initial is not None else {
         "Features and improvements": [], "Fixes": [], "Other changes": [],
     }
-    for line in history.splitlines():
-        sha, subject = line.split("\t", 1)
-        pr = merged_pull_request(repository, sha)
-        if pr is None and sha == revision and subject.startswith("Merge pull request #"):
-            # GitHub can expose the new merge before its commit-to-PR association.
-            for _ in range(2):
-                time.sleep(5)
-                pr = merged_pull_request(repository, sha)
-                if pr is not None:
-                    break
-        if pr:
-            title, labels, number = pr
-            url = f"https://github.com/{repository}/pull/{number}"
-        else:
-            title, labels = subject, []
-            url = f"https://github.com/{repository}/commit/{sha}"
-        title = " ".join(title.split())
-        if not title or re.match(r"^(co-authored-by|copilot-session|signed-off-by):", title, re.I):
-            raise ValueError(f"Commit {sha} has no usable change title")
-        sections[category(title, labels)].append((title, url))
-    if not any(sections.values()):
-        sections["Other changes"].append(("No source changes since the previous build.", None))
+    history = [tuple(line.split("\t", 1)) for line in history.splitlines()]
+    desktop_history = []
     if previous and initial is None:
         old_host, new_host = host_pin(root, previous), host_pin(root, revision)
         if old_host and new_host and old_host != new_host:
-            sections["Desktop host changes"] = [(
-                "View the desktop host changes included in this build",
-                f"https://github.com/sirfergy/copilot-projects/compare/{old_host}...{new_host}"
-            )]
+            if include_host_changes:
+                status, desktop_history = host_changes(old_host, new_host)
+                if status == "ahead":
+                    history = [(sha, subject) for sha, subject in history if not pure_host_update(root, sha)]
+                else:
+                    description = (
+                        "Desktop host rolled back to an earlier revision; compare the removed changes"
+                        if status == "behind" else "Desktop host changed to a different history; compare revisions"
+                    )
+                    left, right = (new_host, old_host) if status == "behind" else (old_host, new_host)
+                    sections["Desktop host changes"] = [(
+                        description, f"https://github.com/{HOST_REPOSITORY}/compare/{left}...{right}"
+                    )]
+            else:
+                sections["Desktop host changes"] = [(
+                    "View the desktop host changes included in this build",
+                    f"https://github.com/{HOST_REPOSITORY}/compare/{old_host}...{new_host}"
+                )]
+    seen = {}
+    collect_changes(repository, history, sections, seen)
+    collect_changes(HOST_REPOSITORY, desktop_history, sections, seen)
+    if not any(sections.values()):
+        sections["Other changes"].append(("No source changes since the previous build.", None))
     markdown = "\n\n".join(
         "## " + escape(heading) + "\n\n" + "\n".join(
-            markdown_change(title, url)
+            markdown_change(title, url, repository if include_host_changes else None)
             for title, url in changes
         ) for heading, changes in sections.items() if changes
     ) + "\n"
@@ -217,6 +346,8 @@ def main():
     create.add_argument("--repository", required=True)
     create.add_argument("--previous")
     create.add_argument("--output", type=Path, required=True)
+    create.add_argument("--include-host-changes", action="store_true",
+                        help="Include public desktop changes for an integrated desktop build")
     check = sub.add_parser("validate")
     check.add_argument("--file", type=Path, required=True)
     check.add_argument("--markdown", action="store_true")
@@ -225,7 +356,8 @@ def main():
         command.add_argument("--build", required=True)
     args = parser.parse_args()
     if args.command == "generate":
-        document = generate(args.root, args.repository, args.previous, args.version, args.build)
+        document = generate(args.root, args.repository, args.previous, args.version, args.build,
+                            args.include_host_changes)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(document, ensure_ascii=False) + "\n", encoding="utf-8")
     else:
