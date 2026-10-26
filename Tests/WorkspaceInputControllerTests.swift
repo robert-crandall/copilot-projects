@@ -96,6 +96,7 @@ final class WorkspaceInputControllerTests: XCTestCase {
                 XCTAssertNil(input.handleKeyDown(event))
                 XCTAssertNotNil(input.imagePreview)
             }
+
             for dismissal in [try key("w", code: 13, modifiers: .command), try key("\u{1b}", code: 53)] {
                 input.presentImage(image(sessions[0]))
                 XCTAssertNil(input.handleKeyDown(dismissal))
@@ -110,6 +111,23 @@ final class WorkspaceInputControllerTests: XCTestCase {
             XCTAssertEqual(model.globalSelectedSessionId, sessions[1].id)
             XCTAssertNil(input.handleKeyDown(try key("w", code: 13, modifiers: .command)))
             XCTAssertFalse(model.projects.flatMap(\.sessions).contains { $0.id == sessions[1].id })
+        }
+    }
+
+    func testReleaseNotesProtectTerminalInputAndDismissWithoutEndingSession() throws {
+        try withWorkspace { model, input, sessions in
+            let controller = try XCTUnwrap(model.controller(for: sessions[0].id))
+            let process = try XCTUnwrap(controller.terminalView.process)
+            let sends = process.sendCount
+            input.presentReleaseNotes()
+            XCTAssertTrue(input.hasWorkspaceSheet)
+            input.presentSessionFinder()
+            XCTAssertNil(input.sessionFinder)
+            XCTAssertNil(input.handleKeyDown(try key("x", code: 7)))
+            XCTAssertNil(input.handleKeyDown(try key("w", code: 13, modifiers: .command)))
+            XCTAssertFalse(input.showsReleaseNotes)
+            XCTAssertEqual(model.globalSelectedSessionId, sessions[0].id)
+            XCTAssertEqual(process.sendCount, sends)
         }
     }
 

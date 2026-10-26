@@ -47,7 +47,9 @@ if command == "git":
         wanted = [arg[len("refs/tags/"):] for arg in args if arg.startswith("refs/tags/")]
         for tag in tags + ([latest] if latest else []):
             if not wanted or tag in wanted:
-                print((os.environ["MOCK_LATEST_SHA"] if tag == latest else "1" * 40) + "\trefs/tags/" + tag)
+                sha = os.environ.get("MOCK_LATEST_SHA") or subprocess.check_output(
+                    [os.environ["REAL_GIT"], "rev-parse", "HEAD"], text=True).strip()
+                print((sha if tag == latest else "1" * 40) + "\trefs/tags/" + tag)
         sys.exit(0)
     sys.exit(subprocess.call([os.environ["REAL_GIT"]] + args))
 if command == "date":
@@ -119,6 +121,10 @@ set -euo pipefail
 printf '%s\\n' "$PWD|$VERSION|$CODESIGN_IDENTITY|$*" > dist-build.txt
 printf '%s' "${CODESIGN_KEYCHAIN:-}" > dist-keychain.txt
 mkdir -p 'dist/Copilot Projects.app'
+if [ -n "${RELEASE_NOTES_FILE:-}" ]; then
+  mkdir -p 'dist/Copilot Projects.app/Contents/Resources'
+  cp "$RELEASE_NOTES_FILE" 'dist/Copilot Projects.app/Contents/Resources/release-notes.json'
+fi
 case "${BUILD_CHANGE:-}" in
   dirty) echo changed >> tracked ;;
   head) git commit --allow-empty -qm 'changed during build' ;;
@@ -184,7 +190,8 @@ class ReleaseTests(unittest.TestCase):
         self.public = self.project("public", "https://github.com/sirfergy/copilot-projects.git")
         shutil.copyfile(RELEASE, self.public / "scripts/release.sh")
         shutil.copyfile(RELEASE_VERSION, self.public / "scripts/release-version.sh")
-        self.git(self.public, "add", "scripts/release.sh", "scripts/release-version.sh")
+        shutil.copyfile(RELEASE.with_name("release-notes.py"), self.public / "scripts/release-notes.py")
+        self.git(self.public, "add", "scripts/release.sh", "scripts/release-version.sh", "scripts/release-notes.py")
         self.git(self.public, "commit", "-qm", "release entrypoint")
         self.git(self.public, "update-ref", "refs/remotes/origin/main", "HEAD")
         self.project_root = self.project("integration with spaces", "git@github.com:example/integration.git")
@@ -234,6 +241,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any(command != "git" or "fetch" in args for _, command, args in self.calls))
         self.assertFalse((self.project_root / "dist-build.txt").exists())
 
+    def assert_only_note_metadata_reads(self):
+        for _, command, args in self.calls:
+            if command == "gh":
+                self.assertEqual(args[:3], ["api", "--paginate", "--slurp"])
+                self.assertEqual(len(args), 4)
+                self.assertRegex(args[3], r"^repos/[^/]+/[^/]+/commits/[0-9a-f]{40}/pulls\?per_page=100$")
+
     def test_publish_refuses_a_version_dated_after_today(self):
         self.env["MOCK_DATE"] = "2026 10 08 PDT"
         result = self.run_release(version="2026.10.9.1")
@@ -267,6 +281,17 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any("sirfergy/copilot-projects" in arg for arg in api_args))
         for command in ("codesign", "spctl", "xcrun", "curl"):
             self.assertTrue(any(cmd == command for _, cmd, _ in self.calls))
+        snapshot = json.loads(
+            (self.project_root / "dist/Copilot Projects.app/Contents/Resources/release-notes.json").read_text()
+        )
+        self.assertEqual(snapshot["sourceRevision"], self.git(self.project_root, "rev-parse", "HEAD"))
+        self.assertEqual(snapshot["repository"], "example/integration")
+        published_body = next(
+            arg[5:] for _, cmd, args in self.calls if cmd == "gh"
+            for arg in args if arg.startswith("body=")
+        )
+        self.assertTrue(published_body.startswith(snapshot["markdown"]))
+        self.assertIn("## Install", published_body)
 
     def test_default_root_and_repository_remain_public(self):
         del self.env["GITHUB_REPOSITORY"]
@@ -631,7 +656,7 @@ class ReleaseTests(unittest.TestCase):
                 self.log.unlink(missing_ok=True)
                 result = self.run_release()
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertFalse(any(cmd == "gh" for _, cmd, _ in self.calls))
+                self.assert_only_note_metadata_reads()
 
     def notary_calls(self, subcommand):
         return [args for _, cmd, args in self.calls if cmd == "xcrun" and args[:2] == ["notarytool", subcommand]]
@@ -688,7 +713,7 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(len(self.notary_calls("log")), logs)
                 self.assertEqual(self.notary_wait_timeouts(), waits)
                 self.assertFalse(any(cmd == "xcrun" and args[:1] == ["stapler"] for _, cmd, args in self.calls))
-                self.assertFalse(any(cmd == "gh" for _, cmd, _ in self.calls))
+                self.assert_only_note_metadata_reads()
 
     def test_rejects_non_numeric_notary_wait_settings(self):
         for name in ("NOTARY_WAIT_MINUTES", "NOTARY_POLL_SECONDS"):

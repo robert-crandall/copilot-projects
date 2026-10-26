@@ -1,0 +1,50 @@
+{
+  "Highlights from October 18-25, 2026": [
+    [
+      "Loaded bounce extensions can now receive a native restart request for an idle session, without typing into the terminal.",
+      "https://github.com/sirfergy/copilot-projects/pull/227"
+    ],
+    [
+      "Find and resume older sessions. Find Session now searches deeper conversation history after the initial matches, rather than stopping at recently ended sessions.",
+      "https://github.com/sirfergy/copilot-projects/pull/230"
+    ],
+    [
+      "Move through visited sessions across projects with Back and Forward, including Command-[ and Command-] keyboard shortcuts.",
+      "https://github.com/sirfergy/copilot-projects/pull/222"
+    ],
+    [
+      "Use your mouse's back and forward buttons to move through session history.",
+      "https://github.com/sirfergy/copilot-projects/pull/223"
+    ],
+    [
+      "Right-click either navigation button to jump directly to one of the last ten visited sessions.",
+      "https://github.com/sirfergy/copilot-projects/pull/224"
+    ],
+    [
+      "Keep your notifications focused: draft pull requests are hidden by default and no longer add to the notification badge while hidden.",
+      "https://github.com/sirfergy/copilot-projects/pull/219"
+    ],
+    [
+      "The compact Hide menu keeps notification filtering controls steady instead of growing as more filters are selected.",
+      "https://github.com/sirfergy/copilot-projects/pull/220"
+    ]
+  ],
+  "Fixes and reliability": [
+    [
+      "Previously loaded pull requests stay visible when one GitHub account fails to refresh, with a warning instead of an empty list. Temporary 502 errors get a short retry.",
+      "https://github.com/sirfergy/copilot-projects/pull/221"
+    ],
+    [
+      "Inline images stay in chronological order with assistant replies, including after a session resume or app restart.",
+      "https://github.com/sirfergy/copilot-projects/pull/229"
+    ],
+    [
+      "Removed obsolete launch flags so session startup and resume remain compatible with newer Copilot CLI versions.",
+      "https://github.com/sirfergy/copilot-projects/pull/225"
+    ],
+    [
+      "Reduced misleading waiting and permission notifications caused by nested Copilot processes.",
+      "https://github.com/sirfergy/copilot-projects/pull/228"
+    ]
+  ]
+}

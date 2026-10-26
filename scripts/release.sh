@@ -136,6 +136,109 @@ if [ "$PUBLISH" = "1" ]; then
   check_release_version_date "$VERSION" "$TODAY" || exit 1
 fi
 
+# Legacy vX.Y.Z tags remain predecessors; date tags always order above them.
+latest_remote_release_tag() {
+  local refs
+  refs="$(git ls-remote --tags --refs origin 'v*')" || return 1
+  awk '{ sub("^refs/tags/", "", $2); print $2 }' <<< "$refs" | latest_release_tag
+}
+
+remote_tag_commit() {
+  local refs direct peeled
+  refs="$(
+    git ls-remote --tags origin \
+      "refs/tags/$1" \
+      "refs/tags/$1^{}"
+  )" || return 1
+  direct="$(awk '$2 !~ /\^\{\}$/ { print $1; exit }' <<< "$refs")"
+  peeled="$(awk '$2 ~ /\^\{\}$/ { print $1; exit }' <<< "$refs")"
+  printf '%s\n' "${peeled:-$direct}"
+}
+
+release_is_complete() {
+  local release expected_asset
+  expected_asset="Copilot-Projects-${1#v}.dmg"
+  release="$(
+    gh release view "$1" \
+      --repo "$REPO" \
+      --json assets,isDraft,publishedAt
+  )" || return 1
+  jq -e --arg asset "$expected_asset" \
+    '.isDraft == false
+     and .publishedAt != null
+     and any(.assets[]; .name == $asset and .size > 0)' \
+    <<< "$release" >/dev/null
+}
+
+verify_expected_predecessor() {
+  local latest_tag latest_sha expected_sha
+  latest_tag="$(latest_remote_release_tag)" || {
+    echo "error: could not list remote release tags" >&2
+    return 1
+  }
+  if [ -n "${EXPECTED_PREVIOUS_TAG:-}" ]; then
+    latest_sha="$(remote_tag_commit "$latest_tag")" || return 1
+    git fetch origin "refs/tags/$latest_tag" --quiet || {
+      echo "error: could not fetch latest release tag $latest_tag" >&2
+      return 1
+    }
+    git merge-base --is-ancestor "$latest_sha" origin/main || {
+      echo "error: latest release $latest_tag is not on origin/main" >&2
+      return 1
+    }
+    expected_sha="${EXPECTED_PREVIOUS_SHA:-}"
+    if [ "$latest_tag" = "$EXPECTED_PREVIOUS_TAG" ]; then
+      [ -n "$expected_sha" ] && [ "$latest_sha" = "$expected_sha" ] || {
+        echo "error: predecessor $EXPECTED_PREVIOUS_TAG moved from ${expected_sha:-unknown} to $latest_sha" >&2
+        return 1
+      }
+      release_is_complete "$latest_tag" || {
+        echo "error: predecessor release $latest_tag is no longer complete" >&2
+        return 1
+      }
+      return 0
+    fi
+    if git merge-base --is-ancestor "$SHA" "$latest_sha" \
+      && release_is_complete "$latest_tag"; then
+      echo "==> superseded by complete descendant release $latest_tag"
+      return 2
+    fi
+    echo "error: latest release changed from $EXPECTED_PREVIOUS_TAG to ${latest_tag:-none}" >&2
+    return 1
+  fi
+  if [ -n "$latest_tag" ]; then
+    echo "error: a predecessor appeared during the first release: $latest_tag" >&2
+    return 1
+  fi
+}
+
+BUNDLED_NOTES=""
+trap '[ -z "$BUNDLED_NOTES" ] || rm -f "$BUNDLED_NOTES"' EXIT
+if [ "$PUBLISH" = "1" ]; then
+  command -v gh >/dev/null || { echo "error: gh CLI not found" >&2; exit 1; }
+  if [ -z "${EXPECTED_PREVIOUS_TAG:-}" ]; then
+    EXPECTED_PREVIOUS_TAG="$(latest_remote_release_tag)"
+    EXPECTED_PREVIOUS_SHA=""
+    if [ -n "$EXPECTED_PREVIOUS_TAG" ]; then
+      EXPECTED_PREVIOUS_SHA="$(remote_tag_commit "$EXPECTED_PREVIOUS_TAG")"
+    fi
+  fi
+  if verify_expected_predecessor; then
+    :
+  else
+    predecessor_status=$?
+    [ "$predecessor_status" -eq 2 ] && exit 0
+    exit "$predecessor_status"
+  fi
+  BUNDLED_NOTES="$(mktemp)"
+  NOTES_ARGS=(generate --root "$ROOT" --repository "$REPO"
+    --version "$VERSION" --build "$VERSION" --output "$BUNDLED_NOTES")
+  if [ -n "${EXPECTED_PREVIOUS_SHA:-}" ]; then
+    NOTES_ARGS+=(--previous "$EXPECTED_PREVIOUS_SHA")
+  fi
+  python3 "$SCRIPT_ROOT/scripts/release-notes.py" "${NOTES_ARGS[@]}"
+fi
+
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 CODESIGN_KEYCHAIN="${CODESIGN_KEYCHAIN:-}"
 IDENTITY_ARGS=(-v -p codesigning)
@@ -187,6 +290,7 @@ fi
 
 echo "==> building release app (v$VERSION)"
 VERSION="$VERSION" CODESIGN_IDENTITY="$CODESIGN_IDENTITY" CODESIGN_KEYCHAIN="$CODESIGN_KEYCHAIN" \
+  RELEASE_NOTES_FILE="${BUNDLED_NOTES:-${RELEASE_NOTES_FILE:-}}" \
   ./scripts/build-app.sh --release
 
 if [ "$PUBLISH" = "1" ]; then
@@ -194,6 +298,12 @@ if [ "$PUBLISH" = "1" ]; then
 fi
 APP="$ROOT/dist/$APP_NAME.app"
 [ -d "$APP" ] || { echo "error: $APP missing after build" >&2; exit 1; }
+if [ "$PUBLISH" = "1" ]; then
+  cmp "$BUNDLED_NOTES" "$APP/Contents/Resources/release-notes.json" || {
+    echo "error: assembled app does not contain the release's exact notes" >&2
+    exit 1
+  }
+fi
 
 echo "==> packaging DMG"
 DMG="$ROOT/dist/Copilot-Projects-$VERSION.dmg"
@@ -211,6 +321,7 @@ cleanup() {
   rm -rf "$STAGING"
   [ -z "$NOTES_FILE" ] || rm -f "$NOTES_FILE"
   [ -z "$APP_ZIP" ] || rm -f "$APP_ZIP"
+  [ -z "$BUNDLED_NOTES" ] || rm -f "$BUNDLED_NOTES"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -297,7 +408,10 @@ command -v gh >/dev/null || { echo "error: gh CLI not found" >&2; exit 1; }
 
 echo "==> publishing GitHub release $TAG to $REPO"
 NOTES_FILE="$(mktemp)"
-cat > "$NOTES_FILE" <<NOTES
+python3 "$SCRIPT_ROOT/scripts/release-notes.py" validate \
+  --file "$BUNDLED_NOTES" --version "$VERSION" --build "$VERSION" --markdown > "$NOTES_FILE"
+cat >> "$NOTES_FILE" <<NOTES
+
 ## Install
 
 1. Download \`Copilot-Projects-$VERSION.dmg\` below and open it.
@@ -359,78 +473,6 @@ cleanup_partial_release() {
   fi
 }
 
-# Legacy vX.Y.Z tags remain predecessors; date tags always order above them.
-latest_remote_release_tag() {
-  local refs
-  refs="$(git ls-remote --tags --refs origin 'v*')" || return 1
-  awk '{ sub("^refs/tags/", "", $2); print $2 }' <<< "$refs" | latest_release_tag
-}
-
-remote_tag_commit() {
-  local refs direct peeled
-  refs="$(
-    git ls-remote --tags origin \
-      "refs/tags/$1" \
-      "refs/tags/$1^{}"
-  )" || return 1
-  direct="$(awk '$2 !~ /\^\{\}$/ { print $1; exit }' <<< "$refs")"
-  peeled="$(awk '$2 ~ /\^\{\}$/ { print $1; exit }' <<< "$refs")"
-  printf '%s\n' "${peeled:-$direct}"
-}
-
-release_is_complete() {
-  local release expected_asset
-  expected_asset="Copilot-Projects-${1#v}.dmg"
-  release="$(
-    gh release view "$1" \
-      --repo "$REPO" \
-      --json assets,isDraft,publishedAt
-  )" || return 1
-  jq -e --arg asset "$expected_asset" \
-    '.isDraft == false
-     and .publishedAt != null
-     and any(.assets[]; .name == $asset and .size > 0)' \
-    <<< "$release" >/dev/null
-}
-
-verify_expected_predecessor() {
-  if [ -n "${EXPECTED_PREVIOUS_TAG:-}" ]; then
-    local latest_tag latest_sha expected_sha
-    latest_tag="$(latest_remote_release_tag)" || {
-      echo "error: could not list remote release tags" >&2
-      return 1
-    }
-    latest_sha="$(remote_tag_commit "$latest_tag")" || return 1
-    git fetch origin "refs/tags/$latest_tag" --quiet || {
-      echo "error: could not fetch latest release tag $latest_tag" >&2
-      return 1
-    }
-    git merge-base --is-ancestor "$latest_sha" origin/main || {
-      echo "error: latest release $latest_tag is not on origin/main" >&2
-      return 1
-    }
-    expected_sha="${EXPECTED_PREVIOUS_SHA:-}"
-    if [ "$latest_tag" = "$EXPECTED_PREVIOUS_TAG" ]; then
-      [ -n "$expected_sha" ] && [ "$latest_sha" = "$expected_sha" ] || {
-        echo "error: predecessor $EXPECTED_PREVIOUS_TAG moved from ${expected_sha:-unknown} to $latest_sha" >&2
-        return 1
-      }
-      release_is_complete "$latest_tag" || {
-        echo "error: predecessor release $latest_tag is no longer complete" >&2
-        return 1
-      }
-      return 0
-    fi
-    if git merge-base --is-ancestor "$SHA" "$latest_sha" \
-      && release_is_complete "$latest_tag"; then
-      echo "==> superseded by complete descendant release $latest_tag"
-      return 2
-    fi
-    echo "error: latest release changed from $EXPECTED_PREVIOUS_TAG to ${latest_tag:-none}" >&2
-    return 1
-  fi
-  return 0
-}
 # Revalidate immediately before publishing so a queued/manual run cannot release
 # a commit that was force-pushed off main while tests, signing, or notarization ran.
 verify_publish_source

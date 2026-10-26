@@ -55,6 +55,9 @@ struct RootView: View {
         .sheet(item: $input.imagePreview) { item in
             TranscriptImagePreview(item: item) { input.imagePreview = nil }
         }
+        .sheet(isPresented: $input.showsReleaseNotes) {
+            ReleaseNotesView { input.showsReleaseNotes = false }
+        }
         .onChange(of: previewSessionId) { _, sessionId in
             if let preview = input.imagePreview, preview.id.sessionId != sessionId {
                 input.imagePreview = nil
@@ -63,6 +66,7 @@ struct RootView: View {
         .onDisappear {
             input.imagePreview = nil
             input.dismissSessionFinder()
+            input.showsReleaseNotes = false
         }
     }
 
