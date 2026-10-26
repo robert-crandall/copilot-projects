@@ -102,19 +102,16 @@ final class TranscriptController: ObservableObject {
         let currentSessionId = sessionId
         let path = Paths.transcriptSnapshotPath(sessionId: currentSessionId)
         Task.detached { [weak self] in
-            guard let result = Self.load(
+            let currentSignature = Self.loadSignature(
                 sessionId: currentSessionId,
-                path: path,
-                previousSignature: previousSignature
-            ) else {
-                return
-            }
+                transcriptPath: path
+            )
+            guard currentSignature != previousSignature else { return }
             await MainActor.run { [weak self] in
-                guard let self, self.reloadGeneration == sampledGeneration else { return }
-                self.reloadGeneration += 1
-                self.snapshotLoadObserver?()
-                self.signature = result.signature
-                self.snapshot = result.snapshot
+                guard let self,
+                      self.reloadGeneration == sampledGeneration,
+                      self.signature == previousSignature else { return }
+                self.reload()
             }
         }
     }

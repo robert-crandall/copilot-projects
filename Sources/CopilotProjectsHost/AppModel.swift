@@ -474,8 +474,41 @@ final class AppModel: ObservableObject {
     private var didPresentStateMessage = false
     private var server: ControlServer?
     private var integration: (any HostIntegration)?
+    private final class ScheduledSaveBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: PersistedState?
+        private var workerEnqueued = false
+
+        func enqueue(_ state: PersistedState) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            pending = state
+            guard !workerEnqueued else { return false }
+            workerEnqueued = true
+            return true
+        }
+
+        func takeNext() -> PersistedState? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let next = pending else {
+                workerEnqueued = false
+                return nil
+            }
+            pending = nil
+            return next
+        }
+
+        func clearPending() {
+            lock.lock()
+            pending = nil
+            lock.unlock()
+        }
+    }
+
     private weak var notifications: (any NotificationPosting)?
     private var saveWork: DispatchWorkItem?
+    private let scheduledSaveBuffer = ScheduledSaveBuffer()
     private let stateSaveQueue = DispatchQueue(
         label: "com.copilot-projects.state-save",
         qos: .utility
@@ -6585,12 +6618,16 @@ final class AppModel: ObservableObject {
         saveWork = nil
         guard stateLoadFailure == nil else { return }
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
+        guard scheduledSaveBuffer.enqueue(state) else { return }
+        let buffer = scheduledSaveBuffer
         let repository = stateRepository
         stateSaveQueue.async {
-            do {
-                try repository.save(state)
-            } catch {
-                NSLog("copilot-projects: failed to save workspace state: \(error)")
+            while let next = buffer.takeNext() {
+                do {
+                    try repository.save(next)
+                } catch {
+                    NSLog("copilot-projects: failed to save workspace state: \(error)")
+                }
             }
         }
     }
@@ -6611,6 +6648,7 @@ final class AppModel: ObservableObject {
             throw WorkspacePersistenceError(errorDescription: stateLoadFailure)
         }
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
+        scheduledSaveBuffer.clearPending()
         try stateSaveQueue.sync {
             try stateRepository.save(state)
         }
