@@ -88,4 +88,52 @@ final class RemoteAttachmentTests: XCTestCase {
             limits: RemoteImageCapabilities(maxImages: 1, maxBytes: 1, mimeTypes: ["image/png"])))
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("\(refusedID).image").path))
     }
+
+    func testExpiredAttachmentsReclaimCapacityInSingleScan() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteAttachmentStore(sessionsDirectory: root)
+        let session = UUID().uuidString
+        let bytes = try image()
+        let start = Date()
+
+        for _ in 0 ..< 128 {
+            _ = try store.store(
+                bytes,
+                id: UUID().uuidString.lowercased(),
+                sessionId: session,
+                conversationEpoch: "epoch",
+                now: start
+            )
+        }
+        XCTAssertThrowsError(try store.store(
+            bytes,
+            id: UUID().uuidString.lowercased(),
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: start
+        )) { error in
+            XCTAssertEqual(error as? RemoteAttachmentError, .full)
+        }
+
+        let afterExpiry = start.addingTimeInterval(RemoteAttachmentContract.lifetime + 1)
+        let replacementId = UUID().uuidString.lowercased()
+        let stored = try store.store(
+            bytes,
+            id: replacementId,
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: afterExpiry
+        )
+        XCTAssertEqual(stored.id, replacementId)
+        XCTAssertEqual(
+            try store.image(
+                id: replacementId,
+                sessionId: session,
+                conversationEpoch: "epoch",
+                now: afterExpiry
+            ).1,
+            bytes
+        )
+    }
 }

@@ -1,7 +1,12 @@
 import Foundation
 import CopilotProjectsCore
 
-struct StateRepository {
+struct StateRepository: Sendable {
+    private final class StorageBox: @unchecked Sendable {
+        let lock = NSLock()
+        var cachedPrimary: (signature: FileSignature, data: Data)?
+    }
+
     enum LoadResult {
         case missing
         case loaded(PersistedState)
@@ -11,6 +16,7 @@ struct StateRepository {
 
     let path: URL
     let backupPath: URL
+    private let box = StorageBox()
     var closeIntentPath: URL { path.appendingPathExtension("closing") }
 
     struct CloseIntent: Codable {
@@ -33,9 +39,15 @@ struct StateRepository {
     }
 
     func load() -> LoadResult {
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        return loadLocked()
+    }
+
+    private func loadLocked() -> LoadResult {
         do {
-            let intent = try pendingCloses()
-            switch loadWorkspace() {
+            let intent = try pendingClosesLocked()
+            switch loadWorkspaceLocked() {
             case .loaded(let state):
                 return .loaded(try normalized(intent.applying(to: state)))
             case .recovered(let state, let message):
@@ -50,8 +62,9 @@ struct StateRepository {
         }
     }
 
-    private func loadWorkspace() -> LoadResult {
+    private func loadWorkspaceLocked() -> LoadResult {
         guard FileManager.default.fileExists(atPath: path.path) else {
+            box.cachedPrimary = nil
             guard FileManager.default.fileExists(atPath: backupPath.path) else { return .missing }
             do {
                 return .recovered(
@@ -65,13 +78,20 @@ struct StateRepository {
             }
         }
         do {
-            return .loaded(try decode(Data(contentsOf: path)))
+            let data = try Data(contentsOf: path)
+            let decoded = try decode(data)
+            if let signature = Self.fileSignature(atPath: path.path) {
+                box.cachedPrimary = (signature, data)
+            }
+            return .loaded(decoded)
         } catch StateError.unsupportedSchema(let version) {
+            box.cachedPrimary = nil
             return .failed(
                 "Workspace state schema \(version) is newer than this app supports "
                 + "(\(PersistedState.currentSchemaVersion)). The file was left untouched."
             )
         } catch {
+            box.cachedPrimary = nil
             do {
                 let state = try decode(Data(contentsOf: backupPath))
                 return .recovered(
@@ -88,6 +108,12 @@ struct StateRepository {
     }
 
     func pendingCloses() throws -> CloseIntent {
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        return try pendingClosesLocked()
+    }
+
+    private func pendingClosesLocked() throws -> CloseIntent {
         guard FileManager.default.fileExists(atPath: closeIntentPath.path) else {
             return CloseIntent()
         }
@@ -98,7 +124,9 @@ struct StateRepository {
     /// tracker commands or workspace rows change. The command markers are not
     /// the journal: a tracker can consume them while a project batch is written.
     func acceptCloses(sessionIds: [String], projectIds: [String] = []) throws {
-        var intent = try pendingCloses()
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        var intent = try pendingClosesLocked()
         intent.sessionIds.formUnion(sessionIds)
         intent.projectIds.formUnion(projectIds)
         try FileManager.default.createDirectory(
@@ -112,14 +140,22 @@ struct StateRepository {
     /// Called only after all accepted teardown tasks finish. Both recovery
     /// copies must exclude the closed rows before the intent can be forgotten.
     func finishCloses(_ state: PersistedState) throws {
+        box.lock.lock()
+        defer { box.lock.unlock() }
         guard FileManager.default.fileExists(atPath: closeIntentPath.path) else { return }
-        let closedState = try normalized(pendingCloses().applying(to: state))
-        try save(closedState)
+        let closedState = try normalized(pendingClosesLocked().applying(to: state))
+        try saveLocked(closedState)
         try JSONEncoder().encode(closedState).write(to: backupPath, options: .atomic)
         try FileManager.default.removeItem(at: closeIntentPath)
     }
 
     func save(_ state: PersistedState) throws {
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        try saveLocked(state)
+    }
+
+    private func saveLocked(_ state: PersistedState) throws {
         try validate(state)
         let encoded = try JSONEncoder().encode(state)
         try FileManager.default.createDirectory(
@@ -128,16 +164,45 @@ struct StateRepository {
             attributes: [.posixPermissions: 0o700]
         )
         // Preserve only a known-good prior file. A corrupt primary must never replace
-        // the last usable backup.
-        if let existing = try? Data(contentsOf: path),
-           (try? decode(existing)) != nil {
+        // the last usable backup. When the primary file's signature matches the last
+        // validated primary write or read from this repository, reuse those validated
+        // bytes instead of re-reading and re-decoding `path` on every save.
+        let backupBytes: Data?
+        if let currentSignature = Self.fileSignature(atPath: path.path),
+           let cached = box.cachedPrimary,
+           cached.signature == currentSignature {
+            backupBytes = cached.data
+        } else if let existing = try? Data(contentsOf: path),
+                  (try? decode(existing)) != nil {
+            backupBytes = existing
+        } else {
+            backupBytes = nil
+        }
+        if let backupBytes {
             do {
-                try existing.write(to: backupPath, options: .atomic)
+                try backupBytes.write(to: backupPath, options: .atomic)
             } catch {
                 NSLog("copilot-projects: could not update state backup: \(error)")
             }
         }
-        try encoded.write(to: path, options: .atomic)
+        do {
+            try encoded.write(to: path, options: .atomic)
+            if let signature = Self.fileSignature(atPath: path.path) {
+                box.cachedPrimary = (signature, encoded)
+            } else {
+                box.cachedPrimary = nil
+            }
+        } catch {
+            box.cachedPrimary = nil
+            throw error
+        }
+    }
+
+    private static func fileSignature(atPath path: String) -> FileSignature? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return nil
+        }
+        return FileSignature(attributes: attributes)
     }
 
     func normalized(_ state: PersistedState) throws -> PersistedState {

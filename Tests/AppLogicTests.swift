@@ -6224,6 +6224,65 @@ final class AppLogicTests: XCTestCase {
         }
     }
 
+    func testStateRepositoryDetectsExternalAtomicRewriteBetweenSaves() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("state.json")
+        let repository = StateRepository(path: path)
+        let first = Project(name: "first", cwd: "/tmp")
+        let external = Project(name: "external", cwd: "/tmp")
+        let second = Project(name: "second", cwd: "/tmp")
+
+        try repository.save(PersistedState(projects: [first], selectedProjectId: first.id))
+        try JSONEncoder().encode(
+            PersistedState(projects: [external], selectedProjectId: external.id)
+        ).write(to: path, options: .atomic)
+        try repository.save(PersistedState(projects: [second], selectedProjectId: second.id))
+        try FileManager.default.removeItem(at: path)
+
+        guard case .recovered(let recovered, _) = repository.load() else {
+            return XCTFail("expected backup recovery after external primary rewrite")
+        }
+        XCTAssertEqual(recovered.projects.map(\.name), ["external"])
+    }
+
+    @MainActor
+    func testScheduledSavePersistsOffMainAndSerializesWithSynchronousSave() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("state.json")
+        let repository = StateRepository(path: path)
+        let session = Session(title: "initial", cwd: "/tmp")
+        let project = Project(
+            name: "first",
+            cwd: "/tmp",
+            sessions: [session],
+            selectedSessionId: session.id
+        )
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+        let model = AppModel(stateRepository: repository, agentActivityDirectory: root)
+
+        model.updateTitle(sessionId: session.id, title: "scheduled")
+        model.flushScheduledSaveForTesting()
+        guard case .loaded(let afterScheduled) = repository.load() else {
+            return XCTFail("expected scheduled save to persist state")
+        }
+        XCTAssertEqual(afterScheduled.projects[0].sessions[0].title, "scheduled")
+
+        model.updateTitle(sessionId: session.id, title: "superseded")
+        model.renameProject(project.id, name: "renamed-synchronously")
+        model.flushScheduledSaveForTesting()
+        guard case .loaded(let afterSync) = repository.load() else {
+            return XCTFail("expected synchronous save to win over pending scheduled save")
+        }
+        XCTAssertEqual(afterSync.projects[0].name, "renamed-synchronously")
+        XCTAssertEqual(afterSync.projects[0].sessions[0].title, "superseded")
+    }
+
     func testControlCommandRouterValidatesBeforeDispatch() {
         var didSetStatus = false
         var copilotRequests: [ControlRequest] = []

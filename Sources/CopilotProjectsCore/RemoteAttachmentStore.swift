@@ -76,11 +76,17 @@ public struct RemoteAttachmentStore: Sendable {
             expiresAtMilliseconds: Int64(now.addingTimeInterval(RemoteAttachmentContract.lifetime).timeIntervalSince1970 * 1_000)
         )
         let imageURL = root.appendingPathComponent("\(id).image")
-        try data.write(to: imageURL, options: [.atomic])
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: imageURL.path)
-        try JSONEncoder().encode(Record(attachment: attachment, sha256: digest))
-            .write(to: metadataURL, options: [.atomic])
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: metadataURL.path)
+        do {
+            try data.write(to: imageURL, options: [.atomic])
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: imageURL.path)
+            try JSONEncoder().encode(Record(attachment: attachment, sha256: digest))
+                .write(to: metadataURL, options: [.atomic])
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: metadataURL.path)
+        } catch {
+            try? fm.removeItem(at: metadataURL)
+            try? fm.removeItem(at: imageURL)
+            throw error
+        }
         return attachment
     }
 
@@ -120,32 +126,54 @@ public struct RemoteAttachmentStore: Sendable {
 
     private func cleanExpired(now: Date) throws -> (count: Int, bytes: Int) {
         let fm = FileManager.default
-        let files = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])
-        for file in files where file.pathExtension == "json" {
-            let id = file.deletingPathExtension().lastPathComponent
-            guard RemoteAttachmentContract.validID(id) else { continue }
-            let shouldRemove: Bool
-            do {
-                let data = try Self.readRegularFile(file, limit: 4_096)
-                let record = try JSONDecoder().decode(Record.self, from: data)
-                shouldRemove = record.attachment.expiresAtMilliseconds <= Int64(now.timeIntervalSince1970 * 1_000)
-            } catch {
-                NSLog("Removing an unreadable screenshot cache entry %@: %@", id, error.localizedDescription)
-                shouldRemove = true
-            }
-            if shouldRemove {
-                let image = root.appendingPathComponent("\(id).image")
-                if fm.fileExists(atPath: image.path) { try fm.removeItem(at: image) }
-                try fm.removeItem(at: file)
+        let files = try fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
+        )
+        let nowMilliseconds = Int64(now.timeIntervalSince1970 * 1_000)
+        var remainingMetadataBasenames: Set<String> = []
+        var removedImageNames: Set<String> = []
+        var imageFiles: [URL] = []
+
+        for file in files {
+            switch file.pathExtension {
+            case "json":
+                let id = file.deletingPathExtension().lastPathComponent
+                guard RemoteAttachmentContract.validID(id) else {
+                    remainingMetadataBasenames.insert(id)
+                    continue
+                }
+                let shouldRemove: Bool
+                do {
+                    let data = try Self.readRegularFile(file, limit: 4_096)
+                    let record = try JSONDecoder().decode(Record.self, from: data)
+                    shouldRemove = record.attachment.expiresAtMilliseconds <= nowMilliseconds
+                } catch {
+                    NSLog("Removing an unreadable screenshot cache entry %@: %@", id, error.localizedDescription)
+                    shouldRemove = true
+                }
+                if shouldRemove {
+                    let imageName = "\(id).image"
+                    let image = root.appendingPathComponent(imageName)
+                    if fm.fileExists(atPath: image.path) { try fm.removeItem(at: image) }
+                    try fm.removeItem(at: file)
+                    removedImageNames.insert(imageName)
+                } else {
+                    remainingMetadataBasenames.insert(id)
+                }
+            case "image":
+                imageFiles.append(file)
+            default:
+                break
             }
         }
+
         var count = 0
         var bytes = 0
-        for file in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])
-            where file.pathExtension == "image" {
+        for file in imageFiles where !removedImageNames.contains(file.lastPathComponent) {
             let values = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-            let metadata = file.deletingPathExtension().appendingPathExtension("json")
-            if !fm.fileExists(atPath: metadata.path),
+            let id = file.deletingPathExtension().lastPathComponent
+            if !remainingMetadataBasenames.contains(id),
                let date = values.contentModificationDate, now.timeIntervalSince(date) > 3_600 {
                 try fm.removeItem(at: file)
             } else {

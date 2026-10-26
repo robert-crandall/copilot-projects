@@ -476,6 +476,10 @@ final class AppModel: ObservableObject {
     private var integration: (any HostIntegration)?
     private weak var notifications: (any NotificationPosting)?
     private var saveWork: DispatchWorkItem?
+    private let stateSaveQueue = DispatchQueue(
+        label: "com.copilot-projects.state-save",
+        qos: .utility
+    )
     private(set) var isTerminating = false
     /// Remembers the `(tier, workspaceIndex)` of an `.unread` session whose unread
     /// flag was cleared by `selectNextAttentionSession()`, so pressing `⇧⌘A` again
@@ -665,7 +669,7 @@ final class AppModel: ObservableObject {
                 promptStatusTimestamp: promptStatusTimestamp
             )
         },
-        isAppActive: @escaping @MainActor () -> Bool = { NSApp.isActive },
+        isAppActive: @escaping @MainActor () -> Bool = { NSApp?.isActive ?? false },
         agentActivityDirectory: URL = Paths.sessionsDir,
         resumeMarkerDirectory: URL = Paths.sessionsDir,
         remotePromptLiveSessions: ((Set<String>) -> Set<String>)? = nil,
@@ -2000,8 +2004,12 @@ final class AppModel: ObservableObject {
 
     private func acceptSessionCloses(sessionIds: [String], projectIds: [String] = []) -> Bool {
         guard stateLoadFailure == nil else { return false }
+        saveWork?.cancel()
+        saveWork = nil
         do {
-            try stateRepository.acceptCloses(sessionIds: sessionIds, projectIds: projectIds)
+            try stateSaveQueue.sync {
+                try stateRepository.acceptCloses(sessionIds: sessionIds, projectIds: projectIds)
+            }
             return true
         } catch {
             NSLog("copilot-projects: could not accept session close: \(error)")
@@ -2011,10 +2019,13 @@ final class AppModel: ObservableObject {
 
     private func finishPersistedSessionCloses() {
         guard pendingSessionDestroys.isEmpty, stateLoadFailure == nil else { return }
+        saveWork?.cancel()
+        saveWork = nil
+        let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
         do {
-            try stateRepository.finishCloses(
-                PersistedState(projects: projects, selectedProjectId: selectedProjectId)
-            )
+            try stateSaveQueue.sync {
+                try stateRepository.finishCloses(state)
+            }
         } catch {
             NSLog("copilot-projects: retaining interrupted session closes: \(error)")
         }
@@ -6313,12 +6324,12 @@ final class AppModel: ObservableObject {
         let count = projects.reduce(0) { acc, p in
             acc + p.sessions.filter { $0.isUnread }.count
         }
-        NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
+        NSApp?.dockTile.badgeLabel = count > 0 ? String(count) : nil
     }
 
     // MARK: - terminal callbacks
 
-    private func updateTitle(sessionId: String, title: String) {
+    func updateTitle(sessionId: String, title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let loc = locateIndex(sessionId) else { return }
         // copilot sets its terminal title to "Copilot: Waiting for background agents"
@@ -6337,7 +6348,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func updateCwd(sessionId: String, dir: String?) {
+    func updateCwd(sessionId: String, dir: String?) {
         guard let dir, !dir.isEmpty, let loc = locateIndex(sessionId) else { return }
         // Shells report OSC 7 as a `file://host/path` URL; store the plain path so
         // a session that later inherits this cwd can actually chdir into it.
@@ -6562,20 +6573,46 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func scheduleSave() {
+    func scheduleSave() {
         guard stateLoadFailure == nil else { return }
         saveWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.save() }
+        let work = DispatchWorkItem { [weak self] in self?.performScheduledSave() }
         saveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    private func performScheduledSave() {
+        saveWork = nil
+        guard stateLoadFailure == nil else { return }
+        let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
+        let repository = stateRepository
+        stateSaveQueue.async {
+            do {
+                try repository.save(state)
+            } catch {
+                NSLog("copilot-projects: failed to save workspace state: \(error)")
+            }
+        }
+    }
+
+    func flushScheduledSaveForTesting() {
+        if let work = saveWork {
+            work.cancel()
+            performScheduledSave()
+        }
+        stateSaveQueue.sync {}
     }
 
     private func persistWorkspace() throws {
         if let stateLoadFailure {
             throw WorkspacePersistenceError(errorDescription: stateLoadFailure)
         }
+        saveWork?.cancel()
+        saveWork = nil
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
-        try stateRepository.save(state)
+        try stateSaveQueue.sync {
+            try stateRepository.save(state)
+        }
     }
 
     func save() {
