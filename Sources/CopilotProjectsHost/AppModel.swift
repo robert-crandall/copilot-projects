@@ -24,14 +24,13 @@ private final class ScreenshotCaptureBox: @unchecked Sendable {
     }
 }
 
-private struct ScreenshotCaptureRequest: Sendable {
+struct ScreenshotCaptureRequest: Equatable, Sendable {
     let windowID: CGWindowID
     let width: Int
     let height: Int
-    let path: String
 }
 
-private enum ScreenshotPreparation {
+enum ScreenshotPreparation: Equatable, Sendable {
     case ready(ScreenshotCaptureRequest)
     case failure(String)
 }
@@ -181,8 +180,26 @@ private struct WorkspacePersistenceError: LocalizedError {
     let errorDescription: String?
 }
 
-private enum WindowScreenshot {
-    static func capture(_ request: ScreenshotCaptureRequest) -> ControlResponse {
+enum WindowScreenshot {
+    typealias ImageCapturer = @Sendable (ScreenshotCaptureRequest) -> Result<CGImage, Error>
+
+    static func defaultDestinationPath() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads/copilot-projects.png").path
+    }
+
+    static func validateDestination(atPath path: String) -> String? {
+        guard !path.isEmpty else {
+            return "screenshot path must not be empty"
+        }
+        var st = stat()
+        if lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFREG {
+            return "refusing to write screenshot to a non-regular file"
+        }
+        return nil
+    }
+
+    static func captureWindowImage(_ request: ScreenshotCaptureRequest) -> Result<CGImage, Error> {
         let result = ScreenshotCaptureBox()
         let semaphore = DispatchSemaphore(value: 0)
         Task.detached {
@@ -214,34 +231,57 @@ private enum WindowScreenshot {
         }
         guard semaphore.wait(timeout: .now() + 5) == .success,
               let captureResult = result.load() else {
-            return .failure("window capture timed out")
+            return .failure(NSError(
+                domain: "CopilotProjectsScreenshot",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "window capture timed out"]
+            ))
         }
-        let image: CGImage
-        switch captureResult {
-        case .success(let captured): image = captured
-        case .failure(let error):
-            return .failure("could not capture window: \(error.localizedDescription)")
+        return captureResult
+    }
+
+    static func writePNG(_ image: CGImage, to path: String) -> ControlResponse {
+        if let validationError = validateDestination(atPath: path) {
+            return .failure(validationError)
         }
         let rep = NSBitmapImageRep(cgImage: image)
         guard let data = rep.representation(using: .png, properties: [:]) else {
             return .failure("could not encode PNG")
         }
 
-        let destination = URL(fileURLWithPath: request.path)
-        var st = stat()
-        if lstat(request.path, &st) == 0, (st.st_mode & S_IFMT) != S_IFREG {
-            return .failure("refusing to write screenshot to a non-regular file")
-        }
+        let destination = URL(fileURLWithPath: path)
         do {
             try FileManager.default.createDirectory(
                 at: destination.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            if let validationError = validateDestination(atPath: path) {
+                return .failure(validationError)
+            }
             try data.write(to: destination)
-            return .success(request.path)
+            return .success(path)
         } catch {
             return .failure("write failed: \(error.localizedDescription)")
         }
+    }
+
+    static func capture(
+        _ request: ScreenshotCaptureRequest,
+        to path: String,
+        captureImage: ImageCapturer = captureWindowImage
+    ) -> ControlResponse {
+        let image: CGImage
+        switch captureImage(request) {
+        case .success(let captured):
+            image = captured
+        case .failure(let error):
+            let nsError = error as NSError
+            if nsError.domain == "CopilotProjectsScreenshot", nsError.code == 2 {
+                return .failure("window capture timed out")
+            }
+            return .failure("could not capture window: \(error.localizedDescription)")
+        }
+        return writePNG(image, to: path)
     }
 }
 
@@ -623,7 +663,11 @@ final class AppModel: ObservableObject {
     private var permissionStatusRestores: [String: PermissionStatusRestore] = [:]
     private let isAppActive: @MainActor () -> Bool
     private let agentActivityDirectory: URL
-    let resumeMarkerDirectory: URL
+    nonisolated let resumeMarkerDirectory: URL
+    nonisolated let controlMainQueueTimeout: TimeInterval
+    nonisolated let controlMainQueue: ControlServer.MainQueueScheduler
+    private let screenshotPreparer: (@MainActor () -> ScreenshotPreparation)?
+    nonisolated let screenshotImageCapturer: WindowScreenshot.ImageCapturer
     private var powerOffProtectionGeneration = 0
     private(set) var isPoweringOff = false
     private let remotePromptLiveSessions: ((Set<String>) -> Set<String>)?
@@ -743,7 +787,13 @@ final class AppModel: ObservableObject {
         },
         alertPresenter: @escaping (NSAlert) -> NSApplication.ModalResponse = {
             $0.runModal()
-        }
+        },
+        controlMainQueueTimeout: TimeInterval = ControlServer.defaultMainActorTimeout,
+        controlMainQueue: @escaping ControlServer.MainQueueScheduler =
+            ControlServer.defaultMainQueueScheduler,
+        screenshotPreparer: (@MainActor () -> ScreenshotPreparation)? = nil,
+        screenshotImageCapturer: @escaping WindowScreenshot.ImageCapturer =
+            WindowScreenshot.captureWindowImage
     ) {
         self.stateRepository = stateRepository
         self.completionNotificationDelayNanoseconds = completionNotificationDelayNanoseconds
@@ -754,6 +804,10 @@ final class AppModel: ObservableObject {
         self.isAppActive = isAppActive
         self.agentActivityDirectory = agentActivityDirectory
         self.resumeMarkerDirectory = resumeMarkerDirectory
+        self.controlMainQueueTimeout = controlMainQueueTimeout
+        self.controlMainQueue = controlMainQueue
+        self.screenshotPreparer = screenshotPreparer
+        self.screenshotImageCapturer = screenshotImageCapturer
         self.remotePromptLiveSessions = remotePromptLiveSessions
         self.copilotResumeSessions = copilotResumeSessions
         self.remotePromptTarget = remotePromptTarget
@@ -818,43 +872,80 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    func startServer() -> Bool {
-        let server = ControlServer { [weak self] req in
+    func startServer(socketPath: String = Paths.socketPath) -> Bool {
+        let server = ControlServer(socketPath: socketPath) { [weak self] req in
             guard let self else { return .failure("app shutting down") }
-            if req.command == "list-sessions" {
-                // Resume markers are read here, off the main thread: the Pull
-                // Requests app asks every two seconds.
-                let (snapshot, markers) = DispatchQueue.main.sync {
-                    MainActor.assumeIsolated {
-                        (self.workspaceSnapshotWithoutCopilotSessions(), self.resumeMarkerDirectory)
-                    }
-                }
-                return Self.listSessionsResponse(
-                    Self.recordingCopilotSessions(in: snapshot, markerDirectory: markers)
-                )
-            }
-            if req.command == "screenshot" {
-                let path = req.path ?? FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent("Downloads/copilot-projects.png").path
-                let preparation = DispatchQueue.main.sync {
-                    MainActor.assumeIsolated {
-                        self.prepareScreenshot(to: path)
-                    }
-                }
-                switch preparation {
-                case .ready(let request):
-                    return WindowScreenshot.capture(request)
-                case .failure(let error):
-                    return .failure(error)
-                }
-            }
-            return DispatchQueue.main.sync {
-                MainActor.assumeIsolated { self.handle(req) }
-            }
+            return self.handleControlServerRequest(req)
         }
         guard server.start() else { return false }
         self.server = server
         return true
+    }
+
+    nonisolated func handleControlServerRequest(_ req: ControlRequest) -> ControlResponse {
+        if req.command == "ping" {
+            return .success("pong")
+        }
+        if req.command == "list-sessions" {
+            // Resume markers are read here, off the main thread: the Pull
+            // Requests app asks every two seconds.
+            guard let snapshotResult = ControlServer.runOnMainActor(
+                timeout: controlMainQueueTimeout,
+                scheduler: controlMainQueue,
+                { [weak self] () -> WorkspaceSnapshot? in
+                    guard let self else { return nil }
+                    return self.workspaceSnapshotWithoutCopilotSessions()
+                }
+            ) else {
+                return ControlServer.busyResponse
+            }
+            guard let snapshot = snapshotResult else {
+                return .failure("app shutting down")
+            }
+            return Self.listSessionsResponse(
+                Self.recordingCopilotSessions(
+                    in: snapshot,
+                    markerDirectory: resumeMarkerDirectory
+                )
+            )
+        }
+        if req.command == "screenshot" {
+            let path = req.path ?? WindowScreenshot.defaultDestinationPath()
+            if let validationError = WindowScreenshot.validateDestination(atPath: path) {
+                return .failure(validationError)
+            }
+            guard let preparation = ControlServer.runOnMainActor(
+                timeout: controlMainQueueTimeout,
+                scheduler: controlMainQueue,
+                { [weak self] () -> ScreenshotPreparation in
+                    guard let self else { return .failure("app shutting down") }
+                    return self.prepareScreenshot()
+                }
+            ) else {
+                return ControlServer.busyResponse
+            }
+            switch preparation {
+            case .failure(let error):
+                return .failure(error)
+            case .ready(let request):
+                return WindowScreenshot.capture(
+                    request,
+                    to: path,
+                    captureImage: screenshotImageCapturer
+                )
+            }
+        }
+        guard let response = ControlServer.runOnMainActor(
+            timeout: controlMainQueueTimeout,
+            scheduler: controlMainQueue,
+            { [weak self] () -> ControlResponse in
+                guard let self else { return .failure("app shutting down") }
+                return self.handle(req)
+            }
+        ) else {
+            return ControlServer.busyResponse
+        }
+        return response
     }
 
     func stopServer() {
@@ -6473,9 +6564,13 @@ final class AppModel: ObservableObject {
         ].joined(separator: "\n")
     }
 
-    /// Collects main-thread window metadata; capture and file I/O run on the
-    /// control-server thread so ScreenCaptureKit never blocks UI interaction.
-    private func prepareScreenshot(to path: String) -> ScreenshotPreparation {
+    /// Collects main-thread window metadata; destination validation, capture, and
+    /// file I/O run on the control-server thread so ScreenCaptureKit and disk writes
+    /// never block UI interaction.
+    private func prepareScreenshot() -> ScreenshotPreparation {
+        if let screenshotPreparer {
+            return screenshotPreparer()
+        }
         guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil })
                 ?? NSApp.mainWindow ?? NSApp.windows.first,
               let view = window.contentView else {
@@ -6489,8 +6584,7 @@ final class AppModel: ObservableObject {
         return .ready(ScreenshotCaptureRequest(
             windowID: CGWindowID(window.windowNumber),
             width: Int(bounds.width * scale),
-            height: Int(bounds.height * scale),
-            path: path
+            height: Int(bounds.height * scale)
         ))
     }
 

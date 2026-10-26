@@ -11,6 +11,18 @@ import CopilotProjectsCore
 // shutdown crosses the boundary only by closing the listening fd, which wakes
 // `accept`. The class owns those synchronization rules explicitly.
 final class ControlServer: @unchecked Sendable {
+    typealias MainQueueScheduler = @Sendable (@escaping @Sendable () -> Void) -> Void
+
+    /// Default main-actor dispatch deadline for a control-socket command. Kept
+    /// strictly below `ControlClient().timeout` (3s) so a stalled main thread
+    /// returns `.failure("the app is busy", code: "busy")` before the client's
+    /// socket read times out.
+    static let defaultMainActorTimeout: TimeInterval = 2
+    static let busyResponse = ControlResponse.failure("the app is busy", code: "busy")
+    static let defaultMainQueueScheduler: MainQueueScheduler = { work in
+        DispatchQueue.main.async(execute: work)
+    }
+
     private let socketPath: String
     private let handler: (ControlRequest) -> ControlResponse
     private var listenFD: Int32 = -1
@@ -22,6 +34,41 @@ final class ControlServer: @unchecked Sendable {
          handler: @escaping (ControlRequest) -> ControlResponse) {
         self.socketPath = socketPath
         self.handler = handler
+    }
+
+    /// Dispatches `operation` onto the main actor and waits up to `timeout` seconds
+    /// for the main queue to begin servicing it. If the deadline expires while the
+    /// block is still queued, returns `nil` and marks the box `.timedOut` so the
+    /// queued block becomes a no-op when the main queue later drains it. Once the
+    /// main actor begins executing `operation` before the deadline, its side effects
+    /// are in progress and this call waits for its result rather than reporting `busy`.
+    static func runOnMainActor<Value: Sendable>(
+        timeout: TimeInterval = defaultMainActorTimeout,
+        scheduler: MainQueueScheduler = defaultMainQueueScheduler,
+        _ operation: @escaping @MainActor @Sendable () -> Value
+    ) -> Value? {
+        let boundedTimeout = max(timeout, 0)
+        let deadline = DispatchTime.now() + boundedTimeout
+        let box = MainActorDispatchBox<Value>(deadline: deadline)
+        let semaphore = DispatchSemaphore(value: 0)
+        scheduler {
+            guard box.beginExecution() else { return }
+            let value = MainActor.assumeIsolated {
+                operation()
+            }
+            box.complete(value)
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: deadline)
+        switch box.resolveAfterDeadlineWait() {
+        case .completed(let value):
+            return value
+        case .timedOutBeforeStart:
+            return nil
+        case .running:
+            semaphore.wait()
+            return box.completedValue()
+        }
     }
 
     @discardableResult
@@ -210,5 +257,71 @@ final class ControlServer: @unchecked Sendable {
                 off += n
             }
         }
+    }
+}
+
+final class MainActorDispatchBox<Value: Sendable>: @unchecked Sendable {
+    enum WaitResolution {
+        case completed(Value)
+        case running
+        case timedOutBeforeStart
+    }
+
+    private enum State {
+        case pending
+        case running
+        case completed(Value)
+        case timedOut
+    }
+
+    private let lock = NSLock()
+    private let deadline: DispatchTime
+    private var state: State = .pending
+
+    init(deadline: DispatchTime) {
+        self.deadline = deadline
+    }
+
+    func beginExecution() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .pending = state else { return false }
+        guard DispatchTime.now() <= deadline else {
+            state = .timedOut
+            return false
+        }
+        state = .running
+        return true
+    }
+
+    func complete(_ value: Value) {
+        lock.lock()
+        defer { lock.unlock() }
+        state = .completed(value)
+    }
+
+    func resolveAfterDeadlineWait() -> WaitResolution {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .completed(let value):
+            return .completed(value)
+        case .running:
+            return .running
+        case .pending:
+            state = .timedOut
+            return .timedOutBeforeStart
+        case .timedOut:
+            return .timedOutBeforeStart
+        }
+    }
+
+    func completedValue() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .completed(let value) = state {
+            return value
+        }
+        return nil
     }
 }

@@ -8676,6 +8676,250 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(response.text, "ping")
     }
 
+    @MainActor
+    func testControlServerPingFastPathSkipsMainActorWhenMainQueueIsHeld() throws {
+        XCTAssertLessThan(
+            ControlServer.defaultMainActorTimeout,
+            ControlClient().timeout,
+            "server main-actor timeout must stay below the default client socket timeout"
+        )
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = "/tmp/cp-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+
+        let lock = NSLock()
+        var enqueuedMainWork: [@Sendable () -> Void] = []
+        let model = AppModel(
+            stateRepository: StateRepository(
+                path: root.appendingPathComponent("state.json")
+            ),
+            agentActivityDirectory: root.appendingPathComponent("sessions", isDirectory: true),
+            resumeMarkerDirectory: root.appendingPathComponent("sessions", isDirectory: true),
+            controlMainQueueTimeout: 0.05,
+            controlMainQueue: { work in
+                lock.lock()
+                enqueuedMainWork.append(work)
+                lock.unlock()
+            }
+        )
+        XCTAssertTrue(model.startServer(socketPath: socketPath))
+        defer { model.stopServer() }
+
+        let response = try ControlClient(socketPath: socketPath)
+            .send(ControlRequest(command: "ping"))
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.text, "pong")
+        lock.lock()
+        let scheduledCount = enqueuedMainWork.count
+        lock.unlock()
+        XCTAssertEqual(scheduledCount, 0, "ping must not hop to the main queue")
+    }
+
+    @MainActor
+    func testControlServerBoundedMainQueueTimeoutReturnsBusyAndCancelsTimedOutWork() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = "/tmp/cp-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+
+        let lock = NSLock()
+        var holdMainQueue = true
+        var heldBlocks: [@Sendable () -> Void] = []
+        let model = AppModel(
+            stateRepository: StateRepository(
+                path: root.appendingPathComponent("state.json")
+            ),
+            agentActivityDirectory: root.appendingPathComponent("sessions", isDirectory: true),
+            resumeMarkerDirectory: root.appendingPathComponent("sessions", isDirectory: true),
+            controlMainQueueTimeout: 0.05,
+            controlMainQueue: { work in
+                lock.lock()
+                let shouldHold = holdMainQueue
+                if shouldHold {
+                    heldBlocks.append(work)
+                }
+                lock.unlock()
+                if !shouldHold {
+                    DispatchQueue.main.async(execute: work)
+                }
+            }
+        )
+        let baselineProjectCount = model.projects.count
+        XCTAssertTrue(model.startServer(socketPath: socketPath))
+        defer { model.stopServer() }
+
+        var newProjectReq = ControlRequest(command: "new-project")
+        newProjectReq.name = "stalled-project"
+        newProjectReq.cwd = root.path
+        let newProjectResponse = try ControlClient(socketPath: socketPath).send(newProjectReq)
+        XCTAssertFalse(newProjectResponse.ok)
+        XCTAssertEqual(newProjectResponse.code, "busy")
+        XCTAssertEqual(newProjectResponse.error, "the app is busy")
+
+        let listSessionsResponse = try ControlClient(socketPath: socketPath)
+            .send(ControlRequest(command: "list-sessions"))
+        XCTAssertFalse(listSessionsResponse.ok)
+        XCTAssertEqual(listSessionsResponse.code, "busy")
+        XCTAssertEqual(listSessionsResponse.error, "the app is busy")
+
+        var screenshotReq = ControlRequest(command: "screenshot")
+        screenshotReq.path = root.appendingPathComponent("shot.png").path
+        let screenshotResponse = try ControlClient(socketPath: socketPath).send(screenshotReq)
+        XCTAssertFalse(screenshotResponse.ok)
+        XCTAssertEqual(screenshotResponse.code, "busy")
+        XCTAssertEqual(screenshotResponse.error, "the app is busy")
+
+        // The control server serial queue must remain responsive for subsequent requests.
+        let pingResponse = try ControlClient(socketPath: socketPath)
+            .send(ControlRequest(command: "ping"))
+        XCTAssertTrue(pingResponse.ok)
+        XCTAssertEqual(pingResponse.text, "pong")
+
+        // Late execution after the main queue unblocks must be a no-op for timed-out requests.
+        lock.lock()
+        let blocksToDrain = heldBlocks
+        heldBlocks.removeAll()
+        lock.unlock()
+        XCTAssertEqual(blocksToDrain.count, 3)
+        for block in blocksToDrain {
+            block()
+        }
+        XCTAssertEqual(model.projects.count, baselineProjectCount)
+        XCTAssertFalse(model.projects.contains { $0.name == "stalled-project" })
+
+        // Deterministic state-machine checks: a block that misses the deadline before
+        // claiming never starts, while a block that claims before the deadline keeps
+        // running and delivers its completed value instead of reporting a false "busy".
+        let expiredBox = MainActorDispatchBox<String>(deadline: .now() - .seconds(1))
+        XCTAssertFalse(expiredBox.beginExecution())
+        if case .timedOutBeforeStart = expiredBox.resolveAfterDeadlineWait() {
+        } else {
+            XCTFail("expected timedOutBeforeStart when deadline passed before beginExecution")
+        }
+
+        let inFlightBox = MainActorDispatchBox<String>(deadline: .now() + .seconds(60))
+        XCTAssertTrue(inFlightBox.beginExecution())
+        if case .running = inFlightBox.resolveAfterDeadlineWait() {
+        } else {
+            XCTFail("expected running when beginExecution claimed before the deadline")
+        }
+        inFlightBox.complete("completed-after-start")
+        XCTAssertEqual(inFlightBox.completedValue(), "completed-after-start")
+    }
+
+    @MainActor
+    func testControlServerScreenshotValidatesOffMainAndWritesPNGFile() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let socketPath = "/tmp/cp-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: 4,
+            height: 3,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let testImage = context.makeImage() else {
+            XCTFail("failed to construct test CGImage")
+            return
+        }
+
+        let lock = NSLock()
+        var schedulerCalls = 0
+        var preparerCalls = 0
+        var preparerCalledOnMainThread: [Bool] = []
+        var capturedRequests: [ScreenshotCaptureRequest] = []
+        var capturerCalledOnMainThread: [Bool] = []
+        let expectedRequest = ScreenshotCaptureRequest(windowID: 77, width: 4, height: 3)
+
+        let model = AppModel(
+            stateRepository: StateRepository(
+                path: root.appendingPathComponent("state.json")
+            ),
+            agentActivityDirectory: root.appendingPathComponent("sessions", isDirectory: true),
+            resumeMarkerDirectory: root.appendingPathComponent("sessions", isDirectory: true),
+            controlMainQueueTimeout: 1,
+            controlMainQueue: { work in
+                lock.lock()
+                schedulerCalls += 1
+                lock.unlock()
+                DispatchQueue.main.async(execute: work)
+            },
+            screenshotPreparer: {
+                lock.lock()
+                preparerCalls += 1
+                preparerCalledOnMainThread.append(Thread.isMainThread)
+                lock.unlock()
+                return .ready(expectedRequest)
+            },
+            screenshotImageCapturer: { request in
+                lock.lock()
+                capturedRequests.append(request)
+                capturerCalledOnMainThread.append(Thread.isMainThread)
+                lock.unlock()
+                return .success(testImage)
+            }
+        )
+        XCTAssertTrue(model.startServer(socketPath: socketPath))
+        defer { model.stopServer() }
+
+        // 1. A non-regular file path (directory) fails before hopping to the main queue.
+        let directoryPath = root.path
+        let directoryResponse = try await Task.detached {
+            var directoryReq = ControlRequest(command: "screenshot")
+            directoryReq.path = directoryPath
+            return try ControlClient(socketPath: socketPath).send(directoryReq)
+        }.value
+        XCTAssertFalse(directoryResponse.ok)
+        XCTAssertEqual(
+            directoryResponse.error,
+            "refusing to write screenshot to a non-regular file"
+        )
+        lock.lock()
+        XCTAssertEqual(schedulerCalls, 0)
+        XCTAssertEqual(preparerCalls, 0)
+        XCTAssertTrue(capturedRequests.isEmpty)
+        lock.unlock()
+
+        // 2. A valid nested path creates intermediate directories and writes a PNG off-main.
+        let nestedOutput = root
+            .appendingPathComponent("nested/screenshots/window.png")
+        let nestedOutputPath = nestedOutput.path
+        let validResponse = try await Task.detached {
+            var validReq = ControlRequest(command: "screenshot")
+            validReq.path = nestedOutputPath
+            return try ControlClient(socketPath: socketPath).send(validReq)
+        }.value
+        XCTAssertTrue(validResponse.ok, validResponse.error ?? "unexpected failure")
+        XCTAssertEqual(validResponse.text, nestedOutput.path)
+
+        lock.lock()
+        XCTAssertEqual(schedulerCalls, 1)
+        XCTAssertEqual(preparerCalls, 1)
+        XCTAssertEqual(preparerCalledOnMainThread, [true])
+        XCTAssertEqual(capturedRequests, [expectedRequest])
+        XCTAssertEqual(capturerCalledOnMainThread, [false])
+        lock.unlock()
+
+        let pngData = try Data(contentsOf: nestedOutput)
+        XCTAssertTrue(pngData.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+        let rep = try XCTUnwrap(NSBitmapImageRep(data: pngData))
+        XCTAssertEqual(rep.pixelsWide, 4)
+        XCTAssertEqual(rep.pixelsHigh, 3)
+    }
+
     private func runHook(
         hookURL: URL,
         action: String,
