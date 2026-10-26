@@ -629,6 +629,7 @@ final class SessionFinderTests: XCTestCase {
         $SIG{TERM} = 'IGNORE';
         $SIG{PIPE} = 'IGNORE';
         setpgrp(0, 0);
+        select undef, undef, undef, 0.01 while getppid() != 1;
         if (open my $p, '>>', $ARGV[1]) { print $p "$$\n"; close $p; }
         select STDOUT; $| = 1;
         print "{\"type\":\"user.message\",\"data\":{\"content\":\"partial\"}}\n";
@@ -643,7 +644,6 @@ final class SessionFinderTests: XCTestCase {
         try perlScript.write(to: perlFile, atomically: true, encoding: .utf8)
         var (detached, root) = try fakeCopilot("""
         /usr/bin/perl '\(perlFile.path)' '\(epipeFile.path)' '\(pidsFile.path)' &
-        while [ ! -s '\(pidsFile.path)' ]; do /bin/sleep 0.02; done
         """)
         defer { try? FileManager.default.removeItem(at: root) }
         let runs = root.appendingPathComponent("runs").path
