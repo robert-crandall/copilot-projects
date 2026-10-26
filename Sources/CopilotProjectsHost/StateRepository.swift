@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CopilotProjectsCore
 
@@ -16,6 +17,7 @@ struct StateRepository: Sendable {
 
     let path: URL
     let backupPath: URL
+    let saveObserver: (@Sendable () -> Void)?
     private let box = StorageBox()
     var closeIntentPath: URL { path.appendingPathExtension("closing") }
 
@@ -33,9 +35,10 @@ struct StateRepository: Sendable {
         }
     }
 
-    init(path: URL = Paths.statePath) {
+    init(path: URL = Paths.statePath, saveObserver: (@Sendable () -> Void)? = nil) {
         self.path = path
         self.backupPath = path.appendingPathExtension("backup")
+        self.saveObserver = saveObserver
     }
 
     func load() -> LoadResult {
@@ -78,10 +81,14 @@ struct StateRepository: Sendable {
             }
         }
         do {
+            let beforeSignature = Self.fileSignature(atPath: path.path)
             let data = try Data(contentsOf: path)
             let decoded = try decode(data)
-            if let signature = Self.fileSignature(atPath: path.path) {
-                box.cachedPrimary = (signature, data)
+            if let beforeSignature,
+               Self.fileSignature(atPath: path.path) == beforeSignature {
+                box.cachedPrimary = (beforeSignature, data)
+            } else {
+                box.cachedPrimary = nil
             }
             return .loaded(decoded)
         } catch StateError.unsupportedSchema(let version) {
@@ -150,6 +157,7 @@ struct StateRepository: Sendable {
     }
 
     func save(_ state: PersistedState) throws {
+        saveObserver?()
         box.lock.lock()
         defer { box.lock.unlock() }
         try saveLocked(state)
@@ -158,8 +166,9 @@ struct StateRepository: Sendable {
     private func saveLocked(_ state: PersistedState) throws {
         try validate(state)
         let encoded = try JSONEncoder().encode(state)
+        let directory = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
+            at: directory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
@@ -185,14 +194,23 @@ struct StateRepository: Sendable {
                 NSLog("copilot-projects: could not update state backup: \(error)")
             }
         }
+        let stagingURL = directory.appendingPathComponent(
+            ".\(path.lastPathComponent).\(UUID().uuidString).tmp",
+            isDirectory: false
+        )
         do {
-            try encoded.write(to: path, options: .atomic)
-            if let signature = Self.fileSignature(atPath: path.path) {
-                box.cachedPrimary = (signature, encoded)
+            try encoded.write(to: stagingURL)
+            let stagedSignature = Self.fileSignature(atPath: stagingURL.path)
+            guard Darwin.rename(stagingURL.path, path.path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            if let stagedSignature {
+                box.cachedPrimary = (stagedSignature, encoded)
             } else {
                 box.cachedPrimary = nil
             }
         } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
             box.cachedPrimary = nil
             throw error
         }

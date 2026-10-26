@@ -6250,12 +6250,32 @@ final class AppLogicTests: XCTestCase {
 
     @MainActor
     func testScheduledSavePersistsOffMainAndSerializesWithSynchronousSave() throws {
+        final class SaveProbe: @unchecked Sendable {
+            let lock = NSLock()
+            let started = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            var blockNextOffMainSave = false
+            var observedOffMainSave = false
+        }
+        let probe = SaveProbe()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let path = root.appendingPathComponent("state.json")
-        let repository = StateRepository(path: path)
+        let repository = StateRepository(path: path) {
+            if !Thread.isMainThread {
+                probe.lock.lock()
+                probe.observedOffMainSave = true
+                let shouldBlock = probe.blockNextOffMainSave
+                probe.blockNextOffMainSave = false
+                probe.lock.unlock()
+                if shouldBlock {
+                    probe.started.signal()
+                    probe.release.wait()
+                }
+            }
+        }
         let session = Session(title: "initial", cwd: "/tmp")
         let project = Project(
             name: "first",
@@ -6268,19 +6288,28 @@ final class AppLogicTests: XCTestCase {
 
         model.updateTitle(sessionId: session.id, title: "scheduled")
         model.flushScheduledSaveForTesting()
+        XCTAssertTrue(probe.observedOffMainSave)
         guard case .loaded(let afterScheduled) = repository.load() else {
             return XCTFail("expected scheduled save to persist state")
         }
         XCTAssertEqual(afterScheduled.projects[0].sessions[0].title, "scheduled")
 
-        model.updateTitle(sessionId: session.id, title: "superseded")
+        probe.lock.lock()
+        probe.blockNextOffMainSave = true
+        probe.lock.unlock()
+        model.updateTitle(sessionId: session.id, title: "in-flight-scheduled")
+        model.enqueueScheduledSaveForTesting()
+        XCTAssertEqual(probe.started.wait(timeout: .now() + 2), .success)
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            probe.release.signal()
+        }
         model.renameProject(project.id, name: "renamed-synchronously")
-        model.flushScheduledSaveForTesting()
         guard case .loaded(let afterSync) = repository.load() else {
-            return XCTFail("expected synchronous save to win over pending scheduled save")
+            return XCTFail("expected synchronous save to wait for in-flight scheduled save and win")
         }
         XCTAssertEqual(afterSync.projects[0].name, "renamed-synchronously")
-        XCTAssertEqual(afterSync.projects[0].sessions[0].title, "superseded")
+        XCTAssertEqual(afterSync.projects[0].sessions[0].title, "in-flight-scheduled")
     }
 
     func testControlCommandRouterValidatesBeforeDispatch() {

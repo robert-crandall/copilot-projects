@@ -2004,12 +2004,12 @@ final class AppModel: ObservableObject {
 
     private func acceptSessionCloses(sessionIds: [String], projectIds: [String] = []) -> Bool {
         guard stateLoadFailure == nil else { return false }
-        saveWork?.cancel()
-        saveWork = nil
         do {
             try stateSaveQueue.sync {
                 try stateRepository.acceptCloses(sessionIds: sessionIds, projectIds: projectIds)
             }
+            saveWork?.cancel()
+            saveWork = nil
             return true
         } catch {
             NSLog("copilot-projects: could not accept session close: \(error)")
@@ -6595,11 +6595,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func enqueueScheduledSaveForTesting() {
+        guard let work = saveWork else { return }
+        work.cancel()
+        performScheduledSave()
+    }
+
     func flushScheduledSaveForTesting() {
-        if let work = saveWork {
-            work.cancel()
-            performScheduledSave()
-        }
+        enqueueScheduledSaveForTesting()
         stateSaveQueue.sync {}
     }
 
