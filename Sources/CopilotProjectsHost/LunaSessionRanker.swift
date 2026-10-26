@@ -340,20 +340,28 @@ enum LunaProcess {
         process.environment = environment
         process.currentDirectoryURL = directory
         process.standardInput = FileHandle.nullDevice
-        let output = Pipe()
-        let errorOutput = Pipe()
-        process.standardOutput = output
-        process.standardError = errorOutput
-        let run = RunState(process, terminationGrace: terminationGrace)
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        let output = Collector(outputPipe)
+        let errorOutput = Collector(errorPipe)
+        defer {
+            output.finish()
+            errorOutput.finish()
+        }
+        let run = RunState(
+            process,
+            collectors: [output, errorOutput],
+            terminationGrace: terminationGrace
+        )
         // Weak, so a launch that throws can't strand the handler and state in a cycle.
         process.terminationHandler = { [weak run] in run?.finish($0.terminationStatus) }
         try process.run()
         run.recordLaunch()
-        let outputReader = PipeReader(output)
-        let errorReader = PipeReader(errorOutput)
 
         let watchdog = Task.detached {
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
             guard !Task.isCancelled else { return }
             run.terminate(timedOut: true)
         }
@@ -362,7 +370,7 @@ enum LunaProcess {
         // the pipes open after copilot itself has exited.
         let (status, stdout, stderr) = await withTaskCancellationHandler {
             let status = await run.exitStatus()
-            return (status, await outputReader.text(), await errorReader.text())
+            return (status, await output.text(), await errorOutput.text())
         } onCancel: {
             run.terminate(timedOut: false)
         }
@@ -404,6 +412,7 @@ enum LunaProcess {
     private final class RunState: @unchecked Sendable {
         private let lock = NSLock()
         private let process: Process
+        private let collectors: [Collector]
         private let terminationGrace: TimeInterval
         private let exit = OneShot<Int32>()
         private var didTimeOut = false
@@ -411,8 +420,9 @@ enum LunaProcess {
         private var isDrained = false
         private var root: ProcessIdentity?
 
-        init(_ process: Process, terminationGrace: TimeInterval) {
+        init(_ process: Process, collectors: [Collector], terminationGrace: TimeInterval) {
             self.process = process
+            self.collectors = collectors
             self.terminationGrace = terminationGrace
         }
 
@@ -438,12 +448,11 @@ enum LunaProcess {
             kill(-pid, signal)
         }
 
-        /// Asks the run and everything it started to stop, then kills whatever is
-        /// left after the grace period: a run that ignores SIGTERM would otherwise
-        /// never exit, and a subprocess holding the output pipes open would keep
-        /// the reads from finishing. `Process` starts copilot as the leader of its
-        /// own process group, and the group still reaches subprocesses that copilot
-        /// left behind when it exited.
+        /// Asks the run and everything it started to stop, kills whatever is left
+        /// after the grace period, and then stops waiting for output that
+        /// something out of reach may still hold open. `Process` starts copilot as
+        /// the leader of its own process group, and the group still reaches
+        /// subprocesses that copilot left behind when it exited.
         func terminate(timedOut: Bool) {
             let first: Bool = lock.withLock {
                 if timedOut { didTimeOut = true }
@@ -458,15 +467,17 @@ enum LunaProcess {
             signalGroup(pid, SIGTERM)
             started.forEach { $0.signal(SIGTERM) }
             let process = self.process
+            let collectors = self.collectors
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + terminationGrace) { [self] in
-                // A drained run is over, and its ids may belong to other processes by now.
-                guard !lock.withLock({ isDrained }) else { return }
-                let stillRunning = process.isRunning
+                // Once drained, the root pid may belong to another process, so only
+                // start-time-verified identities and the guarded group are signalled.
+                let stillRunning = !lock.withLock({ isDrained }) && process.isRunning
                 var survivors = Set(started)
                 if stillRunning { survivors.formUnion(LunaProcess.descendants(of: pid)) }
                 survivors.forEach { $0.signal(SIGKILL) }
                 signalGroup(pid, SIGKILL)
                 if stillRunning { kill(pid, SIGKILL) }
+                collectors.forEach { $0.finish() }
             }
         }
     }
@@ -480,21 +491,49 @@ enum LunaProcess {
         ProcessTree.descendants(of: root)
     }
 
-    /// Drains a pipe on a dispatch thread so the blocking read never occupies the
-    /// Swift concurrency pool, and a full pipe can never stall the child.
-    private final class PipeReader: @unchecked Sendable {
-        private let data = OneShot<Data>()
+    /// Reads a pipe as data arrives and closes the read handle when finished, so a
+    /// full pipe never stalls the child and a stuck writer can be given up on.
+    private final class Collector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        private var isClosed = false
+        private let done = OneShot<Data>()
+        private let handle: FileHandle
 
         init(_ pipe: Pipe) {
-            let handle = pipe.fileHandleForReading
-            let data = data
-            DispatchQueue.global(qos: .userInitiated).async {
-                data.deliver(handle.readDataToEndOfFile())
+            handle = pipe.fileHandleForReading
+            handle.readabilityHandler = { [weak self] handle in
+                guard let self else { return }
+                let reachedEOF: Bool = self.lock.withLock {
+                    guard !self.isClosed else { return false }
+                    let chunk = handle.availableData
+                    if chunk.isEmpty {
+                        return true
+                    }
+                    self.data.append(chunk)
+                    return false
+                }
+                if reachedEOF {
+                    self.finish()
+                }
+            }
+        }
+
+        func finish() {
+            let collected: Data? = lock.withLock {
+                guard !isClosed else { return nil }
+                isClosed = true
+                handle.readabilityHandler = nil
+                try? handle.close()
+                return data
+            }
+            if let collected {
+                done.deliver(collected)
             }
         }
 
         func text() async -> String {
-            String(decoding: await data.wait(), as: UTF8.self)
+            String(decoding: await done.wait(), as: UTF8.self)
         }
     }
 }
