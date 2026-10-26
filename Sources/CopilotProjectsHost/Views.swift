@@ -632,15 +632,26 @@ struct DetailView: View {
 
             if let sessionId = model.globalSelectedSessionId,
                let transcript = model.activeTranscriptController {
+                let operation = model.sessionOperationProjection(sessionId: sessionId)
+                let composer = model.sessionPromptComposer(sessionId: sessionId)
                 TranscriptOverlay(
                     controller: transcript,
                     imageCapture: { model.terminalView(for: sessionId)?.kittyImageCapture },
                     isOpen: model.isTranscriptDrawerOpen(sessionId: sessionId),
                     onClose: { model.closeTranscriptDrawer(sessionId: sessionId) },
                     workflow: model.sessionWorkflow(sessionId: sessionId),
-                    operation: model.sessionOperationProjection(sessionId: sessionId),
+                    operation: operation,
+                    workflowProvider: { model.sessionWorkflow(sessionId: sessionId) },
+                    operationProvider: { model.sessionOperationProjection(sessionId: sessionId) },
+                    promptComposer: composer,
                     onAction: { action in
-                        await model.performLocalSessionAction(sessionId: sessionId, action: action)
+                        await model.performLocalSessionAction(
+                            sessionId: sessionId,
+                            action: action,
+                            expectedConversationEpoch: action.kind == .send
+                                ? (composer.attachedEpoch ?? operation.conversationEpoch)
+                                : operation.conversationEpoch
+                        )
                     },
                     onPreview: onPreview
                 )

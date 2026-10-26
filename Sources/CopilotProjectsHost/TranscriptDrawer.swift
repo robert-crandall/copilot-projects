@@ -31,6 +31,9 @@ struct TranscriptOverlay: View {
     let onClose: () -> Void
     let workflow: RemoteSessionWorkflow?
     let operation: AgentOperationProjection
+    var workflowProvider: (() -> RemoteSessionWorkflow?)? = nil
+    var operationProvider: (() -> AgentOperationProjection)? = nil
+    var promptComposer: DesktopSessionPromptComposer? = nil
     let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     let onPreview: (TranscriptImagePreviewItem) -> Void
 
@@ -42,6 +45,9 @@ struct TranscriptOverlay: View {
                         ImageAssociatedTranscriptDrawer(
                             capture: capture, snapshot: controller.snapshot,
                             workflow: workflow, operation: operation,
+                            workflowProvider: workflowProvider,
+                            operationProvider: operationProvider,
+                            promptComposer: promptComposer,
                             onClose: onClose, onAction: onAction, onPreview: onPreview
                         )
                     } else {
@@ -51,6 +57,9 @@ struct TranscriptOverlay: View {
                             } ?? [],
                             imageCapture: nil,
                             workflow: workflow, operation: operation,
+                            workflowProvider: workflowProvider,
+                            operationProvider: operationProvider,
+                            promptComposer: promptComposer,
                             onClose: onClose, onAction: onAction, onPreview: onPreview
                         )
                     }
@@ -66,6 +75,9 @@ private struct ImageAssociatedTranscriptDrawer: View {
     let snapshot: TranscriptSnapshot?
     let workflow: RemoteSessionWorkflow?
     let operation: AgentOperationProjection
+    let workflowProvider: (() -> RemoteSessionWorkflow?)?
+    let operationProvider: (() -> AgentOperationProjection)?
+    let promptComposer: DesktopSessionPromptComposer?
     let onClose: () -> Void
     let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     let onPreview: (TranscriptImagePreviewItem) -> Void
@@ -77,6 +89,9 @@ private struct ImageAssociatedTranscriptDrawer: View {
             } ?? [],
             imageCapture: capture,
             workflow: workflow, operation: operation,
+            workflowProvider: workflowProvider,
+            operationProvider: operationProvider,
+            promptComposer: promptComposer,
             onClose: onClose, onAction: onAction, onPreview: onPreview
         )
     }
@@ -87,6 +102,9 @@ private struct TranscriptDrawer: View {
     let imageCapture: RemoteKittyImageCapture?
     let workflow: RemoteSessionWorkflow?
     let operation: AgentOperationProjection
+    let workflowProvider: (() -> RemoteSessionWorkflow?)?
+    let operationProvider: (() -> AgentOperationProjection)?
+    let promptComposer: DesktopSessionPromptComposer?
     let onClose: () -> Void
     let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
     let onPreview: (TranscriptImagePreviewItem) -> Void
@@ -143,6 +161,19 @@ private struct TranscriptDrawer: View {
                     proxy.scrollTo("transcript-bottom", anchor: .bottom)
                 }
             }
+
+            if let promptComposer, workflow != nil {
+                Divider()
+                TranscriptPromptComposerView(
+                    composer: promptComposer,
+                    workflow: workflow,
+                    operation: operation,
+                    workflowProvider: workflowProvider,
+                    operationProvider: operationProvider,
+                    onAction: onAction,
+                    onPreview: onPreview
+                )
+            }
         }
         .frame(width: 420)
         .frame(maxHeight: .infinity)
@@ -151,6 +182,234 @@ private struct TranscriptDrawer: View {
             Color(nsColor: .separatorColor).frame(width: 1).allowsHitTesting(false)
         }
         .shadow(color: .black.opacity(0.2), radius: 12, x: -4)
+    }
+}
+
+private struct TranscriptPromptComposerView: View {
+    @ObservedObject var composer: DesktopSessionPromptComposer
+    let workflow: RemoteSessionWorkflow?
+    let operation: AgentOperationProjection
+    let workflowProvider: (() -> RemoteSessionWorkflow?)?
+    let operationProvider: (() -> AgentOperationProjection)?
+    let onAction: @MainActor (RemoteSessionAction) async -> RemoteWorkflowActionResult
+    let onPreview: (TranscriptImagePreviewItem) -> Void
+    @FocusState private var promptFocused: Bool
+
+    private var liveWorkflow: RemoteSessionWorkflow? {
+        workflowProvider?() ?? workflow
+    }
+
+    private var liveOperation: AgentOperationProjection {
+        operationProvider?() ?? operation
+    }
+
+    private func blockedMessage(now: Date) -> String? {
+        composer.statusMessage
+            ?? composer.attachmentsBlockedReason(workflow: liveWorkflow, operation: liveOperation, now: now)
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { context in
+            let currentWorkflow = liveWorkflow
+            let currentOperation = liveOperation
+            let now = context.date
+            VStack(alignment: .leading, spacing: 8) {
+                if !composer.attachments.isEmpty {
+                    HStack {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(composer.attachments) { item in
+                                    StagedAttachmentCard(
+                                        item: item,
+                                        removeDisabled: composer.isSending || composer.pendingOperationId != nil,
+                                        onPreview: { onPreview(composer.previewItem(for: item)) },
+                                        onRemove: { composer.removeAttachment(id: item.id) }
+                                    )
+                                }
+                            }
+                        }
+                        Button("Clear all") {
+                            composer.clearAttachments()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .disabled(composer.isSending || composer.pendingOperationId != nil)
+                        .accessibilityIdentifier("desktop-clear-screenshots")
+                    }
+                    .accessibilityIdentifier("desktop-screenshot-previews")
+                }
+
+                if let message = blockedMessage(now: now) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("desktop-screenshot-status")
+                        Spacer(minLength: 0)
+                        if composer.statusMessage != nil {
+                            Button {
+                                composer.dismissStatusMessage()
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Dismiss attachment status")
+                        }
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Picker("Delivery", selection: $composer.mode) {
+                        ForEach(RemotePromptMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .disabled(composer.isSending || composer.pendingOperationId != nil)
+                    .accessibilityLabel("Message delivery mode")
+
+                    Spacer(minLength: 0)
+
+                    Button(action: chooseFiles) {
+                        Image(systemName: "paperclip")
+                            .frame(width: 24, height: 24)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!composer.canAttach(workflow: currentWorkflow, operation: currentOperation, now: now))
+                    .help(composer.attachHelpText(workflow: currentWorkflow, operation: currentOperation, now: now))
+                    .accessibilityLabel("Attach screenshot")
+                    .accessibilityIdentifier("desktop-attach-screenshot")
+
+                    Button(action: pasteScreenshots) {
+                        Image(systemName: "doc.on.clipboard")
+                            .frame(width: 24, height: 24)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!composer.canAttach(workflow: currentWorkflow, operation: currentOperation, now: now))
+                    .help(composer.attachHelpText(workflow: currentWorkflow, operation: currentOperation, now: now))
+                    .accessibilityLabel("Paste screenshot")
+                    .accessibilityIdentifier("desktop-paste-screenshot")
+                }
+
+                HStack(alignment: .bottom, spacing: 8) {
+                    TextField("Message Copilot", text: $composer.prompt, axis: .vertical)
+                        .lineLimit(1...5)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($promptFocused)
+                        .disabled(composer.isSending || composer.pendingOperationId != nil)
+                        .accessibilityLabel("Message Copilot")
+                        .accessibilityIdentifier("desktop-prompt-field")
+                        .onSubmit(submitPrompt)
+
+                    Button("Send", action: submitPrompt)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!composer.canSend(workflow: currentWorkflow, operation: currentOperation, now: now))
+                        .accessibilityIdentifier("desktop-send-prompt")
+                }
+            }
+            .padding(12)
+        }
+        .onPasteCommand(of: [.image, .fileURL]) { _ in
+            pasteScreenshots()
+        }
+        .onAppear {
+            composer.isPromptFieldFocused = promptFocused
+            let currentOp = liveOperation
+            composer.reconcileReceipts(currentOp.receipts, conversationEpoch: currentOp.conversationEpoch)
+        }
+        .onDisappear {
+            composer.isPromptFieldFocused = false
+        }
+        .onChange(of: promptFocused) { _, focused in
+            composer.isPromptFieldFocused = focused
+        }
+        .onChange(of: operation.conversationEpoch) { _, newEpoch in
+            composer.syncConversationEpoch(newEpoch)
+        }
+        .onChange(of: operation.receipts) { _, newReceipts in
+            composer.reconcileReceipts(newReceipts, conversationEpoch: liveOperation.conversationEpoch)
+        }
+        .onChange(of: composer.pendingOperationId) { _, _ in
+            let currentOp = liveOperation
+            composer.reconcileReceipts(currentOp.receipts, conversationEpoch: currentOp.conversationEpoch)
+        }
+    }
+
+    private func pasteScreenshots() {
+        Task { @MainActor in
+            _ = await composer.pasteFromPasteboard(workflow: liveWorkflow, operation: liveOperation)
+        }
+    }
+
+    private func submitPrompt() {
+        let currentWorkflow = liveWorkflow
+        let currentOperation = liveOperation
+        guard composer.canSend(workflow: currentWorkflow, operation: currentOperation) else { return }
+        Task { @MainActor in
+            await composer.send(workflow: currentWorkflow, operation: currentOperation, onAction: onAction)
+        }
+    }
+
+    private func chooseFiles() {
+        guard let limits = composer.imageLimits(workflow: liveWorkflow, operation: liveOperation) else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Attach Screenshots"
+        panel.prompt = "Attach"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = limits.maxImages - composer.attachments.count > 1
+        panel.allowedContentTypes = [.png, .jpeg, .image]
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        let urls = panel.urls
+        Task { @MainActor in
+            await composer.attachFiles(urls, workflow: liveWorkflow, operation: liveOperation)
+        }
+    }
+}
+
+private struct StagedAttachmentCard: View {
+    let item: DesktopSessionPromptComposer.StagedAttachment
+    let removeDisabled: Bool
+    let onPreview: () -> Void
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button(action: onPreview) {
+                if let image = NSImage(data: item.previewPNGData) ?? NSImage(data: item.data) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 56, height: 42)
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                } else {
+                    Label("Screenshot", systemImage: "photo")
+                        .font(.caption2)
+                        .frame(width: 56, height: 42)
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Open screenshot preview")
+            .accessibilityLabel("Open screenshot preview")
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(StudioStyle.secondaryText)
+            }
+            .buttonStyle(.borderless)
+            .disabled(removeDisabled)
+            .help("Remove screenshot")
+            .accessibilityLabel("Remove screenshot")
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(StudioStyle.raised)
+        )
     }
 }
 

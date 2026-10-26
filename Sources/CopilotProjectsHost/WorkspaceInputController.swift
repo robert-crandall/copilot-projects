@@ -190,6 +190,21 @@ final class WorkspaceInputController: ObservableObject {
             model.closeSelectedSession()
             return nil
         }
+        if mods == .command, event.charactersIgnoringModifiers?.lowercased() == "v",
+           let sessionId = model.globalSelectedSessionId,
+           model.isTranscriptDrawerOpen(sessionId: sessionId),
+           model.sessionPromptComposer(sessionId: sessionId).isPromptFieldFocused,
+           event.window?.firstResponder is NSTextView,
+           DesktopScreenshotAttachmentImage.hasPasteboardImage() {
+            clearNumberHint()
+            let composer = model.sessionPromptComposer(sessionId: sessionId)
+            let workflow = model.sessionWorkflow(sessionId: sessionId)
+            let operation = model.sessionOperationProjection(sessionId: sessionId)
+            Task { @MainActor in
+                _ = await composer.pasteFromPasteboard(workflow: workflow, operation: operation)
+            }
+            return nil
+        }
         if mods == .command, event.charactersIgnoringModifiers == "k" {
             clearNumberHint()
             presentSessionFinder()

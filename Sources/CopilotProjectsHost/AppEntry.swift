@@ -245,14 +245,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // When the app is activated (clicked / ⌘-Tab'd back), put keyboard focus
-        // on the visible terminal instead of the sidebar list.
+        // on the visible terminal instead of the sidebar list, unless a text view
+        // in the open session details drawer already holds focus.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.model.markActiveSessionSeen()
-                if self?.input.hasWorkspaceSheet == false {
-                    self?.model.focusActiveTerminal()
+                guard let self else { return }
+                self.model.markActiveSessionSeen()
+                let drawerEditing = self.model.globalSelectedSessionId.map {
+                    self.model.isTranscriptDrawerOpen(sessionId: $0)
+                } == true && (NSApp.keyWindow?.firstResponder is NSTextView)
+                if !self.input.hasWorkspaceSheet && !drawerEditing {
+                    self.model.focusActiveTerminal()
                 }
             }
         }
