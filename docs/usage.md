@@ -743,14 +743,22 @@ moves out of the state directory, those copies keep their state and locks under
 
 [MIT](../LICENSE). The bundled `dtach` helper is licensed under GPLv2; its source is
 included in [`vendor/dtach`](../vendor/dtach).
-# Release notes
+## Release notes
 
 Choose **Help > What's New** to read the changes bundled with the installed
 version. This does not interrupt the workspace automatically after updates.
 Development builds without bundled notes say so instead of fetching notes for
 a newer release.
 
-Published builds generate notes from first-parent commits since the previous
+The first release containing `release-notes/initial.json` uses its hand-written
+October 18-25 highlights for both the published notes and What's New. The source
+is read from the build's Git commit, not an uncommitted working copy. Keep this
+archive file tracked: once the preceding release contains it, subsequent releases
+return to automatic notes. Each section contains `[text, GitHub-link-or-null]`
+entries; malformed content fails generation rather than silently replacing it.
+Links stay within this repository or the public host.
+
+Subsequent published builds generate notes from first-parent commits since the previous
 complete release. Merged pull requests use their GitHub titles and labels;
 direct commits use their subjects. Features, fixes, and other changes are grouped
 automatically. Write descriptive titles; `bug`/`fix` and `enhancement`/`feature`

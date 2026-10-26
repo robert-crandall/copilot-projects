@@ -154,6 +154,49 @@ class NotesTests(unittest.TestCase):
         self.assertNotIn("https", text)
         self.assertNotIn("##", text)
 
+    def write_initial_notes(self, sections):
+        path = self.root / notes.INITIAL_NOTES
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sections))
+        return self.commit("Add the first curated notes")
+
+    def test_first_release_uses_committed_curated_notes_without_api_lookups(self):
+        self.write_initial_notes({"October 18-25 highlights": [
+            ["Find and resume older sessions.", "https://github.com/example/app/pull/12"],
+        ]})
+        (self.root / notes.INITIAL_NOTES).write_text(json.dumps({"Uncommitted": [["Do not publish", None]]}))
+        with mock.patch.object(notes, "merged_pull_request", side_effect=AssertionError("Unexpected API lookup")):
+            result = self.generate()
+        self.assertIn("October 18-25 highlights", result["markdown"])
+        self.assertIn("Find and resume older sessions.", result["plainText"])
+        self.assertNotIn("Do not publish", result["markdown"])
+        self.assertEqual(result["sourceRevision"], self.git("rev-parse", "HEAD"))
+
+    def test_releases_after_the_first_snapshot_return_to_automatic_changes(self):
+        first = self.write_initial_notes({"Highlights": [["The first week's changes.", None]]})
+        self.commit("fix the next issue")
+        result = self.generate(previous=first)
+        self.assertIn("fix the next issue", result["markdown"])
+        self.assertNotIn("first week's changes", result["markdown"])
+
+    def test_invalid_curated_notes_fail_instead_of_falling_back_to_automatic(self):
+        for sections in [{}, {"Highlights": []}, {"Bad\nheading": [["Text", None]]}, {"Highlights": ["Text"]}]:
+            with self.subTest(sections=sections):
+                self.write_initial_notes(sections)
+                with self.assertRaisesRegex(ValueError, "Initial release note"):
+                    self.generate()
+
+    def test_curated_notes_allow_own_and_public_host_links_only(self):
+        self.write_initial_notes({"Highlights": [
+            ["Shared host improvement.", "https://github.com/sirfergy/copilot-projects/pull/12"],
+        ]})
+        self.assertIn("Shared host improvement", self.generate()["markdown"])
+        self.write_initial_notes({"Highlights": [
+            ["Wrong audience.", "https://github.com/private/companion/pull/12"],
+        ]})
+        with self.assertRaisesRegex(ValueError, "this repository or the public host"):
+            self.generate()
+
     def test_invalid_or_mismatched_notes_fail_validation(self):
         document = self.generate()
         with self.assertRaises(ValueError):

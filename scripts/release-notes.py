@@ -11,6 +11,7 @@ import time
 
 
 MAX_BYTES = 256 * 1024
+INITIAL_NOTES = "release-notes/initial.json"
 
 
 def git(root, *args):
@@ -100,6 +101,33 @@ def markdown_change(title, url):
     return f"{text} ([{reference}]({url}))"
 
 
+def initial_sections(root, repository, previous, revision):
+    if not git(root, "ls-tree", "--name-only", revision, "--", INITIAL_NOTES):
+        return None
+    if previous and git(root, "ls-tree", "--name-only", previous, "--", INITIAL_NOTES):
+        return None
+    sections = json.loads(git(root, "show", f"{revision}:{INITIAL_NOTES}"))
+    if not isinstance(sections, dict) or not sections:
+        raise ValueError("Initial release notes must contain named sections")
+    allowed_repositories = {repository, "sirfergy/copilot-projects"}
+    for heading, entries in sections.items():
+        if not heading.strip() or "\n" in heading or "\r" in heading or not isinstance(entries, list) or not entries:
+            raise ValueError("Initial release notes require nonempty, single-line sections")
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 2 or not isinstance(entry[0], str) or not entry[0].strip():
+                raise ValueError("Initial release note entries must be [text, link-or-null]")
+            if entry[1] is not None:
+                if not isinstance(entry[1], str):
+                    raise ValueError("Initial release note links must be strings")
+                link = re.fullmatch(
+                    r"https://github\.com/([^/]+/[^/]+)/(?:pull/[1-9][0-9]*|commit/[0-9a-f]{40})",
+                    entry[1]
+                )
+                if not link or link[1] not in allowed_repositories:
+                    raise ValueError("Initial release note links must reference this repository or the public host")
+    return sections
+
+
 def generate(root, repository, previous, version, build):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", repository):
         raise ValueError("Repository must be owner/name")
@@ -112,11 +140,14 @@ def generate(root, repository, previous, version, build):
             ["git", "-C", str(root), "merge-base", "--is-ancestor", previous, revision],
             check=True
         )
-    history = git(
+    initial = initial_sections(root, repository, previous, revision)
+    history = "" if initial is not None else git(
         root, "log", "--first-parent", "--reverse", "--format=%H%x09%s",
         f"{previous}..{revision}" if previous else revision
     )
-    sections = {"Features and improvements": [], "Fixes": [], "Other changes": []}
+    sections = initial if initial is not None else {
+        "Features and improvements": [], "Fixes": [], "Other changes": [],
+    }
     for line in history.splitlines():
         sha, subject = line.split("\t", 1)
         pr = merged_pull_request(repository, sha)
@@ -139,7 +170,7 @@ def generate(root, repository, previous, version, build):
         sections[category(title, labels)].append((title, url))
     if not any(sections.values()):
         sections["Other changes"].append(("No source changes since the previous build.", None))
-    if previous:
+    if previous and initial is None:
         old_host, new_host = host_pin(root, previous), host_pin(root, revision)
         if old_host and new_host and old_host != new_host:
             sections["Desktop host changes"] = [(
@@ -147,7 +178,7 @@ def generate(root, repository, previous, version, build):
                 f"https://github.com/sirfergy/copilot-projects/compare/{old_host}...{new_host}"
             )]
     markdown = "\n\n".join(
-        "## " + heading + "\n\n" + "\n".join(
+        "## " + escape(heading) + "\n\n" + "\n".join(
             markdown_change(title, url)
             for title, url in changes
         ) for heading, changes in sections.items() if changes
