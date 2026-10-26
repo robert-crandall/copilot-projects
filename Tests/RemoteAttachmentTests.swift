@@ -135,5 +135,36 @@ final class RemoteAttachmentTests: XCTestCase {
             ).1,
             bytes
         )
+
+        let rollbackId = UUID().uuidString.lowercased()
+        let blockingMetadataDir = store.root.appendingPathComponent("\(rollbackId).json", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockingMetadataDir, withIntermediateDirectories: true)
+        try Data("blocker".utf8).write(to: blockingMetadataDir.appendingPathComponent("nested"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: blockingMetadataDir.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: blockingMetadataDir.path)
+        }
+        XCTAssertThrowsError(try store.store(
+            bytes,
+            id: rollbackId,
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: afterExpiry
+        ))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: store.root.appendingPathComponent("\(rollbackId).image").path
+            )
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: blockingMetadataDir.path)
+        try FileManager.default.removeItem(at: blockingMetadataDir)
+        let recovered = try store.store(
+            bytes,
+            id: rollbackId,
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: afterExpiry
+        )
+        XCTAssertEqual(recovered.id, rollbackId)
     }
 }

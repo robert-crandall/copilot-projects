@@ -2019,13 +2019,13 @@ final class AppModel: ObservableObject {
 
     private func finishPersistedSessionCloses() {
         guard pendingSessionDestroys.isEmpty, stateLoadFailure == nil else { return }
-        saveWork?.cancel()
-        saveWork = nil
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
         do {
             try stateSaveQueue.sync {
                 try stateRepository.finishCloses(state)
             }
+            saveWork?.cancel()
+            saveWork = nil
         } catch {
             NSLog("copilot-projects: retaining interrupted session closes: \(error)")
         }
@@ -6610,12 +6610,12 @@ final class AppModel: ObservableObject {
         if let stateLoadFailure {
             throw WorkspacePersistenceError(errorDescription: stateLoadFailure)
         }
-        saveWork?.cancel()
-        saveWork = nil
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
         try stateSaveQueue.sync {
             try stateRepository.save(state)
         }
+        saveWork?.cancel()
+        saveWork = nil
     }
 
     func save() {
