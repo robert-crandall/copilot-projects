@@ -491,9 +491,45 @@ final class SessionFinderTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("runs").path), [])
     }
 
+    private func recordedPIDs(at url: URL) throws -> [pid_t] {
+        try String(contentsOf: url, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    private func assertProcessesExit(_ pids: [pid_t], timeout: TimeInterval = 3) async throws {
+        let identities = pids.compactMap(LunaProcess.ProcessIdentity.init)
+        defer { identities.forEach { $0.signal(SIGKILL) } }
+        let deadline = Date().addingTimeInterval(timeout)
+        while pids.contains(where: { kill($0, 0) == 0 }), Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        for pid in pids {
+            XCTAssertNotEqual(kill(pid, 0), 0, "pid \(pid) outlived the terminated Luna run")
+        }
+    }
+
     func testRankKillsARunAndItsSubprocessesWhenTheyIgnoreTermination() async throws {
-        // The ignored SIGTERM is inherited, and both sleeps hold the output pipes open.
-        var (stubborn, root) = try fakeCopilot("trap '' TERM\n/bin/sleep 30 &\n/bin/sleep 30\n")
+        // The ignored SIGTERM is inherited, and the children hold the output pipes open
+        // (including one in a separate process group and one that redirected its own output).
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let pidsFile = rootURL.appendingPathComponent("pids")
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let hasPerl = FileManager.default.isExecutableFile(atPath: "/usr/bin/perl")
+        let expectedChildrenPerRun = hasPerl ? 3 : 2
+        var (stubborn, root) = try fakeCopilot("""
+        trap '' TERM
+        /bin/sleep 30 &
+        echo $! >> '\(pidsFile.path)'
+        /bin/sleep 30 >/dev/null 2>&1 &
+        echo $! >> '\(pidsFile.path)'
+        if [ -x /usr/bin/perl ]; then
+          /usr/bin/perl -e 'setpgrp(0, 0); exec "/bin/sleep", "30"' &
+          echo $! >> '\(pidsFile.path)'
+        fi
+        /bin/sleep 30
+        """)
         defer { try? FileManager.default.removeItem(at: root) }
         let runs = root.appendingPathComponent("runs").path
         stubborn.timeout = 0.3
@@ -506,8 +542,12 @@ final class SessionFinderTests: XCTestCase {
             XCTAssertEqual(error as? LunaSearchError, .timedOut)
         }
         XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let timedOutChildren = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(timedOutChildren.count, expectedChildrenPerRun)
+        try await assertProcessesExit(timedOutChildren)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
 
+        try Data().write(to: pidsFile)
         stubborn.timeout = 30
         let task = Task { try await stubborn.rank(query: "anything", entries: [entry("A")]) }
         try await Task.sleep(nanoseconds: 300_000_000)
@@ -520,12 +560,23 @@ final class SessionFinderTests: XCTestCase {
             XCTAssertTrue(error is CancellationError, "\(error)")
         }
         XCTAssertLessThan(Date().timeIntervalSince(cancelled), 5)
+        let cancelledChildren = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(cancelledChildren.count, expectedChildrenPerRun)
+        try await assertProcessesExit(cancelledChildren)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
     }
 
     func testRankStopsALeftoverSubprocessHoldingThePipesAfterCopilotExits() async throws {
         // copilot exits at once; the backgrounded sleep keeps stdout open and ignores SIGTERM.
-        var (leaky, root) = try fakeCopilot("trap '' TERM\n/bin/sleep 30 &\n")
+        let pidsRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let pidsFile = pidsRoot.appendingPathComponent("pids")
+        try FileManager.default.createDirectory(at: pidsRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: pidsRoot) }
+        var (leaky, root) = try fakeCopilot("""
+        trap '' TERM
+        /bin/sleep 30 &
+        echo $! >> '\(pidsFile.path)'
+        """)
         defer { try? FileManager.default.removeItem(at: root) }
         let runs = root.appendingPathComponent("runs").path
         leaky.timeout = 0.3
@@ -538,8 +589,12 @@ final class SessionFinderTests: XCTestCase {
             XCTAssertEqual(error as? LunaSearchError, .timedOut)
         }
         XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let timedOutChildren = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(timedOutChildren.count, 1)
+        try await assertProcessesExit(timedOutChildren)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
 
+        try Data().write(to: pidsFile)
         leaky.timeout = 30
         let task = Task { try await leaky.rank(query: "anything", entries: [entry("A")]) }
         try await Task.sleep(nanoseconds: 300_000_000)
@@ -552,7 +607,148 @@ final class SessionFinderTests: XCTestCase {
             XCTAssertTrue(error is CancellationError, "\(error)")
         }
         XCTAssertLessThan(Date().timeIntervalSince(cancelled), 5)
+        let cancelledChildren = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(cancelledChildren.count, 1)
+        try await assertProcessesExit(cancelledChildren)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
+    }
+
+    func testRankClosesPipesWhenAnOrphanedSeparateGroupGrandchildSurvives() async throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: "/usr/bin/perl"))
+        let pidsRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let pidsFile = pidsRoot.appendingPathComponent("pids")
+        let epipeFile = pidsRoot.appendingPathComponent("epipe")
+        try FileManager.default.createDirectory(at: pidsRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: pidsRoot) }
+        // copilot emits partial output, starts a separate-group child holding stdout open,
+        // and exits immediately so the child is reparented outside copilot's process tree.
+        // After the grace period closes the read handle, the child's next write sees EPIPE.
+        let perlFile = pidsRoot.appendingPathComponent("detached.pl")
+        let perlScript = #"""
+        use Errno qw(EPIPE);
+        $SIG{TERM} = 'IGNORE';
+        $SIG{PIPE} = 'IGNORE';
+        setpgrp(0, 0);
+        select undef, undef, undef, 0.01 while getppid() != 1;
+        if (open my $p, '>>', $ARGV[1]) { print $p "$$\n"; close $p; }
+        select STDOUT; $| = 1;
+        print "{\"type\":\"user.message\",\"data\":{\"content\":\"partial\"}}\n";
+        for (1..400) {
+            select undef, undef, undef, 0.05;
+            if (!defined syswrite(STDOUT, "\n", 1) && $! == EPIPE) {
+                if (open my $f, '>>', $ARGV[0]) { print $f "epipe\n"; close $f; }
+                exit 0;
+            }
+        }
+        """#
+        try perlScript.write(to: perlFile, atomically: true, encoding: .utf8)
+        var (detached, root) = try fakeCopilot("""
+        /usr/bin/perl '\(perlFile.path)' '\(epipeFile.path)' '\(pidsFile.path)' &
+        """)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runs = root.appendingPathComponent("runs").path
+        detached.timeout = 1.0
+        detached.terminationGrace = 0.2
+        let started = Date()
+        do {
+            _ = try await detached.rank(query: "anything", entries: [entry("A")])
+            XCTFail("Expected a timeout")
+        } catch {
+            XCTAssertEqual(error as? LunaSearchError, .timedOut)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 6)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
+        let timedOutChildren = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(timedOutChildren.count, 1)
+        try await assertProcessesExit(timedOutChildren, timeout: 5)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: epipeFile.path),
+            "Closing the pipe read handle should cause the surviving writer to observe EPIPE"
+        )
+
+        try? FileManager.default.removeItem(at: pidsFile)
+        try? FileManager.default.removeItem(at: epipeFile)
+        detached.timeout = 30
+        let task = Task { try await detached.rank(query: "anything", entries: [entry("A")]) }
+        let readyDeadline = Date().addingTimeInterval(5)
+        while ((try? recordedPIDs(at: pidsFile).count) ?? 0) < 1, Date() < readyDeadline {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let cancelled = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(cancelled), 5)
+        let cancelledChildren = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(cancelledChildren.count, 1)
+        try await assertProcessesExit(cancelledChildren, timeout: 5)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: epipeFile.path),
+            "Closing the pipe read handle on cancellation should cause the surviving writer to observe EPIPE"
+        )
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: runs), [])
+    }
+
+    func testRankKillsSurvivingChildAfterPipesDrainOnTermination() async throws {
+        let pidsRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let pidsFile = pidsRoot.appendingPathComponent("pids")
+        try FileManager.default.createDirectory(at: pidsRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: pidsRoot) }
+        // Only the background children ignore SIGTERM and close their pipes (one direct
+        // descendant and one reparented group member); the root shell exits on SIGTERM
+        // so the pipes drain before the grace period elapses.
+        var (ranker, root) = try fakeCopilot("""
+        (trap '' TERM; exec /bin/sleep 30 >/dev/null 2>&1) &
+        echo $! >> '\(pidsFile.path)'
+        (trap '' TERM; /bin/sleep 30 >/dev/null 2>&1 & echo $! >> '\(pidsFile.path)')
+        exec /bin/sleep 30
+        """)
+        defer { try? FileManager.default.removeItem(at: root) }
+        ranker.timeout = 1.0
+        ranker.terminationGrace = 2.5
+        let started = Date()
+        do {
+            _ = try await ranker.rank(query: "anything", entries: [entry("A")])
+            XCTFail("Expected a timeout")
+        } catch {
+            XCTAssertEqual(error as? LunaSearchError, .timedOut)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2.8)
+        let children = try recordedPIDs(at: pidsFile)
+        XCTAssertEqual(children.count, 2)
+        try await assertProcessesExit(children, timeout: 5)
+    }
+
+    func testLunaProcessCollectsMultiChunkStdoutAndStderrWithoutStalling() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lineCount = 4_000
+        let outLine = String(repeating: "o", count: 50)
+        let errLine = String(repeating: "e", count: 50)
+        let script = """
+        awk 'BEGIN { for (i = 0; i < \(lineCount); i++) print "\(outLine)" }' &
+        awk 'BEGIN { for (i = 0; i < \(lineCount); i++) print "\(errLine)" }' >&2 &
+        wait
+        """
+        let result = try await LunaProcess.run(
+            executable: "/bin/sh",
+            arguments: ["-c", script],
+            environment: ["PATH": "/usr/bin:/bin"],
+            directory: root,
+            timeout: 10
+        )
+        let expectedOut = String(repeating: outLine + "\n", count: lineCount)
+        let expectedErr = String(repeating: errLine + "\n", count: lineCount)
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.output.count, expectedOut.count)
+        XCTAssertEqual(result.errorOutput.count, expectedErr.count)
+        XCTAssertEqual(result.output, expectedOut)
+        XCTAssertEqual(result.errorOutput, expectedErr)
     }
 
     func testProcessIdentityStopsMatchingOnceTheProcessExits() throws {
