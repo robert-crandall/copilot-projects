@@ -290,6 +290,7 @@ final class AppModel: ObservableObject {
     var requestMainWindow: (() -> Void)?
 
     private var controllers: [String: TerminalController] = [:]
+    private var sessionPromptComposers: [String: DesktopSessionPromptComposer] = [:]
     private var selectedTranscriptController: TranscriptController?
     private let stateRepository: StateRepository
     /// The durable Kitty-image disk store every session's terminal is wired
@@ -1887,6 +1888,7 @@ final class AppModel: ObservableObject {
             controllers[sid]?.terminate()
         }
         controllers[sid] = nil
+        sessionPromptComposers.removeValue(forKey: sid)?.clearAttachments(force: true)
         if selectedTranscriptController?.sessionId == sid {
             selectedTranscriptController = nil
         }
@@ -3153,6 +3155,24 @@ final class AppModel: ObservableObject {
         let action: RemoteSessionAction
     }
 
+    var attachmentStore: RemoteAttachmentStore {
+        RemoteAttachmentStore(sessionsDirectory: agentActivityDirectory)
+    }
+
+    func sessionPromptComposer(sessionId: String) -> DesktopSessionPromptComposer {
+        if let existing = sessionPromptComposers[sessionId] {
+            return existing
+        }
+        let composer = DesktopSessionPromptComposer(
+            sessionId: sessionId,
+            attachmentStore: attachmentStore
+        )
+        if locateIndex(sessionId) != nil {
+            sessionPromptComposers[sessionId] = composer
+        }
+        return composer
+    }
+
     func sessionWorkflow(sessionId: String) -> RemoteSessionWorkflow? {
         guard let location = locateIndex(sessionId) else { return nil }
         return projects[location.p].sessions[location.s].agentActivity?.workflow
@@ -3166,7 +3186,8 @@ final class AppModel: ObservableObject {
 
     func performLocalSessionAction(
         sessionId: String,
-        action: RemoteSessionAction
+        action: RemoteSessionAction,
+        expectedConversationEpoch: String? = nil
     ) async -> RemoteWorkflowActionResult {
         let adapter = CLIOperationAdapter(
             activityDirectory: agentActivityDirectory,
@@ -3175,6 +3196,12 @@ final class AppModel: ObservableObject {
         guard let snapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: { Date() }),
               let epoch = snapshot.remoteOperationProjection().conversationEpoch else {
             return RemoteWorkflowActionResult(state: .rejected, message: "Native session controls are unavailable.")
+        }
+        if let expectedConversationEpoch, epoch != expectedConversationEpoch {
+            return RemoteWorkflowActionResult(
+                state: .rejected,
+                message: "The conversation changed. Review your message before sending again."
+            )
         }
         let operation = CLIOperationRequest(operationId: UUID().uuidString, conversationEpoch: epoch)
         guard performSessionAction(sessionId: sessionId, action: action, operation: operation) == .accepted else {
@@ -3469,6 +3496,7 @@ final class AppModel: ObservableObject {
                 session.controller?.terminate()
             }
             controllers[session.id] = nil
+            sessionPromptComposers.removeValue(forKey: session.id)?.clearAttachments(force: true)
             if selectedTranscriptController?.sessionId == session.id {
                 selectedTranscriptController = nil
             }
