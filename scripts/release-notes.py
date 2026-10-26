@@ -50,6 +50,14 @@ def release_summary(body):
     paragraph = []
     for line in body.splitlines():
         stripped = line.strip()
+        expanded = line.expandtabs(4)
+        if stripped and len(expanded) - len(expanded.lstrip(" ")) >= 4:
+            if fence or not active:
+                continue
+            if not paragraph:
+                break
+            paragraph.append(stripped)
+            continue
         marker = re.match(r"^(`{3,}|~{3,})", stripped)
         if marker:
             if fence is None:

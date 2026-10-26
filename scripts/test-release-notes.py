@@ -316,6 +316,10 @@ class NotesTests(unittest.TestCase):
             ("## Release notes\n<!-- fill this in -->\n## Tests\nAll pass", None),
             ("## Release notes\nN/A", None),
             ("## Release notes\n- A list is not a paragraph", None),
+            ("## Release notes\n\n    swift test", None),
+            ("    ## Release notes\n    Example only\n\n## Release notes\nActual summary.", "Actual summary."),
+            ("\t## Release notes\n\tExample only", None),
+            ("## Release notes\nA wrapped\n    paragraph.", "A wrapped paragraph."),
             (None, None),
         ]
         for body, expected in examples:
