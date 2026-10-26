@@ -2008,8 +2008,6 @@ final class AppModel: ObservableObject {
             try stateSaveQueue.sync {
                 try stateRepository.acceptCloses(sessionIds: sessionIds, projectIds: projectIds)
             }
-            saveWork?.cancel()
-            saveWork = nil
             return true
         } catch {
             NSLog("copilot-projects: could not accept session close: \(error)")
@@ -2021,11 +2019,13 @@ final class AppModel: ObservableObject {
         guard pendingSessionDestroys.isEmpty, stateLoadFailure == nil else { return }
         let state = PersistedState(projects: projects, selectedProjectId: selectedProjectId)
         do {
-            try stateSaveQueue.sync {
+            let didSave = try stateSaveQueue.sync {
                 try stateRepository.finishCloses(state)
             }
-            saveWork?.cancel()
-            saveWork = nil
+            if didSave {
+                saveWork?.cancel()
+                saveWork = nil
+            }
         } catch {
             NSLog("copilot-projects: retaining interrupted session closes: \(error)")
         }

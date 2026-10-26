@@ -146,14 +146,16 @@ struct StateRepository: Sendable {
 
     /// Called only after all accepted teardown tasks finish. Both recovery
     /// copies must exclude the closed rows before the intent can be forgotten.
-    func finishCloses(_ state: PersistedState) throws {
+    @discardableResult
+    func finishCloses(_ state: PersistedState) throws -> Bool {
         box.lock.lock()
         defer { box.lock.unlock() }
-        guard FileManager.default.fileExists(atPath: closeIntentPath.path) else { return }
+        guard FileManager.default.fileExists(atPath: closeIntentPath.path) else { return false }
         let closedState = try normalized(pendingClosesLocked().applying(to: state))
         try saveLocked(closedState)
         try JSONEncoder().encode(closedState).write(to: backupPath, options: .atomic)
         try FileManager.default.removeItem(at: closeIntentPath)
+        return true
     }
 
     func save(_ state: PersistedState) throws {
