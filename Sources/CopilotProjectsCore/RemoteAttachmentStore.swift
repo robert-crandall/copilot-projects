@@ -26,14 +26,19 @@ public struct RemoteAttachmentStore: Sendable {
     private static let maxTotalBytes = 128 * 1_024 * 1_024
     private static let maxEntries = 128
     public let root: URL
+    private let afterImageWrite: (@Sendable (URL) throws -> Void)?
 
     private struct Record: Codable {
         let attachment: RemoteAttachment
         let sha256: String
     }
 
-    public init(sessionsDirectory: URL = Paths.sessionsDir) {
+    public init(
+        sessionsDirectory: URL = Paths.sessionsDir,
+        afterImageWrite: (@Sendable (URL) throws -> Void)? = nil
+    ) {
         root = sessionsDirectory.appendingPathComponent(Self.directoryName, isDirectory: true)
+        self.afterImageWrite = afterImageWrite
     }
 
     public func store(
@@ -81,6 +86,7 @@ public struct RemoteAttachmentStore: Sendable {
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: imageURL.path)
             try JSONEncoder().encode(Record(attachment: attachment, sha256: digest))
                 .write(to: metadataURL, options: [.atomic])
+            try afterImageWrite?(imageURL)
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: metadataURL.path)
         } catch {
             try? fm.removeItem(at: metadataURL)
