@@ -769,7 +769,8 @@ omitting desktop changes.
 
 Pure host updates are replaced by the changes they bring in. A commit must change
 only `Package.swift` and `Package.resolved`, with the manifest changing only the
-host revision; shared dependency lock updates may accompany it. Mixed feature
+host revision; shared dependency lock updates may accompany it only when they
+match the exact old and new desktop lockfiles. Independent dependency upgrades and mixed feature
 commits remain visible. Identical entries are combined while retaining all source
 links, and desktop PR links name their repository to distinguish them from
 companion PRs. Rollbacks and divergent host history are named explicitly rather

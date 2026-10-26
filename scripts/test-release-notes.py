@@ -163,6 +163,7 @@ class NotesTests(unittest.TestCase):
     def test_first_release_uses_committed_curated_notes_without_api_lookups(self):
         self.write_initial_notes({"October 18-25 highlights": [
             ["Find and resume older sessions.", "https://github.com/example/app/pull/12"],
+            ["Desktop updates.", "https://github.com/sirfergy/copilot-projects/pull/13"],
         ]})
         (self.root / notes.INITIAL_NOTES).write_text(json.dumps({"Uncommitted": [["Do not publish", None]]}))
         with mock.patch.object(notes, "merged_pull_request", side_effect=AssertionError("Unexpected API lookup")):
@@ -229,7 +230,13 @@ class NotesTests(unittest.TestCase):
         self.write_host_pin("c" * 40, shared="2")
         self.commit("update desktop host to v2")
         self.commit("fix a web issue")
-        with mock.patch.object(notes, "host_changes", return_value=("ahead", [
+        def host_dependencies(revision):
+            return {"https://github.com/example/shared.git": {
+                "location": "https://github.com/example/shared.git",
+                "state": {"revision": "1" if revision == "b" * 40 else "2"},
+            }}
+        with mock.patch.object(notes, "host_dependency_pins", side_effect=host_dependencies), \
+                mock.patch.object(notes, "host_changes", return_value=("ahead", [
             ("d" * 40, "add screenshot paste"),
             ("e" * 40, "fix desktop search"),
         ])) as compare:
@@ -261,6 +268,17 @@ class NotesTests(unittest.TestCase):
         mixed = self.commit("update host and add a target")
         self.assertFalse(notes.pure_host_update(self.root, mixed))
         self.assertNotEqual(previous, mixed)
+
+    def test_independent_dependency_updates_remain_visible_alongside_host_changes(self):
+        self.write_host_pin("a" * 40)
+        previous = self.commit("Old desktop")
+        self.write_host_pin("b" * 40, shared="2")
+        self.commit("update desktop and a web-only dependency")
+        with mock.patch.object(notes, "host_dependency_pins", return_value={}), \
+                mock.patch.object(notes, "host_changes", return_value=("ahead", [("c" * 40, "fix desktop")])):
+            result = self.generate_integrated(previous)
+        self.assertIn("update desktop and a web-only dependency", result["markdown"])
+        self.assertIn("fix desktop", result["markdown"])
 
     def test_default_consumer_keeps_compare_link_and_unchanged_pin_never_calls_compare(self):
         self.write_host_pin("a" * 40)
@@ -294,6 +312,7 @@ class NotesTests(unittest.TestCase):
             ("## Release notes\r\n\r\nSessions reconnect\r\nwithout losing your draft.\r\n\r\nMore text", "Sessions reconnect without losing your draft."),
             ("```\n## Release notes\nNot a note\n```\n## Release note\n<!-- template -->\nA real note.\n## Tests\nNope", "A real note."),
             ("~~~markdown\n## Release notes\nNope\n~~~\n# Release notes\nA note.\n- More details", "A note."),
+            ("````markdown\n```markdown\n## Release notes\nExample, not a note.\n```\n````\n## Release notes\nReal summary.", "Real summary."),
             ("## Release notes\n<!-- fill this in -->\n## Tests\nAll pass", None),
             ("## Release notes\nN/A", None),
             ("## Release notes\n- A list is not a paragraph", None),
@@ -366,6 +385,17 @@ class NotesTests(unittest.TestCase):
         with mock.patch.object(subprocess, "check_output", side_effect=subprocess.CalledProcessError(1, "gh")):
             with self.assertRaises(subprocess.CalledProcessError):
                 notes.host_changes("a" * 40, "b" * 40)
+
+    def test_host_dependency_lookup_is_pinned_to_the_public_repository(self):
+        notes.host_dependency_pins.cache_clear()
+        lock = {"pins": [{"location": "https://github.com/example/shared.git", "state": {"revision": "2"}}]}
+        with mock.patch.object(subprocess, "check_output", return_value=json.dumps(lock)) as request:
+            self.assertEqual(notes.host_dependency_pins("a" * 40), notes.dependency_pins(lock))
+            notes.host_dependency_pins("a" * 40)
+        self.assertEqual(request.call_count, 1)
+        self.assertIn(f"repos/{notes.HOST_REPOSITORY}/contents/Package.resolved?ref=" + "a" * 40,
+                      request.call_args.args[0])
+        notes.host_dependency_pins.cache_clear()
 
     def test_pin_only_release_gets_desktop_notes_not_a_false_empty_message(self):
         self.write_host_pin("a" * 40)

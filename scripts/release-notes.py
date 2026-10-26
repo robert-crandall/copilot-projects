@@ -2,6 +2,7 @@
 """Freeze the changes in an exact build, without publishing or changing refs."""
 
 import argparse
+from functools import cache
 import json
 from pathlib import Path
 import re
@@ -55,7 +56,11 @@ def release_summary(body):
                 if active:
                     break
                 fence = marker[1]
-            elif stripped[0] == fence[0] and len(stripped) >= len(fence):
+            elif (
+                marker[1][0] == fence[0]
+                and len(marker[1]) >= len(fence)
+                and not stripped[len(marker[1]):].strip()
+            ):
                 fence = None
             continue
         if fence:
@@ -155,6 +160,21 @@ def host_changes(previous, revision):
     return status, list(reversed(history))
 
 
+def dependency_pins(lock):
+    pins = {pin["location"]: pin for pin in lock["pins"]}
+    if len(pins) != len(lock["pins"]):
+        raise ValueError("Dependency lock contains duplicate locations")
+    return pins
+
+
+@cache
+def host_dependency_pins(revision):
+    return dependency_pins(json.loads(subprocess.check_output([
+        "gh", "api", f"repos/{HOST_REPOSITORY}/contents/Package.resolved?ref={revision}",
+        "--header", "Accept: application/vnd.github.raw+json",
+    ], text=True)))
+
+
 def pure_host_update(root, revision):
     parents = git(root, "rev-list", "--parents", "-n", "1", revision).split()[1:]
     if not parents:
@@ -168,7 +188,37 @@ def pure_host_update(root, revision):
         return False
     before = git(root, "show", f"{previous}:Package.swift")
     after = git(root, "show", f"{revision}:Package.swift")
-    return old_pin in before and before.replace(old_pin, new_pin) == after
+    if old_pin not in before or before.replace(old_pin, new_pin) != after:
+        return False
+    before_lock = json.loads(git(root, "show", f"{previous}:Package.resolved"))
+    after_lock = json.loads(git(root, "show", f"{revision}:Package.resolved"))
+    before_pins, after_pins = dependency_pins(before_lock), dependency_pins(after_lock)
+    for lock in (before_lock, after_lock):
+        lock.pop("pins")
+        lock.pop("originHash", None)
+    if before_lock != after_lock:
+        return False
+    host_url = next(
+        location for location in before_pins
+        if location.removesuffix(".git") == f"https://github.com/{HOST_REPOSITORY}"
+    )
+    before_pins[host_url]["state"]["revision"] = new_pin
+    changed = {
+        location for location in before_pins.keys() | after_pins.keys()
+        if before_pins.get(location) != after_pins.get(location)
+    }
+    if host_url in changed:
+        return False
+    if changed:
+        old_dependencies = host_dependency_pins(old_pin)
+        new_dependencies = host_dependency_pins(new_pin)
+        if any(
+            before_pins.get(location) != old_dependencies.get(location)
+            or after_pins.get(location) != new_dependencies.get(location)
+            for location in changed
+        ):
+            return False
+    return True
 
 
 def plain_text(sections):
@@ -308,7 +358,7 @@ def generate(root, repository, previous, version, build, include_host_changes=Fa
         sections["Other changes"].append(("No source changes since the previous build.", None))
     markdown = "\n\n".join(
         "## " + escape(heading) + "\n\n" + "\n".join(
-            markdown_change(title, url, repository if include_host_changes else None)
+            markdown_change(title, url, repository if include_host_changes and initial is None else None)
             for title, url in changes
         ) for heading, changes in sections.items() if changes
     ) + "\n"
