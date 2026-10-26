@@ -27,7 +27,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
     }
 
     enum Section: Hashable {
-        case recent, recentEnded, matches, luna
+        case recent, recentEnded, matches, luna, history
 
         var title: String {
             switch self {
@@ -35,6 +35,7 @@ final class SessionFinderModel: ObservableObject, Identifiable {
             case .recentEnded: return "Recent Ended Sessions"
             case .matches: return "Matches"
             case .luna: return "Suggested by Luna"
+            case .history: return "Session History"
             }
         }
     }
@@ -505,15 +506,23 @@ final class SessionFinderModel: ObservableObject, Identifiable {
                 )
             }
             // Luna's extra picks go below the instant matches so a late answer never
-            // moves the row under the cursor.
-            let listed = Set(built.map(\.id))
+            // moves the row under the cursor, and deep-history picks follow under their own section.
+            var listed = Set(built.map(\.id))
             let byId = Dictionary(
                 (available + deepAvailable).map { ($0.id, $0) },
                 uniquingKeysWith: { first, _ in first }
             )
-            for pick in picks where !listed.contains(pick.sessionId) {
+            var seenLunaIds = Set<String>()
+            for pick in lunaPicks where seenLunaIds.insert(pick.sessionId).inserted && !listed.contains(pick.sessionId) {
                 guard let entry = byId[pick.sessionId] else { continue }
+                listed.insert(pick.sessionId)
                 built.append(Row(entry: entry, section: .luna, snippet: nil, lunaReason: pick.reason))
+            }
+            var seenDeepIds = Set<String>()
+            for pick in deepPicks where seenDeepIds.insert(pick.sessionId).inserted && !listed.contains(pick.sessionId) {
+                guard let entry = byId[pick.sessionId] else { continue }
+                listed.insert(pick.sessionId)
+                built.append(Row(entry: entry, section: .history, snippet: nil, lunaReason: pick.reason))
             }
         }
         rows = built
@@ -646,7 +655,10 @@ struct SessionFinderView: View {
         } else {
             return
         }
-        if let reason = row.lunaReason, !reason.isEmpty { text += ". Suggested by Luna: \(reason)" }
+        if let reason = row.lunaReason, !reason.isEmpty {
+            let prefix = row.section == .history ? "Session History" : "Suggested by Luna"
+            text += ". \(prefix): \(reason)"
+        }
         AccessibilityNotification.Announcement(text).post()
     }
 
@@ -700,7 +712,7 @@ struct SessionFinderView: View {
         } else if rows.isEmpty && finder.luna == .searching {
             statusList(title: SessionFinderModel.Section.luna.title, message: "Luna is looking through your conversations…")
         } else if rows.isEmpty && finder.deepSearch == .searching {
-            statusList(title: SessionFinderModel.Section.luna.title, message: "Luna is searching your full session history…")
+            statusList(title: SessionFinderModel.Section.history.title, message: "Searching your full session history…")
         } else if rows.isEmpty {
             ContentUnavailableView.search(text: finder.query)
         } else {
@@ -735,10 +747,10 @@ struct SessionFinderView: View {
                             sectionHeader(SessionFinderModel.Section.luna.title)
                             statusText("Luna is looking through your conversations…")
                         } else if finder.deepSearch == .searching {
-                            if !rows.contains(where: { $0.section == .luna }) {
-                                sectionHeader(SessionFinderModel.Section.luna.title)
+                            if !rows.contains(where: { $0.section == .history }) {
+                                sectionHeader(SessionFinderModel.Section.history.title)
                             }
-                            statusText("Luna is searching your full session history…")
+                            statusText("Searching your full session history…")
                         }
                     }
                     .padding(8)
@@ -1002,15 +1014,16 @@ private struct SessionFinderRow: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: onOpen)
         .onHover { isHovering = $0 }
-        .help(reason.map { "\(title)\nSuggested by Luna: \($0)" } ?? title)
+        .help(reason.map { "\(title)\n\(row.section == .history ? "Session History" : "Suggested by Luna"): \($0)" } ?? title)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isHighlighted ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { onOpen() }
     }
 
     private var lunaMark: some View {
-        Image(systemName: "sparkle")
+        let prefix = row.section == .history ? "Session History" : "Suggested by Luna"
+        return Image(systemName: row.section == .history ? "clock.arrow.circlepath" : "sparkle")
             .foregroundStyle(StudioStyle.selectionEdge)
-            .accessibilityLabel(reason.map { "Suggested by Luna: \($0)." } ?? "Suggested by Luna.")
+            .accessibilityLabel(reason.map { "\(prefix): \($0)." } ?? "\(prefix).")
     }
 }

@@ -1265,6 +1265,7 @@ final class SessionFinderModelTests: XCTestCase {
             return false
         }
         XCTAssertEqual(finder.rows.map(\.id), ["beta", olderEntry.id])
+        XCTAssertEqual(finder.rows.map(\.section), [.luna, .history])
         XCTAssertEqual(finder.highlightedId, "beta", "Late deep-history arrivals must not jump the highlight")
         XCTAssertEqual(finder.source(for: olderEntry.id)?.resumableCopilotSessionId, olderCopilotId)
 
