@@ -81,4 +81,38 @@ final class TranscriptReloadTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(150))
         XCTAssertEqual(loads, 0)
     }
+
+    @MainActor
+    func testPollTranscriptIfNeededSkipsUnchangedFilesAndReloadsOnDiskChange() async throws {
+        let sessionId = UUID().uuidString
+        defer { SessionArtifacts.removeFiles(sessionId: sessionId) }
+        let firstDate = Date(timeIntervalSince1970: 1_788_633_600)
+        let secondDate = firstDate.addingTimeInterval(120)
+        try writeSnapshot(sessionId: sessionId, updatedAt: firstDate)
+        var loads = 0
+        let controller = TranscriptController(
+            sessionId: sessionId,
+            snapshotLoadObserver: { loads += 1 }
+        )
+        controller.reload()
+        for _ in 0 ..< 100 {
+            if controller.snapshot?.updatedAt == firstDate { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(controller.snapshot?.updatedAt, firstDate)
+        XCTAssertEqual(loads, 1)
+
+        controller.pollTranscriptIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(loads, 1)
+
+        try writeSnapshot(sessionId: sessionId, updatedAt: secondDate)
+        controller.pollTranscriptIfNeeded()
+        for _ in 0 ..< 100 {
+            if controller.snapshot?.updatedAt == secondDate { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(controller.snapshot?.updatedAt, secondDate)
+        XCTAssertEqual(loads, 2)
+    }
 }

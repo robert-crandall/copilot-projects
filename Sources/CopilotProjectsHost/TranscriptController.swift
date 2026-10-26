@@ -90,10 +90,30 @@ final class TranscriptController: ObservableObject {
         }
 
         let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.reload() }
+            Task { @MainActor [weak self] in self?.pollTranscriptIfNeeded() }
         }
         RunLoop.main.add(timer, forMode: .common)
         fallbackTimer = timer
+    }
+
+    func pollTranscriptIfNeeded() {
+        let sampledGeneration = reloadGeneration
+        let previousSignature = signature
+        let currentSessionId = sessionId
+        let path = Paths.transcriptSnapshotPath(sessionId: currentSessionId)
+        Task.detached { [weak self] in
+            let currentSignature = Self.loadSignature(
+                sessionId: currentSessionId,
+                transcriptPath: path
+            )
+            guard currentSignature != previousSignature else { return }
+            await MainActor.run { [weak self] in
+                guard let self,
+                      self.reloadGeneration == sampledGeneration,
+                      self.signature == previousSignature else { return }
+                self.reload()
+            }
+        }
     }
 
     func reload(after delay: TimeInterval = 0) {

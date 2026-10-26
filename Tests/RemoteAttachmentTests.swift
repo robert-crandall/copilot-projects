@@ -90,6 +90,85 @@ final class RemoteAttachmentTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent("\(refusedID).image").path))
     }
 
+    func testExpiredAttachmentsReclaimCapacityInSingleScan() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RemoteAttachmentStore(sessionsDirectory: root)
+        let session = UUID().uuidString
+        let bytes = try image()
+        let start = Date()
+
+        for _ in 0 ..< 128 {
+            _ = try store.store(
+                bytes,
+                id: UUID().uuidString.lowercased(),
+                sessionId: session,
+                conversationEpoch: "epoch",
+                now: start
+            )
+        }
+        XCTAssertThrowsError(try store.store(
+            bytes,
+            id: UUID().uuidString.lowercased(),
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: start
+        )) { error in
+            XCTAssertEqual(error as? RemoteAttachmentError, .full)
+        }
+
+        let afterExpiry = start.addingTimeInterval(RemoteAttachmentContract.lifetime + 1)
+        let replacementId = UUID().uuidString.lowercased()
+        let stored = try store.store(
+            bytes,
+            id: replacementId,
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: afterExpiry
+        )
+        XCTAssertEqual(stored.id, replacementId)
+        XCTAssertEqual(
+            try store.image(
+                id: replacementId,
+                sessionId: session,
+                conversationEpoch: "epoch",
+                now: afterExpiry
+            ).1,
+            bytes
+        )
+
+        let rollbackId = UUID().uuidString.lowercased()
+        let failingStore = RemoteAttachmentStore(sessionsDirectory: root) { imageURL in
+            XCTAssertTrue(FileManager.default.fileExists(atPath: imageURL.path))
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        }
+        XCTAssertThrowsError(try failingStore.store(
+            bytes,
+            id: rollbackId,
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: afterExpiry
+        ))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: store.root.appendingPathComponent("\(rollbackId).image").path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: store.root.appendingPathComponent("\(rollbackId).json").path
+            )
+        )
+        let recovered = try store.store(
+            bytes,
+            id: rollbackId,
+            sessionId: session,
+            conversationEpoch: "epoch",
+            now: afterExpiry
+        )
+        XCTAssertEqual(recovered.id, rollbackId)
+    }
+
     func testDesktopNormalizationConvertsTIFFAndBuildsPreviewablePNGForJPEGAndWidePNG() async throws {
         let limits = RemoteImageCapabilities(
             maxImages: 4,
