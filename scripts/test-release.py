@@ -316,6 +316,33 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(signing), 1)
         self.assertEqual(signing[0][-3:-1], ["--keychain", keychain])
 
+    def test_only_integrated_publisher_requests_desktop_expansion(self):
+        script = self.public / "scripts/release-notes.py"
+        capture = self.root / "generator-arguments.jsonl"
+        original = script.read_text()
+        script.write_text(
+            "import json, sys\n"
+            f"with open({str(capture)!r}, 'a') as log:\n"
+            "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n" + original
+        )
+        self.git(self.public, "add", "scripts/release-notes.py")
+        self.git(self.public, "commit", "-qm", "capture generator arguments")
+        self.git(self.public, "update-ref", "refs/remotes/origin/main", "HEAD")
+        for integrated in (True, False):
+            with self.subTest(integrated=integrated):
+                if integrated:
+                    self.env["GITHUB_REPOSITORY"] = "example/integration"
+                else:
+                    self.env.pop("GITHUB_REPOSITORY", None)
+                capture.unlink(missing_ok=True)
+                result = self.run_release(override=integrated)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                calls = [json.loads(line) for line in capture.read_text().splitlines()]
+                generation = next(args for args in calls if args[0] == "generate")
+                self.assertEqual("--host-root" in generation, integrated)
+                if integrated:
+                    self.assertEqual(generation[generation.index("--host-root") + 1], str(self.public))
+
     def test_unavailable_explicit_keychain_cannot_fall_back_to_global_identities(self):
         self.env["CODESIGN_KEYCHAIN"] = "/missing/job.keychain-db"
         self.env["FAIL_COMMAND"] = "security find-identity -v"

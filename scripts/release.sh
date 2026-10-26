@@ -236,6 +236,9 @@ if [ "$PUBLISH" = "1" ]; then
   if [ -n "${EXPECTED_PREVIOUS_SHA:-}" ]; then
     NOTES_ARGS+=(--previous "$EXPECTED_PREVIOUS_SHA")
   fi
+  if [ -n "$PROJECT_ROOT" ]; then
+    NOTES_ARGS+=(--host-root "$SCRIPT_ROOT")
+  fi
   python3 "$SCRIPT_ROOT/scripts/release-notes.py" "${NOTES_ARGS[@]}"
 fi
 
