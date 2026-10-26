@@ -2395,6 +2395,15 @@ final class AppModel: ObservableObject {
         guard ProjectsTerminalView.remotePromptPasteBytes(value) != nil,
               let location = locateIndex(sessionId) else { return .invalid }
         let session = projects[location.p].sessions[location.s]
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        if adapter.bounceBlocksAutomaticPrompts(
+            sessionId: sessionId, cachedSnapshot: session.agentActivity, now: { Date() }
+        ) {
+            return .busy
+        }
         let liveSessions = remotePromptLiveSessions?(agentProcessNames)
             ?? ProcessTree.agentSessions(
                 agentNames: agentProcessNames,
@@ -2988,7 +2997,8 @@ final class AppModel: ObservableObject {
             handoffSuffix: "set-model-request.json",
             now: clock,
             validate: { snapshot in
-                guard let target = snapshot.availableModels?
+                guard snapshot.workflow?.bounceRequested != true,
+                      let target = snapshot.availableModels?
                     .first(where: { $0.id == selection.modelId }),
                       target.disabled != true else {
                     return false
@@ -3055,6 +3065,20 @@ final class AppModel: ObservableObject {
                     return workflow.sendReady && !snapshot.hasPendingInput
                 case .abort:
                     return true
+                case .bounce:
+                    guard let location = self.locateIndex(sessionId) else { return false }
+                    let session = self.projects[location.p].sessions[location.s]
+                    let foreground = self.runtimeForegroundActivity(for: session, now: clock())
+                    return workflow.sendReady && !snapshot.hasPendingInput
+                        && !session.hasBackgroundWork && self.remoteSessionHasLiveAgent(sessionId)
+                        && self.projectedStatus(for: session, foreground: foreground, now: clock()) == .idle
+                        && self.remotePromptFences[sessionId] == nil
+                        && !snapshot.foregroundTurnActive && !snapshot.scheduledTurnActive
+                        && snapshot.activeSubagents.isEmpty && snapshot.schedules.isEmpty
+                        && snapshot.runtimeForegroundActivity(
+                            expectedSessionId: snapshot.copilotSessionId,
+                            now: clock(), minimumObservationMilliseconds: nil
+                        ) == .idle
                 case .setBudget:
                     return workflow.limitsKnown && workflow.budgetRequest == nil
                 case .answerBudget:
@@ -5920,6 +5944,10 @@ final class AppModel: ObservableObject {
         }
 
         let session = projects[loc.p].sessions[loc.s]
+        if freshSnapshot?.workflow?.bounceRequested == true
+            || session.agentActivity?.workflow?.bounceRequested == true {
+            return .failure("The session is restarting. Check the terminal before sending more work.", code: "busy")
+        }
         if session.displayStatus == .waiting || session.hasPendingInput {
             return .failure("The session is waiting for your input in the terminal.", code: "busy")
         }
