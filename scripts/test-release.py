@@ -339,7 +339,9 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout)
                 calls = [json.loads(line) for line in capture.read_text().splitlines()]
                 generation = next(args for args in calls if args[0] == "generate")
-                self.assertEqual("--include-host-changes" in generation, integrated)
+                self.assertEqual("--host-root" in generation, integrated)
+                if integrated:
+                    self.assertEqual(generation[generation.index("--host-root") + 1], str(self.public))
 
     def test_unavailable_explicit_keychain_cannot_fall_back_to_global_identities(self):
         self.env["CODESIGN_KEYCHAIN"] = "/missing/job.keychain-db"

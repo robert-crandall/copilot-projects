@@ -2,7 +2,6 @@
 """Freeze the changes in an exact build, without publishing or changing refs."""
 
 import argparse
-from functools import cache
 import json
 from pathlib import Path
 import re
@@ -44,11 +43,28 @@ def category(title, labels):
 def release_summary(body):
     if not body:
         return None
-    body = re.sub(r"<!--.*?(?:-->|$)", "", body, flags=re.DOTALL)
     active = False
     fence = None
+    comment = False
     paragraph = []
     for line in body.splitlines():
+        if not fence:
+            visible = []
+            while line:
+                if comment:
+                    end = line.find("-->")
+                    if end < 0:
+                        line = ""
+                    else:
+                        comment, line = False, line[end + 3:]
+                else:
+                    start = line.find("<!--")
+                    if start < 0:
+                        visible.append(line)
+                        break
+                    visible.append(line[:start])
+                    comment, line = True, line[start + 4:]
+            line = "".join(visible)
         stripped = line.strip()
         expanded = line.expandtabs(4)
         if stripped and len(expanded) - len(expanded.lstrip(" ")) >= 4:
@@ -85,11 +101,11 @@ def release_summary(body):
             if paragraph:
                 break
             continue
-        if re.match(r"^(?:[-+*]\s|\d+[.)]\s|>|[|]|[-*_]{3,}$)", stripped):
+        if re.match(r"^(?:[-+*]\s|\d+[.)]\s|[><|]|!\[|[-*_]{3,}$)", stripped):
             break
         paragraph.append(stripped)
     summary = " ".join(paragraph)
-    if summary.casefold() in {"", "n/a", "none", "tbd", "-"}:
+    if summary.casefold().rstrip(".!") in {"", "n/a", "none", "tbd", "-", "no user-facing changes"}:
         return None
     if len(summary) > 600:
         print("warning: Release notes summary exceeds 600 characters; using the PR title", file=sys.stderr)
@@ -135,37 +151,17 @@ def host_pin(root, revision):
     return None
 
 
-def host_changes(previous, revision):
-    pages = json.loads(subprocess.check_output([
-        "gh", "api", "--paginate", "--slurp",
-        f"repos/{HOST_REPOSITORY}/compare/{previous}...{revision}?per_page=100",
-    ], text=True))
-    if not pages or any(page["base_commit"]["sha"] != previous for page in pages):
-        raise ValueError("Desktop host comparison does not match the previous pin")
-    comparison = pages[0]
-    status = comparison["status"]
-    if status in {"behind", "diverged"}:
-        return status, []
-    if status != "ahead" or comparison["merge_base_commit"]["sha"] != previous:
-        raise ValueError("Desktop host comparison is not a forward pin update")
-    commits = {commit["sha"]: commit for page in pages for commit in page["commits"]}
-    if len(commits) != comparison["total_commits"] or revision not in commits:
-        raise ValueError("Desktop host comparison is incomplete")
-    # Compare includes side-branch work. Follow only first parents, just like the
-    # local release range; a prior pin need not itself be on the first-parent path.
-    history = []
-    seen = set()
-    current = revision
-    while current in commits:
-        if current in seen:
-            raise ValueError("Desktop host comparison contains a parent cycle")
-        seen.add(current)
-        commit = commits[current]
-        if not commit["parents"]:
-            raise ValueError("Desktop host comparison omitted a commit's parents")
-        history.append((current, commit["commit"]["message"].splitlines()[0]))
-        current = commit["parents"][0]["sha"]
-    return status, list(reversed(history))
+def host_changes(root, previous, revision):
+    def contains(older, newer):
+        result = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", older, newer])
+        if result.returncode not in (0, 1):
+            raise ValueError("Could not compare desktop host pins in the provided checkout")
+        return result.returncode == 0
+
+    if not contains(previous, revision):
+        return ("behind" if contains(revision, previous) else "diverged"), []
+    history = git(root, "log", "--first-parent", "--reverse", "--format=%H%x09%s", f"{previous}..{revision}")
+    return "ahead", [tuple(line.split("\t", 1)) for line in history.splitlines()]
 
 
 def dependency_pins(lock):
@@ -175,15 +171,11 @@ def dependency_pins(lock):
     return pins
 
 
-@cache
-def host_dependency_pins(revision):
-    return dependency_pins(json.loads(subprocess.check_output([
-        "gh", "api", f"repos/{HOST_REPOSITORY}/contents/Package.resolved?ref={revision}",
-        "--header", "Accept: application/vnd.github.raw+json",
-    ], text=True)))
+def host_dependency_pins(root, revision):
+    return dependency_pins(json.loads(git(root, "show", f"{revision}:Package.resolved")))
 
 
-def pure_host_update(root, revision):
+def pure_host_update(root, revision, host_root):
     parents = git(root, "rev-list", "--parents", "-n", "1", revision).split()[1:]
     if not parents:
         return False
@@ -218,8 +210,8 @@ def pure_host_update(root, revision):
     if host_url in changed:
         return False
     if changed:
-        old_dependencies = host_dependency_pins(old_pin)
-        new_dependencies = host_dependency_pins(new_pin)
+        old_dependencies = host_dependency_pins(host_root, old_pin)
+        new_dependencies = host_dependency_pins(host_root, new_pin)
         if any(
             before_pins.get(location) != old_dependencies.get(location)
             or after_pins.get(location) != new_dependencies.get(location)
@@ -316,7 +308,7 @@ def initial_sections(root, repository, previous, revision):
     return sections
 
 
-def generate(root, repository, previous, version, build, include_host_changes=False):
+def generate(root, repository, previous, version, build, host_root=None):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", repository):
         raise ValueError("Repository must be owner/name")
     if not version or not build:
@@ -341,10 +333,10 @@ def generate(root, repository, previous, version, build, include_host_changes=Fa
     if previous and initial is None:
         old_host, new_host = host_pin(root, previous), host_pin(root, revision)
         if old_host and new_host and old_host != new_host:
-            if include_host_changes:
-                status, desktop_history = host_changes(old_host, new_host)
+            if host_root is not None:
+                status, desktop_history = host_changes(host_root, old_host, new_host)
                 if status == "ahead":
-                    history = [(sha, subject) for sha, subject in history if not pure_host_update(root, sha)]
+                    history = [(sha, subject) for sha, subject in history if not pure_host_update(root, sha, host_root)]
                 else:
                     description = (
                         "Desktop host rolled back to an earlier revision; compare the removed changes"
@@ -366,7 +358,7 @@ def generate(root, repository, previous, version, build, include_host_changes=Fa
         sections["Other changes"].append(("No source changes since the previous build.", None))
     markdown = "\n\n".join(
         "## " + escape(heading) + "\n\n" + "\n".join(
-            markdown_change(title, url, repository if include_host_changes and initial is None else None)
+            markdown_change(title, url, repository if host_root is not None and initial is None else None)
             for title, url in changes
         ) for heading, changes in sections.items() if changes
     ) + "\n"
@@ -404,8 +396,8 @@ def main():
     create.add_argument("--repository", required=True)
     create.add_argument("--previous")
     create.add_argument("--output", type=Path, required=True)
-    create.add_argument("--include-host-changes", action="store_true",
-                        help="Include public desktop changes for an integrated desktop build")
+    create.add_argument("--host-root", type=Path,
+                        help="Verified public desktop checkout for an integrated desktop build")
     check = sub.add_parser("validate")
     check.add_argument("--file", type=Path, required=True)
     check.add_argument("--markdown", action="store_true")
@@ -415,7 +407,7 @@ def main():
     args = parser.parse_args()
     if args.command == "generate":
         document = generate(args.root, args.repository, args.previous, args.version, args.build,
-                            args.include_host_changes)
+                            args.host_root)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(document, ensure_ascii=False) + "\n", encoding="utf-8")
     else:

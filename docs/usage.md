@@ -758,20 +758,32 @@ return to automatic notes. Each section contains `[text, GitHub-link-or-null]`
 entries; malformed content fails generation rather than silently replacing it.
 Links stay within this repository or the public host.
 
+Subsequent published builds generate notes from first-parent commits since the
+previous complete release. Merged pull requests use their GitHub titles and
+labels; direct commits use their subjects. Features, fixes, and other changes are
+grouped automatically. Write descriptive titles; `bug`/`fix` and
+`enhancement`/`feature` labels take precedence over title-prefix classification.
+
+The same version-stamped snapshot is signed into the app and used in the GitHub
+release body before the existing install instructions. API failures, mismatched
+versions, and changed release predecessors fail publication rather than silently
+publishing stale or empty notes. `scripts/test-release-notes.py` exercises the
+generator without network access.
+
 ### App-focused notes for integrated builds
 
-The integrated desktop publisher passes `--include-host-changes` to the shared
-generator. It combines its own changes with the public desktop changes between
+The integrated desktop publisher passes its verified public checkout using
+`--host-root` to the shared generator. It combines its own changes with the public desktop changes between
 the previous release's host pin and the new pin, including skipped desktop
-versions. This comparison uses immutable commit IDs, not the latest release.
-Incomplete comparisons and GitHub errors stop generation rather than silently
-omitting desktop changes.
+versions. Git reads the first-parent history and dependency locks at those
+immutable commit IDs, not the latest release. Missing history and GitHub metadata
+errors stop generation rather than silently omitting desktop changes.
 
 Pure host updates are replaced by the changes they bring in. A commit must change
 only `Package.swift` and `Package.resolved`, with the manifest changing only the
 host revision; shared dependency lock updates may accompany it only when they
-match the exact old and new desktop lockfiles. Independent dependency upgrades and mixed feature
-commits remain visible. Identical entries are combined while retaining all source
+match the exact old and new desktop lockfiles. Independent dependency upgrades
+and mixed feature commits remain visible. Identical entries are combined while retaining all source
 links, and desktop PR links name their repository to distinguish them from
 companion PRs. Rollbacks and divergent host history are named explicitly rather
 than presented as new fixes.
@@ -804,15 +816,3 @@ No model rewrites or invents release-note claims.
 Like PR titles, summaries are read when the release is generated. Once generated,
 the snapshot is frozen; later edits to a PR body do not change an installed app's
 notes or retroactively update a published release.
-
-Subsequent published builds generate notes from first-parent commits since the previous
-complete release. Merged pull requests use their GitHub titles and labels;
-direct commits use their subjects. Features, fixes, and other changes are grouped
-automatically. Write descriptive titles; `bug`/`fix` and `enhancement`/`feature`
-labels take precedence over title-prefix classification.
-
-The same version-stamped snapshot is signed into the app and used in the GitHub
-release body before the existing install instructions. API failures, mismatched
-versions, and changed release predecessors fail publication rather than silently
-publishing stale or empty notes. `scripts/test-release-notes.py` exercises the
-generator without network access.
