@@ -8490,6 +8490,9 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
             String(repeating: "[x](u) ", count: 30_000)
         ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "<https://x> ", count: 20_000)
+        ))
         let wideHeader = Array(repeating: "h", count: 50).joined(separator: " | ")
         let wideDelimiter = Array(repeating: "---", count: 50).joined(separator: " | ")
         let sparseRows = Array(repeating: "a | b", count: 25).joined(separator: "\n")
@@ -8626,7 +8629,78 @@ final class AppLogicTests: XCTestCase {
         let multiRowRange = tableString.range(of: multiRowTarget)
         XCTAssertNotEqual(multiRowRange.location, NSNotFound)
         tableTextView.setSelectedRange(multiRowRange)
-        XCTAssertEqual(tableString.substring(with: tableTextView.selectedRange()), multiRowTarget)
+        XCTAssertEqual(tableTextView.selectedCopiedText(), multiRowTarget)
+
+        // Header divider sits strictly between the header glyphs and first body row.
+        let dividerY = try XCTUnwrap(tableTextView.headerDividerY())
+        let headerGlyphs = tableTextView.layoutManager!.glyphRange(
+            forCharacterRange: tableString.range(of: "Arm"),
+            actualCharacterRange: nil
+        )
+        let headerRect = tableTextView.layoutManager!.boundingRect(
+            forGlyphRange: headerGlyphs,
+            in: tableTextView.textContainer!
+        )
+        let firstBodyGlyphs = tableTextView.layoutManager!.glyphRange(
+            forCharacterRange: tableString.range(of: "3x Alligator"),
+            actualCharacterRange: nil
+        )
+        let firstBodyRect = tableTextView.layoutManager!.boundingRect(
+            forGlyphRange: firstBodyGlyphs,
+            in: tableTextView.textContainer!
+        )
+        XCTAssertGreaterThan(dividerY, headerRect.maxY)
+        XCTAssertLessThan(dividerY, firstBodyRect.minY)
+
+        // First-column right alignment positions column 0 glyphs to the right of x=0.
+        let rightAlignedFirstCol = """
+        | Count | Name |
+        | ---: | :--- |
+        | 1 | alpha |
+        | 100000 | beta |
+        """
+        let rightHost = NSHostingView(
+            rootView: MarkdownText(text: rightAlignedFirstCol)
+                .frame(width: 320, alignment: .leading)
+        )
+        rightHost.frame = NSRect(x: 0, y: 0, width: 320, height: 200)
+        rightHost.layoutSubtreeIfNeeded()
+        let rightTableTextView = try XCTUnwrap(findTextViews(in: rightHost).first)
+        let rightTableString = rightTableTextView.attributedText.string as NSString
+        let shortNumGlyph = rightTableTextView.layoutManager!.glyphRange(
+            forCharacterRange: rightTableString.range(of: "1\talpha"),
+            actualCharacterRange: nil
+        )
+        let shortNumLocation = rightTableTextView.layoutManager!.location(
+            forGlyphAt: shortNumGlyph.location
+        )
+        XCTAssertGreaterThan(shortNumLocation.x, 10)
+
+        // Selecting across wrapped table cells reconstructs logical cell text without interleaved wrap fragments.
+        let longCell = "Arm (1/2/2 voting + Astra medium agg with extra wrapped description text across lines)"
+        let wrappedTableMarkdown = """
+        | Arm | Score |
+        | :--- | ---: |
+        | \(longCell) | 85.4% / 33.2% |
+        | 3x Terra 6.1 (xhigh) | 83.3% / 34.3% |
+        """
+        let wrappedTableHost = NSHostingView(
+            rootView: MarkdownText(text: wrappedTableMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        wrappedTableHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        wrappedTableHost.layoutSubtreeIfNeeded()
+        let wrappedTableTextView = try XCTUnwrap(findTextViews(in: wrappedTableHost).first)
+        let wrappedString = wrappedTableTextView.attributedText.string as NSString
+        let bodyStart = wrappedString.range(of: "Arm (1/2/2").location
+        XCTAssertNotEqual(bodyStart, NSNotFound)
+        wrappedTableTextView.setSelectedRange(
+            NSRange(location: bodyStart, length: wrappedString.length - bodyStart)
+        )
+        XCTAssertEqual(
+            wrappedTableTextView.selectedCopiedText(),
+            "\(longCell)\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
+        )
 
         func renderedTableHeight(_ detail: String) -> CGFloat {
             let md = """
