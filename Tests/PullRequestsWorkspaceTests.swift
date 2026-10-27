@@ -800,6 +800,141 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         try await waitUntil { !model.isRefreshing && model.lastUpdated != updated }
         XCTAssertTrue(model.sessionsKnown, "sessions arriving later are matched by another refresh")
     }
+
+    func testWorkspaceLoopRefreshesImmediatelyOnStateAndSessionsEventsAndSkipsUnchangedPolls() async throws {
+        let stateDir = root.appendingPathComponent("workspace-state", isDirectory: true)
+        let sessionsDir = stateDir.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try Data(#"{"schemaVersion":1}"#.utf8).write(to: stateDir.appendingPathComponent("state.json"), options: .atomic)
+
+        var addedSessionSnapshot = fixtureSnapshot
+        addedSessionSnapshot.projects[0].sessions.append(
+            .init(id: "s2", title: "New session", status: .running, copilotSessionId: "abcdef12-0002")
+        )
+        var idleSessionSnapshot = addedSessionSnapshot
+        idleSessionSnapshot.projects[0].sessions[1].status = .idle
+        var unseenClearedSnapshot = idleSessionSnapshot
+        unseenClearedSnapshot.projects[0].sessions[0].status = .idle
+
+        let workspace = FakeWorkspace(fetches: [
+            .snapshot(fixtureSnapshot),
+            .snapshot(addedSessionSnapshot),
+            .snapshot(idleSessionSnapshot),
+            .snapshot(unseenClearedSnapshot),
+        ])
+        var now = testNow
+        let model = PullRequestsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: UUID().uuidString)!,
+            stateDirectory: root.appendingPathComponent("pr-state", isDirectory: true),
+            workspaceStateDirectory: stateDir,
+            workspacePollInterval: 30,
+            workspaceUnchangedPollInterval: 15,
+            workspaceWatchDebounce: 0.02,
+            loadAccounts: { [] },
+            clock: { now },
+            isVisible: { true },
+            presentError: { _, _ in }
+        )
+        let loop = Task { await model.runWorkspaceLoop() }
+        defer { loop.cancel() }
+
+        try await waitUntil { workspace.snapshotCalls == 1 && model.workspace == .connected(fixtureSnapshot) }
+
+        // Unchanged state and sessions directories skip redundant list-sessions polls.
+        await model.pollWorkspaceIfNeeded()
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+
+        // Excluded transcript/staging/helper files do not invalidate the signature.
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: sessionsDir.appendingPathComponent("s1.transcript-live.json"), options: .atomic)
+        try Data("{}".utf8).write(to: sessionsDir.appendingPathComponent("s1.transcript.json"), options: .atomic)
+        try Data("{}".utf8).write(to: sessionsDir.appendingPathComponent(".staging.tmp"), options: .atomic)
+        try FileManager.default.createDirectory(
+            at: stateDir.appendingPathComponent("pull-requests", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("{}".utf8).write(to: stateDir.appendingPathComponent("pull-requests/goals.json"), options: .atomic)
+        try await Task.sleep(nanoseconds: 80_000_000)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 1, "excluded transcript and helper files must not trigger a poll")
+
+        // Updating state.json triggers an immediate event-driven refresh well before the 30s poll interval.
+        try Data(#"{"schemaVersion":1,"updated":2}"#.utf8).write(
+            to: stateDir.appendingPathComponent("state.json"),
+            options: .atomic
+        )
+        try await waitUntil { model.workspace == .connected(addedSessionSnapshot) }
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2, "settled state.json update skips redundant polls")
+
+        // Updating a tracked file in sessions/ triggers an immediate event-driven refresh.
+        try Data(#"{"schemaVersion":1,"status":"idle"}"#.utf8).write(
+            to: sessionsDir.appendingPathComponent("s2.status-record.json"),
+            options: .atomic
+        )
+        try await waitUntil { model.workspace == .connected(idleSessionSnapshot) }
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+
+        // Advancing past the staleness cap forces a backstop poll even without disk changes.
+        now = now.addingTimeInterval(16)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 4)
+        XCTAssertEqual(model.workspace, .connected(unseenClearedSnapshot))
+    }
+
+    func testDiskChangeBeforeHostAppliesInMemoryUpdateAllowsOneFollowUpPoll() async throws {
+        let stateDir = root.appendingPathComponent("lagged-state", isDirectory: true)
+        let sessionsDir = stateDir.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+        var updatedSnapshot = fixtureSnapshot
+        updatedSnapshot.projects[0].sessions[0].status = .idle
+        // Second fetch still returns fixtureSnapshot (simulating host lag after hook file write);
+        // third fetch returns updatedSnapshot.
+        let workspace = FakeWorkspace(fetches: [
+            .snapshot(fixtureSnapshot),
+            .snapshot(fixtureSnapshot),
+            .snapshot(updatedSnapshot),
+        ])
+        let model = PullRequestsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: UUID().uuidString)!,
+            stateDirectory: root.appendingPathComponent("pr-state", isDirectory: true),
+            workspaceStateDirectory: stateDir,
+            loadAccounts: { [] },
+            clock: { testNow },
+            isVisible: { true },
+            presentError: { _, _ in }
+        )
+
+        await model.pollWorkspace()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+
+        // Hook writes status-record.json before host applies set-status in memory.
+        try Data(#"{"schemaVersion":1,"status":"idle"}"#.utf8).write(
+            to: sessionsDir.appendingPathComponent("s1.status-record.json"),
+            options: .atomic
+        )
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+        XCTAssertEqual(model.workspace, .connected(fixtureSnapshot))
+
+        // Because the snapshot was unchanged despite the disk change, one follow-up poll is allowed.
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+        XCTAssertEqual(model.workspace, .connected(updatedSnapshot))
+
+        // Once settled, subsequent polls with no further disk change are skipped.
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+    }
 }
 
 final class PullRequestsAppSupportTests: XCTestCase {

@@ -20,6 +20,10 @@ final class PullRequestsModel: ObservableObject {
     static let reopenFreshness: TimeInterval = 60
     /// How often the workspace's sessions are read while the window is visible.
     static let workspacePollInterval: TimeInterval = 2
+    /// Backstop interval when the workspace state and sessions directories are unchanged.
+    static let workspaceUnchangedPollInterval: TimeInterval = 15
+    /// Coalescing debounce for state/sessions directory file-system events.
+    static let workspaceWatchDebounce: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval
     /// How long Resume Session stays busy waiting for the resumed session to report itself.
     static let resumeSettleInterval: TimeInterval = 20
     /// The pause between searches for ended sessions while some are left unread.
@@ -89,6 +93,13 @@ final class PullRequestsModel: ObservableObject {
     /// The last snapshot Copilot Projects sent, kept to group lanes while it's away.
     private var lastGoodSnapshot: WorkspaceSnapshot?
     private var workspacePollInFlight = false
+    private let workspaceStateDirectory: URL?
+    private let workspacePollPeriod: TimeInterval
+    private let workspaceUnchangedPollPeriod: TimeInterval
+    private let workspaceWatchDebouncePeriod: TimeInterval
+    private var lastWorkspaceSignature: WorkspaceDirectorySignature?
+    private var settledWorkspaceSignature: WorkspaceDirectorySignature?
+    private var lastWorkspacePollAt: Date?
     /// The last refresh matched transcripts without live sessions, so the next
     /// snapshot matches them again.
     private var matchedWithoutSessions = false
@@ -142,6 +153,10 @@ final class PullRequestsModel: ObservableObject {
         settingsNote: String? = nil,
         storageNote: String? = nil,
         stateDirectory: URL? = Paths.pullRequestsStateDir,
+        workspaceStateDirectory: URL? = nil,
+        workspacePollInterval: TimeInterval = PullRequestsModel.workspacePollInterval,
+        workspaceUnchangedPollInterval: TimeInterval = PullRequestsModel.workspaceUnchangedPollInterval,
+        workspaceWatchDebounce: TimeInterval = PullRequestsModel.workspaceWatchDebounce,
         service: PullRequestService = PullRequestService(),
         loadAccounts: @escaping @Sendable () async throws -> [GitHubAccount] = { try await PullRequestsModel.signedInAccounts() },
         resumableFinder: (any ResumableSessionSearching)? = nil,
@@ -160,6 +175,10 @@ final class PullRequestsModel: ObservableObject {
         self.defaults = defaults
         self.settingsNote = settingsNote
         self.storageNote = storageNote
+        self.workspaceStateDirectory = workspaceStateDirectory ?? workspace.stateDirectory
+        workspacePollPeriod = workspacePollInterval
+        workspaceUnchangedPollPeriod = workspaceUnchangedPollInterval
+        workspaceWatchDebouncePeriod = workspaceWatchDebounce
         self.service = service
         self.loadAccounts = loadAccounts
         self.isVisible = isVisible
@@ -309,16 +328,42 @@ final class PullRequestsModel: ObservableObject {
         return prs.filter { sessionless.contains($0.key) }
     }
 
-    /// Reads the workspace when the window opens, then every two seconds while
-    /// it is visible. Each read finishes, or times out, before the next starts.
+    /// Reads the workspace when the window opens, then on state/sessions directory
+    /// changes or periodic backstop ticks while it is visible. Each read finishes,
+    /// or times out, before the next starts.
     func runWorkspaceLoop() async {
         guard !hostedReadOnly else { return }
+        let watcher = workspaceStateDirectory.map {
+            WorkspaceDirectoryWatcher(stateDirectory: $0, debounceInterval: workspaceWatchDebouncePeriod)
+        }
+        defer { watcher?.stop() }
         await pollWorkspace()
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: UInt64(Self.workspacePollInterval * 1_000_000_000))
+            if let watcher {
+                await watcher.waitForNextPoll(timeout: workspacePollPeriod)
+            } else {
+                try? await Task.sleep(nanoseconds: UInt64(workspacePollPeriod * 1_000_000_000))
+            }
             guard !Task.isCancelled else { break }
-            if isVisible() { await pollWorkspace() }
+            if isVisible() { await pollWorkspaceIfNeeded() }
         }
+    }
+
+    /// Reads the workspace when the state or sessions directory signature has
+    /// changed since the last settled poll, or when the staleness cap has elapsed.
+    func pollWorkspaceIfNeeded() async {
+        if isConnected,
+           resumingSessions.isEmpty,
+           resumeDeadlines.isEmpty,
+           !pendingPrompts.values.contains(where: \.isQueuedNative),
+           let settledWorkspaceSignature,
+           let lastWorkspacePollAt,
+           clock().timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
+           let directory = workspaceStateDirectory,
+           await WorkspaceDirectorySignature.captureAsync(at: directory) == settledWorkspaceSignature {
+            return
+        }
+        await pollWorkspace()
     }
 
     /// Reads the workspace now. A read already on its way finishes first, so
@@ -330,10 +375,52 @@ final class PullRequestsModel: ObservableObject {
         }
         workspacePollInFlight = true
         defer { workspacePollInFlight = false }
-        apply(await source.snapshot())
+        let sampledSignature: WorkspaceDirectorySignature?
+        if let directory = workspaceStateDirectory {
+            sampledSignature = await WorkspaceDirectorySignature.captureAsync(at: directory)
+        } else {
+            sampledSignature = nil
+        }
+        let previousSnapshot = connectedSnapshot
+        let fetch = await source.snapshot()
+        apply(fetch)
+        recordWorkspacePoll(
+            fetch: fetch,
+            previousSnapshot: previousSnapshot,
+            sampledSignature: sampledSignature
+        )
         if isConnected {
             await reconcileQueuedPrompts()
         }
+    }
+
+    private func recordWorkspacePoll(
+        fetch: WorkspaceFetch,
+        previousSnapshot: WorkspaceSnapshot?,
+        sampledSignature: WorkspaceDirectorySignature?
+    ) {
+        guard case .snapshot(let snapshot) = fetch else {
+            lastWorkspaceSignature = nil
+            settledWorkspaceSignature = nil
+            lastWorkspacePollAt = nil
+            return
+        }
+        lastWorkspacePollAt = clock()
+        guard let sampledSignature else {
+            lastWorkspaceSignature = nil
+            settledWorkspaceSignature = nil
+            return
+        }
+        if lastWorkspaceSignature == nil
+            || sampledSignature == lastWorkspaceSignature
+            || snapshot != previousSnapshot {
+            settledWorkspaceSignature = sampledSignature
+        } else {
+            // Disk changed before the host's in-memory snapshot changed; allow
+            // one follow-up periodic poll at this signature before settling.
+            settledWorkspaceSignature = nil
+        }
+        lastWorkspaceSignature = sampledSignature
     }
 
     func apply(_ fetch: WorkspaceFetch) {

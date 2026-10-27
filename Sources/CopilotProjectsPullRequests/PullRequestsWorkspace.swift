@@ -26,6 +26,9 @@ enum WorkspaceCommandResult: Equatable, Sendable {
 
 /// The workspace the Pull Requests app reads sessions from and acts on.
 protocol PullRequestsWorkspace: Sendable {
+    /// The host state directory (`state.json` and `sessions/`) whose changes
+    /// trigger workspace refreshes; nil when not backed by a local state directory.
+    var stateDirectory: URL? { get }
     func snapshot() async -> WorkspaceFetch
     /// Selects a session in the workspace window without activating the app.
     func revealSession(projectId: String?, sessionId: String) async -> WorkspaceCommandResult
@@ -42,8 +45,313 @@ protocol PullRequestsWorkspace: Sendable {
 }
 
 extension PullRequestsWorkspace {
+    var stateDirectory: URL? { nil }
+
     func reviewPullRequest(projectId: String, requestId: UUID, pullRequestURL: String) async -> WorkspaceCommandResult {
         .refused(code: "unsupported", message: "Reviewing pull requests is not supported by this workspace.")
+    }
+}
+
+/// Modification fingerprint of the host's workspace state (`state.json` and
+/// `sessions/`), used by the helper apps to skip redundant `list-sessions`
+/// socket polls when nothing on disk has changed since the last successful poll.
+struct WorkspaceDirectorySignature: Equatable, Sendable {
+    struct DirectoryIdentity: Equatable, Sendable {
+        let device: Int32
+        let inode: UInt64
+
+        init?(path: String) {
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return nil }
+            device = info.st_dev
+            inode = info.st_ino
+        }
+    }
+
+    struct FileFingerprint: Equatable, Sendable {
+        let device: Int32
+        let inode: UInt64
+        let mode: UInt16
+        let size: Int64
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let statusChangedSeconds: Int
+        let statusChangedNanoseconds: Int
+
+        init?(path: String) {
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return nil }
+            device = info.st_dev
+            inode = info.st_ino
+            mode = info.st_mode
+            size = info.st_size
+            modifiedSeconds = info.st_mtimespec.tv_sec
+            modifiedNanoseconds = info.st_mtimespec.tv_nsec
+            statusChangedSeconds = info.st_ctimespec.tv_sec
+            statusChangedNanoseconds = info.st_ctimespec.tv_nsec
+        }
+    }
+
+    struct NamedEntry: Equatable, Sendable {
+        let name: String
+        let fingerprint: FileFingerprint?
+    }
+
+    let stateEntries: [NamedEntry]
+    let sessionEntries: [NamedEntry]
+
+    private static let trackedStateFiles = [
+        "app.lock",
+        "control.sock",
+        "project-creation-ledger.json",
+        "session-creation-ledger.json",
+        "state.json",
+        "state.json.backup",
+        "state.json.closing",
+    ]
+
+    private static let ignoredSessionSuffixes = [
+        ".tmp",
+        ".transcript.json",
+        ".transcript-live.json",
+        ".transcript-owner.json",
+        ".transcript-owner.json.flock",
+        ".transcript-quarantine.json",
+    ]
+
+    static func isTrackedSessionEntry(_ name: String) -> Bool {
+        guard !name.isEmpty, !name.hasPrefix(".") else { return false }
+        if name.contains(".status-record.json.") { return false }
+        return !ignoredSessionSuffixes.contains { name.hasSuffix($0) }
+    }
+
+    static func capture(at directory: URL) -> WorkspaceDirectorySignature {
+        let stateEntries: [NamedEntry] = trackedStateFiles.compactMap { name in
+            let path = directory.appendingPathComponent(name).path
+            guard let fingerprint = FileFingerprint(path: path) else { return nil }
+            return NamedEntry(name: name, fingerprint: fingerprint)
+        }
+        let sessionsURL = directory.appendingPathComponent("sessions", isDirectory: true)
+        let sessionsPath = sessionsURL.path
+        let sessionNames = ((try? FileManager.default.contentsOfDirectory(atPath: sessionsPath)) ?? [])
+            .filter(isTrackedSessionEntry)
+            .sorted()
+        let sessionEntries = sessionNames.map { name in
+            NamedEntry(
+                name: name,
+                fingerprint: FileFingerprint(path: sessionsURL.appendingPathComponent(name).path)
+            )
+        }
+        return WorkspaceDirectorySignature(
+            stateEntries: stateEntries,
+            sessionEntries: sessionEntries
+        )
+    }
+
+    static func captureAsync(at directory: URL) async -> WorkspaceDirectorySignature {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: capture(at: directory))
+            }
+        }
+    }
+}
+
+/// Watches the host workspace's state and sessions directories with
+/// `DispatchSourceFileSystemObject` and coalesces bursts into debounced wakeups.
+@MainActor
+final class WorkspaceDirectoryWatcher {
+    static let defaultDebounceInterval: TimeInterval = 0.05
+
+    private enum Target: Hashable {
+        case parentDirectory
+        case stateDirectory
+        case sessionsDirectory
+        case stateFile
+    }
+
+    private struct WatchedSource {
+        let identity: WorkspaceDirectorySignature.DirectoryIdentity
+        let source: DispatchSourceFileSystemObject
+    }
+
+    let stateDirectory: URL
+    let debounceInterval: TimeInterval
+    private var sources: [Target: WatchedSource] = [:]
+    private var debounceWork: DispatchWorkItem?
+    private var timeoutWork: DispatchWorkItem?
+    private var waiter: (id: UUID, continuation: CheckedContinuation<Void, Never>)?
+    private var hasPendingEvent = false
+    private var isStopped = false
+
+    init(stateDirectory: URL, debounceInterval: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval) {
+        self.stateDirectory = stateDirectory
+        self.debounceInterval = max(0, debounceInterval)
+        refreshSources()
+    }
+
+    deinit {
+        debounceWork?.cancel()
+        timeoutWork?.cancel()
+        for entry in sources.values {
+            entry.source.cancel()
+        }
+    }
+
+    func stop() {
+        isStopped = true
+        debounceWork?.cancel()
+        debounceWork = nil
+        hasPendingEvent = false
+        if let continuation = takeWaiter() {
+            continuation.resume()
+        }
+        for key in Array(sources.keys) {
+            invalidateSource(for: key)
+        }
+    }
+
+    /// Waits until either a coalesced filesystem event fires or `timeout` elapses.
+    func waitForNextPoll(timeout: TimeInterval) async {
+        guard !isStopped, !Task.isCancelled else { return }
+        refreshSources()
+        if hasPendingEvent {
+            hasPendingEvent = false
+            return
+        }
+        let waiterId = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if isStopped || Task.isCancelled || hasPendingEvent {
+                    hasPendingEvent = false
+                    continuation.resume()
+                    return
+                }
+                replaceWaiter(id: waiterId, continuation: continuation, timeout: timeout)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelWaiter(id: waiterId)
+            }
+        }
+    }
+
+    private func refreshSources() {
+        guard !isStopped else { return }
+        let statePath = stateDirectory.path
+        if WorkspaceDirectorySignature.DirectoryIdentity(path: statePath) != nil {
+            invalidateSource(for: .parentDirectory)
+            ensureSource(for: .stateDirectory, path: statePath)
+            ensureSource(
+                for: .sessionsDirectory,
+                path: stateDirectory.appendingPathComponent("sessions", isDirectory: true).path
+            )
+            ensureSource(
+                for: .stateFile,
+                path: stateDirectory.appendingPathComponent("state.json").path
+            )
+        } else {
+            invalidateSource(for: .stateDirectory)
+            invalidateSource(for: .sessionsDirectory)
+            invalidateSource(for: .stateFile)
+            ensureSource(
+                for: .parentDirectory,
+                path: stateDirectory.deletingLastPathComponent().path
+            )
+        }
+    }
+
+    private func ensureSource(for target: Target, path: String) {
+        guard let currentIdentity = WorkspaceDirectorySignature.DirectoryIdentity(path: path) else {
+            invalidateSource(for: target)
+            return
+        }
+        if let existing = sources[target], existing.identity == currentIdentity {
+            return
+        }
+        invalidateSource(for: target)
+        let descriptor = open(path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .rename, .delete, .attrib],
+            queue: .main
+        )
+        source.setEventHandler { [weak self, weak source] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let flags = source?.data ?? []
+                self.handleEvent(for: target, flags: flags)
+            }
+        }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        source.resume()
+        sources[target] = WatchedSource(identity: currentIdentity, source: source)
+    }
+
+    private func invalidateSource(for target: Target) {
+        guard let removed = sources.removeValue(forKey: target) else { return }
+        removed.source.cancel()
+    }
+
+    private func handleEvent(for target: Target, flags: DispatchSource.FileSystemEvent) {
+        guard !isStopped else { return }
+        if !flags.intersection([.delete, .rename, .revoke]).isEmpty {
+            invalidateSource(for: target)
+        }
+        refreshSources()
+        scheduleDebouncedWake()
+    }
+
+    private func scheduleDebouncedWake() {
+        guard debounceWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, !self.isStopped else { return }
+                self.debounceWork = nil
+                self.refreshSources()
+                if let continuation = self.takeWaiter() {
+                    continuation.resume()
+                } else {
+                    self.hasPendingEvent = true
+                }
+            }
+        }
+        debounceWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounceInterval, execute: work)
+    }
+
+    private func replaceWaiter(
+        id: UUID,
+        continuation: CheckedContinuation<Void, Never>,
+        timeout: TimeInterval
+    ) {
+        if let previous = takeWaiter() {
+            previous.resume()
+        }
+        waiter = (id, continuation)
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.waiter?.id == id, let continuation = self.takeWaiter() else { return }
+                continuation.resume()
+            }
+        }
+        timeoutWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, timeout), execute: work)
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard waiter?.id == id, let continuation = takeWaiter() else { return }
+        continuation.resume()
+    }
+
+    private func takeWaiter() -> CheckedContinuation<Void, Never>? {
+        timeoutWork?.cancel()
+        timeoutWork = nil
+        defer { waiter = nil }
+        return waiter?.continuation
     }
 }
 
@@ -52,10 +360,22 @@ extension PullRequestsWorkspace {
 actor ControlWorkspaceBridge: PullRequestsWorkspace {
     let socketPath: String
     let timeout: TimeInterval
+    nonisolated let stateDirectory: URL?
 
-    init(socketPath: String = Paths.socketPath, timeout: TimeInterval = 3) {
+    init(
+        socketPath: String = Paths.socketPath,
+        timeout: TimeInterval = 3,
+        stateDirectory: URL? = nil
+    ) {
         self.socketPath = socketPath
         self.timeout = timeout
+        if let stateDirectory {
+            self.stateDirectory = stateDirectory
+        } else if socketPath == Paths.socketPath {
+            self.stateDirectory = Paths.stateDir
+        } else {
+            self.stateDirectory = nil
+        }
     }
 
     func snapshot() async -> WorkspaceFetch {

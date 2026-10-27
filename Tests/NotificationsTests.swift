@@ -2051,6 +2051,79 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(restartedModel.preferredProjectId(for: prItem.thread), "p", "last chosen review project persists across launches")
     }
 
+    func testWorkspaceLoopRefreshesImmediatelyOnDiskEventsAndSkipsUnchangedPolls() async throws {
+        let stateDir = FileManager.default.temporaryDirectory.appendingPathComponent("notif-ws-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = stateDir.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stateDir) }
+        try Data(#"{"schemaVersion":1}"#.utf8).write(to: stateDir.appendingPathComponent("state.json"), options: .atomic)
+
+        let initialSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: []),
+        ])
+        let linkedSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Review PR", status: .running, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let waitingSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Review PR", status: .waiting, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let workspace = FakeWorkspace(fetches: [
+            .snapshot(initialSnapshot),
+            .snapshot(linkedSnapshot),
+            .snapshot(waitingSnapshot),
+        ])
+        let clock = TestClock(now)
+        let model = NotificationsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            workspaceStateDirectory: stateDir,
+            workspacePollInterval: 30,
+            workspaceUnchangedPollInterval: 15,
+            workspaceWatchDebounce: 0.02,
+            loadAccounts: { [] },
+            transcriptPath: { _ in nil },
+            clock: { clock.now },
+            isVisible: { true }
+        )
+        model.setBadge = { _ in }
+        model.show([thread("1", "review_requested")], accounts: ["octocat"])
+
+        let loop = Task { await model.runWorkspaceLoop() }
+        defer { loop.cancel() }
+
+        try await waitUntil { workspace.snapshotCalls == 1 && model.workspace == .connected(initialSnapshot) }
+
+        // Unchanged signature skips redundant polls.
+        await model.pollWorkspaceIfNeeded()
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+
+        // Writing state.json triggers an immediate refresh and links the new session.
+        try Data(#"{"schemaVersion":1,"sessions":1}"#.utf8).write(
+            to: stateDir.appendingPathComponent("state.json"),
+            options: .atomic
+        )
+        try await waitUntil { model.links[PullRequestKey("octo/app#1")!] == "s1" }
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+
+        // Writing a session status record in sessions/ triggers an immediate refresh.
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        try Data(#"{"schemaVersion":1,"status":"waiting"}"#.utf8).write(
+            to: sessionsDir.appendingPathComponent("s1.status-record.json"),
+            options: .atomic
+        )
+        try await waitUntil { model.liveSessions["s1"]?.status == .waiting }
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+    }
+
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {
