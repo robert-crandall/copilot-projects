@@ -2,7 +2,9 @@ import XCTest
 @testable import CopilotProjectsHost
 import CopilotProjectsCore
 import CopilotProjectsProtocol
+import CopilotProjectsUI
 import AppKit
+import SwiftUI
 import SwiftTerm
 import Combine
 import Security
@@ -8481,6 +8483,105 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
             Array(repeating: "**x** ", count: 40_000).joined()
         ))
+    }
+
+    @MainActor
+    func testMarkdownSelectableTextViewSupportsRangeSelectionAcrossBlocks() throws {
+        let markdown = """
+        # Summary
+
+        ASSISTANT_DELTA A separate follow-up with *`emphasized_code`*.
+
+        1. Review the **selected** reply.
+        2. Do not include its siblings.
+
+        > Quoted note at the end.
+        """
+        let hostingView = NSHostingView(
+            rootView: MarkdownText(text: markdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 480)
+        hostingView.layoutSubtreeIfNeeded()
+
+        func findTextViews(in root: NSView) -> [MarkdownSelectableTextView] {
+            var found: [MarkdownSelectableTextView] = []
+            if let textView = root as? MarkdownSelectableTextView {
+                found.append(textView)
+            }
+            for subview in root.subviews {
+                found.append(contentsOf: findTextViews(in: subview))
+            }
+            return found
+        }
+
+        let textViews = findTextViews(in: hostingView)
+        XCTAssertEqual(
+            textViews.count, 1,
+            "Consecutive headings, paragraphs, lists, and quotes should share one selectable text view"
+        )
+        let textView = try XCTUnwrap(textViews.first)
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertTrue(textView.isSelectable)
+
+        let fullString = textView.attributedText.string as NSString
+        let headingRange = fullString.range(of: "Summary")
+        XCTAssertNotEqual(headingRange.location, NSNotFound)
+        XCTAssertEqual(
+            textView.attributedText.attribute(
+                MarkdownText.headingLevelAttribute,
+                at: headingRange.location,
+                effectiveRange: nil
+            ) as? NSNumber,
+            1
+        )
+        let boldRange = fullString.range(of: "selected")
+        XCTAssertNotEqual(boldRange.location, NSNotFound)
+        let boldFont = try XCTUnwrap(
+            textView.attributedText.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(boldFont.fontDescriptor.symbolicTraits.contains(.bold))
+
+        let codeRange = fullString.range(of: "emphasized_code")
+        XCTAssertNotEqual(codeRange.location, NSNotFound)
+        let codeFont = try XCTUnwrap(
+            textView.attributedText.attribute(.font, at: codeRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(codeFont.fontDescriptor.symbolicTraits.contains(.monoSpace))
+        XCTAssertTrue(codeFont.fontDescriptor.symbolicTraits.contains(.italic))
+
+        let spanTarget = "Summary\nASSISTANT_DELTA A separate follow-up with emphasized_code.\n1.\tReview the selected reply.\n2.\tDo not include its siblings.\nQuoted note at the end."
+        let spanRange = fullString.range(of: spanTarget)
+        XCTAssertNotEqual(spanRange.location, NSNotFound)
+        textView.setSelectedRange(spanRange)
+        XCTAssertEqual(fullString.substring(with: textView.selectedRange()), spanTarget)
+
+        let preservedRange = fullString.range(of: "Review the selected reply.")
+        textView.setSelectedRange(preservedRange)
+        hostingView.rootView = MarkdownText(text: markdown + "\n\nMore streamed output.")
+            .frame(width: 320, alignment: .leading)
+        hostingView.layoutSubtreeIfNeeded()
+        XCTAssertTrue(findTextViews(in: hostingView).first === textView)
+        XCTAssertEqual(textView.selectedRange(), preservedRange)
+
+        hostingView.rootView = MarkdownText(text: "Completely replaced message.")
+            .frame(width: 320, alignment: .leading)
+        hostingView.layoutSubtreeIfNeeded()
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 0, length: 0))
+
+        let alignments: [MarkdownColumnAlignment] = [.leading, .center, .trailing]
+        XCTAssertEqual(
+            MarkdownText.resolvedTableTextAlignment(
+                alignments, column: 0, layoutDirection: .leftToRight
+            ),
+            .left
+        )
+        XCTAssertEqual(
+            MarkdownText.resolvedTableTextAlignment(
+                alignments, column: 2, layoutDirection: .rightToLeft
+            ),
+            .left
+        )
     }
 
     // MARK: - Remote web terminal image rendering
