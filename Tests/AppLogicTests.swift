@@ -8631,6 +8631,38 @@ final class AppLogicTests: XCTestCase {
         tableTextView.setSelectedRange(multiRowRange)
         XCTAssertEqual(tableTextView.selectedCopiedText(), multiRowTarget)
 
+        // Selecting a substring inside a table cell copies that exact substring.
+        let midCellRange = tableString.range(of: "Terra (high)")
+        XCTAssertNotEqual(midCellRange.location, NSNotFound)
+        tableTextView.setSelectedRange(midCellRange)
+        XCTAssertEqual(tableTextView.selectedCopiedText(), "Terra (high)")
+
+        // Empty cells and empty rows are preserved in copied table ranges.
+        let sparseTableMarkdown = """
+        | A | B | C |
+        | --- | --- | --- |
+        | left | | right |
+        | | | |
+        | x | y | z |
+        """
+        let sparseHost = NSHostingView(
+            rootView: MarkdownText(text: sparseTableMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        sparseHost.frame = NSRect(x: 0, y: 0, width: 320, height: 240)
+        sparseHost.layoutSubtreeIfNeeded()
+        let sparseTextView = try XCTUnwrap(findTextViews(in: sparseHost).first)
+        let sparseString = sparseTextView.attributedText.string as NSString
+        let sparseStart = sparseString.range(of: "left").location
+        XCTAssertNotEqual(sparseStart, NSNotFound)
+        sparseTextView.setSelectedRange(
+            NSRange(location: sparseStart, length: sparseString.length - sparseStart)
+        )
+        XCTAssertEqual(
+            sparseTextView.selectedCopiedText(),
+            "left\t\tright\n\t\t\nx\ty\tz"
+        )
+
         // Header divider sits strictly between the header glyphs and first body row.
         let dividerY = try XCTUnwrap(tableTextView.headerDividerY())
         let headerGlyphs = tableTextView.layoutManager!.glyphRange(

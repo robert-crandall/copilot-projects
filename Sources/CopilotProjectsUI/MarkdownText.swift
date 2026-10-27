@@ -578,6 +578,9 @@ public struct MarkdownText: View, Equatable {
     fileprivate static let tableCellFragmentAttribute = NSAttributedString.Key(
         "CopilotProjects.MarkdownTableCellFragment"
     )
+    fileprivate static let tableSeparatorPositionAttribute = NSAttributedString.Key(
+        "CopilotProjects.MarkdownTableSeparatorPosition"
+    )
     fileprivate static let tableAccessibilityLabelAttribute = NSAttributedString.Key(
         "CopilotProjects.MarkdownTableAccessibilityLabel"
     )
@@ -587,6 +590,12 @@ public struct MarkdownText: View, Equatable {
         let column: Int
         let fullCellText: String
         let rangeInCell: NSRange
+    }
+
+    fileprivate struct TableSeparatorPosition: Equatable {
+        let row: Int
+        let leftColumn: Int
+        let rightColumn: Int
     }
 
     fileprivate struct TableHeaderDividerInfo: Equatable {
@@ -1131,13 +1140,21 @@ public struct MarkdownText: View, Equatable {
                 }
                 for column in 0..<columns {
                     if column > 0 {
+                        var separatorAttributes: [NSAttributedString.Key: Any] = [
+                            .font: fallbackFont,
+                            .foregroundColor: primaryLabelColor,
+                        ]
+                        if lineIndex == 0 {
+                            separatorAttributes[tableSeparatorPositionAttribute] = TableSeparatorPosition(
+                                row: rowIndex,
+                                leftColumn: column - 1,
+                                rightColumn: column
+                            )
+                        }
                         lineAttributed.append(
                             NSAttributedString(
                                 string: "\t",
-                                attributes: [
-                                    .font: fallbackFont,
-                                    .foregroundColor: primaryLabelColor,
-                                ]
+                                attributes: separatorAttributes
                             )
                         )
                     }
@@ -1147,13 +1164,21 @@ public struct MarkdownText: View, Equatable {
                     }
                 }
                 if lineAttributed.length == 0 {
+                    var placeholderAttributes: [NSAttributedString.Key: Any] = [
+                        .font: fallbackFont,
+                        .foregroundColor: primaryLabelColor,
+                    ]
+                    if lineIndex == 0 {
+                        placeholderAttributes[tableSeparatorPositionAttribute] = TableSeparatorPosition(
+                            row: rowIndex,
+                            leftColumn: 0,
+                            rightColumn: 0
+                        )
+                    }
                     lineAttributed.append(
                         NSAttributedString(
                             string: " ",
-                            attributes: [
-                                .font: fallbackFont,
-                                .foregroundColor: primaryLabelColor,
-                            ]
+                            attributes: placeholderAttributes
                         )
                     )
                 }
@@ -1298,16 +1323,16 @@ public struct MarkdownText: View, Equatable {
         return attributedText.string
     }
 
-    fileprivate static func copiedText(
+    fileprivate static func tableCopiedText(
         from attributedText: NSAttributedString,
         in selectedRange: NSRange
-    ) -> String {
+    ) -> String? {
         guard selectedRange.length > 0,
               NSMaxRange(selectedRange) <= attributedText.length else {
-            return ""
+            return nil
         }
-        let nsString = attributedText.string as NSString
-        var hasTableFragments = false
+        let fullRange = NSRange(location: 0, length: attributedText.length)
+        var hasTableElements = false
         struct CellSpan {
             let fullCellText: String
             var start: Int
@@ -1317,12 +1342,12 @@ public struct MarkdownText: View, Equatable {
 
         attributedText.enumerateAttribute(
             tableCellFragmentAttribute,
-            in: selectedRange
+            in: fullRange
         ) { value, attrRange, _ in
             guard let fragment = value as? TableCellFragment else { return }
             let overlap = NSIntersectionRange(selectedRange, attrRange)
             guard overlap.length > 0 else { return }
-            hasTableFragments = true
+            hasTableElements = true
             let cellLength = (fragment.fullCellText as NSString).length
             let startOffset = overlap.location - attrRange.location
             let endOffset = startOffset + overlap.length
@@ -1344,13 +1369,41 @@ public struct MarkdownText: View, Equatable {
             }
         }
 
-        guard hasTableFragments else {
-            return nsString.substring(with: selectedRange)
+        attributedText.enumerateAttribute(
+            tableSeparatorPositionAttribute,
+            in: fullRange
+        ) { value, attrRange, _ in
+            guard let separator = value as? TableSeparatorPosition else { return }
+            let overlap = NSIntersectionRange(selectedRange, attrRange)
+            guard overlap.length > 0 else { return }
+            hasTableElements = true
+            if rows[separator.row]?[separator.leftColumn] == nil {
+                rows[separator.row, default: [:]][separator.leftColumn] = CellSpan(
+                    fullCellText: "",
+                    start: 0,
+                    end: 0
+                )
+            }
+            if rows[separator.row]?[separator.rightColumn] == nil {
+                rows[separator.row, default: [:]][separator.rightColumn] = CellSpan(
+                    fullCellText: "",
+                    start: 0,
+                    end: 0
+                )
+            }
+        }
+
+        guard hasTableElements else {
+            return nil
         }
 
         return rows.keys.sorted().map { rowIndex in
             let rowCells = rows[rowIndex] ?? [:]
-            return rowCells.keys.sorted().map { columnIndex in
+            guard let minCol = rowCells.keys.min(),
+                  let maxCol = rowCells.keys.max() else {
+                return ""
+            }
+            return (minCol...maxCol).map { columnIndex in
                 guard let span = rowCells[columnIndex] else { return "" }
                 let cellNS = span.fullCellText as NSString
                 let safeStart = min(max(0, span.start), cellNS.length)
@@ -1358,6 +1411,18 @@ public struct MarkdownText: View, Equatable {
                 return cellNS.substring(with: NSRange(location: safeStart, length: safeEnd - safeStart))
             }.joined(separator: "\t")
         }.joined(separator: "\n")
+    }
+
+    fileprivate static func copiedText(
+        from attributedText: NSAttributedString,
+        in selectedRange: NSRange
+    ) -> String {
+        guard selectedRange.length > 0,
+              NSMaxRange(selectedRange) <= attributedText.length else {
+            return ""
+        }
+        return tableCopiedText(from: attributedText, in: selectedRange)
+            ?? (attributedText.string as NSString).substring(with: selectedRange)
     }
 
     private static func makeAttributedText(
@@ -1621,9 +1686,9 @@ public final class MarkdownSelectableTextView: UITextView {
     }
 
     public override func copy(_ sender: Any?) {
-        let copied = selectedCopiedText()
-        if !copied.isEmpty {
-            UIPasteboard.general.string = copied
+        if let attributedText,
+           let tableCopied = MarkdownText.tableCopiedText(from: attributedText, in: selectedRange) {
+            UIPasteboard.general.string = tableCopied
         } else {
             super.copy(sender)
         }
@@ -1854,11 +1919,10 @@ public final class MarkdownSelectableTextView: NSTextView {
     }
 
     public override func copy(_ sender: Any?) {
-        let copied = selectedCopiedText()
-        if !copied.isEmpty {
+        if let tableCopied = MarkdownText.tableCopiedText(from: attributedText, in: selectedRange()) {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
-            pasteboard.setString(copied, forType: .string)
+            pasteboard.setString(tableCopied, forType: .string)
         } else {
             super.copy(sender)
         }
