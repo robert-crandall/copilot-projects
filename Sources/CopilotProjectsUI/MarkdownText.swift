@@ -1135,6 +1135,7 @@ public struct MarkdownText: View, Equatable {
                 }
                 let lineStyle = NSMutableParagraphStyle()
                 lineStyle.alignment = paragraphAlignment
+                lineStyle.baseWritingDirection = .leftToRight
                 lineStyle.lineBreakMode = .byClipping
                 lineStyle.paragraphSpacing = spacingAfterLine
                 lineStyle.tabStops = tabStops
@@ -1151,32 +1152,20 @@ public struct MarkdownText: View, Equatable {
                         )
                     )
                 }
-                let firstWrappedColumn = (0..<columns).first(where: { lineIndex < wrappedColumns[$0].count })
                 for column in 0..<columns {
                     if column > 0 {
-                        let attachesSeparator: Bool = if lineIndex == 0 {
-                            true
-                        } else if let firstWrappedColumn, column > firstWrappedColumn {
-                            (rowCells[column - 1].length == 0 || lineIndex < wrappedColumns[column - 1].count)
-                                && (rowCells[column].length == 0 || lineIndex < wrappedColumns[column].count)
-                        } else {
-                            false
-                        }
-                        var separatorAttributes: [NSAttributedString.Key: Any] = [
-                            .font: fallbackFont,
-                            .foregroundColor: primaryLabelColor,
-                        ]
-                        if attachesSeparator {
-                            separatorAttributes[tableSeparatorPositionAttribute] = TableSeparatorPosition(
-                                row: rowIndex,
-                                leftColumn: column - 1,
-                                rightColumn: column
-                            )
-                        }
                         lineAttributed.append(
                             NSAttributedString(
                                 string: "\t",
-                                attributes: separatorAttributes
+                                attributes: [
+                                    .font: fallbackFont,
+                                    .foregroundColor: primaryLabelColor,
+                                    tableSeparatorPositionAttribute: TableSeparatorPosition(
+                                        row: rowIndex,
+                                        leftColumn: column - 1,
+                                        rightColumn: column
+                                    ),
+                                ]
                             )
                         )
                     }
@@ -1309,6 +1298,7 @@ public struct MarkdownText: View, Equatable {
                 let lastChar = nsString.character(at: NSMaxRange(charRange) - 1)
                 if lastChar == 0x0A || lastChar == 0x0D
                     || ((lastChar == 0x20 || lastChar == 0x09)
+                        && charRange.length > 1
                         && NSMaxRange(lineGlyphRange) < totalGlyphs) {
                     charRange.length -= 1
                 } else {
@@ -1366,6 +1356,7 @@ public struct MarkdownText: View, Equatable {
             var end: Int
         }
         var rows: [Int: [Int: CellSpan]] = [:]
+        var rowCharSpans: [Int: (start: Int, end: Int)] = [:]
 
         attributedText.enumerateAttribute(
             tableCellFragmentAttribute,
@@ -1374,6 +1365,17 @@ public struct MarkdownText: View, Equatable {
             guard let fragment = value as? TableCellFragment else { return }
             let overlap = NSIntersectionRange(selectedRange, attrRange)
             guard overlap.length > 0 else { return }
+            if let existingSpan = rowCharSpans[fragment.row] {
+                rowCharSpans[fragment.row] = (
+                    start: min(existingSpan.start, overlap.location),
+                    end: max(existingSpan.end, NSMaxRange(overlap))
+                )
+            } else {
+                rowCharSpans[fragment.row] = (
+                    start: overlap.location,
+                    end: NSMaxRange(overlap)
+                )
+            }
             let cellLength = (fragment.fullCellText as NSString).length
             let startOffset = overlap.location - attrRange.location
             let endOffset = startOffset + overlap.length
@@ -1398,8 +1400,13 @@ public struct MarkdownText: View, Equatable {
         attributedText.enumerateAttribute(
             tableSeparatorPositionAttribute,
             in: selectedRange
-        ) { value, _, _ in
+        ) { value, attrRange, _ in
             guard let separator = value as? TableSeparatorPosition else { return }
+            if let charSpan = rowCharSpans[separator.row],
+               attrRange.location >= charSpan.start,
+               NSMaxRange(attrRange) <= charSpan.end {
+                return
+            }
             if rows[separator.row]?[separator.leftColumn] == nil {
                 rows[separator.row, default: [:]][separator.leftColumn] = CellSpan(
                     fullCellText: "",

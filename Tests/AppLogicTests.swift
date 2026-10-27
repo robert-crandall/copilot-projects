@@ -8739,12 +8739,12 @@ final class AppLogicTests: XCTestCase {
             "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
         )
 
-        // Selecting a wrapped non-first-column cell alone does not synthesize leading tabs from exhausted or empty earlier columns.
-        for roleCell in ["primary", ""] {
+        // Selecting a wrapped non-first-column cell alone does not synthesize leading or trailing tabs from exhausted or empty neighbor columns.
+        for rowSpec in ["| host | primary | \(longCell) |", "| host | | \(longCell) |", "| host | \(longCell) | |"] {
             let thirdColWrappedMarkdown = """
             | Name | Role | Detail |
             | :--- | :--- | :--- |
-            | host | \(roleCell) | \(longCell) |
+            \(rowSpec)
             """
             let thirdColHost = NSHostingView(
                 rootView: MarkdownText(text: thirdColWrappedMarkdown)
@@ -8755,9 +8755,10 @@ final class AppLogicTests: XCTestCase {
             let thirdColTextView = try XCTUnwrap(findTextViews(in: thirdColHost).first)
             let thirdColString = thirdColTextView.attributedText.string as NSString
             let detailStart = thirdColString.range(of: "Arm (1/2/2").location
+            let detailEnd = NSMaxRange(thirdColString.range(of: "code  )"))
             XCTAssertNotEqual(detailStart, NSNotFound)
             thirdColTextView.setSelectedRange(
-                NSRange(location: detailStart, length: thirdColString.length - detailStart)
+                NSRange(location: detailStart, length: detailEnd - detailStart)
             )
             XCTAssertEqual(
                 thirdColTextView.selectedCopiedText(),
@@ -8791,13 +8792,14 @@ final class AppLogicTests: XCTestCase {
         tableTextView.setSelectedRange(rowWithBreaksRange)
         XCTAssertEqual(tableTextView.selectedCopiedText(), rowWithBreaks)
 
-        // Selecting from a wrapped continuation line into the next row preserves empty trailing cells,
-        // and embedded cell tabs are expanded so they do not collide with column separators.
+        // Selecting from a wrapped continuation line into the next row preserves empty trailing cells
+        // (including across an exhausted middle column), and embedded cell tabs are expanded so they
+        // do not collide with column separators.
         let wrappedEmptyTrailingMarkdown = """
-        | Arm | Score |
-        | :--- | :--- |
-        | \(longCell) | |
-        | next\tpart | value |
+        | Arm | Role | Score |
+        | :--- | :--- | :--- |
+        | \(longCell) | short | |
+        | next\tpart | role | value |
         """
         let wrappedEmptyHost = NSHostingView(
             rootView: MarkdownText(text: wrappedEmptyTrailingMarkdown)
@@ -8807,12 +8809,12 @@ final class AppLogicTests: XCTestCase {
         wrappedEmptyHost.layoutSubtreeIfNeeded()
         let wrappedEmptyTextView = try XCTUnwrap(findTextViews(in: wrappedEmptyHost).first)
         let wrappedEmptyString = wrappedEmptyTextView.attributedText.string as NSString
-        let continuationRange = wrappedEmptyString.range(of: "code  )\t\nnext    part\tvalue")
+        let continuationRange = wrappedEmptyString.range(of: "code  )\t\t\nnext    part\trole\tvalue")
         XCTAssertNotEqual(continuationRange.location, NSNotFound)
         wrappedEmptyTextView.setSelectedRange(continuationRange)
         XCTAssertEqual(
             wrappedEmptyTextView.selectedCopiedText(),
-            "code  )\t\nnext    part\tvalue"
+            "code  )\t\t\nnext    part\trole\tvalue"
         )
 
         // Wide tables with heavily wrapped cells fall back to plain text once cumulative visual cells exceed the budget.
