@@ -3,8 +3,25 @@ import CopilotProjectsCore
 import CopilotProjectsProtocol
 
 public enum SessionInputValidation {
+    /// Remote prompt pastes and review-prompt templates share this UTF-8 budget.
+    public static let maximumPromptBytes = 8_192
+
     public static func isValidPrompt(_ value: String) -> Bool {
-        ProjectsTerminalView.remotePromptPasteBytes(value) != nil
+        let normalized = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              normalized.utf8.count <= maximumPromptBytes else {
+            return false
+        }
+        for scalar in normalized.unicodeScalars {
+            if scalar.value == 0x7f
+                || (scalar.value < 0x20 && scalar != "\n" && scalar != "\t")
+                || (0x80 ... 0x9f).contains(scalar.value) {
+                return false
+            }
+        }
+        return true
     }
 
     public static func isValidCommand(_ value: String) -> Bool {
