@@ -1452,7 +1452,7 @@ final class AppModel: ObservableObject {
         var initialText = ""
         while let input = promptForText(
             title: "Review Pull Request",
-            message: "Paste a GitHub pull request URL. Copilot will start a review with your pull request review prompt. Change that prompt in Copilot Projects ▸ Pull Request Review Prompt….",
+            message: "Paste a GitHub pull request URL. Copilot will start a review with your pull request review prompt. Change that prompt in Copilot Projects ▸ Pull Request Review Prompt…",
             confirmTitle: "Review",
             initialText: initialText,
             transform: PullRequestReviewTarget.withoutFragment

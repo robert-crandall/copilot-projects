@@ -958,10 +958,11 @@ enum PullRequestReviewPromptEditor {
     }
 
     private static func informativeText(errorMessage: String?) -> String {
-        let instructions = "This prompt is sent to Copilot when you start Review Pull Request…. "
-            + "Include \(PullRequestReviewPrompt.urlPlaceholder) where the pull request URL should be inserted. "
-            + "Command-Return saves."
-        guard let errorMessage else { return instructions }
-        return errorMessage + " " + instructions
+        guard let errorMessage else {
+            return "This prompt is sent to Copilot when you start Review Pull Request… "
+                + "Include \(PullRequestReviewPrompt.urlPlaceholder) where the pull request URL should be inserted. "
+                + "Command-Return saves."
+        }
+        return errorMessage + " Command-Return saves."
     }
 }
