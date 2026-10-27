@@ -8739,28 +8739,49 @@ final class AppLogicTests: XCTestCase {
             "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
         )
 
-        // Selecting a wrapped non-first-column cell alone does not synthesize a leading tab from continuation padding.
-        let secondColWrappedMarkdown = """
-        | Name | Detail |
-        | :--- | :--- |
-        | host | \(longCell) |
-        """
-        let secondColHost = NSHostingView(
-            rootView: MarkdownText(text: secondColWrappedMarkdown)
-                .frame(width: 320, alignment: .leading)
-        )
-        secondColHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
-        secondColHost.layoutSubtreeIfNeeded()
-        let secondColTextView = try XCTUnwrap(findTextViews(in: secondColHost).first)
-        let secondColString = secondColTextView.attributedText.string as NSString
-        let detailStart = secondColString.range(of: "Arm (1/2/2").location
-        XCTAssertNotEqual(detailStart, NSNotFound)
-        secondColTextView.setSelectedRange(
-            NSRange(location: detailStart, length: secondColString.length - detailStart)
-        )
+        // Selecting a wrapped non-first-column cell alone does not synthesize leading tabs from exhausted or empty earlier columns.
+        for roleCell in ["primary", ""] {
+            let thirdColWrappedMarkdown = """
+            | Name | Role | Detail |
+            | :--- | :--- | :--- |
+            | host | \(roleCell) | \(longCell) |
+            """
+            let thirdColHost = NSHostingView(
+                rootView: MarkdownText(text: thirdColWrappedMarkdown)
+                    .frame(width: 320, alignment: .leading)
+            )
+            thirdColHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+            thirdColHost.layoutSubtreeIfNeeded()
+            let thirdColTextView = try XCTUnwrap(findTextViews(in: thirdColHost).first)
+            let thirdColString = thirdColTextView.attributedText.string as NSString
+            let detailStart = thirdColString.range(of: "Arm (1/2/2").location
+            XCTAssertNotEqual(detailStart, NSNotFound)
+            thirdColTextView.setSelectedRange(
+                NSRange(location: detailStart, length: thirdColString.length - detailStart)
+            )
+            XCTAssertEqual(
+                thirdColTextView.selectedCopiedText(),
+                "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )"
+            )
+        }
+
+        // Multi-range selections on macOS are preserved across streamed updates and reconstructed on copy.
+        let firstDisjoint = tableString.range(of: "3x Alligator/Terra (high)")
+        let secondDisjoint = tableString.range(of: "4x Terra 6.1 (high)")
+        tableTextView.selectedRanges = [
+            NSValue(range: firstDisjoint),
+            NSValue(range: secondDisjoint),
+        ]
         XCTAssertEqual(
-            secondColTextView.selectedCopiedText(),
-            "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )"
+            tableTextView.selectedCopiedText(),
+            "3x Alligator/Terra (high)\n4x Terra 6.1 (high)"
+        )
+        tableHost.rootView = MarkdownText(text: tableMarkdown + "\n| 5x Luna | 90.0% |")
+            .frame(width: 320, alignment: .leading)
+        tableHost.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            tableTextView.selectedRanges.map(\.rangeValue),
+            [firstDisjoint, secondDisjoint]
         )
 
         // Selected leading and trailing logical row breaks are preserved during copy.

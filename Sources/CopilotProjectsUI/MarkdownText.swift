@@ -1151,23 +1151,32 @@ public struct MarkdownText: View, Equatable {
                         )
                     )
                 }
+                let firstWrappedColumn = (0..<columns).first(where: { lineIndex < wrappedColumns[$0].count })
                 for column in 0..<columns {
                     if column > 0 {
-                        let leftPresent = lineIndex == 0
-                            || rowCells[column - 1].length == 0
-                            || lineIndex < wrappedColumns[column - 1].count
+                        let attachesSeparator: Bool = if lineIndex == 0 {
+                            true
+                        } else if let firstWrappedColumn, column > firstWrappedColumn {
+                            (rowCells[column - 1].length == 0 || lineIndex < wrappedColumns[column - 1].count)
+                                && (rowCells[column].length == 0 || lineIndex < wrappedColumns[column].count)
+                        } else {
+                            false
+                        }
+                        var separatorAttributes: [NSAttributedString.Key: Any] = [
+                            .font: fallbackFont,
+                            .foregroundColor: primaryLabelColor,
+                        ]
+                        if attachesSeparator {
+                            separatorAttributes[tableSeparatorPositionAttribute] = TableSeparatorPosition(
+                                row: rowIndex,
+                                leftColumn: column - 1,
+                                rightColumn: column
+                            )
+                        }
                         lineAttributed.append(
                             NSAttributedString(
                                 string: "\t",
-                                attributes: [
-                                    .font: fallbackFont,
-                                    .foregroundColor: primaryLabelColor,
-                                    tableSeparatorPositionAttribute: TableSeparatorPosition(
-                                        row: rowIndex,
-                                        leftColumn: leftPresent ? column - 1 : column,
-                                        rightColumn: column
-                                    ),
-                                ]
+                                attributes: separatorAttributes
                             )
                         )
                     }
@@ -2067,7 +2076,7 @@ public final class MarkdownSelectableTextView: NSTextView {
 
     public override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
-        if resigned, selectedRange().length > 0 {
+        if resigned, selectedRanges.contains(where: { $0.rangeValue.length > 0 }) {
             setSelectedRange(NSRange(location: 0, length: 0))
         }
         return resigned
@@ -2127,16 +2136,18 @@ private struct SelectableMarkdownText: NSViewRepresentable {
         nsView.renderKey = key
         let attributedText = MarkdownText.makeSegmentAttributedText(key)
         if nsView.attributedText != attributedText {
-            let previousSelection = nsView.selectedRange()
+            let previousRanges = nsView.selectedRanges.map(\.rangeValue).filter { $0.length > 0 }
             let previousString = nsView.attributedText.string as NSString
             let nextString = attributedText.string as NSString
             nsView.attributedText = attributedText
             nsView.setAccessibilityLabel(MarkdownText.accessibilityText(for: attributedText))
-            if previousSelection.length > 0,
-               NSMaxRange(previousSelection) <= nextString.length,
-               previousString.substring(with: previousSelection) == nextString.substring(with: previousSelection) {
-                nsView.setSelectedRange(previousSelection)
-            } else if nsView.selectedRange().location != 0 || nsView.selectedRange().length != 0 {
+            if !previousRanges.isEmpty,
+               previousRanges.allSatisfy({
+                   NSMaxRange($0) <= nextString.length
+                       && previousString.substring(with: $0) == nextString.substring(with: $0)
+               }) {
+                nsView.selectedRanges = previousRanges.map(NSValue.init(range:))
+            } else if nsView.selectedRanges.contains(where: { $0.rangeValue.location != 0 || $0.rangeValue.length != 0 }) {
                 nsView.setSelectedRange(NSRange(location: 0, length: 0))
             }
             nsView.invalidateIntrinsicContentSize()
