@@ -96,7 +96,9 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
     /// timestamps (`updatedAt`, `observedAtMilliseconds`) that rewrite every 5s.
     struct ActivitySummary: Equatable, Sendable {
         struct RuntimeSummary: Decodable, Equatable, Sendable {
-            let state: String?
+            let processing: Bool?
+            let idleAtMilliseconds: Int64?
+            let error: String?
         }
 
         struct SubagentSummary: Decodable, Equatable, Sendable {
@@ -107,33 +109,28 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
             let requestId: String?
         }
 
+        struct WorkflowSummary: Decodable, Equatable, Sendable {
+            let budgetRequest: QuestionSummary?
+        }
+
         let copilotSessionId: String?
         let conversationEpoch: String?
         let foregroundTurnActive: Bool?
+        let foregroundTransitionAt: String?
         let scheduledTurnActive: Bool?
+        let idleGeneration: Int?
         let activeSubagentIds: [String]
         let userInputIds: [String]
         let elicitationIds: [String]
         let permissionIds: [String]
-        let runtimeState: String?
+        let hasBudgetRequest: Bool
+        let budgetRequestId: String?
+        let runtimeProcessing: Bool?
+        let runtimeIdleAtMilliseconds: Int64?
+        let runtimeError: String?
         let hasSessionIdle: Bool
         let inputCompletionKeys: [String]
         let error: String?
-
-        private enum CodingKeys: String, CodingKey {
-            case copilotSessionId
-            case conversationEpoch
-            case foregroundTurnActive
-            case scheduledTurnActive
-            case activeSubagents
-            case trackedUserInputs
-            case trackedElicitations
-            case pendingPermissionRequestIds
-            case runtimeActivity
-            case sessionIdleAtMilliseconds
-            case inputCompletions
-            case error
-        }
 
         init?(path: String) {
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -143,12 +140,18 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
             copilotSessionId = decoded.copilotSessionId
             conversationEpoch = decoded.conversationEpoch
             foregroundTurnActive = decoded.foregroundTurnActive
+            foregroundTransitionAt = decoded.foregroundTransitionAt
             scheduledTurnActive = decoded.scheduledTurnActive
+            idleGeneration = decoded.idleGeneration
             activeSubagentIds = (decoded.activeSubagents ?? []).compactMap(\.id).sorted()
             userInputIds = (decoded.trackedUserInputs ?? []).compactMap(\.requestId).sorted()
             elicitationIds = (decoded.trackedElicitations ?? []).compactMap(\.requestId).sorted()
             permissionIds = (decoded.pendingPermissionRequestIds ?? []).sorted()
-            runtimeState = decoded.runtimeActivity?.state
+            hasBudgetRequest = decoded.workflow?.budgetRequest != nil
+            budgetRequestId = decoded.workflow?.budgetRequest?.requestId
+            runtimeProcessing = decoded.runtimeActivity?.processing
+            runtimeIdleAtMilliseconds = decoded.runtimeActivity?.idleAtMilliseconds
+            runtimeError = decoded.runtimeActivity?.error
             hasSessionIdle = decoded.sessionIdleAtMilliseconds != nil
             inputCompletionKeys = (decoded.inputCompletions ?? [:]).keys.sorted()
             error = decoded.error
@@ -158,11 +161,14 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
             let copilotSessionId: String?
             let conversationEpoch: String?
             let foregroundTurnActive: Bool?
+            let foregroundTransitionAt: String?
             let scheduledTurnActive: Bool?
+            let idleGeneration: Int?
             let activeSubagents: [SubagentSummary]?
             let trackedUserInputs: [QuestionSummary]?
             let trackedElicitations: [QuestionSummary]?
             let pendingPermissionRequestIds: [String]?
+            let workflow: WorkflowSummary?
             let runtimeActivity: RuntimeSummary?
             let sessionIdleAtMilliseconds: Int64?
             let inputCompletions: [String: Int64]?

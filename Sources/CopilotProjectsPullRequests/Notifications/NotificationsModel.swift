@@ -767,17 +767,10 @@ final class NotificationsModel: ObservableObject {
         } else {
             sampledSignature = nil
         }
-        let previousSnapshot: WorkspaceSnapshot?
-        if case .connected(let current) = workspace {
-            previousSnapshot = current
-        } else {
-            previousSnapshot = nil
-        }
         let fetch = await source.snapshot()
         guard generation == workspacePollGeneration else { return }
         recordWorkspacePoll(
             fetch: fetch,
-            previousSnapshot: previousSnapshot,
             sampledSignature: sampledSignature
         )
         apply(fetch)
@@ -786,10 +779,9 @@ final class NotificationsModel: ObservableObject {
 
     private func recordWorkspacePoll(
         fetch: WorkspaceFetch,
-        previousSnapshot: WorkspaceSnapshot?,
         sampledSignature: WorkspaceDirectorySignature?
     ) {
-        guard case .snapshot(let snapshot) = fetch else {
+        guard case .snapshot = fetch else {
             lastWorkspaceSignature = nil
             settledWorkspaceSignature = nil
             unsettledDiskChangeAt = nil
@@ -804,9 +796,7 @@ final class NotificationsModel: ObservableObject {
             unsettledDiskChangeAt = nil
             return
         }
-        if lastWorkspaceSignature == nil
-            || sampledSignature == lastWorkspaceSignature
-            || snapshot != previousSnapshot {
+        if lastWorkspaceSignature == nil || sampledSignature == lastWorkspaceSignature {
             settledWorkspaceSignature = sampledSignature
             unsettledDiskChangeAt = nil
         } else {

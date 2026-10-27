@@ -892,14 +892,17 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         let sessionsDir = stateDir.appendingPathComponent("sessions", isDirectory: true)
         try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
 
-        var updatedSnapshot = fixtureSnapshot
-        updatedSnapshot.projects[0].sessions[0].status = .idle
-        // Second fetch still returns fixtureSnapshot (simulating host lag after hook file write);
-        // third fetch returns updatedSnapshot.
+        var partiallyUpdatedSnapshot = fixtureSnapshot
+        partiallyUpdatedSnapshot.projects[0].sessions[0].copilotSessionId = "abcdef12-0009"
+        var fullyUpdatedSnapshot = partiallyUpdatedSnapshot
+        fullyUpdatedSnapshot.projects[0].sessions[0].status = .idle
+        // Second fetch returns a partial update (resume marker read immediately while
+        // the host's 0.5s throttled activity scan has not updated status yet);
+        // third fetch returns the settled status update.
         let workspace = FakeWorkspace(fetches: [
             .snapshot(fixtureSnapshot),
-            .snapshot(fixtureSnapshot),
-            .snapshot(updatedSnapshot),
+            .snapshot(partiallyUpdatedSnapshot),
+            .snapshot(fullyUpdatedSnapshot),
         ])
         var now = testNow
         let model = PullRequestsModel(
@@ -918,14 +921,14 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 1)
 
-        // Hook writes status-record.json before host applies set-status in memory.
+        // Hook/tracker writes session files before host finishes its throttled scan.
         try Data(#"{"schemaVersion":1,"status":"idle"}"#.utf8).write(
             to: sessionsDir.appendingPathComponent("s1.status-record.json"),
             options: .atomic
         )
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 2)
-        XCTAssertEqual(model.workspace, .connected(fixtureSnapshot))
+        XCTAssertEqual(model.workspace, .connected(partiallyUpdatedSnapshot))
 
         // An early excluded-file wakeup before workspaceSettleFollowUpDelay must not consume
         // the follow-up poll while the host is still within its 0.5s throttle window.
@@ -937,7 +940,7 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         now = now.addingTimeInterval(0.5)
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 3)
-        XCTAssertEqual(model.workspace, .connected(updatedSnapshot))
+        XCTAssertEqual(model.workspace, .connected(fullyUpdatedSnapshot))
 
         // Once settled, subsequent polls with no further disk change are skipped.
         await model.pollWorkspaceIfNeeded()
@@ -953,21 +956,26 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
             _ sessionId: String,
             updatedAt: String,
             observedAt: Int64,
-            foregroundActive: Bool = false,
-            questionId: String? = nil
+            processing: Bool = false,
+            questionId: String? = nil,
+            budgetRequestId: String? = nil
         ) throws {
             let questions = questionId.map { #"[{"requestId":"\#($0)","question":"Proceed?"}]"# } ?? "[]"
+            let workflow = budgetRequestId.map {
+                #"{"version":1,"observedAtMilliseconds":\#(observedAt),"capabilities":[],"sendReady":true,"limitsKnown":true,"budgetRequest":{"requestId":"\#($0)","maxAiCredits":50,"usedAiCredits":50},"agents":[],"schedules":[]}"#
+            } ?? "null"
             let json = """
             {
               "schemaVersion": 1,
               "copilotSessionId": "abcdef12-0001",
               "conversationEpoch": "abcdef12-0001:1",
               "updatedAt": "\(updatedAt)",
-              "foregroundTurnActive": \(foregroundActive),
+              "foregroundTurnActive": false,
               "scheduledTurnActive": false,
               "activeSubagents": [],
               "trackedUserInputs": \(questions),
-              "runtimeActivity": {"state": "idle", "observedAtMilliseconds": \(observedAt)}
+              "workflow": \(workflow),
+              "runtimeActivity": {"processing": \(processing), "observedAtMilliseconds": \(observedAt), "idleAtMilliseconds": 500}
             }
             """
             try Data(json.utf8).write(
@@ -979,11 +987,20 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         try writeActivity("s1", updatedAt: "2026-10-27T12:00:00.000Z", observedAt: 1_000)
         try writeActivity("s2", updatedAt: "2026-10-27T12:00:01.000Z", observedAt: 2_000)
 
-        var waitingQuestionSnapshot = fixtureSnapshot
+        var runningSnapshot = fixtureSnapshot
+        runningSnapshot.projects[0].sessions[0].status = .running
+        var waitingQuestionSnapshot = runningSnapshot
+        waitingQuestionSnapshot.projects[0].sessions[0].status = .waiting
         waitingQuestionSnapshot.projects[0].sessions[0].hasPendingInput = true
+        var budgetRequestSnapshot = waitingQuestionSnapshot
+        budgetRequestSnapshot.projects[0].sessions[0].title = "Budget approval"
+        var clearedBudgetSnapshot = fixtureSnapshot
         let workspace = FakeWorkspace(fetches: [
             .snapshot(fixtureSnapshot),
+            .snapshot(runningSnapshot),
             .snapshot(waitingQuestionSnapshot),
+            .snapshot(budgetRequestSnapshot),
+            .snapshot(clearedBudgetSnapshot),
         ])
         let model = PullRequestsModel(
             workspace: workspace,
@@ -1006,16 +1023,49 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 1)
 
-        // A real change to a workspace-affecting field (trackedUserInputs) triggers a poll.
+        // A runtimeActivity.processing transition triggers a poll.
         try writeActivity(
             "s1",
             updatedAt: "2026-10-27T12:00:07.000Z",
             observedAt: 8_000,
-            questionId: "q-1"
+            processing: true
         )
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 2)
+        XCTAssertEqual(model.workspace, .connected(runningSnapshot))
+
+        // A change to trackedUserInputs triggers a poll.
+        try writeActivity(
+            "s1",
+            updatedAt: "2026-10-27T12:00:08.000Z",
+            observedAt: 9_000,
+            processing: true,
+            questionId: "q-1"
+        )
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 3)
         XCTAssertEqual(model.workspace, .connected(waitingQuestionSnapshot))
+
+        // Adding and removing workflow.budgetRequest triggers polls.
+        try writeActivity(
+            "s1",
+            updatedAt: "2026-10-27T12:00:09.000Z",
+            observedAt: 10_000,
+            budgetRequestId: "budget-1"
+        )
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 4)
+        XCTAssertEqual(model.workspace, .connected(budgetRequestSnapshot))
+
+        try writeActivity(
+            "s1",
+            updatedAt: "2026-10-27T12:00:10.000Z",
+            observedAt: 11_000,
+            budgetRequestId: nil
+        )
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 5)
+        XCTAssertEqual(model.workspace, .connected(clearedBudgetSnapshot))
 
         // ControlWorkspaceBridge only infers Paths.stateDir for the conventional socket in Paths.stateDir.
         let externalBridge = ControlWorkspaceBridge(socketPath: "/tmp/external-copilot.sock")

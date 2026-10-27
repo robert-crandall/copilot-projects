@@ -393,12 +393,10 @@ final class PullRequestsModel: ObservableObject {
         } else {
             sampledSignature = nil
         }
-        let previousSnapshot = connectedSnapshot
         let fetch = await source.snapshot()
         apply(fetch)
         recordWorkspacePoll(
             fetch: fetch,
-            previousSnapshot: previousSnapshot,
             sampledSignature: sampledSignature
         )
         if isConnected {
@@ -408,10 +406,9 @@ final class PullRequestsModel: ObservableObject {
 
     private func recordWorkspacePoll(
         fetch: WorkspaceFetch,
-        previousSnapshot: WorkspaceSnapshot?,
         sampledSignature: WorkspaceDirectorySignature?
     ) {
-        guard case .snapshot(let snapshot) = fetch else {
+        guard case .snapshot = fetch else {
             lastWorkspaceSignature = nil
             settledWorkspaceSignature = nil
             unsettledDiskChangeAt = nil
@@ -426,14 +423,12 @@ final class PullRequestsModel: ObservableObject {
             unsettledDiskChangeAt = nil
             return
         }
-        if lastWorkspaceSignature == nil
-            || sampledSignature == lastWorkspaceSignature
-            || snapshot != previousSnapshot {
+        if lastWorkspaceSignature == nil || sampledSignature == lastWorkspaceSignature {
             settledWorkspaceSignature = sampledSignature
             unsettledDiskChangeAt = nil
         } else {
-            // Disk changed before the host's in-memory snapshot changed; allow
-            // one delayed follow-up poll at this signature before settling.
+            // A newly observed disk signature stays eligible for one delayed
+            // follow-up poll so throttled host activity scans can settle.
             settledWorkspaceSignature = nil
             unsettledDiskChangeAt = now
         }
