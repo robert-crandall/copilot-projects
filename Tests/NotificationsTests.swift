@@ -2051,6 +2051,172 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(restartedModel.preferredProjectId(for: prItem.thread), "p", "last chosen review project persists across launches")
     }
 
+    func testWorkspaceLoopRefreshesImmediatelyOnDiskEventsAndSkipsUnchangedPolls() async throws {
+        let stateDir = FileManager.default.temporaryDirectory.appendingPathComponent("notif-ws-\(UUID().uuidString)", isDirectory: true)
+        let sessionsDir = stateDir.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stateDir) }
+        try Data(#"{"schemaVersion":1}"#.utf8).write(to: stateDir.appendingPathComponent("state.json"), options: .atomic)
+
+        let initialSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: []),
+        ])
+        let linkedSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Review PR", status: .running, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let waitingSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Review PR", status: .waiting, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let workspace = FakeWorkspace(fetches: [
+            .snapshot(initialSnapshot),
+            .snapshot(linkedSnapshot),
+            .snapshot(waitingSnapshot),
+        ])
+        let clock = TestClock(now)
+        let model = NotificationsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            workspaceStateDirectory: stateDir,
+            workspacePollInterval: 30,
+            workspaceUnchangedPollInterval: 15,
+            workspaceWatchDebounce: 0.02,
+            loadAccounts: { [] },
+            transcriptPath: { _ in nil },
+            clock: { clock.now },
+            isVisible: { true }
+        )
+        model.setBadge = { _ in }
+        model.show([thread("1", "review_requested")], accounts: ["octocat"])
+
+        let loop = Task { await model.runWorkspaceLoop() }
+        defer { loop.cancel() }
+
+        try await waitUntil { workspace.snapshotCalls == 1 && model.workspace == .connected(initialSnapshot) }
+
+        // Unchanged signature skips redundant polls.
+        await model.pollWorkspaceIfNeeded()
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+
+        // Writing state.json triggers an immediate refresh and links the new session.
+        try Data(#"{"schemaVersion":1,"sessions":1}"#.utf8).write(
+            to: stateDir.appendingPathComponent("state.json"),
+            options: .atomic
+        )
+        try await waitUntil { model.links[PullRequestKey("octo/app#1")!] == "s1" }
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+
+        // Writing a session status record in sessions/ triggers an immediate refresh.
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        try Data(#"{"schemaVersion":1,"status":"waiting"}"#.utf8).write(
+            to: sessionsDir.appendingPathComponent("s1.status-record.json"),
+            options: .atomic
+        )
+        try await waitUntil { model.liveSessions["s1"]?.status == .waiting }
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 3)
+    }
+
+    func testSupersededWorkspaceSnapshotDoesNotOverwriteNewerPoll() async throws {
+        actor DelayedWorkspace: PullRequestsWorkspace {
+            private var continuations: [Int: CheckedContinuation<WorkspaceFetch, Never>] = [:]
+            private var calls = 0
+            let answers: [Int: WorkspaceFetch]
+            let heldCalls: Set<Int>
+
+            init(answers: [Int: WorkspaceFetch], heldCalls: Set<Int>) {
+                self.answers = answers
+                self.heldCalls = heldCalls
+            }
+
+            func snapshot() async -> WorkspaceFetch {
+                calls += 1
+                let call = calls
+                if heldCalls.contains(call) {
+                    return await withCheckedContinuation { continuations[call] = $0 }
+                }
+                return answers[call] ?? .unreachable
+            }
+
+            func isWaiting(call: Int) -> Bool { continuations[call] != nil }
+
+            func release(call: Int) {
+                continuations.removeValue(forKey: call)?.resume(returning: answers[call] ?? .unreachable)
+            }
+
+            func revealSession(projectId: String?, sessionId: String) async -> WorkspaceCommandResult { .unreachable }
+            func startCopilotSession(projectId: String, requestId: UUID, prompt: String) async -> WorkspaceCommandResult { .unreachable }
+            func resumeCopilotSession(projectId: String, requestId: UUID, copilotSessionId: String) async -> WorkspaceCommandResult { .unreachable }
+            func sendSessionPrompt(projectId: String?, sessionId: String, requestId: UUID, prompt: String) async -> WorkspaceCommandResult { .unreachable }
+        }
+
+        let staleSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: []),
+        ])
+        let freshSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Fresh", status: .waiting, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let newestSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "q", projects: [
+            .init(id: "q", name: "Moved", sessions: [
+                .init(id: "s1", title: "Fresh", status: .running, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let workspace = DelayedWorkspace(
+            answers: [1: .snapshot(staleSnapshot), 2: .snapshot(freshSnapshot), 3: .snapshot(freshSnapshot), 4: .snapshot(newestSnapshot)],
+            heldCalls: [1, 3, 4]
+        )
+        let model = NotificationsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            loadAccounts: { [] },
+            transcriptPath: { _ in nil },
+            clock: { self.now }
+        )
+        model.setBadge = { _ in }
+        model.show([thread("1", "review_requested")], accounts: ["octocat"])
+
+        let firstPoll = Task { await model.pollWorkspace() }
+        for _ in 0..<250 {
+            if await workspace.isWaiting(call: 1) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await model.pollWorkspace()
+        XCTAssertEqual(model.workspace, .connected(freshSnapshot))
+        XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s1")
+
+        await workspace.release(call: 1)
+        await firstPoll.value
+        XCTAssertEqual(model.workspace, .connected(freshSnapshot), "an older snapshot finishing late must be discarded")
+        XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s1")
+
+        // An earlier poll finishing while a newer poll is still in flight still applies its result.
+        let thirdPoll = Task { await model.pollWorkspace() }
+        for _ in 0..<250 {
+            if await workspace.isWaiting(call: 3) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let fourthPoll = Task { await model.pollWorkspace() }
+        for _ in 0..<250 {
+            if await workspace.isWaiting(call: 4) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await workspace.release(call: 3)
+        await thirdPoll.value
+        XCTAssertEqual(model.liveSessions["s1"]?.projectId, "p", "an in-flight newer poll must not discard a completed refresh")
+        await workspace.release(call: 4)
+        await fourthPoll.value
+        XCTAssertEqual(model.liveSessions["s1"]?.projectId, "q")
+    }
+
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {

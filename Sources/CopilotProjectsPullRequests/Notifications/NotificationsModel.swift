@@ -64,6 +64,12 @@ final class NotificationsModel: ObservableObject {
     static let reopenFreshness: TimeInterval = 60
     static let accountsLifetime: TimeInterval = 600
     static let workspacePollInterval: TimeInterval = 3
+    /// Backstop interval when the workspace state and sessions directories are unchanged.
+    static let workspaceUnchangedPollInterval: TimeInterval = 15
+    /// Coalescing debounce for state/sessions directory file-system events.
+    static let workspaceWatchDebounce: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval
+    /// Minimum delay before a follow-up poll can settle a disk change.
+    static let workspaceSettleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
     /// Individual banners per refresh; more become one summary banner.
     static let individualBannerLimit = 3
     /// How long an open review request's state is trusted before it's read
@@ -191,6 +197,13 @@ final class NotificationsModel: ObservableObject {
     private var loop: Task<Void, Never>?
     private var workspaceLoop: Task<Void, Never>?
     private var lastGoodSnapshot: WorkspaceSnapshot?
+    private let workspaceStateDirectory: URL?
+    private let workspacePollPeriod: TimeInterval
+    private let workspaceUnchangedPollPeriod: TimeInterval
+    private let workspaceWatchDebouncePeriod: TimeInterval
+    private var workspacePollGate = WorkspacePollGate()
+    private var workspacePollGeneration: UInt64 = 0
+    private var appliedWorkspacePollGeneration: UInt64 = 0
     /// The `updatedAt` each thread's details were read for.
     private var detailVersions: [NotificationThread.Key: Date] = [:]
     /// Per `account|org`: the user's teams there, whether that list was whole, and when it was read.
@@ -234,6 +247,10 @@ final class NotificationsModel: ObservableObject {
         storageNote: String? = nil,
         summaryURL: URL? = nil,
         stateDirectory: URL? = nil,
+        workspaceStateDirectory: URL? = nil,
+        workspacePollInterval: TimeInterval = NotificationsModel.workspacePollInterval,
+        workspaceUnchangedPollInterval: TimeInterval = NotificationsModel.workspaceUnchangedPollInterval,
+        workspaceWatchDebounce: TimeInterval = NotificationsModel.workspaceWatchDebounce,
         api: GitHubNotificationsAPI = GitHubNotificationsAPI(),
         plan: NotificationsFetchPlan = NotificationsFetchPlan(),
         detailsFetcher: NotificationDetailsFetcher = NotificationDetailsFetcher(),
@@ -254,6 +271,10 @@ final class NotificationsModel: ObservableObject {
         self.clearsAnswered = clearsAnswered
         self.storageNote = storageNote
         self.summaryURL = summaryURL
+        self.workspaceStateDirectory = workspaceStateDirectory ?? workspace.stateDirectory
+        workspacePollPeriod = workspacePollInterval
+        workspaceUnchangedPollPeriod = workspaceUnchangedPollInterval
+        workspaceWatchDebouncePeriod = workspaceWatchDebounce
         self.api = api
         self.plan = plan
         self.detailsFetcher = detailsFetcher
@@ -699,17 +720,67 @@ final class NotificationsModel: ObservableObject {
 
     // MARK: Sessions
 
-    private func runWorkspaceLoop() async {
+    func runWorkspaceLoop() async {
+        let watcher = workspaceStateDirectory.map {
+            WorkspaceDirectoryWatcher(stateDirectory: $0, debounceInterval: workspaceWatchDebouncePeriod)
+        }
+        defer { watcher?.stop() }
+        var wasVisible = isVisible()
         await pollWorkspace()
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: UInt64(Self.workspacePollInterval * 1_000_000_000))
+            if let watcher {
+                await watcher.waitForNextPoll(timeout: workspacePollPeriod)
+            } else {
+                try? await Task.sleep(nanoseconds: UInt64(workspacePollPeriod * 1_000_000_000))
+            }
             guard !Task.isCancelled else { return }
-            if isVisible() { await pollWorkspace() }
+            let visible = isVisible()
+            defer { wasVisible = visible }
+            if visible {
+                if !wasVisible {
+                    await pollWorkspace()
+                } else {
+                    await pollWorkspaceIfNeeded()
+                }
+            }
         }
     }
 
+    func pollWorkspaceIfNeeded() async {
+        let now = clock()
+        if let directory = workspaceStateDirectory {
+            let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
+            if workspacePollGate.shouldSkipPoll(
+                currentSignature: current,
+                now: now,
+                unchangedPollInterval: isConnected ? workspaceUnchangedPollPeriod : workspacePollPeriod,
+                settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
+            ) {
+                return
+            }
+        }
+        await pollWorkspace()
+    }
+
     func pollWorkspace() async {
-        apply(await source.snapshot())
+        let sampledSignature: WorkspaceDirectorySignature?
+        if let directory = workspaceStateDirectory {
+            sampledSignature = await WorkspaceDirectorySignature.captureAsync(at: directory)
+        } else {
+            sampledSignature = nil
+        }
+        workspacePollGeneration &+= 1
+        let generation = workspacePollGeneration
+        let fetch = await source.snapshot()
+        guard generation > appliedWorkspacePollGeneration else { return }
+        appliedWorkspacePollGeneration = generation
+        workspacePollGate.record(
+            fetch: fetch,
+            sampledSignature: sampledSignature,
+            now: clock(),
+            settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
+        )
+        apply(fetch)
         if Self.signature(liveSessions) != linkedSessions { await matchSessions() }
     }
 
