@@ -201,10 +201,7 @@ final class NotificationsModel: ObservableObject {
     private let workspacePollPeriod: TimeInterval
     private let workspaceUnchangedPollPeriod: TimeInterval
     private let workspaceWatchDebouncePeriod: TimeInterval
-    private var lastWorkspaceSignature: WorkspaceDirectorySignature?
-    private var settledWorkspaceSignature: WorkspaceDirectorySignature?
-    private var unsettledDiskChangeAt: Date?
-    private var lastWorkspacePollAt: Date?
+    private var workspacePollGate = WorkspacePollGate()
     private var workspacePollGeneration: UInt64 = 0
     /// The `updatedAt` each thread's details were read for.
     private var detailVersions: [NotificationThread.Key: Date] = [:]
@@ -742,16 +739,14 @@ final class NotificationsModel: ObservableObject {
     func pollWorkspaceIfNeeded() async {
         let now = clock()
         if isConnected,
-           let lastWorkspacePollAt,
-           now.timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
            let directory = workspaceStateDirectory {
             let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
-            if current == settledWorkspaceSignature {
-                return
-            }
-            if current == lastWorkspaceSignature,
-               let unsettledDiskChangeAt,
-               now.timeIntervalSince(unsettledDiskChangeAt) < Self.workspaceSettleFollowUpDelay {
+            if workspacePollGate.shouldSkipPoll(
+                currentSignature: current,
+                now: now,
+                unchangedPollInterval: workspaceUnchangedPollPeriod,
+                settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
+            ) {
                 return
             }
         }
@@ -769,41 +764,14 @@ final class NotificationsModel: ObservableObject {
         }
         let fetch = await source.snapshot()
         guard generation == workspacePollGeneration else { return }
-        recordWorkspacePoll(
+        workspacePollGate.record(
             fetch: fetch,
-            sampledSignature: sampledSignature
+            sampledSignature: sampledSignature,
+            now: clock(),
+            settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
         )
         apply(fetch)
         if Self.signature(liveSessions) != linkedSessions { await matchSessions() }
-    }
-
-    private func recordWorkspacePoll(
-        fetch: WorkspaceFetch,
-        sampledSignature: WorkspaceDirectorySignature?
-    ) {
-        guard case .snapshot = fetch else {
-            lastWorkspaceSignature = nil
-            settledWorkspaceSignature = nil
-            unsettledDiskChangeAt = nil
-            lastWorkspacePollAt = nil
-            return
-        }
-        let now = clock()
-        lastWorkspacePollAt = now
-        guard let sampledSignature else {
-            lastWorkspaceSignature = nil
-            settledWorkspaceSignature = nil
-            unsettledDiskChangeAt = nil
-            return
-        }
-        if lastWorkspaceSignature == nil || sampledSignature == lastWorkspaceSignature {
-            settledWorkspaceSignature = sampledSignature
-            unsettledDiskChangeAt = nil
-        } else {
-            settledWorkspaceSignature = nil
-            unsettledDiskChangeAt = now
-        }
-        lastWorkspaceSignature = sampledSignature
     }
 
     func apply(_ fetch: WorkspaceFetch) {

@@ -270,6 +270,74 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
     }
 }
 
+/// Tracks the last polled workspace state-directory signature, allowing one
+/// delayed follow-up poll after a disk change before skipping unchanged polls
+/// up to the staleness backstop interval.
+struct WorkspacePollGate: Sendable {
+    static let defaultSettleFollowUpDelay: TimeInterval = 0.5
+
+    private(set) var lastSignature: WorkspaceDirectorySignature?
+    private(set) var settledSignature: WorkspaceDirectorySignature?
+    private(set) var unsettledDiskChangeAt: Date?
+    private(set) var lastPollAt: Date?
+
+    func shouldSkipPoll(
+        currentSignature: WorkspaceDirectorySignature,
+        now: Date,
+        unchangedPollInterval: TimeInterval,
+        settleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
+    ) -> Bool {
+        guard let lastPollAt,
+              now.timeIntervalSince(lastPollAt) < unchangedPollInterval else {
+            return false
+        }
+        if currentSignature == settledSignature {
+            return true
+        }
+        if currentSignature == lastSignature,
+           let unsettledDiskChangeAt,
+           now.timeIntervalSince(unsettledDiskChangeAt) < settleFollowUpDelay {
+            return true
+        }
+        return false
+    }
+
+    mutating func record(
+        fetch: WorkspaceFetch,
+        sampledSignature: WorkspaceDirectorySignature?,
+        now: Date,
+        settleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
+    ) {
+        guard case .snapshot = fetch else {
+            lastSignature = nil
+            settledSignature = nil
+            unsettledDiskChangeAt = nil
+            lastPollAt = nil
+            return
+        }
+        lastPollAt = now
+        guard let sampledSignature else {
+            lastSignature = nil
+            settledSignature = nil
+            unsettledDiskChangeAt = nil
+            return
+        }
+        if lastSignature == nil {
+            settledSignature = sampledSignature
+            unsettledDiskChangeAt = nil
+        } else if sampledSignature == lastSignature {
+            if unsettledDiskChangeAt.map({ now.timeIntervalSince($0) >= settleFollowUpDelay }) ?? true {
+                settledSignature = sampledSignature
+                unsettledDiskChangeAt = nil
+            }
+        } else {
+            settledSignature = nil
+            unsettledDiskChangeAt = now
+        }
+        lastSignature = sampledSignature
+    }
+}
+
 /// Watches the host workspace's state and sessions directories with
 /// `DispatchSourceFileSystemObject` and coalesces bursts into debounced wakeups.
 @MainActor

@@ -99,10 +99,7 @@ final class PullRequestsModel: ObservableObject {
     private let workspacePollPeriod: TimeInterval
     private let workspaceUnchangedPollPeriod: TimeInterval
     private let workspaceWatchDebouncePeriod: TimeInterval
-    private var lastWorkspaceSignature: WorkspaceDirectorySignature?
-    private var settledWorkspaceSignature: WorkspaceDirectorySignature?
-    private var unsettledDiskChangeAt: Date?
-    private var lastWorkspacePollAt: Date?
+    private var workspacePollGate = WorkspacePollGate()
     /// The last refresh matched transcripts without live sessions, so the next
     /// snapshot matches them again.
     private var matchedWithoutSessions = false
@@ -360,18 +357,14 @@ final class PullRequestsModel: ObservableObject {
            resumingSessions.isEmpty,
            resumeDeadlines.isEmpty,
            !pendingPrompts.values.contains(where: \.isQueuedNative),
-           let lastWorkspacePollAt,
-           now.timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
            let directory = workspaceStateDirectory {
             let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
-            if current == settledWorkspaceSignature {
-                return
-            }
-            // Wait for the host's throttled activity scan before spending the single
-            // follow-up poll for a disk change that initially returned the old snapshot.
-            if current == lastWorkspaceSignature,
-               let unsettledDiskChangeAt,
-               now.timeIntervalSince(unsettledDiskChangeAt) < Self.workspaceSettleFollowUpDelay {
+            if workspacePollGate.shouldSkipPoll(
+                currentSignature: current,
+                now: now,
+                unchangedPollInterval: workspaceUnchangedPollPeriod,
+                settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
+            ) {
                 return
             }
         }
@@ -395,44 +388,15 @@ final class PullRequestsModel: ObservableObject {
         }
         let fetch = await source.snapshot()
         apply(fetch)
-        recordWorkspacePoll(
+        workspacePollGate.record(
             fetch: fetch,
-            sampledSignature: sampledSignature
+            sampledSignature: sampledSignature,
+            now: clock(),
+            settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
         )
         if isConnected {
             await reconcileQueuedPrompts()
         }
-    }
-
-    private func recordWorkspacePoll(
-        fetch: WorkspaceFetch,
-        sampledSignature: WorkspaceDirectorySignature?
-    ) {
-        guard case .snapshot = fetch else {
-            lastWorkspaceSignature = nil
-            settledWorkspaceSignature = nil
-            unsettledDiskChangeAt = nil
-            lastWorkspacePollAt = nil
-            return
-        }
-        let now = clock()
-        lastWorkspacePollAt = now
-        guard let sampledSignature else {
-            lastWorkspaceSignature = nil
-            settledWorkspaceSignature = nil
-            unsettledDiskChangeAt = nil
-            return
-        }
-        if lastWorkspaceSignature == nil || sampledSignature == lastWorkspaceSignature {
-            settledWorkspaceSignature = sampledSignature
-            unsettledDiskChangeAt = nil
-        } else {
-            // A newly observed disk signature stays eligible for one delayed
-            // follow-up poll so throttled host activity scans can settle.
-            settledWorkspaceSignature = nil
-            unsettledDiskChangeAt = now
-        }
-        lastWorkspaceSignature = sampledSignature
     }
 
     func apply(_ fetch: WorkspaceFetch) {
