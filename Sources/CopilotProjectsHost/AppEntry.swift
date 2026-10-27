@@ -97,6 +97,11 @@ private struct WorkspaceCommands: Commands {
         CommandGroup(after: .appSettings) {
             Toggle("Keep Running When Window Closes", isOn: $keepRunning)
             Toggle("Start Notifications with Copilot Projects", isOn: $startsNotifications)
+            Divider()
+            Button("Pull Request Review Prompt…") {
+                model.configurePullRequestReviewPromptInteractive()
+            }
+            .disabled(input.hasWorkspaceSheet)
         }
         CommandGroup(after: .help) {
             Button("What's New") {

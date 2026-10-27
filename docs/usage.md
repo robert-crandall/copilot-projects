@@ -81,8 +81,11 @@ with a CoreGraphics fallback. The result is a few Swift files instead of hundred
   Prompts are never retried automatically. New and restored Copilot sessions never pass
   `--allow-all`; tool approvals follow your normal Copilot CLI permission settings.
 - **Local PR reviews:** choose **Review Pull Request…** from the **+** split button's
-  dropdown, paste a GitHub pull request URL, and open a new Copilot CLI session with a
-  local adversarial-review prompt in the current project.
+  dropdown, paste a GitHub pull request URL, and open a new Copilot CLI session in the
+  current project. The session starts with the prompt from **Copilot Projects ▸ Pull
+  Request Review Prompt…**. Put `{url}` where the pull request URL goes. **Restore
+  Default** returns the built-in adversarial-review prompt. Copilot Notifications, the
+  CLI, and a remote device use that same prompt.
 - **Status:** each session reports `idle` / `running` / `waiting`. Running and waiting
   labeled symbol counts appear in the project column; a blue dot on the session row marks work that finished
   while you were away, and a red exclamation with **Request failed** marks a session whose latest

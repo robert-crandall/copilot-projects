@@ -19,9 +19,9 @@ public enum RemoteSessionContract {
     /// The host could not durably save the created session or its replay ledger.
     public static let persistenceUnavailableErrorCode = "persistence-unavailable"
 
-    /// Dedicated path for a session that launches Copilot with the fixed local
-    /// adversarial-review prompt. Keeping this separate makes older hosts return
-    /// 404 instead of silently ignoring the additive request field.
+    /// Dedicated path for a session that launches Copilot with the host's
+    /// configured pull request review prompt. Keeping this separate makes older
+    /// hosts return 404 instead of silently ignoring the additive request field.
     public static let reviewPath = "sessions/review"
 }
 
