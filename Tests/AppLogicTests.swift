@@ -8453,6 +8453,10 @@ final class AppLogicTests: XCTestCase {
             MarkdownParser.blocks(from: "```\nunterminated"),
             [.codeBlock("unterminated")]
         )
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "```inline triple backtick```"),
+            [.paragraph("```inline triple backtick```")]
+        )
     }
 
     func testMarkdownRenderingLimitsPreventStructuralAmplification() {
@@ -8482,6 +8486,15 @@ final class AppLogicTests: XCTestCase {
         ))
         XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
             Array(repeating: "**x** ", count: 40_000).joined()
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "[x](u) ", count: 30_000)
+        ))
+        let wideHeader = Array(repeating: "h", count: 50).joined(separator: " | ")
+        let wideDelimiter = Array(repeating: "---", count: 50).joined(separator: " | ")
+        let sparseRows = Array(repeating: "a | b", count: 25).joined(separator: "\n")
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            "\(wideHeader)\n\(wideDelimiter)\n\(sparseRows)"
         ))
     }
 
@@ -8582,6 +8595,60 @@ final class AppLogicTests: XCTestCase {
             ),
             .left
         )
+
+        let uncachedTextView = MarkdownSelectableTextView(frame: .zero)
+        uncachedTextView.attributedText = NSAttributedString(string: "Short line")
+        let intrinsic = uncachedTextView.intrinsicContentSize
+        XCTAssertGreaterThan(intrinsic.width, 0)
+        XCTAssertLessThan(intrinsic.width, 1_000)
+
+        let tableMarkdown = """
+        | Arm | Score |
+        | --- | ---: |
+        | 3x Alligator/Terra (high) | 85.4% / 33.2% |
+        | 3x Terra 6.1 (xhigh) | 83.3% / 34.3% |
+        | 4x Terra 6.1 (high) | 85.6% / 33.4% |
+        """
+        let tableHost = NSHostingView(
+            rootView: MarkdownText(text: tableMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        tableHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        tableHost.layoutSubtreeIfNeeded()
+        let tableTextViews = findTextViews(in: tableHost)
+        XCTAssertEqual(
+            tableTextViews.count, 1,
+            "An entire Markdown table should render in a single selectable text view so selection can span multiple rows"
+        )
+        let tableTextView = try XCTUnwrap(tableTextViews.first)
+        let tableString = tableTextView.attributedText.string as NSString
+        let multiRowTarget = "3x Alligator/Terra (high)\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
+        let multiRowRange = tableString.range(of: multiRowTarget)
+        XCTAssertNotEqual(multiRowRange.location, NSNotFound)
+        tableTextView.setSelectedRange(multiRowRange)
+        XCTAssertEqual(tableString.substring(with: tableTextView.selectedRange()), multiRowTarget)
+
+        func renderedTableHeight(_ detail: String) -> CGFloat {
+            let md = """
+            | Name | Detail |
+            | :--- | ---: |
+            | host | \(detail) |
+            """
+            let view = NSHostingView(
+                rootView: MarkdownText(text: md)
+                    .frame(width: 300, alignment: .leading)
+            )
+            return view.fittingSize.height
+        }
+        let shortHeight = renderedTableHeight("short")
+        let wrappedHeight = renderedTableHeight(
+            String(repeating: "wrap this table cell ", count: 40)
+        )
+        let unbrokenHeight = renderedTableHeight(
+            String(repeating: "unbroken", count: 100)
+        )
+        XCTAssertGreaterThan(wrappedHeight, shortHeight + 100)
+        XCTAssertGreaterThan(unbrokenHeight, shortHeight + 100)
     }
 
     // MARK: - Remote web terminal image rendering

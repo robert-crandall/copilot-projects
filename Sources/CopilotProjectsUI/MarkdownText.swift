@@ -218,6 +218,7 @@ public enum MarkdownParser {
     private static let maximumRenderedLines = 500
     private static let maximumRenderedPipes = 1_000
     private static let maximumInlineMarkers = 2_000
+    public static let maximumRenderedTableCells = 1_000
 
     public static let maxBlockCacheEntries = 256
     public static let maxInlineCacheEntries = 1_024
@@ -250,10 +251,25 @@ public enum MarkdownParser {
             } else if character == "|" {
                 pipes += 1
                 if pipes > maximumRenderedPipes { return false }
-            } else if character == "*" || character == "_" || character == "~" || character == "`" {
+            } else if character == "*" || character == "_" || character == "~"
+                        || character == "`" || character == "[" {
                 inlineMarkers += 1
                 if inlineMarkers > maximumInlineMarkers { return false }
             }
+        }
+        return isWithinTableCellLimits(blocks(from: text))
+    }
+
+    public static func isWithinTableCellLimits(_ blocks: [MarkdownBlock]) -> Bool {
+        var totalCells = 0
+        for block in blocks {
+            guard case let .table(table) = block else { continue }
+            let rowCount = table.rows.count + 1
+            let (tableCells, overflow) = table.header.count.multipliedReportingOverflow(by: rowCount)
+            if overflow { return false }
+            let (nextTotal, sumOverflow) = totalCells.addingReportingOverflow(tableCells)
+            if sumOverflow || nextTotal > maximumRenderedTableCells { return false }
+            totalCells = nextTotal
         }
         return true
     }
@@ -417,7 +433,8 @@ public enum MarkdownParser {
 
     private static func fenceLength(_ line: String) -> Int? {
         let ticks = line.prefix { $0 == "`" }.count
-        return ticks >= 3 ? ticks : nil
+        guard ticks >= 3, !line.dropFirst(ticks).contains("`") else { return nil }
+        return ticks
     }
 
     private static func isClosingFence(_ line: String, _ openLength: Int) -> Bool {
@@ -555,6 +572,9 @@ public struct MarkdownText: View, Equatable {
     public static let quoteBarAttribute = NSAttributedString.Key(
         "CopilotProjects.MarkdownQuoteBar"
     )
+    public static let tableHeaderDividerAttribute = NSAttributedString.Key(
+        "CopilotProjects.MarkdownTableHeaderDivider"
+    )
 
     #if canImport(UIKit) && !os(watchOS)
     public static let headingLevelAttribute = NSAttributedString.Key.accessibilityTextHeadingLevel
@@ -665,32 +685,13 @@ public struct MarkdownText: View, Equatable {
 
     @ViewBuilder
     private func tableView(_ table: MarkdownTable) -> some View {
-        let columns = table.header.count
         ScrollView(.horizontal, showsIndicators: false) {
-            Grid(alignment: .topLeading, horizontalSpacing: 14, verticalSpacing: 6) {
-                GridRow {
-                    ForEach(0..<columns, id: \.self) { column in
-                        cell(
-                            inline(table.header[column]),
-                            table.alignments,
-                            column,
-                            weight: .semibold
-                        )
-                    }
-                }
-                Divider().gridCellColumns(max(columns, 1))
-                ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
-                    GridRow {
-                        ForEach(0..<columns, id: \.self) { column in
-                            cell(
-                                inline(column < row.count ? row[column] : ""),
-                                table.alignments,
-                                column,
-                                weight: .regular
-                            )
-                        }
-                    }
-                }
+            SelectableMarkdownText(wraps: false) { styleContext, layoutDirection in
+                Self.makeTableAttributedText(
+                    table,
+                    styleContext: styleContext,
+                    layoutDirection: layoutDirection
+                )
             }
             .padding(10)
         }
@@ -702,31 +703,9 @@ public struct MarkdownText: View, Equatable {
         )
     }
 
-    private func cell(
-        _ content: AttributedString,
-        _ alignments: [MarkdownColumnAlignment],
-        _ column: Int,
-        weight: PlatformFont.Weight
-    ) -> some View {
-        SelectableMarkdownText(wraps: true) { styleContext, layoutDirection in
-            Self.makeAttributedText(
-                content,
-                role: .body,
-                weight: weight,
-                foregroundColor: Self.primaryLabelColor,
-                alignment: Self.resolvedTableTextAlignment(
-                    alignments,
-                    column: column,
-                    layoutDirection: layoutDirection
-                ),
-                wraps: true,
-                styleContext: styleContext
-            )
-        }
-        .frame(width: Self.cellWidth)
-    }
-
     private static let cellWidth: CGFloat = 280
+    private static let minCellWidth: CGFloat = 36
+    private static let tableColumnSpacing: CGFloat = 14
 
     private static var containerBackgroundColor: Color {
         #if canImport(UIKit) && !os(watchOS)
@@ -992,6 +971,242 @@ public struct MarkdownText: View, Equatable {
         )
     }
 
+    private static func makeTableAttributedText(
+        _ table: MarkdownTable,
+        styleContext: StyleContext,
+        layoutDirection: LayoutDirection
+    ) -> NSAttributedString {
+        let columns = max(table.header.count, 1)
+        let headerCells: [NSAttributedString] = (0..<columns).map { column in
+            let text = column < table.header.count ? table.header[column] : ""
+            return makeAttributedText(
+                MarkdownParser.inline(text),
+                role: .body,
+                weight: .semibold,
+                foregroundColor: primaryLabelColor,
+                alignment: .natural,
+                wraps: true,
+                styleContext: styleContext
+            )
+        }
+        let bodyRows: [[NSAttributedString]] = table.rows.map { row in
+            (0..<columns).map { column in
+                let text = column < row.count ? row[column] : ""
+                return makeAttributedText(
+                    MarkdownParser.inline(text),
+                    role: .body,
+                    weight: .regular,
+                    foregroundColor: primaryLabelColor,
+                    alignment: .natural,
+                    wraps: true,
+                    styleContext: styleContext
+                )
+            }
+        }
+
+        let columnWidths: [CGFloat] = (0..<columns).map { column in
+            var widest = minCellWidth
+            for cell in [headerCells[column]] + bodyRows.map({ $0[column] }) where cell.length > 0 {
+                let measured = ceil(
+                    cell.boundingRect(
+                        with: CGSize(
+                            width: CGFloat.greatestFiniteMagnitude,
+                            height: CGFloat.greatestFiniteMagnitude
+                        ),
+                        options: [.usesLineFragmentOrigin, .usesFontLeading],
+                        context: nil
+                    ).width
+                )
+                widest = max(widest, min(cellWidth, measured))
+            }
+            return widest
+        }
+
+        var columnOrigins: [CGFloat] = []
+        var runningX: CGFloat = 0
+        for (column, width) in columnWidths.enumerated() {
+            columnOrigins.append(runningX)
+            runningX += width + (column < columns - 1 ? tableColumnSpacing : 0)
+        }
+
+        let tabStops: [NSTextTab] = (1..<columns).map { column in
+            let alignment = resolvedTableTextAlignment(
+                table.alignments,
+                column: column,
+                layoutDirection: layoutDirection
+            )
+            let location: CGFloat = switch alignment {
+            case .center:
+                columnOrigins[column] + columnWidths[column] / 2
+            case .right:
+                columnOrigins[column] + columnWidths[column]
+            default:
+                columnOrigins[column]
+            }
+            return NSTextTab(textAlignment: alignment, location: location)
+        }
+        let firstColumnAlignment = columns == 1
+            ? resolvedTableTextAlignment(
+                table.alignments,
+                column: 0,
+                layoutDirection: layoutDirection
+            )
+            : .left
+
+        let allRows = [headerCells] + bodyRows
+        let result = NSMutableAttributedString()
+        let fallbackFont = scaledSystemFont(
+            role: .body,
+            weight: .regular,
+            styleContext: styleContext
+        )
+
+        for (rowIndex, rowCells) in allRows.enumerated() {
+            let isHeader = rowIndex == 0
+            let isLastRow = rowIndex == allRows.count - 1
+            let wrappedColumns: [[NSAttributedString]] = (0..<columns).map { column in
+                wrapCellIntoLines(rowCells[column], width: columnWidths[column])
+            }
+            let visualLineCount = max(1, wrappedColumns.map(\.count).max() ?? 1)
+            let rowStart = result.length
+
+            for lineIndex in 0..<visualLineCount {
+                let isLastVisualLine = lineIndex == visualLineCount - 1
+                let spacingAfterLine: CGFloat = if !isLastVisualLine {
+                    0
+                } else if isLastRow {
+                    0
+                } else if isHeader {
+                    12
+                } else {
+                    6
+                }
+                let lineStyle = NSMutableParagraphStyle()
+                lineStyle.alignment = firstColumnAlignment
+                lineStyle.lineBreakMode = .byClipping
+                lineStyle.paragraphSpacing = spacingAfterLine
+                lineStyle.tabStops = tabStops
+
+                let lineAttributed = NSMutableAttributedString()
+                for column in 0..<columns {
+                    if column > 0 {
+                        lineAttributed.append(
+                            NSAttributedString(
+                                string: "\t",
+                                attributes: [
+                                    .font: fallbackFont,
+                                    .foregroundColor: primaryLabelColor,
+                                ]
+                            )
+                        )
+                    }
+                    let columnLines = wrappedColumns[column]
+                    if lineIndex < columnLines.count {
+                        lineAttributed.append(columnLines[lineIndex])
+                    }
+                }
+                if lineAttributed.length == 0 {
+                    lineAttributed.append(
+                        NSAttributedString(
+                            string: " ",
+                            attributes: [
+                                .font: fallbackFont,
+                                .foregroundColor: primaryLabelColor,
+                            ]
+                        )
+                    )
+                }
+                lineAttributed.addAttribute(
+                    .paragraphStyle,
+                    value: lineStyle,
+                    range: NSRange(location: 0, length: lineAttributed.length)
+                )
+                result.append(lineAttributed)
+                if !(isLastRow && isLastVisualLine) {
+                    result.append(
+                        NSAttributedString(
+                            string: "\n",
+                            attributes: [
+                                .font: fallbackFont,
+                                .foregroundColor: primaryLabelColor,
+                                .paragraphStyle: lineStyle,
+                            ]
+                        )
+                    )
+                }
+            }
+
+            if isHeader, !table.rows.isEmpty, result.length > rowStart {
+                result.addAttribute(
+                    tableHeaderDividerAttribute,
+                    value: max(runningX, 1),
+                    range: NSRange(location: rowStart, length: result.length - rowStart)
+                )
+            }
+        }
+
+        return result
+    }
+
+    private static func wrapCellIntoLines(
+        _ cell: NSAttributedString,
+        width: CGFloat
+    ) -> [NSAttributedString] {
+        guard cell.length > 0 else { return [NSAttributedString()] }
+        let singleLineWidth = ceil(
+            cell.boundingRect(
+                with: CGSize(
+                    width: CGFloat.greatestFiniteMagnitude,
+                    height: CGFloat.greatestFiniteMagnitude
+                ),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            ).width
+        )
+        if singleLineWidth <= width && !cell.string.contains("\n") {
+            return [cell]
+        }
+
+        let storage = NSTextStorage(attributedString: cell)
+        let layoutManager = NSLayoutManager()
+        let container = NSTextContainer(
+            size: CGSize(width: max(1, width), height: CGFloat.greatestFiniteMagnitude)
+        )
+        container.lineFragmentPadding = 0
+        container.lineBreakMode = .byWordWrapping
+        layoutManager.addTextContainer(container)
+        storage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: container)
+
+        var lines: [NSAttributedString] = []
+        let totalGlyphs = layoutManager.numberOfGlyphs
+        var glyphIndex = 0
+        let nsString = storage.string as NSString
+        while glyphIndex < totalGlyphs {
+            var lineGlyphRange = NSRange(location: 0, length: 0)
+            _ = layoutManager.lineFragmentRect(
+                forGlyphAt: glyphIndex,
+                effectiveRange: &lineGlyphRange
+            )
+            guard lineGlyphRange.length > 0 else { break }
+            var charRange = layoutManager.characterRange(
+                forGlyphRange: lineGlyphRange,
+                actualGlyphRange: nil
+            )
+            while charRange.length > 0 {
+                let lastChar = nsString.character(at: NSMaxRange(charRange) - 1)
+                if lastChar == 0x0A || lastChar == 0x0D || lastChar == 0x20 || lastChar == 0x09 {
+                    charRange.length -= 1
+                } else {
+                    break
+                }
+            }
+            lines.append(storage.attributedSubstring(from: charRange))
+            glyphIndex = NSMaxRange(lineGlyphRange)
+        }
+        return lines.isEmpty ? [NSAttributedString()] : lines
+    }
+
     private static func makeAttributedText(
         _ content: AttributedString,
         role: TextRole,
@@ -1219,6 +1434,21 @@ public final class MarkdownSelectableTextView: UITextView {
         }
     }
 
+    fileprivate var minimumTableWidth: CGFloat {
+        guard let attributedText, attributedText.length > 0 else { return 0 }
+        var maxTableWidth: CGFloat = 0
+        let fullRange = NSRange(location: 0, length: attributedText.length)
+        attributedText.enumerateAttribute(
+            MarkdownText.tableHeaderDividerAttribute,
+            in: fullRange
+        ) { value, _, _ in
+            if let width = value as? CGFloat {
+                maxTableWidth = max(maxTableWidth, width)
+            }
+        }
+        return ceil(maxTableWidth)
+    }
+
     public override var intrinsicContentSize: CGSize {
         let targetWidth = wrapsText && preferredMaxLayoutWidth > 0
             ? preferredMaxLayoutWidth
@@ -1227,7 +1457,7 @@ public final class MarkdownSelectableTextView: UITextView {
             CGSize(width: targetWidth, height: .greatestFiniteMagnitude)
         )
         return CGSize(
-            width: ceil(measured.width),
+            width: max(ceil(measured.width), minimumTableWidth),
             height: ceil(measured.height)
         )
     }
@@ -1256,6 +1486,29 @@ public final class MarkdownSelectableTextView: UITextView {
             let barRect = CGRect(x: barX, y: minY, width: 3, height: maxY - minY)
             UIColor.secondaryLabel.setFill()
             UIBezierPath(roundedRect: barRect, cornerRadius: 2).fill()
+        }
+        attributedText.enumerateAttribute(
+            MarkdownText.tableHeaderDividerAttribute,
+            in: fullRange
+        ) { value, range, _ in
+            guard let tableWidth = value as? CGFloat,
+                  let start = position(from: beginningOfDocument, offset: range.location),
+                  let end = position(from: start, offset: range.length),
+                  let textRange = textRange(from: start, to: end) else { return }
+            let rects = selectionRects(for: textRange)
+                .map(\.rect)
+                .filter { !$0.height.isZero && !$0.height.isInfinite }
+            guard let maxY = rects.map(\.maxY).max() else { return }
+            let scale = window?.screen.scale ?? traitCollection.displayScale
+            let thickness = 1 / max(scale, 1)
+            let lineRect = CGRect(
+                x: 0,
+                y: maxY - 6,
+                width: max(bounds.width, tableWidth),
+                height: thickness
+            )
+            UIColor.separator.setFill()
+            UIRectFill(lineRect)
         }
     }
 
@@ -1361,7 +1614,10 @@ private struct SelectableMarkdownText: UIViewRepresentable {
                     height: CGFloat.greatestFiniteMagnitude
                 )
             )
-            return CGSize(width: ceil(measured.width), height: ceil(measured.height))
+            return CGSize(
+                width: max(ceil(measured.width), uiView.minimumTableWidth),
+                height: ceil(measured.height)
+            )
         }
     }
 }
@@ -1389,6 +1645,21 @@ public final class MarkdownSelectableTextView: NSTextView {
         }
     }
 
+    fileprivate var minimumTableWidth: CGFloat {
+        guard let textStorage, textStorage.length > 0 else { return 0 }
+        var maxTableWidth: CGFloat = 0
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttribute(
+            MarkdownText.tableHeaderDividerAttribute,
+            in: fullRange
+        ) { value, _, _ in
+            if let width = value as? CGFloat {
+                maxTableWidth = max(maxTableWidth, width)
+            }
+        }
+        return ceil(maxTableWidth)
+    }
+
     public override var intrinsicContentSize: NSSize {
         let targetWidth = wrapsText && preferredMaxLayoutWidth > 0
             ? preferredMaxLayoutWidth
@@ -1398,7 +1669,9 @@ public final class MarkdownSelectableTextView: NSTextView {
 
     func measuredSize(forWidth width: CGFloat) -> CGSize {
         guard let textContainer, let layoutManager else { return .zero }
+        textContainer.lineFragmentPadding = 0
         let finiteWidth = wrapsText && width.isFinite && width > 0
+            && width < CGFloat.greatestFiniteMagnitude
         let targetWidth = finiteWidth ? width : CGFloat.greatestFiniteMagnitude
         textContainer.widthTracksTextView = false
         textContainer.size = CGSize(
@@ -1407,8 +1680,22 @@ public final class MarkdownSelectableTextView: NSTextView {
         )
         layoutManager.ensureLayout(for: textContainer)
         let used = layoutManager.usedRect(for: textContainer)
+        let naturalWidth: CGFloat
+        if finiteWidth {
+            naturalWidth = width
+        } else {
+            let bounded = attributedText.boundingRect(
+                with: CGSize(
+                    width: CGFloat.greatestFiniteMagnitude,
+                    height: CGFloat.greatestFiniteMagnitude
+                ),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            ).width
+            naturalWidth = max(ceil(bounded), minimumTableWidth)
+        }
         return CGSize(
-            width: finiteWidth ? width : ceil(used.width),
+            width: naturalWidth,
             height: ceil(used.height)
         )
     }
@@ -1455,6 +1742,29 @@ public final class MarkdownSelectableTextView: NSTextView {
             )
             NSColor.secondaryLabelColor.setFill()
             NSBezierPath(roundedRect: barRect, xRadius: 2, yRadius: 2).fill()
+        }
+        textStorage.enumerateAttribute(
+            MarkdownText.tableHeaderDividerAttribute,
+            in: fullRange
+        ) { value, range, _ in
+            guard let tableWidth = value as? CGFloat else { return }
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: range,
+                actualCharacterRange: nil
+            )
+            let rect = layoutManager.boundingRect(
+                forGlyphRange: glyphRange,
+                in: textContainer
+            )
+            guard rect.height > 0 else { return }
+            let lineRect = NSRect(
+                x: 0,
+                y: rect.maxY - 6,
+                width: max(bounds.width, tableWidth),
+                height: 1
+            )
+            NSColor.separatorColor.setFill()
+            lineRect.fill()
         }
     }
 
