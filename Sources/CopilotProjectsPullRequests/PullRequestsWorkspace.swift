@@ -197,7 +197,6 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
         "app.lock",
         "control.sock",
         "project-creation-ledger.json",
-        "session-creation-ledger.json",
         "state.json",
         "state.json.backup",
         "state.json.closing",
@@ -279,6 +278,7 @@ struct WorkspacePollGate: Sendable {
     private(set) var lastSignature: WorkspaceDirectorySignature?
     private(set) var unsettledDiskChangeAt: Date?
     private(set) var lastPollAt: Date?
+    private(set) var lastPollSucceeded = false
 
     func shouldSkipPoll(
         currentSignature: WorkspaceDirectorySignature,
@@ -303,19 +303,20 @@ struct WorkspacePollGate: Sendable {
         now: Date,
         settleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
     ) {
-        guard case .snapshot = fetch else {
-            lastSignature = nil
-            unsettledDiskChangeAt = nil
-            lastPollAt = nil
-            return
-        }
         lastPollAt = now
         guard let sampledSignature else {
             lastSignature = nil
             unsettledDiskChangeAt = nil
+            lastPollSucceeded = false
             return
         }
-        if sampledSignature == lastSignature {
+        guard case .snapshot = fetch else {
+            lastSignature = sampledSignature
+            unsettledDiskChangeAt = nil
+            lastPollSucceeded = false
+            return
+        }
+        if lastPollSucceeded, sampledSignature == lastSignature {
             if unsettledDiskChangeAt.map({ now.timeIntervalSince($0) >= settleFollowUpDelay }) ?? true {
                 unsettledDiskChangeAt = nil
             }
@@ -323,6 +324,7 @@ struct WorkspacePollGate: Sendable {
             unsettledDiskChangeAt = now
         }
         lastSignature = sampledSignature
+        lastPollSucceeded = true
     }
 }
 

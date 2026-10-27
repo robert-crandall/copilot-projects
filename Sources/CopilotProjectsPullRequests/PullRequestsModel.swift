@@ -362,16 +362,16 @@ final class PullRequestsModel: ObservableObject {
     /// changed since the last settled poll, or when the staleness cap has elapsed.
     func pollWorkspaceIfNeeded() async {
         let now = clock()
-        if isConnected,
-           resumingSessions.isEmpty,
-           resumeDeadlines.isEmpty,
-           !pendingPrompts.values.contains(where: \.isQueuedNative),
-           let directory = workspaceStateDirectory {
+        if let directory = workspaceStateDirectory {
             let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
+            let hasPendingLifecycle = !isConnected
+                || !resumingSessions.isEmpty
+                || !resumeDeadlines.isEmpty
+                || pendingPrompts.values.contains(where: \.isQueuedNative)
             if workspacePollGate.shouldSkipPoll(
                 currentSignature: current,
                 now: now,
-                unchangedPollInterval: workspaceUnchangedPollPeriod,
+                unchangedPollInterval: hasPendingLifecycle ? workspacePollPeriod : workspaceUnchangedPollPeriod,
                 settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
             ) {
                 return

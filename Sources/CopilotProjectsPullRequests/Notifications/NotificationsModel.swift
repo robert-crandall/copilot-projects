@@ -748,13 +748,12 @@ final class NotificationsModel: ObservableObject {
 
     func pollWorkspaceIfNeeded() async {
         let now = clock()
-        if isConnected,
-           let directory = workspaceStateDirectory {
+        if let directory = workspaceStateDirectory {
             let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
             if workspacePollGate.shouldSkipPoll(
                 currentSignature: current,
                 now: now,
-                unchangedPollInterval: workspaceUnchangedPollPeriod,
+                unchangedPollInterval: isConnected ? workspaceUnchangedPollPeriod : workspacePollPeriod,
                 settleFollowUpDelay: Self.workspaceSettleFollowUpDelay
             ) {
                 return
@@ -764,14 +763,14 @@ final class NotificationsModel: ObservableObject {
     }
 
     func pollWorkspace() async {
-        workspacePollGeneration &+= 1
-        let generation = workspacePollGeneration
         let sampledSignature: WorkspaceDirectorySignature?
         if let directory = workspaceStateDirectory {
             sampledSignature = await WorkspaceDirectorySignature.captureAsync(at: directory)
         } else {
             sampledSignature = nil
         }
+        workspacePollGeneration &+= 1
+        let generation = workspacePollGeneration
         let fetch = await source.snapshot()
         guard generation > appliedWorkspacePollGeneration else { return }
         appliedWorkspacePollGeneration = generation
