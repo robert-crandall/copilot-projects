@@ -2124,6 +2124,73 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(workspace.snapshotCalls, 3)
     }
 
+    func testSupersededWorkspaceSnapshotDoesNotOverwriteNewerPoll() async throws {
+        actor DelayedWorkspace: PullRequestsWorkspace {
+            private var firstContinuation: CheckedContinuation<WorkspaceFetch, Never>?
+            private var calls = 0
+            let firstAnswer: WorkspaceFetch
+            let secondAnswer: WorkspaceFetch
+
+            init(first: WorkspaceFetch, second: WorkspaceFetch) {
+                firstAnswer = first
+                secondAnswer = second
+            }
+
+            func snapshot() async -> WorkspaceFetch {
+                calls += 1
+                if calls == 1 {
+                    return await withCheckedContinuation { firstContinuation = $0 }
+                }
+                return secondAnswer
+            }
+
+            var hasFirstWaiter: Bool { firstContinuation != nil }
+
+            func releaseFirst() {
+                firstContinuation?.resume(returning: firstAnswer)
+                firstContinuation = nil
+            }
+
+            func revealSession(projectId: String?, sessionId: String) async -> WorkspaceCommandResult { .unreachable }
+            func startCopilotSession(projectId: String, requestId: UUID, prompt: String) async -> WorkspaceCommandResult { .unreachable }
+            func resumeCopilotSession(projectId: String, requestId: UUID, copilotSessionId: String) async -> WorkspaceCommandResult { .unreachable }
+            func sendSessionPrompt(projectId: String?, sessionId: String, requestId: UUID, prompt: String) async -> WorkspaceCommandResult { .unreachable }
+        }
+
+        let staleSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: []),
+        ])
+        let freshSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "p", projects: [
+            .init(id: "p", name: "Workspace", sessions: [
+                .init(id: "s1", title: "Fresh", status: .waiting, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let workspace = DelayedWorkspace(first: .snapshot(staleSnapshot), second: .snapshot(freshSnapshot))
+        let model = NotificationsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
+            loadAccounts: { [] },
+            transcriptPath: { _ in nil },
+            clock: { self.now }
+        )
+        model.setBadge = { _ in }
+        model.show([thread("1", "review_requested")], accounts: ["octocat"])
+
+        let firstPoll = Task { await model.pollWorkspace() }
+        for _ in 0..<250 {
+            if await workspace.hasFirstWaiter { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await model.pollWorkspace()
+        XCTAssertEqual(model.workspace, .connected(freshSnapshot))
+        XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s1")
+
+        await workspace.releaseFirst()
+        await firstPoll.value
+        XCTAssertEqual(model.workspace, .connected(freshSnapshot), "an older snapshot finishing late must be discarded")
+        XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s1")
+    }
+
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {

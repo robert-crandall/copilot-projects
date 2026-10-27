@@ -901,13 +901,14 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
             .snapshot(fixtureSnapshot),
             .snapshot(updatedSnapshot),
         ])
+        var now = testNow
         let model = PullRequestsModel(
             workspace: workspace,
             defaults: UserDefaults(suiteName: UUID().uuidString)!,
             stateDirectory: root.appendingPathComponent("pr-state", isDirectory: true),
             workspaceStateDirectory: stateDir,
             loadAccounts: { [] },
-            clock: { testNow },
+            clock: { now },
             isVisible: { true },
             presentError: { _, _ in }
         )
@@ -926,7 +927,14 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         XCTAssertEqual(workspace.snapshotCalls, 2)
         XCTAssertEqual(model.workspace, .connected(fixtureSnapshot))
 
-        // Because the snapshot was unchanged despite the disk change, one follow-up poll is allowed.
+        // An early excluded-file wakeup before workspaceSettleFollowUpDelay must not consume
+        // the follow-up poll while the host is still within its 0.5s throttle window.
+        now = now.addingTimeInterval(0.1)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+
+        // Once the settle delay elapses, one follow-up poll is allowed and picks up the host update.
+        now = now.addingTimeInterval(0.5)
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 3)
         XCTAssertEqual(model.workspace, .connected(updatedSnapshot))
@@ -934,6 +942,88 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         // Once settled, subsequent polls with no further disk change are skipped.
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 3)
+    }
+
+    func testActivityHeartbeatsDoNotTriggerPollsUntilWorkspaceFieldsChange() async throws {
+        let stateDir = root.appendingPathComponent("heartbeat-state", isDirectory: true)
+        let sessionsDir = stateDir.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+        func writeActivity(
+            _ sessionId: String,
+            updatedAt: String,
+            observedAt: Int64,
+            foregroundActive: Bool = false,
+            questionId: String? = nil
+        ) throws {
+            let questions = questionId.map { #"[{"requestId":"\#($0)","question":"Proceed?"}]"# } ?? "[]"
+            let json = """
+            {
+              "schemaVersion": 1,
+              "copilotSessionId": "abcdef12-0001",
+              "conversationEpoch": "abcdef12-0001:1",
+              "updatedAt": "\(updatedAt)",
+              "foregroundTurnActive": \(foregroundActive),
+              "scheduledTurnActive": false,
+              "activeSubagents": [],
+              "trackedUserInputs": \(questions),
+              "runtimeActivity": {"state": "idle", "observedAtMilliseconds": \(observedAt)}
+            }
+            """
+            try Data(json.utf8).write(
+                to: sessionsDir.appendingPathComponent("\(sessionId).agent-activity.json"),
+                options: .atomic
+            )
+        }
+
+        try writeActivity("s1", updatedAt: "2026-10-27T12:00:00.000Z", observedAt: 1_000)
+        try writeActivity("s2", updatedAt: "2026-10-27T12:00:01.000Z", observedAt: 2_000)
+
+        var waitingQuestionSnapshot = fixtureSnapshot
+        waitingQuestionSnapshot.projects[0].sessions[0].hasPendingInput = true
+        let workspace = FakeWorkspace(fetches: [
+            .snapshot(fixtureSnapshot),
+            .snapshot(waitingQuestionSnapshot),
+        ])
+        let model = PullRequestsModel(
+            workspace: workspace,
+            defaults: UserDefaults(suiteName: UUID().uuidString)!,
+            stateDirectory: root.appendingPathComponent("pr-state", isDirectory: true),
+            workspaceStateDirectory: stateDir,
+            loadAccounts: { [] },
+            clock: { testNow },
+            isVisible: { true },
+            presentError: { _, _ in }
+        )
+
+        await model.pollWorkspace()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+
+        // Staggered 5s heartbeats that only advance updatedAt and observedAtMilliseconds
+        // across multiple sessions must not invalidate the workspace signature.
+        try writeActivity("s1", updatedAt: "2026-10-27T12:00:05.000Z", observedAt: 6_000)
+        try writeActivity("s2", updatedAt: "2026-10-27T12:00:06.000Z", observedAt: 7_000)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 1)
+
+        // A real change to a workspace-affecting field (trackedUserInputs) triggers a poll.
+        try writeActivity(
+            "s1",
+            updatedAt: "2026-10-27T12:00:07.000Z",
+            observedAt: 8_000,
+            questionId: "q-1"
+        )
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+        XCTAssertEqual(model.workspace, .connected(waitingQuestionSnapshot))
+
+        // ControlWorkspaceBridge only infers Paths.stateDir for the conventional socket in Paths.stateDir.
+        let externalBridge = ControlWorkspaceBridge(socketPath: "/tmp/external-copilot.sock")
+        XCTAssertNil(externalBridge.stateDirectory)
+        let defaultSocketBridge = ControlWorkspaceBridge(
+            socketPath: Paths.stateDir.appendingPathComponent("control.sock").path
+        )
+        XCTAssertEqual(defaultSocketBridge.stateDirectory, Paths.stateDir)
     }
 }
 

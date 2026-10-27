@@ -68,6 +68,8 @@ final class NotificationsModel: ObservableObject {
     static let workspaceUnchangedPollInterval: TimeInterval = 15
     /// Coalescing debounce for state/sessions directory file-system events.
     static let workspaceWatchDebounce: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval
+    /// Minimum delay before a follow-up poll can settle a disk change whose first poll returned an unchanged snapshot.
+    static let workspaceSettleFollowUpDelay: TimeInterval = 0.5
     /// Individual banners per refresh; more become one summary banner.
     static let individualBannerLimit = 3
     /// How long an open review request's state is trusted before it's read
@@ -201,6 +203,7 @@ final class NotificationsModel: ObservableObject {
     private let workspaceWatchDebouncePeriod: TimeInterval
     private var lastWorkspaceSignature: WorkspaceDirectorySignature?
     private var settledWorkspaceSignature: WorkspaceDirectorySignature?
+    private var unsettledDiskChangeAt: Date?
     private var lastWorkspacePollAt: Date?
     private var workspacePollGeneration: UInt64 = 0
     /// The `updatedAt` each thread's details were read for.
@@ -737,13 +740,20 @@ final class NotificationsModel: ObservableObject {
     }
 
     func pollWorkspaceIfNeeded() async {
+        let now = clock()
         if isConnected,
-           let settledWorkspaceSignature,
            let lastWorkspacePollAt,
-           clock().timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
-           let directory = workspaceStateDirectory,
-           await WorkspaceDirectorySignature.captureAsync(at: directory) == settledWorkspaceSignature {
-            return
+           now.timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
+           let directory = workspaceStateDirectory {
+            let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
+            if current == settledWorkspaceSignature {
+                return
+            }
+            if current == lastWorkspaceSignature,
+               let unsettledDiskChangeAt,
+               now.timeIntervalSince(unsettledDiskChangeAt) < Self.workspaceSettleFollowUpDelay {
+                return
+            }
         }
         await pollWorkspace()
     }
@@ -764,13 +774,12 @@ final class NotificationsModel: ObservableObject {
             previousSnapshot = nil
         }
         let fetch = await source.snapshot()
-        if generation == workspacePollGeneration {
-            recordWorkspacePoll(
-                fetch: fetch,
-                previousSnapshot: previousSnapshot,
-                sampledSignature: sampledSignature
-            )
-        }
+        guard generation == workspacePollGeneration else { return }
+        recordWorkspacePoll(
+            fetch: fetch,
+            previousSnapshot: previousSnapshot,
+            sampledSignature: sampledSignature
+        )
         apply(fetch)
         if Self.signature(liveSessions) != linkedSessions { await matchSessions() }
     }
@@ -783,21 +792,26 @@ final class NotificationsModel: ObservableObject {
         guard case .snapshot(let snapshot) = fetch else {
             lastWorkspaceSignature = nil
             settledWorkspaceSignature = nil
+            unsettledDiskChangeAt = nil
             lastWorkspacePollAt = nil
             return
         }
-        lastWorkspacePollAt = clock()
+        let now = clock()
+        lastWorkspacePollAt = now
         guard let sampledSignature else {
             lastWorkspaceSignature = nil
             settledWorkspaceSignature = nil
+            unsettledDiskChangeAt = nil
             return
         }
         if lastWorkspaceSignature == nil
             || sampledSignature == lastWorkspaceSignature
             || snapshot != previousSnapshot {
             settledWorkspaceSignature = sampledSignature
+            unsettledDiskChangeAt = nil
         } else {
             settledWorkspaceSignature = nil
+            unsettledDiskChangeAt = now
         }
         lastWorkspaceSignature = sampledSignature
     }

@@ -92,13 +92,100 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
         }
     }
 
+    /// Snapshot-relevant fields of `<id>.agent-activity.json`, excluding heartbeat
+    /// timestamps (`updatedAt`, `observedAtMilliseconds`) that rewrite every 5s.
+    struct ActivitySummary: Equatable, Sendable {
+        struct RuntimeSummary: Decodable, Equatable, Sendable {
+            let state: String?
+        }
+
+        struct SubagentSummary: Decodable, Equatable, Sendable {
+            let id: String?
+        }
+
+        struct QuestionSummary: Decodable, Equatable, Sendable {
+            let requestId: String?
+        }
+
+        let copilotSessionId: String?
+        let conversationEpoch: String?
+        let foregroundTurnActive: Bool?
+        let scheduledTurnActive: Bool?
+        let activeSubagentIds: [String]
+        let userInputIds: [String]
+        let elicitationIds: [String]
+        let permissionIds: [String]
+        let runtimeState: String?
+        let hasSessionIdle: Bool
+        let inputCompletionKeys: [String]
+        let error: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case copilotSessionId
+            case conversationEpoch
+            case foregroundTurnActive
+            case scheduledTurnActive
+            case activeSubagents
+            case trackedUserInputs
+            case trackedElicitations
+            case pendingPermissionRequestIds
+            case runtimeActivity
+            case sessionIdleAtMilliseconds
+            case inputCompletions
+            case error
+        }
+
+        init?(path: String) {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let decoded = try? JSONDecoder().decode(DecodedPayload.self, from: data) else {
+                return nil
+            }
+            copilotSessionId = decoded.copilotSessionId
+            conversationEpoch = decoded.conversationEpoch
+            foregroundTurnActive = decoded.foregroundTurnActive
+            scheduledTurnActive = decoded.scheduledTurnActive
+            activeSubagentIds = (decoded.activeSubagents ?? []).compactMap(\.id).sorted()
+            userInputIds = (decoded.trackedUserInputs ?? []).compactMap(\.requestId).sorted()
+            elicitationIds = (decoded.trackedElicitations ?? []).compactMap(\.requestId).sorted()
+            permissionIds = (decoded.pendingPermissionRequestIds ?? []).sorted()
+            runtimeState = decoded.runtimeActivity?.state
+            hasSessionIdle = decoded.sessionIdleAtMilliseconds != nil
+            inputCompletionKeys = (decoded.inputCompletions ?? [:]).keys.sorted()
+            error = decoded.error
+        }
+
+        private struct DecodedPayload: Decodable {
+            let copilotSessionId: String?
+            let conversationEpoch: String?
+            let foregroundTurnActive: Bool?
+            let scheduledTurnActive: Bool?
+            let activeSubagents: [SubagentSummary]?
+            let trackedUserInputs: [QuestionSummary]?
+            let trackedElicitations: [QuestionSummary]?
+            let pendingPermissionRequestIds: [String]?
+            let runtimeActivity: RuntimeSummary?
+            let sessionIdleAtMilliseconds: Int64?
+            let inputCompletions: [String: Int64]?
+            let error: String?
+        }
+    }
+
+    enum EntrySignature: Equatable, Sendable {
+        case file(FileFingerprint?)
+        case activity(ActivitySummary)
+    }
+
     struct NamedEntry: Equatable, Sendable {
         let name: String
-        let fingerprint: FileFingerprint?
+        let signature: EntrySignature
     }
 
     let stateEntries: [NamedEntry]
     let sessionEntries: [NamedEntry]
+
+    private static let activityCacheLock = NSLock()
+    nonisolated(unsafe) private static var activityCache:
+        [String: (fingerprint: FileFingerprint, summary: ActivitySummary)] = [:]
 
     private static let trackedStateFiles = [
         "app.lock",
@@ -125,11 +212,30 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
         return !ignoredSessionSuffixes.contains { name.hasSuffix($0) }
     }
 
+    private static func sessionEntrySignature(name: String, path: String) -> EntrySignature {
+        let fileFingerprint = FileFingerprint(path: path)
+        guard name.hasSuffix(".agent-activity.json"), let fileFingerprint else {
+            return .file(fileFingerprint)
+        }
+        if let cached = activityCacheLock.withLock({ activityCache[path] }),
+           cached.fingerprint == fileFingerprint {
+            return .activity(cached.summary)
+        }
+        guard let summary = ActivitySummary(path: path) else {
+            return .file(fileFingerprint)
+        }
+        activityCacheLock.withLock {
+            if activityCache.count > 256 { activityCache.removeAll(keepingCapacity: true) }
+            activityCache[path] = (fileFingerprint, summary)
+        }
+        return .activity(summary)
+    }
+
     static func capture(at directory: URL) -> WorkspaceDirectorySignature {
         let stateEntries: [NamedEntry] = trackedStateFiles.compactMap { name in
             let path = directory.appendingPathComponent(name).path
             guard let fingerprint = FileFingerprint(path: path) else { return nil }
-            return NamedEntry(name: name, fingerprint: fingerprint)
+            return NamedEntry(name: name, signature: .file(fingerprint))
         }
         let sessionsURL = directory.appendingPathComponent("sessions", isDirectory: true)
         let sessionsPath = sessionsURL.path
@@ -137,9 +243,10 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
             .filter(isTrackedSessionEntry)
             .sorted()
         let sessionEntries = sessionNames.map { name in
-            NamedEntry(
+            let path = sessionsURL.appendingPathComponent(name).path
+            return NamedEntry(
                 name: name,
-                fingerprint: FileFingerprint(path: sessionsURL.appendingPathComponent(name).path)
+                signature: sessionEntrySignature(name: name, path: path)
             )
         }
         return WorkspaceDirectorySignature(
@@ -277,11 +384,12 @@ final class WorkspaceDirectoryWatcher {
             eventMask: [.write, .rename, .delete, .attrib],
             queue: .main
         )
-        source.setEventHandler { [weak self, weak source] in
+        source.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                let flags = source?.data ?? []
-                self.handleEvent(for: target, flags: flags)
+                guard let self,
+                      let entry = self.sources[target],
+                      entry.identity == currentIdentity else { return }
+                self.handleEvent(for: target, flags: entry.source.data)
             }
         }
         source.setCancelHandler {
@@ -371,7 +479,7 @@ actor ControlWorkspaceBridge: PullRequestsWorkspace {
         self.timeout = timeout
         if let stateDirectory {
             self.stateDirectory = stateDirectory
-        } else if socketPath == Paths.socketPath {
+        } else if socketPath == Paths.stateDir.appendingPathComponent("control.sock").path {
             self.stateDirectory = Paths.stateDir
         } else {
             self.stateDirectory = nil

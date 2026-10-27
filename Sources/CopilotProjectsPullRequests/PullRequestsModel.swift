@@ -24,6 +24,8 @@ final class PullRequestsModel: ObservableObject {
     static let workspaceUnchangedPollInterval: TimeInterval = 15
     /// Coalescing debounce for state/sessions directory file-system events.
     static let workspaceWatchDebounce: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval
+    /// Minimum delay before a follow-up poll can settle a disk change whose first poll returned an unchanged snapshot.
+    static let workspaceSettleFollowUpDelay: TimeInterval = 0.5
     /// How long Resume Session stays busy waiting for the resumed session to report itself.
     static let resumeSettleInterval: TimeInterval = 20
     /// The pause between searches for ended sessions while some are left unread.
@@ -99,6 +101,7 @@ final class PullRequestsModel: ObservableObject {
     private let workspaceWatchDebouncePeriod: TimeInterval
     private var lastWorkspaceSignature: WorkspaceDirectorySignature?
     private var settledWorkspaceSignature: WorkspaceDirectorySignature?
+    private var unsettledDiskChangeAt: Date?
     private var lastWorkspacePollAt: Date?
     /// The last refresh matched transcripts without live sessions, so the next
     /// snapshot matches them again.
@@ -352,16 +355,25 @@ final class PullRequestsModel: ObservableObject {
     /// Reads the workspace when the state or sessions directory signature has
     /// changed since the last settled poll, or when the staleness cap has elapsed.
     func pollWorkspaceIfNeeded() async {
+        let now = clock()
         if isConnected,
            resumingSessions.isEmpty,
            resumeDeadlines.isEmpty,
            !pendingPrompts.values.contains(where: \.isQueuedNative),
-           let settledWorkspaceSignature,
            let lastWorkspacePollAt,
-           clock().timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
-           let directory = workspaceStateDirectory,
-           await WorkspaceDirectorySignature.captureAsync(at: directory) == settledWorkspaceSignature {
-            return
+           now.timeIntervalSince(lastWorkspacePollAt) < workspaceUnchangedPollPeriod,
+           let directory = workspaceStateDirectory {
+            let current = await WorkspaceDirectorySignature.captureAsync(at: directory)
+            if current == settledWorkspaceSignature {
+                return
+            }
+            // Wait for the host's throttled activity scan before spending the single
+            // follow-up poll for a disk change that initially returned the old snapshot.
+            if current == lastWorkspaceSignature,
+               let unsettledDiskChangeAt,
+               now.timeIntervalSince(unsettledDiskChangeAt) < Self.workspaceSettleFollowUpDelay {
+                return
+            }
         }
         await pollWorkspace()
     }
@@ -402,23 +414,28 @@ final class PullRequestsModel: ObservableObject {
         guard case .snapshot(let snapshot) = fetch else {
             lastWorkspaceSignature = nil
             settledWorkspaceSignature = nil
+            unsettledDiskChangeAt = nil
             lastWorkspacePollAt = nil
             return
         }
-        lastWorkspacePollAt = clock()
+        let now = clock()
+        lastWorkspacePollAt = now
         guard let sampledSignature else {
             lastWorkspaceSignature = nil
             settledWorkspaceSignature = nil
+            unsettledDiskChangeAt = nil
             return
         }
         if lastWorkspaceSignature == nil
             || sampledSignature == lastWorkspaceSignature
             || snapshot != previousSnapshot {
             settledWorkspaceSignature = sampledSignature
+            unsettledDiskChangeAt = nil
         } else {
             // Disk changed before the host's in-memory snapshot changed; allow
-            // one follow-up periodic poll at this signature before settling.
+            // one delayed follow-up poll at this signature before settling.
             settledWorkspaceSignature = nil
+            unsettledDiskChangeAt = now
         }
         lastWorkspaceSignature = sampledSignature
     }
