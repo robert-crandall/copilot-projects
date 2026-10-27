@@ -364,6 +364,7 @@ struct SidebarView: View {
                     showNumber: model.numberHint == .projects,
                     isDropTarget: dropTargetProjectId == project.id
                 )
+                    .equatable()
                     .tag(project.id)
                     .onDrop(of: [.text], delegate: ProjectDropDelegate(
                         projectId: project.id,
@@ -411,11 +412,26 @@ struct SidebarView: View {
     }
 }
 
-struct ProjectRow: View {
+struct ProjectRow: View, Equatable {
     let project: Project
     var number: Int? = nil
     var showNumber: Bool = false
     var isDropTarget: Bool = false
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.number == rhs.number
+            && lhs.showNumber == rhs.showNumber
+            && lhs.isDropTarget == rhs.isDropTarget
+            && lhs.project.id == rhs.project.id
+            && lhs.project.name == rhs.project.name
+            && lhs.project.sessions.count == rhs.project.sessions.count
+            && lhs.project.hasUnread == rhs.project.hasUnread
+            && lhs.project.runningCount == rhs.project.runningCount
+            && lhs.project.backgroundWorkCount == rhs.project.backgroundWorkCount
+            && lhs.project.scheduledCount == rhs.project.scheduledCount
+            && lhs.project.waitingCount == rhs.project.waitingCount
+            && lhs.project.failedCount == rhs.project.failedCount
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -506,8 +522,14 @@ struct ProjectRow: View {
 /// it yet ("ready for interaction"); idle shows nothing.
 /// The 9pt frame keeps the slot a constant size whether or not a dot is shown.
 /// SessionRow suppresses its separate unread dot while this indicator is blue.
-struct SessionStateIndicator: View {
+struct SessionStateIndicator: View, Equatable {
     let session: Session
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.session.displayStatus == rhs.session.displayStatus
+            && lhs.session.failedRequest == rhs.session.failedRequest
+            && lhs.session.finishedUnseen == rhs.session.finishedUnseen
+    }
 
     var body: some View {
         statusIndicator
@@ -697,7 +719,11 @@ struct SessionBrowser: View {
             .frame(height: 56)
             Divider()
             if let project = model.selectedProject {
-                SessionList(model: model, project: project)
+                SessionList(
+                    model: model,
+                    project: project,
+                    showTabNumbers: model.numberHint == .tabs
+                )
                     .id(project.id)
             } else {
                 ContentUnavailableView("Choose a project", systemImage: "folder")
@@ -709,8 +735,9 @@ struct SessionBrowser: View {
 }
 
 private struct SessionList: View {
-    @ObservedObject var model: AppModel
+    let model: AppModel
     let project: Project
+    let showTabNumbers: Bool
     @State private var draggedSession: Session?
     @State private var dropTargetId: String?     // a session id, or "" for end-of-list
 
@@ -729,13 +756,14 @@ private struct SessionList: View {
                             session: session,
                             isActive: session.id == project.selectedSessionId,
                             number: index < 9 ? index + 1 : nil,
-                            showNumber: model.numberHint == .tabs,
+                            showNumber: showTabNumbers,
                             onSelect: {
                                 model.selectSession(projectId: project.id, sessionId: session.id)
                                 model.focusActiveTerminal()
                             },
                             onClose: { model.requestCloseSession(projectId: project.id, sessionId: session.id) }
                         )
+                        .equatable()
                         .id(session.id)
                         .contextMenu {
                             if model.startingPrompt(for: session.id) != nil {
@@ -791,7 +819,7 @@ private struct SessionList: View {
 }
 
 private struct SessionCreationButtons: View {
-    @ObservedObject var model: AppModel
+    let model: AppModel
     let project: Project
 
     var body: some View {
@@ -905,14 +933,47 @@ private struct ProjectDropDelegate: DropDelegate {
     }
 }
 
-struct SessionRow: View {
+private struct SessionRowChromeModifier: ViewModifier {
+    let isActive: Bool
+    @State private var isHovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? StudioStyle.selection : isHovering ? StudioStyle.raised : .clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(isActive ? StudioStyle.selectionEdge : .clear, lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+            .onHover { isHovering = $0 }
+    }
+}
+
+struct SessionRow: View, Equatable {
     let session: Session
     let isActive: Bool
     var number: Int? = nil
     var showNumber: Bool = false
     let onSelect: () -> Void
     let onClose: () -> Void
-    @State private var isHovering = false
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.isActive == rhs.isActive
+            && lhs.number == rhs.number
+            && lhs.showNumber == rhs.showNumber
+            && lhs.session.id == rhs.session.id
+            && lhs.session.title == rhs.session.title
+            && lhs.session.statusText == rhs.session.statusText
+            && lhs.session.displayStatus == rhs.session.displayStatus
+            && lhs.session.failedRequest == rhs.session.failedRequest
+            && lhs.session.finishedUnseen == rhs.session.finishedUnseen
+            && lhs.session.isUnread == rhs.session.isUnread
+            && lhs.session.hasBackgroundWork == rhs.session.hasBackgroundWork
+            && lhs.session.schedules == rhs.session.schedules
+    }
 
     var showsUnreadIndicator: Bool {
         // Avoid duplicating the idle completion dot unless the tab-number hint
@@ -938,6 +999,7 @@ struct SessionRow: View {
             HStack(alignment: .top, spacing: 7) {
                 ZStack {
                     SessionStateIndicator(session: session)
+                        .equatable()
                         .opacity(showNumber ? 0 : 1)
                     if showNumber, let number {
                         NumberBadge(number: number)
@@ -984,16 +1046,7 @@ struct SessionRow: View {
         }
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? StudioStyle.selection : isHovering ? StudioStyle.raised : .clear)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(isActive ? StudioStyle.selectionEdge : .clear, lineWidth: 1)
-        )
-        .contentShape(Rectangle())
-        .onHover { isHovering = $0 }
+        .modifier(SessionRowChromeModifier(isActive: isActive))
         .accessibilityRepresentation {
             HStack {
                 Button(session.title, action: onSelect)

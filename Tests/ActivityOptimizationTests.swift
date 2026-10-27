@@ -1,5 +1,6 @@
 import XCTest
 @testable import CopilotProjectsHost
+import CopilotProjectsCore
 import CopilotProjectsProtocol
 import AppKit
 import Combine
@@ -216,6 +217,187 @@ final class ActivityOptimizationTests: XCTestCase {
         XCTAssertEqual(publications, 4)
         XCTAssertNil(model.projects[0].sessions[0].agentActivity)
         XCTAssertNotNil(model.projects[0].sessions[1].agentActivity)
+    }
+
+    @MainActor
+    func testRuntimeReconciliationCoalescesPublicationsAndSkipsNoOpStatusUpdates() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = [Session(title: "one", cwd: root.path), Session(title: "two", cwd: root.path)]
+        defer {
+            for session in sessions {
+                SessionArtifacts.removeFiles(sessionId: session.id)
+            }
+        }
+        let project = Project(
+            name: "runtime",
+            cwd: root.path,
+            sessions: sessions,
+            selectedSessionId: sessions[0].id
+        )
+        let repository = StateRepository(path: root.appendingPathComponent("state.json"))
+        try repository.save(PersistedState(projects: [project], selectedProjectId: project.id))
+        for session in sessions {
+            try Data("copilot-\(session.id)".utf8).write(
+                to: root.appendingPathComponent("\(session.id).copilot-session"),
+                options: .atomic
+            )
+        }
+        let model = AppModel(
+            stateRepository: repository,
+            isAppActive: { false },
+            agentActivityDirectory: root,
+            resumeMarkerDirectory: root
+        )
+        let base = Date()
+        let baseMs = Int64(base.timeIntervalSince1970 * 1_000)
+
+        func writeRuntimeSnapshots(
+            at date: Date,
+            processing: Bool,
+            observedAtMs: Int64,
+            sessionIdleAtMs: Int64? = nil
+        ) throws {
+            for session in sessions {
+                var activity = snapshot(at: date)
+                activity.copilotSessionId = "copilot-\(session.id)"
+                activity.conversationEpoch = "epoch-1"
+                activity.foregroundTurnActive = processing
+                activity.runtimeActivity = RuntimeActivitySnapshot(
+                    processing: processing,
+                    observedAtMilliseconds: observedAtMs,
+                    idleAtMilliseconds: processing ? nil : observedAtMs,
+                    error: nil
+                )
+                activity.sessionIdleAtMilliseconds = sessionIdleAtMs
+                try JSONEncoder().encode(activity).write(
+                    to: root.appendingPathComponent("\(session.id).agent-activity.json"),
+                    options: .atomic
+                )
+            }
+        }
+
+        var publications = 0
+        let observation = model.objectWillChange.sink { publications += 1 }
+        defer { withExtendedLifetime(observation) {} }
+
+        // Both sessions flip idle -> running via runtimeActivity in one scan:
+        // applyAgentActivityReads + reconcileRuntimeActivity must publish once total.
+        try writeRuntimeSnapshots(at: base, processing: true, observedAtMs: baseMs)
+        model.refreshAgentActivitySnapshots(now: base)
+        XCTAssertEqual(publications, 1)
+        XCTAssertEqual(model.projects[0].sessions[0].status, .running)
+        XCTAssertEqual(model.projects[0].sessions[1].status, .running)
+        XCTAssertTrue(model.projects[0].sessions[0].statusIsRuntimeDerived)
+
+        // A hook that reports the already-current status with nil text is a no-op
+        // for UI state: it clears statusIsRuntimeDerived without publishing.
+        model.setStatus(
+            sessionId: sessions[0].id,
+            status: .running,
+            text: nil,
+            timestamp: baseMs + 10
+        )
+        XCTAssertEqual(publications, 1)
+        XCTAssertFalse(model.projects[0].sessions[0].statusIsRuntimeDerived)
+
+        // Arm session 0 with backgroundAgentsActive + a deferred completion, while
+        // session 1 remains running. Finishing both in one scan exercises
+        // applyAgentActivityReads + reconcileRuntimeActivity + setBackgroundAgentsActive
+        // + postCompletionIfReady + postNotification and must publish once total.
+        model.setBackgroundAgentsActive(sessionId: sessions[0].id, active: true)
+        model.setStatus(
+            sessionId: sessions[0].id,
+            status: .idle,
+            text: nil,
+            timestamp: baseMs + 20,
+            source: "agent-stop",
+            notification: .completed
+        )
+        XCTAssertFalse(model.projects[0].sessions[0].turnCompleted)
+        XCTAssertEqual(model.projects[0].sessions[1].status, .running)
+
+        let beforeFinish = publications
+        let finishDate = base.addingTimeInterval(1)
+        let finishMs = baseMs + 1_000
+        try writeRuntimeSnapshots(
+            at: finishDate,
+            processing: false,
+            observedAtMs: finishMs,
+            sessionIdleAtMs: finishMs
+        )
+        model.refreshAgentActivitySnapshots(now: finishDate)
+        XCTAssertEqual(publications, beforeFinish + 1)
+        XCTAssertEqual(model.projects[0].sessions[0].status, .idle)
+        XCTAssertFalse(model.projects[0].sessions[0].backgroundAgentsActive)
+        XCTAssertTrue(model.projects[0].sessions[0].turnCompleted)
+        XCTAssertTrue(model.projects[0].sessions[0].finishedUnseen)
+        XCTAssertEqual(model.projects[0].sessions[1].status, .idle)
+    }
+
+    func testProjectRowAndSessionRowEquatableScopeInvalidationToRenderedFields() {
+        var first = Session(id: "s-1", title: "Alpha", cwd: "/tmp")
+        var second = Session(id: "s-2", title: "Beta", cwd: "/tmp")
+        let now = Date(timeIntervalSince1970: 1_787_865_600)
+        var firstActivity = snapshot(at: now)
+        firstActivity.currentIntent = "Inspecting files"
+        firstActivity.activeSubagents = [
+            TrackedSubagent(id: "sub-1", name: "explore", description: "Search", model: nil)
+        ]
+        first.agentActivity = firstActivity
+
+        var updatedFirst = first
+        var updatedActivity = firstActivity
+        updatedActivity.updatedAt = now.addingTimeInterval(5).ISO8601Format(.iso8601IncludingFractionalSeconds)
+        updatedActivity.foregroundTransitionAt = updatedActivity.updatedAt
+        updatedActivity.currentIntent = "Still inspecting"
+        updatedActivity.idleGeneration = 2
+        updatedActivity.model = TrackedModel(name: "gpt-6.1-sol", reasoningEffort: "high", contextTier: nil)
+        updatedActivity.activeSubagents.append(
+            TrackedSubagent(id: "sub-2", name: "review", description: "Check", model: nil)
+        )
+        updatedFirst.agentActivity = updatedActivity
+
+        let rowA = SessionRow(
+            session: first, isActive: true, number: 1, showNumber: false, onSelect: {}, onClose: {}
+        )
+        let rowB = SessionRow(
+            session: updatedFirst, isActive: true, number: 1, showNumber: false, onSelect: {}, onClose: {}
+        )
+        XCTAssertEqual(rowA, rowB)
+        XCTAssertEqual(SessionStateIndicator(session: first), SessionStateIndicator(session: updatedFirst))
+
+        var runningFirst = updatedFirst
+        runningFirst.status = .running
+        let rowRunning = SessionRow(
+            session: runningFirst, isActive: true, number: 1, showNumber: false, onSelect: {}, onClose: {}
+        )
+        XCTAssertNotEqual(rowA, rowRunning)
+        XCTAssertNotEqual(SessionStateIndicator(session: first), SessionStateIndicator(session: runningFirst))
+
+        let projectA = Project(
+            id: "p-1", name: "Repo", cwd: "/tmp",
+            sessions: [first, second], selectedSessionId: first.id
+        )
+        let projectSelectionChanged = Project(
+            id: "p-1", name: "Repo", cwd: "/tmp",
+            sessions: [updatedFirst, second], selectedSessionId: second.id
+        )
+        XCTAssertEqual(
+            ProjectRow(project: projectA, number: 1, showNumber: false, isDropTarget: false),
+            ProjectRow(project: projectSelectionChanged, number: 1, showNumber: false, isDropTarget: false)
+        )
+
+        let projectWithRunning = Project(
+            id: "p-1", name: "Repo", cwd: "/tmp",
+            sessions: [runningFirst, second], selectedSessionId: first.id
+        )
+        XCTAssertNotEqual(
+            ProjectRow(project: projectA, number: 1, showNumber: false, isDropTarget: false),
+            ProjectRow(project: projectWithRunning, number: 1, showNumber: false, isDropTarget: false)
+        )
     }
 }
 
