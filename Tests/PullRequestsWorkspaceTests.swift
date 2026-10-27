@@ -931,13 +931,13 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         XCTAssertEqual(model.workspace, .connected(partiallyUpdatedSnapshot))
 
         // An early excluded-file wakeup before workspaceSettleFollowUpDelay must not consume
-        // the follow-up poll while the host is still within its 0.5s throttle window.
-        now = now.addingTimeInterval(0.1)
+        // the follow-up poll while the host is still within its completion/throttle window.
+        now = now.addingTimeInterval(0.4)
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 2)
 
         // Once the settle delay elapses, one follow-up poll is allowed and picks up the host update.
-        now = now.addingTimeInterval(0.5)
+        now = now.addingTimeInterval(0.8)
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 3)
         XCTAssertEqual(model.workspace, .connected(fullyUpdatedSnapshot))

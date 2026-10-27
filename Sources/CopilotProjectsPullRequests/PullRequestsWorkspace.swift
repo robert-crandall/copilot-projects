@@ -128,8 +128,8 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
         let runtimeProcessing: Bool?
         let runtimeIdleAtMilliseconds: Int64?
         let runtimeError: String?
-        let hasSessionIdle: Bool
-        let inputCompletionKeys: [String]
+        let sessionIdleAtMilliseconds: Int64?
+        let inputCompletions: [String: Int64]?
         let error: String?
 
         init?(path: String) {
@@ -152,8 +152,8 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
             runtimeProcessing = decoded.runtimeActivity?.processing
             runtimeIdleAtMilliseconds = decoded.runtimeActivity?.idleAtMilliseconds
             runtimeError = decoded.runtimeActivity?.error
-            hasSessionIdle = decoded.sessionIdleAtMilliseconds != nil
-            inputCompletionKeys = (decoded.inputCompletions ?? [:]).keys.sorted()
+            sessionIdleAtMilliseconds = decoded.sessionIdleAtMilliseconds
+            inputCompletions = decoded.inputCompletions
             error = decoded.error
         }
 
@@ -274,10 +274,9 @@ struct WorkspaceDirectorySignature: Equatable, Sendable {
 /// delayed follow-up poll after a disk change before skipping unchanged polls
 /// up to the staleness backstop interval.
 struct WorkspacePollGate: Sendable {
-    static let defaultSettleFollowUpDelay: TimeInterval = 0.5
+    static let defaultSettleFollowUpDelay: TimeInterval = 1.1
 
     private(set) var lastSignature: WorkspaceDirectorySignature?
-    private(set) var settledSignature: WorkspaceDirectorySignature?
     private(set) var unsettledDiskChangeAt: Date?
     private(set) var lastPollAt: Date?
 
@@ -288,18 +287,14 @@ struct WorkspacePollGate: Sendable {
         settleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
     ) -> Bool {
         guard let lastPollAt,
-              now.timeIntervalSince(lastPollAt) < unchangedPollInterval else {
+              now.timeIntervalSince(lastPollAt) < unchangedPollInterval,
+              currentSignature == lastSignature else {
             return false
         }
-        if currentSignature == settledSignature {
+        guard let unsettledDiskChangeAt else {
             return true
         }
-        if currentSignature == lastSignature,
-           let unsettledDiskChangeAt,
-           now.timeIntervalSince(unsettledDiskChangeAt) < settleFollowUpDelay {
-            return true
-        }
-        return false
+        return now.timeIntervalSince(unsettledDiskChangeAt) < settleFollowUpDelay
     }
 
     mutating func record(
@@ -310,7 +305,6 @@ struct WorkspacePollGate: Sendable {
     ) {
         guard case .snapshot = fetch else {
             lastSignature = nil
-            settledSignature = nil
             unsettledDiskChangeAt = nil
             lastPollAt = nil
             return
@@ -318,20 +312,16 @@ struct WorkspacePollGate: Sendable {
         lastPollAt = now
         guard let sampledSignature else {
             lastSignature = nil
-            settledSignature = nil
             unsettledDiskChangeAt = nil
             return
         }
         if lastSignature == nil {
-            settledSignature = sampledSignature
             unsettledDiskChangeAt = nil
         } else if sampledSignature == lastSignature {
             if unsettledDiskChangeAt.map({ now.timeIntervalSince($0) >= settleFollowUpDelay }) ?? true {
-                settledSignature = sampledSignature
                 unsettledDiskChangeAt = nil
             }
         } else {
-            settledSignature = nil
             unsettledDiskChangeAt = now
         }
         lastSignature = sampledSignature

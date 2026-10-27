@@ -68,8 +68,8 @@ final class NotificationsModel: ObservableObject {
     static let workspaceUnchangedPollInterval: TimeInterval = 15
     /// Coalescing debounce for state/sessions directory file-system events.
     static let workspaceWatchDebounce: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval
-    /// Minimum delay before a follow-up poll can settle a disk change whose first poll returned an unchanged snapshot.
-    static let workspaceSettleFollowUpDelay: TimeInterval = 0.5
+    /// Minimum delay before a follow-up poll can settle a disk change.
+    static let workspaceSettleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
     /// Individual banners per refresh; more become one summary banner.
     static let individualBannerLimit = 3
     /// How long an open review request's state is trusted before it's read
@@ -724,6 +724,7 @@ final class NotificationsModel: ObservableObject {
             WorkspaceDirectoryWatcher(stateDirectory: $0, debounceInterval: workspaceWatchDebouncePeriod)
         }
         defer { watcher?.stop() }
+        var wasVisible = isVisible()
         await pollWorkspace()
         while !Task.isCancelled {
             if let watcher {
@@ -732,7 +733,15 @@ final class NotificationsModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(workspacePollPeriod * 1_000_000_000))
             }
             guard !Task.isCancelled else { return }
-            if isVisible() { await pollWorkspaceIfNeeded() }
+            let visible = isVisible()
+            defer { wasVisible = visible }
+            if visible {
+                if !wasVisible {
+                    await pollWorkspace()
+                } else {
+                    await pollWorkspaceIfNeeded()
+                }
+            }
         }
     }
 

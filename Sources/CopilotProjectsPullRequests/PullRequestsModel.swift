@@ -24,8 +24,8 @@ final class PullRequestsModel: ObservableObject {
     static let workspaceUnchangedPollInterval: TimeInterval = 15
     /// Coalescing debounce for state/sessions directory file-system events.
     static let workspaceWatchDebounce: TimeInterval = WorkspaceDirectoryWatcher.defaultDebounceInterval
-    /// Minimum delay before a follow-up poll can settle a disk change whose first poll returned an unchanged snapshot.
-    static let workspaceSettleFollowUpDelay: TimeInterval = 0.5
+    /// Minimum delay before a follow-up poll can settle a disk change.
+    static let workspaceSettleFollowUpDelay: TimeInterval = WorkspacePollGate.defaultSettleFollowUpDelay
     /// How long Resume Session stays busy waiting for the resumed session to report itself.
     static let resumeSettleInterval: TimeInterval = 20
     /// The pause between searches for ended sessions while some are left unread.
@@ -337,6 +337,7 @@ final class PullRequestsModel: ObservableObject {
             WorkspaceDirectoryWatcher(stateDirectory: $0, debounceInterval: workspaceWatchDebouncePeriod)
         }
         defer { watcher?.stop() }
+        var wasVisible = isVisible()
         await pollWorkspace()
         while !Task.isCancelled {
             if let watcher {
@@ -345,7 +346,15 @@ final class PullRequestsModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(workspacePollPeriod * 1_000_000_000))
             }
             guard !Task.isCancelled else { break }
-            if isVisible() { await pollWorkspaceIfNeeded() }
+            let visible = isVisible()
+            defer { wasVisible = visible }
+            if visible {
+                if !wasVisible {
+                    await pollWorkspace()
+                } else {
+                    await pollWorkspaceIfNeeded()
+                }
+            }
         }
     }
 
