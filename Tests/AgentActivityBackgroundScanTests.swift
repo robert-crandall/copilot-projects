@@ -97,6 +97,24 @@ final class AgentActivityBackgroundScanTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)
     }
 
+    func testStartAgentActivityTrackingScansOffTheMainThread() async throws {
+        try publish(generation: 1)
+        let model = try makeModel()
+        modelUnderTest = model
+        reader.holdNextRead()
+        model.startAgentActivityTracking()
+        defer { model.beginTermination() }
+        XCTAssertEqual(scans, 1)
+        XCTAssertNil(activity, "startup tracking must not block the main thread on a synchronous read")
+        reader.waitUntilHeld()
+        XCTAssertEqual(reader.onMain, [false])
+        XCTAssertNil(activity)
+        reader.release()
+        try await settle(afterReads: 1)
+        XCTAssertEqual(activity?.idleGeneration, 1)
+        XCTAssertEqual(reader.onMain, [false])
+    }
+
     func testWatcherScansReadFilesOffTheMainThread() async throws {
         try publish(generation: 1)
         let model = try makeModel()

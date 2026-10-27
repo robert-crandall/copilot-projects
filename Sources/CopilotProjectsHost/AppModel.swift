@@ -317,12 +317,31 @@ public enum AutomationSessionCloseResult: Equatable, Sendable {
 @MainActor
 final class AppModel: ObservableObject {
     private var projectStorage: [Project] = []
+    private var projectPublicationBatchDepth = 0
+    private var projectPublicationPending = false
     private(set) var projects: [Project] {
         get { projectStorage }
         set {
-            objectWillChange.send()
+            guard projectStorage != newValue else { return }
+            if projectPublicationBatchDepth == 0 {
+                objectWillChange.send()
+            } else if !projectPublicationPending {
+                objectWillChange.send()
+                projectPublicationPending = true
+            }
             projectStorage = newValue
         }
+    }
+
+    private func withCoalescedProjectPublications<T>(_ body: () throws -> T) rethrows -> T {
+        projectPublicationBatchDepth += 1
+        defer {
+            projectPublicationBatchDepth -= 1
+            if projectPublicationBatchDepth == 0 {
+                projectPublicationPending = false
+            }
+        }
+        return try body()
     }
     @Published private(set) var selectedProjectId: String?
     @Published var numberHint: NumberHint = .none
@@ -2743,58 +2762,62 @@ final class AppModel: ObservableObject {
     }
 
     private func reconcileRuntimeActivity(now: Date) {
-        restoreCompletedPermissionWaits(now: now)
-        var changed = false
-        for pi in projects.indices {
-            for si in projects[pi].sessions.indices {
-                let session = projects[pi].sessions[si]
-                let foreground = runtimeForegroundActivity(for: session, now: now)
-                guard foreground == .working || foreground == .idle
-                    || (session.status == .waiting
-                        && inputWaitWasResolved(for: session, foreground: foreground, now: now))
-                else { continue }
-                let status = projectedStatus(for: session, foreground: foreground, now: now)
-                if status != session.status {
-                    if session.status == .waiting, !session.statusIsRuntimeDerived,
-                       status != .waiting, permissionStatusRestores[session.id] == nil,
-                       let timestamp = sessionSemantics.statusClock.timestamp(for: session.id),
-                       let promptTimestamp = sessionSemantics.promptSafetyClock.timestamp(for: session.id) {
-                        // Certified resolution must survive restart even when no
-                        // pre-wait permission snapshot survived with it.
-                        persistPermissionStatus(session.id, status, timestamp, promptTimestamp)
-                    }
-                    projects[pi].sessions[si].status = status
-                    projects[pi].sessions[si].statusIsRuntimeDerived = true
-                    projects[pi].sessions[si].statusText = nil
-                    sessionSemantics.activityTracker.reset(sessionId: session.id)
-                    if status == .running {
-                        projects[pi].sessions[si].finishedUnseen = false
-                        projects[pi].sessions[si].turnCompleted = false
-                        completionPending.remove(session.id)
-                        completionSummaryContexts[session.id] = nil
-                    }
-                    if status != .waiting {
-                        elicitationNotificationTokens[session.id] = nil
-                        if permissionStatusRestores[session.id] == nil {
-                            cancelWaitingNotifications(sessionId: session.id)
+        withCoalescedProjectPublications {
+            restoreCompletedPermissionWaits(now: now)
+            var changed = false
+            for pi in projects.indices {
+                for si in projects[pi].sessions.indices {
+                    let session = projects[pi].sessions[si]
+                    let foreground = runtimeForegroundActivity(for: session, now: now)
+                    guard foreground == .working || foreground == .idle
+                        || (session.status == .waiting
+                            && inputWaitWasResolved(for: session, foreground: foreground, now: now))
+                    else { continue }
+                    let status = projectedStatus(for: session, foreground: foreground, now: now)
+                    if status != session.status {
+                        if session.status == .waiting, !session.statusIsRuntimeDerived,
+                           status != .waiting, permissionStatusRestores[session.id] == nil,
+                           let timestamp = sessionSemantics.statusClock.timestamp(for: session.id),
+                           let promptTimestamp = sessionSemantics.promptSafetyClock.timestamp(for: session.id) {
+                            // Certified resolution must survive restart even when no
+                            // pre-wait permission snapshot survived with it.
+                            persistPermissionStatus(session.id, status, timestamp, promptTimestamp)
                         }
+                        var updated = projects[pi].sessions[si]
+                        updated.status = status
+                        updated.statusIsRuntimeDerived = true
+                        updated.statusText = nil
+                        sessionSemantics.activityTracker.reset(sessionId: session.id)
+                        if status == .running {
+                            updated.finishedUnseen = false
+                            updated.turnCompleted = false
+                            completionPending.remove(session.id)
+                            completionSummaryContexts[session.id] = nil
+                        }
+                        projects[pi].sessions[si] = updated
+                        if status != .waiting {
+                            elicitationNotificationTokens[session.id] = nil
+                            if permissionStatusRestores[session.id] == nil {
+                                cancelWaitingNotifications(sessionId: session.id)
+                            }
+                        }
+                        changed = true
                     }
-                    changed = true
-                }
-                if let idleAt = session.agentActivity?.sessionIdleAtMilliseconds,
-                   idleAt <= Int64(now.timeIntervalSince1970 * 1_000),
-                   idleAt >= (sessionSemantics.statusClock.timestamp(for: session.id) ?? .min),
-                   session.agentActivity?.foregroundTurnActive == false,
-                   session.agentActivity?.activeSubagents.isEmpty == true {
-                    setBackgroundAgentsActive(sessionId: session.id, active: false)
-                }
-                if status == .idle {
-                    postCompletionIfReady(sessionId: session.id)
+                    if let idleAt = session.agentActivity?.sessionIdleAtMilliseconds,
+                       idleAt <= Int64(now.timeIntervalSince1970 * 1_000),
+                       idleAt >= (sessionSemantics.statusClock.timestamp(for: session.id) ?? .min),
+                       session.agentActivity?.foregroundTurnActive == false,
+                       session.agentActivity?.activeSubagents.isEmpty == true {
+                        setBackgroundAgentsActive(sessionId: session.id, active: false)
+                    }
+                    if status == .idle {
+                        postCompletionIfReady(sessionId: session.id)
+                    }
                 }
             }
+            dismissAnsweredQuestionNotifications(now: now)
+            if changed { updateDockBadge() }
         }
-        dismissAnsweredQuestionNotifications(now: now)
-        if changed { updateDockBadge() }
     }
 
     /// Evidence that a session is only busy because scheduled, subagent, or CLI
@@ -3855,7 +3878,8 @@ final class AppModel: ObservableObject {
             timestamp: timestamp,
             source: source
         ) else { return }
-        projects[loc.p].sessions[loc.s].statusIsRuntimeDerived = false
+        projectStorage[loc.p].sessions[loc.s].statusIsRuntimeDerived = false
+        withCoalescedProjectPublications {
         if status == .waiting {
             if case .loaded(let record) = SessionArtifacts.loadStatusRecord(
                 sessionId: sessionId, sessionsDirectory: agentActivityDirectory
@@ -4074,6 +4098,7 @@ final class AppModel: ObservableObject {
             }
         } else if notification == .elicitation {
             scheduleElicitationNotification(sessionId: sessionId)
+        }
         }
     }
 
@@ -4515,7 +4540,7 @@ final class AppModel: ObservableObject {
             at: agentActivityDirectory,
             withIntermediateDirectories: true
         )
-        refreshAgentActivitySnapshots()
+        scanAgentActivityInBackground()
 
         let fd = open(agentActivityDirectory.path, O_EVTONLY)
         if fd >= 0 {
@@ -4613,8 +4638,8 @@ final class AppModel: ObservableObject {
         if again { startAgentActivityRead() }
     }
 
-    /// Scans every session's snapshot synchronously, reading files on the main
-    /// actor; tracking's first scan uses it, and tests assert right after.
+    /// Scans every session's snapshot synchronously on the main actor for
+    /// deterministic unit tests that assert immediately after.
     func refreshAgentActivitySnapshots(now: Date = Date()) {
         // Trackers keep publishing while the scan runs, so each snapshot is
         // judged when it's applied, after its file was read, rather than when
@@ -4716,32 +4741,34 @@ final class AppModel: ObservableObject {
                 }
             }
         }
-        if activityChanged {
-            projects = nextProjects
-        } else {
-            // Keep one authoritative snapshot, including its latest freshness and
-            // disconnect timestamps, without redrawing for heartbeat-only changes.
-            projectStorage = nextProjects
+        return withCoalescedProjectPublications {
+            if activityChanged {
+                projects = nextProjects
+            } else if projectStorage != nextProjects {
+                // Keep one authoritative snapshot, including its latest freshness and
+                // disconnect timestamps, without redrawing for heartbeat-only changes.
+                projectStorage = nextProjects
+            }
+            // Drop cache entries for sessions no longer present so the cache can't grow
+            // across a long-lived app run that opens and closes many sessions. Filtering
+            // ~30 entries is microsecond-cheap, so run it unconditionally — a count-based
+            // guard misses the case where one session is closed while another (whose file
+            // isn't written yet) is opened, leaving the count unchanged but a stale entry.
+            agentActivitySnapshotCache = agentActivitySnapshotCache
+                .filter { seenSessionIds.contains($0.key) }
+            agentActivityObservations = agentActivityObservations.filter { seenSessionIds.contains($0.key) }
+            runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
+            budgetNotificationKeys = budgetNotificationKeys.filter { seenSessionIds.contains($0.key) }
+            reconcileRuntimeActivity(now: readTime())
+            for target in budgetNotifications {
+                postNotification(
+                    projectId: target.projectId, sessionId: target.sessionId, kind: .permission,
+                    title: "Copilot reached its session budget",
+                    body: "Open this session to add AI credits or stop the blocked request."
+                )
+            }
+            return complete
         }
-        // Drop cache entries for sessions no longer present so the cache can't grow
-        // across a long-lived app run that opens and closes many sessions. Filtering
-        // ~30 entries is microsecond-cheap, so run it unconditionally — a count-based
-        // guard misses the case where one session is closed while another (whose file
-        // isn't written yet) is opened, leaving the count unchanged but a stale entry.
-        agentActivitySnapshotCache = agentActivitySnapshotCache
-            .filter { seenSessionIds.contains($0.key) }
-        agentActivityObservations = agentActivityObservations.filter { seenSessionIds.contains($0.key) }
-        runtimeTrackedOwners = runtimeTrackedOwners.filter { seenSessionIds.contains($0.key) }
-        budgetNotificationKeys = budgetNotificationKeys.filter { seenSessionIds.contains($0.key) }
-        reconcileRuntimeActivity(now: readTime())
-        for target in budgetNotifications {
-            postNotification(
-                projectId: target.projectId, sessionId: target.sessionId, kind: .permission,
-                title: "Copilot reached its session budget",
-                body: "Open this session to add AI credits or stop the blocked request."
-            )
-        }
-        return complete
     }
 
     /// Load one session's agent-activity snapshot on the main actor, skipping the
@@ -4821,6 +4848,7 @@ final class AppModel: ObservableObject {
     /// Includes `waiting`, so an Esc-cancel of an ask_user/permission wait — which
     /// also fires no stop hook — is caught too.
     func reconcileAgentFooters() {
+        withCoalescedProjectPublications {
         reconcileRuntimeActivity(now: Date())
         var tracked: Set<String> = []
         for pi in projects.indices {
@@ -5029,84 +5057,91 @@ final class AppModel: ObservableObject {
             }
         }
         sessionSemantics.activityTracker.retain(activeSessionIds: tracked)
+        }
     }
 
     /// Drop a session to idle and (unless it's on screen) flag it finished & unseen,
     /// then persist the corrected status. Shared by the liveness and footer reconcilers.
     private func clearStatusToIdle(pi: Int, si: Int, markFinished: Bool, effectiveTime: Int64? = nil) {
-        let sid = projects[pi].sessions[si].id
-        sessionSemantics.activityTracker.reset(sessionId: sid)
-        cancelWaitingNotifications(sessionId: sid)
-        projects[pi].sessions[si].status = .idle
-        projects[pi].sessions[si].statusText = nil
-        if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
-            projects[pi].sessions[si].finishedUnseen = true
+        withCoalescedProjectPublications {
+            let sid = projects[pi].sessions[si].id
+            sessionSemantics.activityTracker.reset(sessionId: sid)
+            cancelWaitingNotifications(sessionId: sid)
+            var updated = projects[pi].sessions[si]
+            updated.status = .idle
+            updated.statusText = nil
+            if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
+                updated.finishedUnseen = true
+            }
+            projects[pi].sessions[si] = updated
+            // Seed the clock from the evidence that triggered the demotion, not `now`.
+            // For a snapshot-driven demotion `effectiveTime` is the snapshot's own
+            // timestamp; advancing the clock to `now` would let it swallow a fresh
+            // user-prompt running hook whose timestamp is slightly earlier than `now`,
+            // freezing the tab in idle. Clamp to `now` so a future-dated snapshot (e.g.
+            // after a system-clock rollback) can't poison the clock and reject later
+            // legitimate hooks. Liveness/footer callers pass nil and keep the prior
+            // `now`-based behavior.
+            let now = SessionArtifacts.currentStatusTimestamp()
+            let base = min(effectiveTime ?? now, now)
+            let timestamp = max(
+                base,
+                sessionSemantics.statusClock.timestamp(for: sid) ?? base
+            )
+            sessionSemantics.statusClock.seed(sessionId: sid, timestamp: timestamp)
+            sessionSemantics.promptSafetyClock.seed(
+                sessionId: sid,
+                timestamp: timestamp
+            )
+            SessionArtifacts.persistStatus(
+                sessionId: sid,
+                status: .idle,
+                timestamp: timestamp,
+                promptStatusTimestamp: timestamp
+            )
+            dismissAnsweredQuestionNotifications(sessionId: sid)
         }
-        // Seed the clock from the evidence that triggered the demotion, not `now`.
-        // For a snapshot-driven demotion `effectiveTime` is the snapshot's own
-        // timestamp; advancing the clock to `now` would let it swallow a fresh
-        // user-prompt running hook whose timestamp is slightly earlier than `now`,
-        // freezing the tab in idle. Clamp to `now` so a future-dated snapshot (e.g.
-        // after a system-clock rollback) can't poison the clock and reject later
-        // legitimate hooks. Liveness/footer callers pass nil and keep the prior
-        // `now`-based behavior.
-        let now = SessionArtifacts.currentStatusTimestamp()
-        let base = min(effectiveTime ?? now, now)
-        let timestamp = max(
-            base,
-            sessionSemantics.statusClock.timestamp(for: sid) ?? base
-        )
-        sessionSemantics.statusClock.seed(sessionId: sid, timestamp: timestamp)
-        sessionSemantics.promptSafetyClock.seed(
-            sessionId: sid,
-            timestamp: timestamp
-        )
-        SessionArtifacts.persistStatus(
-            sessionId: sid,
-            status: .idle,
-            timestamp: timestamp,
-            promptStatusTimestamp: timestamp
-        )
-        dismissAnsweredQuestionNotifications(sessionId: sid)
     }
 
     private func reconcileLiveness(markFinished: Bool = true) {
-        let snapshot = ProcessTree.snapshot()
-        // Sessions whose shell currently hosts a live agent (copilot) process.
-        // Also used by scroll-forwarding: a resumed session's terminal is desynced
-        // (SwiftTerm restarted in the normal buffer, copilot never re-emits its
-        // mouse mode), but copilot's input parser still expects mouse events — so
-        // the wheel is force-forwarded as mouse when the session has a live agent.
-        liveAgentSessions = ProcessTree.agentSessions(agentNames: agentProcessNames, in: snapshot)
+        withCoalescedProjectPublications {
+            let snapshot = ProcessTree.snapshot()
+            // Sessions whose shell currently hosts a live agent (copilot) process.
+            // Also used by scroll-forwarding: a resumed session's terminal is desynced
+            // (SwiftTerm restarted in the normal buffer, copilot never re-emits its
+            // mouse mode), but copilot's input parser still expects mouse events — so
+            // the wheel is force-forwarded as mouse when the session has a live agent.
+            liveAgentSessions = ProcessTree.agentSessions(agentNames: agentProcessNames, in: snapshot)
 
-        for pi in projects.indices {
-            for si in projects[pi].sessions.indices {
-                let sid = projects[pi].sessions[si].id
-                if projects[pi].sessions[si].backgroundAgentsActive,
-                   !liveAgentSessions.contains(sid) {
-                    setBackgroundAgentsActive(sessionId: sid, active: false)
-                    backgroundAgentsSuppressed.insert(sid)
+            for pi in projects.indices {
+                for si in projects[pi].sessions.indices {
+                    let sid = projects[pi].sessions[si].id
+                    if projects[pi].sessions[si].backgroundAgentsActive,
+                       !liveAgentSessions.contains(sid) {
+                        setBackgroundAgentsActive(sessionId: sid, active: false)
+                        backgroundAgentsSuppressed.insert(sid)
+                    }
                 }
             }
-        }
 
-        let hasActive = projects.contains { project in
-            project.sessions.contains { $0.status == .running || $0.status == .waiting }
-        }
-        guard hasActive else { return }
+            let hasActive = projects.contains { project in
+                project.sessions.contains { $0.status == .running || $0.status == .waiting }
+            }
+            guard hasActive else { return }
 
-        let liveSessions = liveAgentSessions
-        for pi in projects.indices {
-            for si in projects[pi].sessions.indices {
-                let status = projects[pi].sessions[si].status
-                guard status == .running || status == .waiting else { continue }
-                if ActivityTracker.livenessShouldDemote(
-                    currentStatus: status,
-                    hasLiveAgent: liveSessions.contains(projects[pi].sessions[si].id)
-                ) {
-                    // The agent exited/crashed (active → idle). Flag it as finished &
-                    // unseen unless you're looking at it right now.
-                    clearStatusToIdle(pi: pi, si: si, markFinished: markFinished)
+            let liveSessions = liveAgentSessions
+            for pi in projects.indices {
+                for si in projects[pi].sessions.indices {
+                    let status = projects[pi].sessions[si].status
+                    guard status == .running || status == .waiting else { continue }
+                    if ActivityTracker.livenessShouldDemote(
+                        currentStatus: status,
+                        hasLiveAgent: liveSessions.contains(projects[pi].sessions[si].id)
+                    ) {
+                        // The agent exited/crashed (active → idle). Flag it as finished &
+                        // unseen unless you're looking at it right now.
+                        clearStatusToIdle(pi: pi, si: si, markFinished: markFinished)
+                    }
                 }
             }
         }
@@ -5220,7 +5255,7 @@ final class AppModel: ObservableObject {
         {
             completionPending.remove(sessionId)
             completionSummaryContexts[sessionId] = nil
-            projects[loc.p].sessions[loc.s].turnCompleted = true
+            projectStorage[loc.p].sessions[loc.s].turnCompleted = true
             foregroundIdleGenerationBaselines.removeValue(forKey: sessionId)
             return
         }
@@ -5234,7 +5269,7 @@ final class AppModel: ObservableObject {
         let summaryContext = completionSummaryContexts.removeValue(forKey: sessionId)
 
         guard !projects[loc.p].sessions[loc.s].turnCompleted else { return }
-        projects[loc.p].sessions[loc.s].turnCompleted = true
+        projectStorage[loc.p].sessions[loc.s].turnCompleted = true
         foregroundIdleGenerationBaselines.removeValue(forKey: sessionId)
 
         guard !isVisible(projectIndex: loc.p, sessionIndex: loc.s) else { return }
@@ -5244,15 +5279,17 @@ final class AppModel: ObservableObject {
         // `previous == .idle`, so the active→idle edge in `setStatus` won't set this.
         // Setting it at the completion chokepoint keeps the sidebar/tab dot in parity
         // for both the direct-finish and the pre-demoted paths.
-        projects[loc.p].sessions[loc.s].finishedUnseen = true
-        postNotification(
-            projectId: projects[loc.p].id,
-            sessionId: sessionId,
-            kind: .completed,
-            title: StatusNotificationKind.completed.title,
-            body: nil,
-            completionSummaryContext: summaryContext
-        )
+        withCoalescedProjectPublications {
+            projects[loc.p].sessions[loc.s].finishedUnseen = true
+            postNotification(
+                projectId: projects[loc.p].id,
+                sessionId: sessionId,
+                kind: .completed,
+                title: StatusNotificationKind.completed.title,
+                body: nil,
+                completionSummaryContext: summaryContext
+            )
+        }
     }
 
     func setBackgroundAgentsActive(sessionId: String, active: Bool) {
