@@ -2126,29 +2126,29 @@ final class NotificationsTests: XCTestCase {
 
     func testSupersededWorkspaceSnapshotDoesNotOverwriteNewerPoll() async throws {
         actor DelayedWorkspace: PullRequestsWorkspace {
-            private var firstContinuation: CheckedContinuation<WorkspaceFetch, Never>?
+            private var continuations: [Int: CheckedContinuation<WorkspaceFetch, Never>] = [:]
             private var calls = 0
-            let firstAnswer: WorkspaceFetch
-            let secondAnswer: WorkspaceFetch
+            let answers: [Int: WorkspaceFetch]
+            let heldCalls: Set<Int>
 
-            init(first: WorkspaceFetch, second: WorkspaceFetch) {
-                firstAnswer = first
-                secondAnswer = second
+            init(answers: [Int: WorkspaceFetch], heldCalls: Set<Int>) {
+                self.answers = answers
+                self.heldCalls = heldCalls
             }
 
             func snapshot() async -> WorkspaceFetch {
                 calls += 1
-                if calls == 1 {
-                    return await withCheckedContinuation { firstContinuation = $0 }
+                let call = calls
+                if heldCalls.contains(call) {
+                    return await withCheckedContinuation { continuations[call] = $0 }
                 }
-                return secondAnswer
+                return answers[call] ?? .unreachable
             }
 
-            var hasFirstWaiter: Bool { firstContinuation != nil }
+            func isWaiting(call: Int) -> Bool { continuations[call] != nil }
 
-            func releaseFirst() {
-                firstContinuation?.resume(returning: firstAnswer)
-                firstContinuation = nil
+            func release(call: Int) {
+                continuations.removeValue(forKey: call)?.resume(returning: answers[call] ?? .unreachable)
             }
 
             func revealSession(projectId: String?, sessionId: String) async -> WorkspaceCommandResult { .unreachable }
@@ -2165,7 +2165,15 @@ final class NotificationsTests: XCTestCase {
                 .init(id: "s1", title: "Fresh", status: .waiting, pullRequestKeys: ["octo/app#1"]),
             ]),
         ])
-        let workspace = DelayedWorkspace(first: .snapshot(staleSnapshot), second: .snapshot(freshSnapshot))
+        let newestSnapshot = WorkspaceSnapshot(hostProcessIdentifier: 42, selectedProjectId: "q", projects: [
+            .init(id: "q", name: "Moved", sessions: [
+                .init(id: "s1", title: "Fresh", status: .running, pullRequestKeys: ["octo/app#1"]),
+            ]),
+        ])
+        let workspace = DelayedWorkspace(
+            answers: [1: .snapshot(staleSnapshot), 2: .snapshot(freshSnapshot), 3: .snapshot(freshSnapshot), 4: .snapshot(newestSnapshot)],
+            heldCalls: [1, 3, 4]
+        )
         let model = NotificationsModel(
             workspace: workspace,
             defaults: UserDefaults(suiteName: "notifications-\(UUID().uuidString)")!,
@@ -2178,17 +2186,35 @@ final class NotificationsTests: XCTestCase {
 
         let firstPoll = Task { await model.pollWorkspace() }
         for _ in 0..<250 {
-            if await workspace.hasFirstWaiter { break }
+            if await workspace.isWaiting(call: 1) { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         await model.pollWorkspace()
         XCTAssertEqual(model.workspace, .connected(freshSnapshot))
         XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s1")
 
-        await workspace.releaseFirst()
+        await workspace.release(call: 1)
         await firstPoll.value
         XCTAssertEqual(model.workspace, .connected(freshSnapshot), "an older snapshot finishing late must be discarded")
         XCTAssertEqual(model.links[PullRequestKey("octo/app#1")!], "s1")
+
+        // An earlier poll finishing while a newer poll is still in flight still applies its result.
+        let thirdPoll = Task { await model.pollWorkspace() }
+        for _ in 0..<250 {
+            if await workspace.isWaiting(call: 3) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let fourthPoll = Task { await model.pollWorkspace() }
+        for _ in 0..<250 {
+            if await workspace.isWaiting(call: 4) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await workspace.release(call: 3)
+        await thirdPoll.value
+        XCTAssertEqual(model.liveSessions["s1"]?.projectId, "p", "an in-flight newer poll must not discard a completed refresh")
+        await workspace.release(call: 4)
+        await fourthPoll.value
+        XCTAssertEqual(model.liveSessions["s1"]?.projectId, "q")
     }
 
     private func waitUntil(timeout: TimeInterval = 5, _ condition: () -> Bool) async throws {

@@ -896,10 +896,10 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         partiallyUpdatedSnapshot.projects[0].sessions[0].copilotSessionId = "abcdef12-0009"
         var fullyUpdatedSnapshot = partiallyUpdatedSnapshot
         fullyUpdatedSnapshot.projects[0].sessions[0].status = .idle
-        // Second fetch returns a partial update (resume marker read immediately while
-        // the host's 0.5s throttled activity scan has not updated status yet);
-        // third fetch returns the settled status update.
+        // First connection poll receives one delayed follow-up poll in case the helper connected
+        // after a session file changed on disk but before the host applied it in memory.
         let workspace = FakeWorkspace(fetches: [
+            .snapshot(fixtureSnapshot),
             .snapshot(fixtureSnapshot),
             .snapshot(partiallyUpdatedSnapshot),
             .snapshot(fullyUpdatedSnapshot),
@@ -920,6 +920,11 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
         XCTAssertEqual(workspace.snapshotCalls, 1)
         await model.pollWorkspaceIfNeeded()
         XCTAssertEqual(workspace.snapshotCalls, 1)
+        now = now.addingTimeInterval(1.2)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2)
+        await model.pollWorkspaceIfNeeded()
+        XCTAssertEqual(workspace.snapshotCalls, 2, "settled initial signature skips unchanged polls")
 
         // Hook/tracker writes session files before host finishes its throttled scan.
         try Data(#"{"schemaVersion":1,"status":"idle"}"#.utf8).write(
@@ -927,24 +932,24 @@ final class PullRequestsWorkspaceModelTests: XCTestCase {
             options: .atomic
         )
         await model.pollWorkspaceIfNeeded()
-        XCTAssertEqual(workspace.snapshotCalls, 2)
+        XCTAssertEqual(workspace.snapshotCalls, 3)
         XCTAssertEqual(model.workspace, .connected(partiallyUpdatedSnapshot))
 
         // An early excluded-file wakeup before workspaceSettleFollowUpDelay must not consume
         // the follow-up poll while the host is still within its completion/throttle window.
         now = now.addingTimeInterval(0.4)
         await model.pollWorkspaceIfNeeded()
-        XCTAssertEqual(workspace.snapshotCalls, 2)
+        XCTAssertEqual(workspace.snapshotCalls, 3)
 
         // Once the settle delay elapses, one follow-up poll is allowed and picks up the host update.
         now = now.addingTimeInterval(0.8)
         await model.pollWorkspaceIfNeeded()
-        XCTAssertEqual(workspace.snapshotCalls, 3)
+        XCTAssertEqual(workspace.snapshotCalls, 4)
         XCTAssertEqual(model.workspace, .connected(fullyUpdatedSnapshot))
 
         // Once settled, subsequent polls with no further disk change are skipped.
         await model.pollWorkspaceIfNeeded()
-        XCTAssertEqual(workspace.snapshotCalls, 3)
+        XCTAssertEqual(workspace.snapshotCalls, 4)
     }
 
     func testActivityHeartbeatsDoNotTriggerPollsUntilWorkspaceFieldsChange() async throws {

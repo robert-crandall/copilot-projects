@@ -315,9 +315,7 @@ struct WorkspacePollGate: Sendable {
             unsettledDiskChangeAt = nil
             return
         }
-        if lastSignature == nil {
-            unsettledDiskChangeAt = nil
-        } else if sampledSignature == lastSignature {
+        if sampledSignature == lastSignature {
             if unsettledDiskChangeAt.map({ now.timeIntervalSince($0) >= settleFollowUpDelay }) ?? true {
                 unsettledDiskChangeAt = nil
             }

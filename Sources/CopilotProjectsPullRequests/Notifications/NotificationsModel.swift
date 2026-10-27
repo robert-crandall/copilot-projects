@@ -203,6 +203,7 @@ final class NotificationsModel: ObservableObject {
     private let workspaceWatchDebouncePeriod: TimeInterval
     private var workspacePollGate = WorkspacePollGate()
     private var workspacePollGeneration: UInt64 = 0
+    private var appliedWorkspacePollGeneration: UInt64 = 0
     /// The `updatedAt` each thread's details were read for.
     private var detailVersions: [NotificationThread.Key: Date] = [:]
     /// Per `account|org`: the user's teams there, whether that list was whole, and when it was read.
@@ -772,7 +773,8 @@ final class NotificationsModel: ObservableObject {
             sampledSignature = nil
         }
         let fetch = await source.snapshot()
-        guard generation == workspacePollGeneration else { return }
+        guard generation > appliedWorkspacePollGeneration else { return }
+        appliedWorkspacePollGeneration = generation
         workspacePollGate.record(
             fetch: fetch,
             sampledSignature: sampledSignature,
