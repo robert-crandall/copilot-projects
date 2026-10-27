@@ -8499,6 +8499,10 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
             "\(wideHeader)\n\(wideDelimiter)\n\(sparseRows)"
         ))
+        let wrappedTableUnit = "| A | B |\n| --- | --- |\n| \(String(repeating: "wrapped ", count: 250)) | y |"
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: wrappedTableUnit, count: 10).joined(separator: "\n\n")
+        ))
     }
 
     @MainActor
@@ -8708,8 +8712,9 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertGreaterThan(shortNumLocation.x, 10)
 
-        // Selecting across wrapped table cells reconstructs logical cell text without interleaved wrap fragments.
-        let longCell = "Arm (1/2/2 voting + Astra medium agg with extra wrapped description text across lines)"
+        // Selecting across wrapped table cells reconstructs logical cell text without interleaved wrap fragments,
+        // and preserves authored trailing spaces inside wrapped inline-code spans.
+        let longCell = "Arm (1/2/2 voting + Astra medium agg with `wrapped trailing code  `)"
         let wrappedTableMarkdown = """
         | Arm | Score |
         | :--- | ---: |
@@ -8731,7 +8736,84 @@ final class AppLogicTests: XCTestCase {
         )
         XCTAssertEqual(
             wrappedTableTextView.selectedCopiedText(),
-            "\(longCell)\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
+            "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
+        )
+
+        // Selecting a wrapped non-first-column cell alone does not synthesize a leading tab from continuation padding.
+        let secondColWrappedMarkdown = """
+        | Name | Detail |
+        | :--- | :--- |
+        | host | \(longCell) |
+        """
+        let secondColHost = NSHostingView(
+            rootView: MarkdownText(text: secondColWrappedMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        secondColHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        secondColHost.layoutSubtreeIfNeeded()
+        let secondColTextView = try XCTUnwrap(findTextViews(in: secondColHost).first)
+        let secondColString = secondColTextView.attributedText.string as NSString
+        let detailStart = secondColString.range(of: "Arm (1/2/2").location
+        XCTAssertNotEqual(detailStart, NSNotFound)
+        secondColTextView.setSelectedRange(
+            NSRange(location: detailStart, length: secondColString.length - detailStart)
+        )
+        XCTAssertEqual(
+            secondColTextView.selectedCopiedText(),
+            "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )"
+        )
+
+        // Selected leading and trailing logical row breaks are preserved during copy.
+        let rowWithBreaks = "\n3x Alligator/Terra (high)\t85.4% / 33.2%\n"
+        let rowWithBreaksRange = tableString.range(of: rowWithBreaks)
+        XCTAssertNotEqual(rowWithBreaksRange.location, NSNotFound)
+        tableTextView.setSelectedRange(rowWithBreaksRange)
+        XCTAssertEqual(tableTextView.selectedCopiedText(), rowWithBreaks)
+
+        // Selecting from a wrapped continuation line into the next row preserves empty trailing cells,
+        // and embedded cell tabs are expanded so they do not collide with column separators.
+        let wrappedEmptyTrailingMarkdown = """
+        | Arm | Score |
+        | :--- | :--- |
+        | \(longCell) | |
+        | next\tpart | value |
+        """
+        let wrappedEmptyHost = NSHostingView(
+            rootView: MarkdownText(text: wrappedEmptyTrailingMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        wrappedEmptyHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        wrappedEmptyHost.layoutSubtreeIfNeeded()
+        let wrappedEmptyTextView = try XCTUnwrap(findTextViews(in: wrappedEmptyHost).first)
+        let wrappedEmptyString = wrappedEmptyTextView.attributedText.string as NSString
+        let continuationRange = wrappedEmptyString.range(of: "code  )\t\nnext    part\tvalue")
+        XCTAssertNotEqual(continuationRange.location, NSNotFound)
+        wrappedEmptyTextView.setSelectedRange(continuationRange)
+        XCTAssertEqual(
+            wrappedEmptyTextView.selectedCopiedText(),
+            "code  )\t\nnext    part\tvalue"
+        )
+
+        // Wide tables with heavily wrapped cells fall back to plain text once cumulative visual cells exceed the budget.
+        let wideCols = 200
+        let wideHeaderRow = Array(repeating: "h", count: wideCols).joined(separator: " | ")
+        let wideDelimRow = Array(repeating: "---", count: wideCols).joined(separator: " | ")
+        let wideProse = String(repeating: "W", count: 128)
+        let wideBodyRow = ([wideProse] + Array(repeating: "x", count: wideCols - 1)).joined(separator: " | ")
+        let wideMarkdown = "\(wideHeaderRow)\n\(wideDelimRow)\n\(wideBodyRow)"
+        XCTAssertTrue(MarkdownParser.isWithinRenderingLimits(wideMarkdown))
+        let wideWrappedHost = NSHostingView(
+            rootView: MarkdownText(text: wideMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        wideWrappedHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        wideWrappedHost.layoutSubtreeIfNeeded()
+        let wideWrappedTextView = try XCTUnwrap(findTextViews(in: wideWrappedHost).first)
+        XCTAssertNil(wideWrappedTextView.headerDividerY())
+        XCTAssertEqual(
+            wideWrappedTextView.attributedText.string,
+            Array(repeating: "h", count: wideCols).joined(separator: "\t") + "\n"
+                + ([wideProse] + Array(repeating: "x", count: wideCols - 1)).joined(separator: "\t")
         )
 
         func renderedTableHeight(_ detail: String) -> CGFloat {

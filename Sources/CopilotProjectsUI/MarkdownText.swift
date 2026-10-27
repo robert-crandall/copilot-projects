@@ -264,12 +264,15 @@ public enum MarkdownParser {
         var totalCells = 0
         for block in blocks {
             guard case let .table(table) = block else { continue }
-            let rowCount = table.rows.count + 1
-            let (tableCells, overflow) = table.header.count.multipliedReportingOverflow(by: rowCount)
-            if overflow { return false }
-            let (nextTotal, sumOverflow) = totalCells.addingReportingOverflow(tableCells)
-            if sumOverflow || nextTotal > maximumRenderedTableCells { return false }
-            totalCells = nextTotal
+            let columns = max(table.header.count, 1)
+            for row in [table.header] + table.rows {
+                let maxChars = row.prefix(columns).map(\.count).max() ?? 0
+                let visualLines = max(1, (maxChars + 31) / 32)
+                let (rowCells, overflow) = columns.multipliedReportingOverflow(by: visualLines)
+                let (nextTotal, sumOverflow) = totalCells.addingReportingOverflow(rowCells)
+                if overflow || sumOverflow || nextTotal > maximumRenderedTableCells { return false }
+                totalCells = nextTotal
+            }
         }
         return true
     }
@@ -581,24 +584,25 @@ public struct MarkdownText: View, Equatable {
     fileprivate static let tableSeparatorPositionAttribute = NSAttributedString.Key(
         "CopilotProjects.MarkdownTableSeparatorPosition"
     )
+    fileprivate static let tableRowBreakAttribute = NSAttributedString.Key("CopilotProjects.MarkdownTableRowBreak")
     fileprivate static let tableAccessibilityLabelAttribute = NSAttributedString.Key(
         "CopilotProjects.MarkdownTableAccessibilityLabel"
     )
 
-    fileprivate struct TableCellFragment: Equatable {
+    fileprivate struct TableCellFragment: Hashable {
         let row: Int
         let column: Int
         let fullCellText: String
         let rangeInCell: NSRange
     }
 
-    fileprivate struct TableSeparatorPosition: Equatable {
+    fileprivate struct TableSeparatorPosition: Hashable {
         let row: Int
         let leftColumn: Int
         let rightColumn: Int
     }
 
-    fileprivate struct TableHeaderDividerInfo: Equatable {
+    fileprivate struct TableHeaderDividerInfo: Hashable {
         let tableWidth: CGFloat
         let firstBodyRowCharacterIndex: Int
     }
@@ -615,26 +619,44 @@ public struct MarkdownText: View, Equatable {
         case footnote
     }
 
-    private enum ProsePart: Equatable {
+    fileprivate enum ProsePart: Equatable {
         case heading(level: Int, text: String)
         case paragraph(String)
         case list([MarkdownListItem])
         case quote(String)
     }
 
-    private enum RenderSegment: Equatable {
+    fileprivate enum RenderSegment: Equatable {
+        case plain(String)
         case prose([ProsePart])
         case codeBlock(String)
         case table(MarkdownTable)
     }
 
+    fileprivate struct RenderKey: Equatable {
+        let segment: RenderSegment
+        let styleContext: StyleContext
+        let layoutDirection: LayoutDirection
+    }
+
+    fileprivate static func makeSegmentAttributedText(_ key: RenderKey) -> NSAttributedString {
+        switch key.segment {
+        case let .plain(text):
+            makePlainAttributedText(text, styleContext: key.styleContext)
+        case let .prose(parts):
+            makeProseAttributedText(parts, styleContext: key.styleContext)
+        case let .codeBlock(code):
+            makeCodeBlockAttributedText(code, styleContext: key.styleContext)
+        case let .table(table):
+            makeTableAttributedText(table, styleContext: key.styleContext, layoutDirection: key.layoutDirection)
+        }
+    }
+
     public var body: some View {
         if !MarkdownParser.isWithinRenderingLimits(text) {
-            SelectableMarkdownText(wraps: true) { styleContext, _ in
-                Self.makePlainAttributedText(text, styleContext: styleContext)
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            SelectableMarkdownText(wraps: true, segment: .plain(text))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 let segments = Self.segments(from: MarkdownParser.blocks(from: text))
@@ -680,24 +702,14 @@ public struct MarkdownText: View, Equatable {
     @ViewBuilder
     private func view(for segment: RenderSegment) -> some View {
         switch segment {
-        case let .prose(parts):
-            SelectableMarkdownText(wraps: true) { styleContext, _ in
-                Self.makeProseAttributedText(
-                    parts,
-                    styleContext: styleContext
-                )
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        case let .codeBlock(code):
+        case .plain, .prose:
+            SelectableMarkdownText(wraps: true, segment: segment)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .codeBlock:
             ScrollView(.horizontal, showsIndicators: false) {
-                SelectableMarkdownText(wraps: false) { styleContext, _ in
-                    Self.makeCodeBlockAttributedText(
-                        code,
-                        styleContext: styleContext
-                    )
-                }
-                .padding(10)
+                SelectableMarkdownText(wraps: false, segment: segment)
+                    .padding(10)
             }
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -713,14 +725,8 @@ public struct MarkdownText: View, Equatable {
     @ViewBuilder
     private func tableView(_ table: MarkdownTable) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            SelectableMarkdownText(wraps: false) { styleContext, layoutDirection in
-                Self.makeTableAttributedText(
-                    table,
-                    styleContext: styleContext,
-                    layoutDirection: layoutDirection
-                )
-            }
-            .padding(10)
+            SelectableMarkdownText(wraps: false, segment: .table(table))
+                .padding(10)
         }
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1007,7 +1013,7 @@ public struct MarkdownText: View, Equatable {
         let headerCells: [NSAttributedString] = (0..<columns).map { column in
             let text = column < table.header.count ? table.header[column] : ""
             return makeAttributedText(
-                MarkdownParser.inline(text),
+                MarkdownParser.inline(text.replacingOccurrences(of: "\t", with: "    ")),
                 role: .body,
                 weight: .semibold,
                 foregroundColor: primaryLabelColor,
@@ -1020,7 +1026,7 @@ public struct MarkdownText: View, Equatable {
             (0..<columns).map { column in
                 let text = column < row.count ? row[column] : ""
                 return makeAttributedText(
-                    MarkdownParser.inline(text),
+                    MarkdownParser.inline(text.replacingOccurrences(of: "\t", with: "    ")),
                     role: .body,
                     weight: .regular,
                     foregroundColor: primaryLabelColor,
@@ -1092,6 +1098,7 @@ public struct MarkdownText: View, Equatable {
             styleContext: styleContext
         )
         var firstBodyRowCharIndex: Int?
+        var totalVisualCells = 0
 
         for (rowIndex, rowCells) in allRows.enumerated() {
             let isHeader = rowIndex == 0
@@ -1099,15 +1106,21 @@ public struct MarkdownText: View, Equatable {
             if rowIndex == 1 {
                 firstBodyRowCharIndex = result.length
             }
-            let wrappedColumns: [[NSAttributedString]] = (0..<columns).map { column in
+            let remainingVisualLines = (MarkdownParser.maximumRenderedTableCells - totalVisualCells) / columns
+            let wrappedColumns: [[NSAttributedString]] = remainingVisualLines < 1 ? [] : (0..<columns).map { column in
                 wrapCellIntoLines(
                     rowCells[column],
                     width: columnWidths[column],
                     row: rowIndex,
-                    column: column
+                    column: column,
+                    maxLines: remainingVisualLines
                 )
             }
             let visualLineCount = max(1, wrappedColumns.map(\.count).max() ?? 1)
+            guard visualLineCount <= remainingVisualLines else {
+                return makePlainAttributedText(logicalAccessibilityText, styleContext: styleContext)
+            }
+            totalVisualCells += columns * visualLineCount
 
             for lineIndex in 0..<visualLineCount {
                 let isLastVisualLine = lineIndex == visualLineCount - 1
@@ -1140,21 +1153,21 @@ public struct MarkdownText: View, Equatable {
                 }
                 for column in 0..<columns {
                     if column > 0 {
-                        var separatorAttributes: [NSAttributedString.Key: Any] = [
-                            .font: fallbackFont,
-                            .foregroundColor: primaryLabelColor,
-                        ]
-                        if lineIndex == 0 {
-                            separatorAttributes[tableSeparatorPositionAttribute] = TableSeparatorPosition(
-                                row: rowIndex,
-                                leftColumn: column - 1,
-                                rightColumn: column
-                            )
-                        }
+                        let leftPresent = lineIndex == 0
+                            || rowCells[column - 1].length == 0
+                            || lineIndex < wrappedColumns[column - 1].count
                         lineAttributed.append(
                             NSAttributedString(
                                 string: "\t",
-                                attributes: separatorAttributes
+                                attributes: [
+                                    .font: fallbackFont,
+                                    .foregroundColor: primaryLabelColor,
+                                    tableSeparatorPositionAttribute: TableSeparatorPosition(
+                                        row: rowIndex,
+                                        leftColumn: leftPresent ? column - 1 : column,
+                                        rightColumn: column
+                                    ),
+                                ]
                             )
                         )
                     }
@@ -1164,21 +1177,18 @@ public struct MarkdownText: View, Equatable {
                     }
                 }
                 if lineAttributed.length == 0 {
-                    var placeholderAttributes: [NSAttributedString.Key: Any] = [
-                        .font: fallbackFont,
-                        .foregroundColor: primaryLabelColor,
-                    ]
-                    if lineIndex == 0 {
-                        placeholderAttributes[tableSeparatorPositionAttribute] = TableSeparatorPosition(
-                            row: rowIndex,
-                            leftColumn: 0,
-                            rightColumn: 0
-                        )
-                    }
                     lineAttributed.append(
                         NSAttributedString(
                             string: " ",
-                            attributes: placeholderAttributes
+                            attributes: [
+                                .font: fallbackFont,
+                                .foregroundColor: primaryLabelColor,
+                                tableSeparatorPositionAttribute: TableSeparatorPosition(
+                                    row: rowIndex,
+                                    leftColumn: 0,
+                                    rightColumn: 0
+                                ),
+                            ]
                         )
                     )
                 }
@@ -1189,14 +1199,18 @@ public struct MarkdownText: View, Equatable {
                 )
                 result.append(lineAttributed)
                 if !(isLastRow && isLastVisualLine) {
+                    var breakAttributes: [NSAttributedString.Key: Any] = [
+                        .font: fallbackFont,
+                        .foregroundColor: primaryLabelColor,
+                        .paragraphStyle: lineStyle,
+                    ]
+                    if isLastVisualLine {
+                        breakAttributes[tableRowBreakAttribute] = rowIndex
+                    }
                     result.append(
                         NSAttributedString(
                             string: "\n",
-                            attributes: [
-                                .font: fallbackFont,
-                                .foregroundColor: primaryLabelColor,
-                                .paragraphStyle: lineStyle,
-                            ]
+                            attributes: breakAttributes
                         )
                     )
                 }
@@ -1227,7 +1241,8 @@ public struct MarkdownText: View, Equatable {
         _ cell: NSAttributedString,
         width: CGFloat,
         row: Int,
-        column: Int
+        column: Int,
+        maxLines: Int
     ) -> [NSAttributedString] {
         let fullText = cell.string
         guard cell.length > 0 else { return [NSAttributedString()] }
@@ -1265,7 +1280,6 @@ public struct MarkdownText: View, Equatable {
         container.lineBreakMode = .byWordWrapping
         layoutManager.addTextContainer(container)
         storage.addLayoutManager(layoutManager)
-        layoutManager.ensureLayout(for: container)
 
         var lines: [NSAttributedString] = []
         let totalGlyphs = layoutManager.numberOfGlyphs
@@ -1284,7 +1298,9 @@ public struct MarkdownText: View, Equatable {
             )
             while charRange.length > 0 {
                 let lastChar = nsString.character(at: NSMaxRange(charRange) - 1)
-                if lastChar == 0x0A || lastChar == 0x0D || lastChar == 0x20 || lastChar == 0x09 {
+                if lastChar == 0x0A || lastChar == 0x0D
+                    || ((lastChar == 0x20 || lastChar == 0x09)
+                        && NSMaxRange(lineGlyphRange) < totalGlyphs) {
                     charRange.length -= 1
                 } else {
                     break
@@ -1306,6 +1322,9 @@ public struct MarkdownText: View, Equatable {
                 )
             }
             lines.append(slice)
+            if lines.count > maxLines {
+                break
+            }
             glyphIndex = NSMaxRange(lineGlyphRange)
         }
         return lines.isEmpty ? [NSAttributedString()] : lines
@@ -1332,7 +1351,6 @@ public struct MarkdownText: View, Equatable {
             return nil
         }
         let fullRange = NSRange(location: 0, length: attributedText.length)
-        var hasTableElements = false
         struct CellSpan {
             let fullCellText: String
             var start: Int
@@ -1347,7 +1365,6 @@ public struct MarkdownText: View, Equatable {
             guard let fragment = value as? TableCellFragment else { return }
             let overlap = NSIntersectionRange(selectedRange, attrRange)
             guard overlap.length > 0 else { return }
-            hasTableElements = true
             let cellLength = (fragment.fullCellText as NSString).length
             let startOffset = overlap.location - attrRange.location
             let endOffset = startOffset + overlap.length
@@ -1371,12 +1388,9 @@ public struct MarkdownText: View, Equatable {
 
         attributedText.enumerateAttribute(
             tableSeparatorPositionAttribute,
-            in: fullRange
-        ) { value, attrRange, _ in
+            in: selectedRange
+        ) { value, _, _ in
             guard let separator = value as? TableSeparatorPosition else { return }
-            let overlap = NSIntersectionRange(selectedRange, attrRange)
-            guard overlap.length > 0 else { return }
-            hasTableElements = true
             if rows[separator.row]?[separator.leftColumn] == nil {
                 rows[separator.row, default: [:]][separator.leftColumn] = CellSpan(
                     fullCellText: "",
@@ -1393,11 +1407,20 @@ public struct MarkdownText: View, Equatable {
             }
         }
 
-        guard hasTableElements else {
+        let sortedRows = rows.keys.sorted()
+        guard let minRow = sortedRows.first, let maxRow = sortedRows.last else {
             return nil
         }
 
-        return rows.keys.sorted().map { rowIndex in
+        var hasLeadingRowBreak = false
+        var hasTrailingRowBreak = false
+        attributedText.enumerateAttribute(tableRowBreakAttribute, in: selectedRange) { value, _, _ in
+            guard let breakRow = value as? Int else { return }
+            if breakRow < minRow { hasLeadingRowBreak = true }
+            if breakRow >= maxRow { hasTrailingRowBreak = true }
+        }
+
+        let body = sortedRows.map { rowIndex in
             let rowCells = rows[rowIndex] ?? [:]
             guard let minCol = rowCells.keys.min(),
                   let maxCol = rowCells.keys.max() else {
@@ -1411,6 +1434,7 @@ public struct MarkdownText: View, Equatable {
                 return cellNS.substring(with: NSRange(location: safeStart, length: safeEnd - safeStart))
             }.joined(separator: "\t")
         }.joined(separator: "\n")
+        return (hasLeadingRowBreak ? "\n" : "") + body + (hasTrailingRowBreak ? "\n" : "")
     }
 
     fileprivate static func copiedText(
@@ -1644,6 +1668,7 @@ public struct MarkdownText: View, Equatable {
 /// without scrolling independently or clipping selection handles.
 public final class MarkdownSelectableTextView: UITextView {
     public var wrapsText = true
+    fileprivate var renderKey: MarkdownText.RenderKey?
     public var preferredMaxLayoutWidth: CGFloat = 0 {
         didSet {
             if abs(oldValue - preferredMaxLayoutWidth) > 0.5 {
@@ -1698,13 +1723,30 @@ public final class MarkdownSelectableTextView: UITextView {
         let targetWidth = wrapsText && preferredMaxLayoutWidth > 0
             ? preferredMaxLayoutWidth
             : CGFloat.greatestFiniteMagnitude
+        return measuredSize(forWidth: targetWidth)
+    }
+
+    func measuredSize(forWidth width: CGFloat) -> CGSize {
+        let finiteWidth = wrapsText && width.isFinite && width > 0
+            && width < CGFloat.greatestFiniteMagnitude
+        let naturalWidth: CGFloat
+        if finiteWidth {
+            naturalWidth = width
+        } else {
+            let bounded = (attributedText ?? NSAttributedString()).boundingRect(
+                with: CGSize(
+                    width: CGFloat.greatestFiniteMagnitude,
+                    height: CGFloat.greatestFiniteMagnitude
+                ),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            ).width
+            naturalWidth = max(ceil(bounded), minimumTableWidth)
+        }
         let measured = sizeThatFits(
-            CGSize(width: targetWidth, height: .greatestFiniteMagnitude)
+            CGSize(width: max(1, naturalWidth), height: .greatestFiniteMagnitude)
         )
-        return CGSize(
-            width: max(ceil(measured.width), minimumTableWidth),
-            height: ceil(measured.height)
-        )
+        return CGSize(width: naturalWidth, height: ceil(measured.height))
     }
 
     public override func draw(_ rect: CGRect) {
@@ -1757,21 +1799,24 @@ public final class MarkdownSelectableTextView: UITextView {
 
 private struct SelectableMarkdownText: UIViewRepresentable {
     let wraps: Bool
-    let makeAttributedText: (MarkdownText.StyleContext, LayoutDirection) -> NSAttributedString
+    let segment: MarkdownText.RenderSegment
 
-    private func resolvedAttributedText(context: Context) -> NSAttributedString {
-        makeAttributedText(
-            MarkdownText.StyleContext(
+    private func renderKey(context: Context) -> MarkdownText.RenderKey {
+        MarkdownText.RenderKey(
+            segment: segment,
+            styleContext: MarkdownText.StyleContext(
                 dynamicTypeSize: context.environment.dynamicTypeSize,
                 legibilityWeight: context.environment.legibilityWeight
             ),
-            context.environment.layoutDirection
+            layoutDirection: context.environment.layoutDirection
         )
     }
 
     func makeUIView(context: Context) -> MarkdownSelectableTextView {
-        let attributedText = resolvedAttributedText(context: context)
+        let key = renderKey(context: context)
+        let attributedText = MarkdownText.makeSegmentAttributedText(key)
         let textView = MarkdownSelectableTextView()
+        textView.renderKey = key
         textView.wrapsText = wraps
         textView.isEditable = false
         textView.isSelectable = true
@@ -1797,9 +1842,12 @@ private struct SelectableMarkdownText: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: MarkdownSelectableTextView, context: Context) {
-        let attributedText = resolvedAttributedText(context: context)
+        let key = renderKey(context: context)
         uiView.wrapsText = wraps
         uiView.textContainer.lineBreakMode = wraps ? .byWordWrapping : .byClipping
+        guard uiView.renderKey != key else { return }
+        uiView.renderKey = key
+        let attributedText = MarkdownText.makeSegmentAttributedText(key)
         if uiView.attributedText != attributedText {
             let previousSelection = uiView.selectedRange
             let previousString = uiView.attributedText.string as NSString
@@ -1826,32 +1874,18 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         if wraps {
             if let proposedWidth = proposal.width, proposedWidth.isFinite, proposedWidth > 0 {
                 uiView.preferredMaxLayoutWidth = proposedWidth
-                let measured = uiView.sizeThatFits(
-                    CGSize(width: proposedWidth, height: .greatestFiniteMagnitude)
-                )
-                return CGSize(width: proposedWidth, height: ceil(measured.height))
+                return uiView.measuredSize(forWidth: proposedWidth)
             }
             let fallbackWidth = uiView.preferredMaxLayoutWidth > 0
                 ? uiView.preferredMaxLayoutWidth
                 : CGFloat.greatestFiniteMagnitude
-            let measured = uiView.sizeThatFits(
-                CGSize(width: fallbackWidth, height: .greatestFiniteMagnitude)
-            )
+            let measured = uiView.measuredSize(forWidth: fallbackWidth)
             return CGSize(
-                width: uiView.preferredMaxLayoutWidth > 0 ? fallbackWidth : ceil(measured.width),
-                height: ceil(measured.height)
+                width: uiView.preferredMaxLayoutWidth > 0 ? fallbackWidth : measured.width,
+                height: measured.height
             )
         } else {
-            let measured = uiView.sizeThatFits(
-                CGSize(
-                    width: CGFloat.greatestFiniteMagnitude,
-                    height: CGFloat.greatestFiniteMagnitude
-                )
-            )
-            return CGSize(
-                width: max(ceil(measured.width), uiView.minimumTableWidth),
-                height: ceil(measured.height)
-            )
+            return uiView.measuredSize(forWidth: CGFloat.greatestFiniteMagnitude)
         }
     }
 }
@@ -1862,6 +1896,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
 /// across contiguous Markdown blocks without scrolling independently.
 public final class MarkdownSelectableTextView: NSTextView {
     public var wrapsText = true
+    fileprivate var renderKey: MarkdownText.RenderKey?
     public var preferredMaxLayoutWidth: CGFloat = 0 {
         didSet {
             if abs(oldValue - preferredMaxLayoutWidth) > 0.5 {
@@ -1890,7 +1925,11 @@ public final class MarkdownSelectableTextView: NSTextView {
     }
 
     public func selectedCopiedText() -> String {
-        MarkdownText.copiedText(from: attributedText, in: selectedRange())
+        let ranges = selectedRanges.map(\.rangeValue).filter { $0.length > 0 }
+        guard !ranges.isEmpty else {
+            return MarkdownText.copiedText(from: attributedText, in: selectedRange())
+        }
+        return ranges.map { MarkdownText.copiedText(from: attributedText, in: $0) }.joined(separator: "\n")
     }
 
     public func headerDividerY() -> CGFloat? {
@@ -1919,10 +1958,11 @@ public final class MarkdownSelectableTextView: NSTextView {
     }
 
     public override func copy(_ sender: Any?) {
-        if let tableCopied = MarkdownText.tableCopiedText(from: attributedText, in: selectedRange()) {
+        let ranges = selectedRanges.map(\.rangeValue).filter { $0.length > 0 }
+        if ranges.contains(where: { MarkdownText.tableCopiedText(from: attributedText, in: $0) != nil }) {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
-            pasteboard.setString(tableCopied, forType: .string)
+            pasteboard.setString(selectedCopiedText(), forType: .string)
         } else {
             super.copy(sender)
         }
@@ -2036,21 +2076,24 @@ public final class MarkdownSelectableTextView: NSTextView {
 
 private struct SelectableMarkdownText: NSViewRepresentable {
     let wraps: Bool
-    let makeAttributedText: (MarkdownText.StyleContext, LayoutDirection) -> NSAttributedString
+    let segment: MarkdownText.RenderSegment
 
-    private func resolvedAttributedText(context: Context) -> NSAttributedString {
-        makeAttributedText(
-            MarkdownText.StyleContext(
+    private func renderKey(context: Context) -> MarkdownText.RenderKey {
+        MarkdownText.RenderKey(
+            segment: segment,
+            styleContext: MarkdownText.StyleContext(
                 dynamicTypeSize: context.environment.dynamicTypeSize,
                 legibilityWeight: context.environment.legibilityWeight
             ),
-            context.environment.layoutDirection
+            layoutDirection: context.environment.layoutDirection
         )
     }
 
     func makeNSView(context: Context) -> MarkdownSelectableTextView {
-        let attributedText = resolvedAttributedText(context: context)
+        let key = renderKey(context: context)
+        let attributedText = MarkdownText.makeSegmentAttributedText(key)
         let textView = MarkdownSelectableTextView(frame: .zero)
+        textView.renderKey = key
         textView.wrapsText = wraps
         textView.isEditable = false
         textView.isSelectable = true
@@ -2076,10 +2119,13 @@ private struct SelectableMarkdownText: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MarkdownSelectableTextView, context: Context) {
-        let attributedText = resolvedAttributedText(context: context)
+        let key = renderKey(context: context)
         nsView.wrapsText = wraps
         nsView.isHorizontallyResizable = !wraps
         nsView.textContainer?.lineBreakMode = wraps ? .byWordWrapping : .byClipping
+        guard nsView.renderKey != key else { return }
+        nsView.renderKey = key
+        let attributedText = MarkdownText.makeSegmentAttributedText(key)
         if nsView.attributedText != attributedText {
             let previousSelection = nsView.selectedRange()
             let previousString = nsView.attributedText.string as NSString
