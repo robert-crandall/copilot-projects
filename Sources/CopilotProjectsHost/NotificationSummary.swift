@@ -1,5 +1,6 @@
 import Foundation
 import CopilotProjectsProtocol
+import CopilotProjectsUI
 
 struct CompletionSummaryContext: Sendable {
     let copilotSessionId: String

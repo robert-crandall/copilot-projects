@@ -2,7 +2,9 @@ import XCTest
 @testable import CopilotProjectsHost
 import CopilotProjectsCore
 import CopilotProjectsProtocol
+import CopilotProjectsUI
 import AppKit
+import SwiftUI
 import SwiftTerm
 import Combine
 import Security
@@ -8451,6 +8453,10 @@ final class AppLogicTests: XCTestCase {
             MarkdownParser.blocks(from: "```\nunterminated"),
             [.codeBlock("unterminated")]
         )
+        XCTAssertEqual(
+            MarkdownParser.blocks(from: "```inline triple backtick```"),
+            [.paragraph("```inline triple backtick```")]
+        )
     }
 
     func testMarkdownRenderingLimitsPreventStructuralAmplification() {
@@ -8481,6 +8487,379 @@ final class AppLogicTests: XCTestCase {
         XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
             Array(repeating: "**x** ", count: 40_000).joined()
         ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "[x](u) ", count: 30_000)
+        ))
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            String(repeating: "<https://x> ", count: 20_000)
+        ))
+        let wideHeader = Array(repeating: "h", count: 50).joined(separator: " | ")
+        let wideDelimiter = Array(repeating: "---", count: 50).joined(separator: " | ")
+        let sparseRows = Array(repeating: "a | b", count: 25).joined(separator: "\n")
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            "\(wideHeader)\n\(wideDelimiter)\n\(sparseRows)"
+        ))
+        let wrappedTableUnit = "| A | B |\n| --- | --- |\n| \(String(repeating: "wrapped ", count: 250)) | y |"
+        XCTAssertFalse(MarkdownParser.isWithinRenderingLimits(
+            Array(repeating: wrappedTableUnit, count: 10).joined(separator: "\n\n")
+        ))
+    }
+
+    @MainActor
+    func testMarkdownSelectableTextViewSupportsRangeSelectionAcrossBlocks() throws {
+        let markdown = """
+        # Summary
+
+        ASSISTANT_DELTA A separate follow-up with *`emphasized_code`*.
+
+        1. Review the **selected** reply.
+        2. Do not include its siblings.
+
+        > Quoted note at the end.
+        """
+        let hostingView = NSHostingView(
+            rootView: MarkdownText(text: markdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 480)
+        hostingView.layoutSubtreeIfNeeded()
+
+        func findTextViews(in root: NSView) -> [MarkdownSelectableTextView] {
+            var found: [MarkdownSelectableTextView] = []
+            if let textView = root as? MarkdownSelectableTextView {
+                found.append(textView)
+            }
+            for subview in root.subviews {
+                found.append(contentsOf: findTextViews(in: subview))
+            }
+            return found
+        }
+
+        let textViews = findTextViews(in: hostingView)
+        XCTAssertEqual(
+            textViews.count, 1,
+            "Consecutive headings, paragraphs, lists, and quotes should share one selectable text view"
+        )
+        let textView = try XCTUnwrap(textViews.first)
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertTrue(textView.isSelectable)
+
+        let fullString = textView.attributedText.string as NSString
+        let headingRange = fullString.range(of: "Summary")
+        XCTAssertNotEqual(headingRange.location, NSNotFound)
+        XCTAssertEqual(
+            textView.attributedText.attribute(
+                MarkdownText.headingLevelAttribute,
+                at: headingRange.location,
+                effectiveRange: nil
+            ) as? NSNumber,
+            1
+        )
+        let boldRange = fullString.range(of: "selected")
+        XCTAssertNotEqual(boldRange.location, NSNotFound)
+        let boldFont = try XCTUnwrap(
+            textView.attributedText.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(boldFont.fontDescriptor.symbolicTraits.contains(.bold))
+
+        let codeRange = fullString.range(of: "emphasized_code")
+        XCTAssertNotEqual(codeRange.location, NSNotFound)
+        let codeFont = try XCTUnwrap(
+            textView.attributedText.attribute(.font, at: codeRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertTrue(codeFont.fontDescriptor.symbolicTraits.contains(.monoSpace))
+        XCTAssertTrue(codeFont.fontDescriptor.symbolicTraits.contains(.italic))
+
+        let spanTarget = "Summary\nASSISTANT_DELTA A separate follow-up with emphasized_code.\n1.\tReview the selected reply.\n2.\tDo not include its siblings.\nQuoted note at the end."
+        let spanRange = fullString.range(of: spanTarget)
+        XCTAssertNotEqual(spanRange.location, NSNotFound)
+        textView.setSelectedRange(spanRange)
+        XCTAssertEqual(fullString.substring(with: textView.selectedRange()), spanTarget)
+
+        let preservedRange = fullString.range(of: "Review the selected reply.")
+        textView.setSelectedRange(preservedRange)
+        hostingView.rootView = MarkdownText(text: markdown + "\n\nMore streamed output.")
+            .frame(width: 320, alignment: .leading)
+        hostingView.layoutSubtreeIfNeeded()
+        XCTAssertTrue(findTextViews(in: hostingView).first === textView)
+        XCTAssertEqual(textView.selectedRange(), preservedRange)
+
+        hostingView.rootView = MarkdownText(text: "Completely replaced message.")
+            .frame(width: 320, alignment: .leading)
+        hostingView.layoutSubtreeIfNeeded()
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 0, length: 0))
+
+        let alignments: [MarkdownColumnAlignment] = [.leading, .center, .trailing]
+        XCTAssertEqual(
+            MarkdownText.resolvedTableTextAlignment(
+                alignments, column: 0, layoutDirection: .leftToRight
+            ),
+            .left
+        )
+        XCTAssertEqual(
+            MarkdownText.resolvedTableTextAlignment(
+                alignments, column: 2, layoutDirection: .rightToLeft
+            ),
+            .left
+        )
+
+        let uncachedTextView = MarkdownSelectableTextView(frame: .zero)
+        uncachedTextView.attributedText = NSAttributedString(string: "Short line")
+        let intrinsic = uncachedTextView.intrinsicContentSize
+        XCTAssertGreaterThan(intrinsic.width, 0)
+        XCTAssertLessThan(intrinsic.width, 1_000)
+
+        let tableMarkdown = """
+        | Arm | Score |
+        | --- | ---: |
+        | 3x Alligator/Terra (high) | 85.4% / 33.2% |
+        | 3x Terra 6.1 (xhigh) | 83.3% / 34.3% |
+        | 4x Terra 6.1 (high) | 85.6% / 33.4% |
+        """
+        let tableHost = NSHostingView(
+            rootView: MarkdownText(text: tableMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        tableHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        tableHost.layoutSubtreeIfNeeded()
+        let tableTextViews = findTextViews(in: tableHost)
+        XCTAssertEqual(
+            tableTextViews.count, 1,
+            "An entire Markdown table should render in a single selectable text view so selection can span multiple rows"
+        )
+        let tableTextView = try XCTUnwrap(tableTextViews.first)
+        let tableString = tableTextView.attributedText.string as NSString
+        let multiRowTarget = "3x Alligator/Terra (high)\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
+        let multiRowRange = tableString.range(of: multiRowTarget)
+        XCTAssertNotEqual(multiRowRange.location, NSNotFound)
+        tableTextView.setSelectedRange(multiRowRange)
+        XCTAssertEqual(tableTextView.selectedCopiedText(), multiRowTarget)
+
+        // Selecting a substring inside a table cell copies that exact substring.
+        let midCellRange = tableString.range(of: "Terra (high)")
+        XCTAssertNotEqual(midCellRange.location, NSNotFound)
+        tableTextView.setSelectedRange(midCellRange)
+        XCTAssertEqual(tableTextView.selectedCopiedText(), "Terra (high)")
+
+        // Empty cells and empty rows are preserved in copied table ranges.
+        let sparseTableMarkdown = """
+        | A | B | C |
+        | --- | --- | --- |
+        | left | | right |
+        | | | |
+        | x | y | z |
+        """
+        let sparseHost = NSHostingView(
+            rootView: MarkdownText(text: sparseTableMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        sparseHost.frame = NSRect(x: 0, y: 0, width: 320, height: 240)
+        sparseHost.layoutSubtreeIfNeeded()
+        let sparseTextView = try XCTUnwrap(findTextViews(in: sparseHost).first)
+        let sparseString = sparseTextView.attributedText.string as NSString
+        let sparseStart = sparseString.range(of: "left").location
+        XCTAssertNotEqual(sparseStart, NSNotFound)
+        sparseTextView.setSelectedRange(
+            NSRange(location: sparseStart, length: sparseString.length - sparseStart)
+        )
+        XCTAssertEqual(
+            sparseTextView.selectedCopiedText(),
+            "left\t\tright\n\t\t\nx\ty\tz"
+        )
+
+        // Header divider sits strictly between the header glyphs and first body row.
+        let dividerY = try XCTUnwrap(tableTextView.headerDividerY())
+        let headerGlyphs = tableTextView.layoutManager!.glyphRange(
+            forCharacterRange: tableString.range(of: "Arm"),
+            actualCharacterRange: nil
+        )
+        let headerRect = tableTextView.layoutManager!.boundingRect(
+            forGlyphRange: headerGlyphs,
+            in: tableTextView.textContainer!
+        )
+        let firstBodyGlyphs = tableTextView.layoutManager!.glyphRange(
+            forCharacterRange: tableString.range(of: "3x Alligator"),
+            actualCharacterRange: nil
+        )
+        let firstBodyRect = tableTextView.layoutManager!.boundingRect(
+            forGlyphRange: firstBodyGlyphs,
+            in: tableTextView.textContainer!
+        )
+        XCTAssertGreaterThan(dividerY, headerRect.maxY)
+        XCTAssertLessThan(dividerY, firstBodyRect.minY)
+
+        // First-column right alignment positions column 0 glyphs to the right of x=0.
+        let rightAlignedFirstCol = """
+        | Count | Name |
+        | ---: | :--- |
+        | 1 | alpha |
+        | 100000 | beta |
+        """
+        let rightHost = NSHostingView(
+            rootView: MarkdownText(text: rightAlignedFirstCol)
+                .frame(width: 320, alignment: .leading)
+        )
+        rightHost.frame = NSRect(x: 0, y: 0, width: 320, height: 200)
+        rightHost.layoutSubtreeIfNeeded()
+        let rightTableTextView = try XCTUnwrap(findTextViews(in: rightHost).first)
+        let rightTableString = rightTableTextView.attributedText.string as NSString
+        let shortNumGlyph = rightTableTextView.layoutManager!.glyphRange(
+            forCharacterRange: rightTableString.range(of: "1\talpha"),
+            actualCharacterRange: nil
+        )
+        let shortNumLocation = rightTableTextView.layoutManager!.location(
+            forGlyphAt: shortNumGlyph.location
+        )
+        XCTAssertGreaterThan(shortNumLocation.x, 10)
+
+        // Selecting across wrapped table cells reconstructs logical cell text without interleaved wrap fragments,
+        // and preserves authored trailing spaces inside wrapped inline-code spans.
+        let longCell = "Arm (1/2/2 voting + Astra medium agg with `wrapped trailing code  `)"
+        let wrappedTableMarkdown = """
+        | Arm | Score |
+        | :--- | ---: |
+        | \(longCell) | 85.4% / 33.2% |
+        | 3x Terra 6.1 (xhigh) | 83.3% / 34.3% |
+        """
+        let wrappedTableHost = NSHostingView(
+            rootView: MarkdownText(text: wrappedTableMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        wrappedTableHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        wrappedTableHost.layoutSubtreeIfNeeded()
+        let wrappedTableTextView = try XCTUnwrap(findTextViews(in: wrappedTableHost).first)
+        let wrappedString = wrappedTableTextView.attributedText.string as NSString
+        let bodyStart = wrappedString.range(of: "Arm (1/2/2").location
+        XCTAssertNotEqual(bodyStart, NSNotFound)
+        wrappedTableTextView.setSelectedRange(
+            NSRange(location: bodyStart, length: wrappedString.length - bodyStart)
+        )
+        XCTAssertEqual(
+            wrappedTableTextView.selectedCopiedText(),
+            "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )\t85.4% / 33.2%\n3x Terra 6.1 (xhigh)\t83.3% / 34.3%"
+        )
+
+        // Selecting a wrapped non-first-column cell alone does not synthesize leading or trailing tabs from exhausted or empty neighbor columns.
+        for rowSpec in ["| host | primary | \(longCell) |", "| host | | \(longCell) |", "| host | \(longCell) | |"] {
+            let thirdColWrappedMarkdown = """
+            | Name | Role | Detail |
+            | :--- | :--- | :--- |
+            \(rowSpec)
+            """
+            let thirdColHost = NSHostingView(
+                rootView: MarkdownText(text: thirdColWrappedMarkdown)
+                    .frame(width: 320, alignment: .leading)
+            )
+            thirdColHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+            thirdColHost.layoutSubtreeIfNeeded()
+            let thirdColTextView = try XCTUnwrap(findTextViews(in: thirdColHost).first)
+            let thirdColString = thirdColTextView.attributedText.string as NSString
+            let detailStart = thirdColString.range(of: "Arm (1/2/2").location
+            let detailEnd = NSMaxRange(thirdColString.range(of: "code  )"))
+            XCTAssertNotEqual(detailStart, NSNotFound)
+            thirdColTextView.setSelectedRange(
+                NSRange(location: detailStart, length: detailEnd - detailStart)
+            )
+            XCTAssertEqual(
+                thirdColTextView.selectedCopiedText(),
+                "Arm (1/2/2 voting + Astra medium agg with wrapped trailing code  )"
+            )
+        }
+
+        // Multi-range selections on macOS are preserved across streamed updates and reconstructed on copy.
+        let firstDisjoint = tableString.range(of: "3x Alligator/Terra (high)")
+        let secondDisjoint = tableString.range(of: "4x Terra 6.1 (high)")
+        tableTextView.selectedRanges = [
+            NSValue(range: firstDisjoint),
+            NSValue(range: secondDisjoint),
+        ]
+        XCTAssertEqual(
+            tableTextView.selectedCopiedText(),
+            "3x Alligator/Terra (high)\n4x Terra 6.1 (high)"
+        )
+        tableHost.rootView = MarkdownText(text: tableMarkdown + "\n| 5x Luna | 90.0% |")
+            .frame(width: 320, alignment: .leading)
+        tableHost.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            tableTextView.selectedRanges.map(\.rangeValue),
+            [firstDisjoint, secondDisjoint]
+        )
+
+        // Selected leading and trailing logical row breaks are preserved during copy.
+        let rowWithBreaks = "\n3x Alligator/Terra (high)\t85.4% / 33.2%\n"
+        let rowWithBreaksRange = tableString.range(of: rowWithBreaks)
+        XCTAssertNotEqual(rowWithBreaksRange.location, NSNotFound)
+        tableTextView.setSelectedRange(rowWithBreaksRange)
+        XCTAssertEqual(tableTextView.selectedCopiedText(), rowWithBreaks)
+
+        // Selecting from a wrapped continuation line into the next row preserves empty trailing cells
+        // (including across an exhausted middle column), and embedded cell tabs are expanded so they
+        // do not collide with column separators.
+        let wrappedEmptyTrailingMarkdown = """
+        | Arm | Role | Score |
+        | :--- | :--- | :--- |
+        | \(longCell) | short | |
+        | next\tpart | role | value |
+        """
+        let wrappedEmptyHost = NSHostingView(
+            rootView: MarkdownText(text: wrappedEmptyTrailingMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        wrappedEmptyHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        wrappedEmptyHost.layoutSubtreeIfNeeded()
+        let wrappedEmptyTextView = try XCTUnwrap(findTextViews(in: wrappedEmptyHost).first)
+        let wrappedEmptyString = wrappedEmptyTextView.attributedText.string as NSString
+        let continuationRange = wrappedEmptyString.range(of: "code  )\t\t\nnext    part\trole\tvalue")
+        XCTAssertNotEqual(continuationRange.location, NSNotFound)
+        wrappedEmptyTextView.setSelectedRange(continuationRange)
+        XCTAssertEqual(
+            wrappedEmptyTextView.selectedCopiedText(),
+            "code  )\t\t\nnext    part\trole\tvalue"
+        )
+
+        // Wide tables with heavily wrapped cells fall back to plain text once cumulative visual cells exceed the budget.
+        let wideCols = 200
+        let wideHeaderRow = Array(repeating: "h", count: wideCols).joined(separator: " | ")
+        let wideDelimRow = Array(repeating: "---", count: wideCols).joined(separator: " | ")
+        let wideProse = String(repeating: "W", count: 128)
+        let wideBodyRow = ([wideProse] + Array(repeating: "x", count: wideCols - 1)).joined(separator: " | ")
+        let wideMarkdown = "\(wideHeaderRow)\n\(wideDelimRow)\n\(wideBodyRow)"
+        XCTAssertTrue(MarkdownParser.isWithinRenderingLimits(wideMarkdown))
+        let wideWrappedHost = NSHostingView(
+            rootView: MarkdownText(text: wideMarkdown)
+                .frame(width: 320, alignment: .leading)
+        )
+        wideWrappedHost.frame = NSRect(x: 0, y: 0, width: 320, height: 320)
+        wideWrappedHost.layoutSubtreeIfNeeded()
+        let wideWrappedTextView = try XCTUnwrap(findTextViews(in: wideWrappedHost).first)
+        XCTAssertNil(wideWrappedTextView.headerDividerY())
+        XCTAssertEqual(
+            wideWrappedTextView.attributedText.string,
+            Array(repeating: "h", count: wideCols).joined(separator: "\t") + "\n"
+                + ([wideProse] + Array(repeating: "x", count: wideCols - 1)).joined(separator: "\t")
+        )
+
+        func renderedTableHeight(_ detail: String) -> CGFloat {
+            let md = """
+            | Name | Detail |
+            | :--- | ---: |
+            | host | \(detail) |
+            """
+            let view = NSHostingView(
+                rootView: MarkdownText(text: md)
+                    .frame(width: 300, alignment: .leading)
+            )
+            return view.fittingSize.height
+        }
+        let shortHeight = renderedTableHeight("short")
+        let wrappedHeight = renderedTableHeight(
+            String(repeating: "wrap this table cell ", count: 40)
+        )
+        let unbrokenHeight = renderedTableHeight(
+            String(repeating: "unbroken", count: 100)
+        )
+        XCTAssertGreaterThan(wrappedHeight, shortHeight + 100)
+        XCTAssertGreaterThan(unbrokenHeight, shortHeight + 100)
     }
 
     // MARK: - Remote web terminal image rendering

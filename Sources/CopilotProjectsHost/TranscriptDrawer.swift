@@ -495,7 +495,6 @@ private struct TranscriptTurnCard: View {
 
     private func transcriptText(_ text: String) -> some View {
         MarkdownText(text: text)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
