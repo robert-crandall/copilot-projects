@@ -352,6 +352,9 @@ final class AppModel: ObservableObject {
     private var sessionPromptComposers: [String: DesktopSessionPromptComposer] = [:]
     private var selectedTranscriptController: TranscriptController?
     private let stateRepository: StateRepository
+    /// User settings this model reads. Tests inject a suite so a saved review
+    /// prompt cannot leak into another test through `UserDefaults.standard`.
+    private let defaults: UserDefaults
     /// The durable Kitty-image disk store every session's terminal is wired
     /// to. Defaults to the real process-wide singleton; tests inject an
     /// isolated instance (a fresh temp-directory-backed store) so a test
@@ -812,7 +815,8 @@ final class AppModel: ObservableObject {
             ControlServer.defaultMainQueueScheduler,
         screenshotPreparer: (@MainActor () -> ScreenshotPreparation)? = nil,
         screenshotImageCapturer: @escaping WindowScreenshot.ImageCapturer =
-            WindowScreenshot.captureWindowImage
+            WindowScreenshot.captureWindowImage,
+        defaults: UserDefaults = .standard
     ) {
         self.stateRepository = stateRepository
         self.completionNotificationDelayNanoseconds = completionNotificationDelayNanoseconds
@@ -845,6 +849,7 @@ final class AppModel: ObservableObject {
         self.gracefulSessionDestroyer = gracefulSessionDestroyer
         self.forcedSessionDestroyer = forcedSessionDestroyer
         self.alertPresenter = alertPresenter
+        self.defaults = defaults
         load()
     }
 
@@ -1501,7 +1506,7 @@ final class AppModel: ObservableObject {
         let session = Session(title: target.title, cwd: cwd)
         projects[pi].sessions.append(session)
         projects[pi].selectedSessionId = session.id
-        let prompt = Self.adversarialReviewPrompt(for: target)
+        let prompt = pullRequestReviewPrompt(for: target)
         launchSession(
             session.id,
             executable: copilotExecutable,
@@ -1533,13 +1538,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    nonisolated static func adversarialReviewPrompt(
-        for target: PullRequestReviewTarget
-    ) -> String {
-        "Perform a read-only local adversarial review of \(target.url). "
-            + "Use the adversarial-review skill. Inspect the pull request from a local checkout "
-            + "or isolated worktree. Do not edit files, push changes, or post anything to GitHub. "
-            + "Report the findings in this session."
+    func pullRequestReviewPrompt(for target: PullRequestReviewTarget) -> String {
+        PullRequestReviewPrompt.stored(in: defaults).prompt(for: target)
+    }
+
+    func configurePullRequestReviewPromptInteractive(
+        present: @MainActor (NSAlert) -> NSApplication.ModalResponse = { $0.runModal() }
+    ) {
+        guard let updated = PullRequestReviewPromptEditor.runModal(
+            initialPrompt: PullRequestReviewPrompt.stored(in: defaults),
+            present: present
+        ) else {
+            return
+        }
+        updated.save(to: defaults)
     }
 
     private func presentAlert(title: String, message: String) {
@@ -1725,7 +1737,7 @@ final class AppModel: ObservableObject {
             isPlainCreate: false,
             kind: .copilot,
             title: target.title,
-            initialPrompt: Self.adversarialReviewPrompt(for: target),
+            initialPrompt: pullRequestReviewPrompt(for: target),
             now: now
         )
     }
@@ -1763,6 +1775,8 @@ final class AppModel: ObservableObject {
         let fingerprint = fingerprintOverride ?? SessionCreationRecord.fingerprint(
             projectId: request.projectId,
             kind: kind,
+            // Review retries stay keyed by the pull request URL. The review prompt
+            // is a user setting and can change between a client's retries.
             initialPrompt: request.pullRequestURL == nil ? initialPrompt : nil,
             pullRequestURL: request.pullRequestURL
         )
@@ -5593,7 +5607,7 @@ final class AppModel: ObservableObject {
             isPlainCreate: false,
             kind: .copilot,
             title: target.title,
-            initialPrompt: Self.adversarialReviewPrompt(for: target),
+            initialPrompt: pullRequestReviewPrompt(for: target),
             placement: selectOnMac ? .local : .project,
             pullRequestKeys: [canonicalKey],
             now: now

@@ -570,15 +570,7 @@ final class ProjectsTerminalView: ProcessTerminalView {
         let normalized = value
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
-        guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              normalized.utf8.count <= 8_192 else { return nil }
-        for scalar in normalized.unicodeScalars {
-            if scalar.value == 0x7f
-                || (scalar.value < 0x20 && scalar != "\n" && scalar != "\t")
-                || (0x80 ... 0x9f).contains(scalar.value) {
-                return nil
-            }
-        }
+        guard SessionInputValidation.isValidPrompt(normalized) else { return nil }
         var bytes = scopedFocus ? remoteFocusInBytes : []
         bytes.append(contentsOf: [0x1b, 0x1b])
         bytes.append(contentsOf: "\u{1b}[200~".utf8)

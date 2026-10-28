@@ -109,8 +109,9 @@ discards it. Closing the drawer or switching sessions dismisses that preview.
   splits what was sent to you from what was sent to your teams, and keeps a Dock
   badge and banners current even when its window is closed.
 - **Local pull-request reviews.** Choose **Review Pull Request…** from the split
-  button's dropdown to open a Copilot CLI session with a local adversarial-review
-  prompt for a GitHub pull request.
+  button's dropdown to open a Copilot CLI session for a GitHub pull request.
+  That session starts with the prompt from **Copilot Projects ▸ Pull Request Review
+  Prompt…**. Put `{url}` where the pull request URL goes.
 - **Resumable terminals.** The bundled `dtach` backend keeps shells and agents
   alive when the app quits or relaunches. You can also reattach over SSH.
 
@@ -355,6 +356,10 @@ The **+** side of the split button starts an interactive Copilot CLI session imm
 inheriting the current session's working directory. Its dropdown offers
 **Start with Prompt…** (a multiline composer), **New Terminal** (just a shell), and
 **Review Pull Request…** (a GitHub pull request URL dialog).
+To change the review prompt, choose **Copilot Projects ▸ Pull Request Review Prompt…**.
+Put `{url}` where the pull request URL goes. **Restore Default** returns the built-in
+adversarial-review prompt. Copilot Notifications, the CLI, and a remote device use that
+same prompt.
 The Session menu and project context menus also offer Copilot, starting-prompt,
 and plain-terminal creation. New projects
 created with `⌘N` also start with Copilot. Copilot Projects never adds `--allow-all`;

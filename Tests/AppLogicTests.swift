@@ -6709,7 +6709,8 @@ final class AppLogicTests: XCTestCase {
         reposDirectory: @escaping () -> String?,
         backendAvailable: @escaping () -> Bool = { true },
         ledger: SessionCreationLedger,
-        onLaunch: @escaping (String, String?, String?) -> Void
+        onLaunch: @escaping (String, String?, String?) -> Void,
+        defaults: UserDefaults = .standard
     ) throws -> AppModel {
         let repository = StateRepository(path: root.appendingPathComponent("state.json"))
         try repository.save(PersistedState(
@@ -6723,7 +6724,8 @@ final class AppLogicTests: XCTestCase {
             remoteReposDirectory: reposDirectory,
             remoteSessionBackendAvailable: backendAvailable,
             remoteSessionLauncher: onLaunch,
-            sessionCreationLedger: ledger
+            sessionCreationLedger: ledger,
+            defaults: defaults
         )
     }
 
@@ -7093,7 +7095,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(launches.count, 1)
         XCTAssertEqual(
             launches.first?.prompt,
-            AppModel.adversarialReviewPrompt(
+            PullRequestReviewPrompt.builtIn.prompt(
                 for: try XCTUnwrap(PullRequestReviewTarget.parse(pullRequestURL))
             )
         )
@@ -7158,7 +7160,7 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(launches.count, 1)
         XCTAssertEqual(
             launches.first?.prompt,
-            AppModel.adversarialReviewPrompt(
+            PullRequestReviewPrompt.builtIn.prompt(
                 for: try XCTUnwrap(PullRequestReviewTarget.parse(pullRequestURL))
             )
         )
@@ -7212,6 +7214,119 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(typedHashInDialog, "https://github.com/github/github/pull/123#")
         XCTAssertEqual(trimmedInDialog, "https://github.com/github/github/pull/123")
         XCTAssertEqual(launches.count, 2)
+    }
+
+    @MainActor
+    func testAddAdversarialReviewSessionUsesStoredPrompt() throws {
+        let suite = "review-prompt-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try PullRequestReviewPrompt.validated("Review {url} for security only.").get().save(to: defaults)
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var launches: [(sessionId: String, executable: String?, prompt: String?)] = []
+        let model = try makeRemoteCreateModel(
+            root: root,
+            projects: [Project(id: "p1", name: "Reviews", cwd: "/tmp", sessions: [])],
+            selectedProjectId: "p1",
+            reposDirectory: { nil },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { launches.append(($0, $1, $2)) },
+            defaults: defaults
+        )
+        let pullRequestURL = "https://github.com/github/github/pull/123"
+        XCTAssertNotNil(model.addAdversarialReviewSession(
+            toProjectId: "p1",
+            pullRequestURL: pullRequestURL
+        ))
+        XCTAssertEqual(launches.map(\.prompt), ["Review \(pullRequestURL) for security only."])
+    }
+
+    @MainActor
+    func testCreateRemoteAdversarialReviewSessionUsesStoredPrompt() throws {
+        let suite = "review-prompt-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try PullRequestReviewPrompt.validated("Review {url} for security only.").get().save(to: defaults)
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let repos = root.appendingPathComponent("Repos", isDirectory: true)
+        try FileManager.default.createDirectory(at: repos, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var launches: [(sessionId: String, executable: String?, prompt: String?)] = []
+        let model = try makeRemoteCreateModel(
+            root: root,
+            projects: [Project(id: "p1", name: "Reviews", cwd: "/tmp", sessions: [])],
+            selectedProjectId: "p1",
+            reposDirectory: { repos.path },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { launches.append(($0, $1, $2)) },
+            defaults: defaults
+        )
+        let pullRequestURL = "https://github.com/github/github/pull/123"
+        let outcome = model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+            requestId: UUID(),
+            projectId: "p1",
+            pullRequestURL: pullRequestURL
+        ))
+        guard case .created = outcome else {
+            return XCTFail("expected created, got \(outcome)")
+        }
+        XCTAssertEqual(launches.map(\.prompt), ["Review \(pullRequestURL) for security only."])
+    }
+
+    @MainActor
+    func testRemoteReviewReplayAfterPromptChangeStaysExisting() throws {
+        let suite = "review-prompt-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try PullRequestReviewPrompt.validated("Review {url} for security only.").get().save(to: defaults)
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let repos = root.appendingPathComponent("Repos", isDirectory: true)
+        try FileManager.default.createDirectory(at: repos, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var launches: [(sessionId: String, executable: String?, prompt: String?)] = []
+        let model = try makeRemoteCreateModel(
+            root: root,
+            projects: [Project(id: "p1", name: "Reviews", cwd: "/tmp", sessions: [])],
+            selectedProjectId: "p1",
+            reposDirectory: { repos.path },
+            ledger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
+            onLaunch: { launches.append(($0, $1, $2)) },
+            defaults: defaults
+        )
+        let pullRequestURL = "https://github.com/github/github/pull/123"
+        let request = RemoteCreateSessionRequest(
+            requestId: UUID(),
+            projectId: "p1",
+            pullRequestURL: pullRequestURL
+        )
+        let created = model.createRemoteAdversarialReviewSession(request)
+        guard case .created(let response) = created else {
+            return XCTFail("expected created, got \(created)")
+        }
+        try PullRequestReviewPrompt.validated("Review {url} for regressions only.").get().save(to: defaults)
+        XCTAssertEqual(model.createRemoteAdversarialReviewSession(request), .existing(response))
+        XCTAssertEqual(launches.map(\.prompt), ["Review \(pullRequestURL) for security only."])
+
+        let changed = model.createRemoteAdversarialReviewSession(RemoteCreateSessionRequest(
+            requestId: UUID(),
+            projectId: "p1",
+            pullRequestURL: pullRequestURL
+        ))
+        guard case .created = changed else {
+            return XCTFail("expected a new review to use the changed prompt, got \(changed)")
+        }
+        XCTAssertEqual(launches.map(\.prompt), [
+            "Review \(pullRequestURL) for security only.",
+            "Review \(pullRequestURL) for regressions only.",
+        ])
     }
 
     @MainActor

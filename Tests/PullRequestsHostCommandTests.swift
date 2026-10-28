@@ -28,6 +28,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
 
     private func withHost(
         projects: (URL) -> [Project], selectedProjectIndex: Int = 0,
+        defaults: UserDefaults = .standard,
         _ body: (Host) throws -> Void
     ) throws {
         _ = NSApplication.shared
@@ -71,7 +72,8 @@ final class PullRequestsHostCommandTests: XCTestCase {
                 remoteSessionBackendAvailable: { true },
                 remoteSessionLauncher: { launches.append(($0, $1, $2)) },
                 sessionCreationLedger: SessionCreationLedger(url: root.appendingPathComponent("ledger.json")),
-                kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images"))
+                kittyImageDiskStore: RemoteKittyImageDiskStore(root: root.appendingPathComponent("images")),
+                defaults: defaults
             )
             models.append(model)
             return model
@@ -574,7 +576,7 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertEqual(host.launches().count, 1)
             XCTAssertEqual(host.launches()[0].id, sessionId)
             let target = try XCTUnwrap(PullRequestReviewTarget.parse(prURL))
-            XCTAssertEqual(host.launches()[0].prompt, AppModel.adversarialReviewPrompt(for: target))
+            XCTAssertEqual(host.launches()[0].prompt, PullRequestReviewPrompt.builtIn.prompt(for: target))
 
             let project = try XCTUnwrap(model.project("A"))
             let session = try XCTUnwrap(project.sessions.last)
@@ -590,6 +592,27 @@ final class PullRequestsHostCommandTests: XCTestCase {
             XCTAssertEqual(review(url: "https://github.com/Octo/App/pull/43").code, "conflict")
             XCTAssertEqual(review(UUID().uuidString, url: "https://github.com/Octo/App/issues/42").code, "bad-request")
             XCTAssertEqual(host.launches().count, 1)
+        }
+    }
+
+    func testReviewPullRequestCommandUsesStoredPrompt() throws {
+        let suite = "review-prompt-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try PullRequestReviewPrompt.validated("Review {url} for security only.").get().save(to: defaults)
+        try withHost(projects: twoProjects, defaults: defaults) { host in
+            var request = request(
+                "review-pull-request",
+                project: "A",
+                requestId: UUID().uuidString
+            )
+            request.path = "https://github.com/Octo/App/pull/42"
+            let created = host.model.handle(request)
+            XCTAssertEqual(created.code, "created", created.error ?? "")
+            XCTAssertEqual(
+                host.launches().map(\.prompt),
+                ["Review https://github.com/Octo/App/pull/42 for security only."]
+            )
         }
     }
 

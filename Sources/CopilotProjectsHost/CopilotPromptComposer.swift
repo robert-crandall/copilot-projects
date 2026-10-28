@@ -661,13 +661,20 @@ final class CopilotPromptComposer: NSObject, NSTextViewDelegate {
     }
 
     let alert = NSAlert()
-    let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 440, height: 180))
+    let textView: NSTextView
     private let instructions = "Write the first prompt for an interactive Copilot session. "
         + "Return adds a line; Command-Return starts Copilot. "
         + "If startup fails, use the tab's Copy Starting Prompt menu before closing the tab or quitting."
 
     override init() {
+        let (scrollView, textView) = Self.makePromptEditorScrollView(
+            initialText: "",
+            font: .systemFont(ofSize: NSFont.systemFontSize)
+        )
+        self.textView = textView
         super.init()
+        textView.setAccessibilityLabel("Starting prompt")
+        textView.delegate = self
         alert.messageText = "Start Copilot with a Prompt"
         alert.addButton(withTitle: "Start Copilot")
         alert.addButton(withTitle: "Cancel")
@@ -677,29 +684,38 @@ final class CopilotPromptComposer: NSObject, NSTextViewDelegate {
         alert.buttons[0].keyEquivalent = "\r"
         alert.buttons[0].keyEquivalentModifierMask = .command
         alert.buttons[1].keyEquivalent = "\u{1b}"
+        alert.accessoryView = scrollView
+        alert.window.initialFirstResponder = textView
+        updateValidation()
+    }
 
+    /// Plain-text prompt editor shared by the starting-prompt composer and the
+    /// pull request review prompt editor. Smart substitutions stay off so AppKit
+    /// cannot rewrite prompt text.
+    fileprivate static func makePromptEditorScrollView(
+        initialText: String,
+        font: NSFont
+    ) -> (NSScrollView, NSTextView) {
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 440, height: 180))
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.allowsUndo = true
-        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
+        textView.font = font
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
         textView.autoresizingMask = [.width]
-        textView.setAccessibilityLabel("Starting prompt")
-        textView.delegate = self
+        textView.string = initialText
 
         let scrollView = NSScrollView(frame: textView.frame)
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
         scrollView.documentView = textView
-        alert.accessoryView = scrollView
-        alert.window.initialFirstResponder = textView
-        updateValidation()
+        return (scrollView, textView)
     }
 
     func textDidChange(_ notification: Notification) {
@@ -742,5 +758,211 @@ final class CopilotPromptComposer: NSObject, NSTextViewDelegate {
                 }
             }
         }
+    }
+}
+
+/// A review prompt that can be launched for every parsed pull request.
+///
+/// Only `validated(_:)` and `builtIn` create values. Launch paths therefore
+/// render the template and do not re-check it.
+public struct PullRequestReviewPrompt: Equatable, Sendable {
+    public static let urlPlaceholder = "{url}"
+    /// Absent means the user has not customized the prompt, so they keep
+    /// receiving later edits to `builtIn`. The name has no dots so it can move
+    /// into App-scene `@AppStorage` without rebuilding the scene on every write.
+    public static let defaultsKey = "pullRequestReviewPrompt"
+
+    public static let builtIn = PullRequestReviewPrompt(
+        uncheckedTemplate:
+            "Perform a read-only local adversarial review of {url}. "
+            + "Use the adversarial-review skill. Inspect the pull request from a local checkout "
+            + "or isolated worktree. Do not edit files, push changes, or post anything to GitHub. "
+            + "Report the findings in this session."
+    )
+
+    public enum ValidationError: Error, Equatable, Sendable {
+        case empty
+        case missingURLPlaceholder
+        case tooLong(maximumBytes: Int)
+        case unsupportedCharacters
+
+        public var message: String {
+            switch self {
+            case .empty:
+                return "Enter a review prompt."
+            case .missingURLPlaceholder:
+                return "Include \(PullRequestReviewPrompt.urlPlaceholder) where the pull request URL should be inserted."
+            case .tooLong(let maximumBytes):
+                let limit = maximumBytes.formatted(.number.locale(Locale(identifier: "en_US")))
+                return "Keep the prompt to at most \(limit) UTF-8 bytes so the pull request URL fits."
+            case .unsupportedCharacters:
+                return "Remove terminal control characters from the prompt."
+            }
+        }
+    }
+
+    public let template: String
+
+    public var isBuiltIn: Bool { self == .builtIn }
+
+    private init(uncheckedTemplate: String) {
+        template = uncheckedTemplate
+    }
+
+    public static func validated(_ rawTemplate: String) -> Result<PullRequestReviewPrompt, ValidationError> {
+        let normalized = rawTemplate
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return .failure(.empty) }
+        let placeholderCount = normalized.components(separatedBy: urlPlaceholder).count - 1
+        guard placeholderCount > 0 else { return .failure(.missingURLPlaceholder) }
+
+        let maximumBytes = templateBudget(placeholderCount: placeholderCount)
+        if let worstCasePrompt = worstCasePrompt(normalized, placeholderCount: placeholderCount),
+           SessionInputValidation.isValidPrompt(worstCasePrompt) {
+            return .success(PullRequestReviewPrompt(uncheckedTemplate: normalized))
+        }
+        if containsUnsupportedControls(normalized) {
+            return .failure(.unsupportedCharacters)
+        }
+        return .failure(.tooLong(maximumBytes: maximumBytes))
+    }
+
+    public static func stored(in defaults: UserDefaults = .standard) -> PullRequestReviewPrompt {
+        guard let raw = defaults.string(forKey: defaultsKey),
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .builtIn
+        }
+        switch validated(raw) {
+        case .success(let prompt):
+            return prompt
+        case .failure(let error):
+            logInvalidStoredPrompt(error.message)
+            return .builtIn
+        }
+    }
+
+    private static let invalidStoredPromptLock = NSLock()
+    private static var didLogInvalidStoredPrompt = false
+
+    /// A corrupt setting is read on every review launch. Log the first fallback
+    /// only, and never write the key back.
+    private static func logInvalidStoredPrompt(_ message: String) {
+        invalidStoredPromptLock.lock()
+        let shouldLog = !didLogInvalidStoredPrompt
+        didLogInvalidStoredPrompt = true
+        invalidStoredPromptLock.unlock()
+        guard shouldLog else { return }
+        NSLog(
+            "copilot-projects: stored pull request review prompt is invalid (%@); using the built-in prompt",
+            message
+        )
+    }
+
+    public func save(to defaults: UserDefaults = .standard) {
+        if self == .builtIn {
+            defaults.removeObject(forKey: Self.defaultsKey)
+        } else {
+            defaults.set(template, forKey: Self.defaultsKey)
+        }
+    }
+
+    public static func reset(in defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+
+    public func prompt(for target: PullRequestReviewTarget) -> String {
+        template.replacingOccurrences(of: Self.urlPlaceholder, with: target.url)
+    }
+
+    /// Template bytes left after reserving the longest URL `PullRequestReviewTarget.parse`
+    /// can produce for every `{url}`. Each placeholder grows by that URL minus `{url}` itself.
+    private static func templateBudget(placeholderCount: Int) -> Int {
+        let expansion = PullRequestReviewTarget.maximumInputBytes - urlPlaceholder.utf8.count
+        let (reserved, overflow) = placeholderCount.multipliedReportingOverflow(by: expansion)
+        guard !overflow else { return 0 }
+        return max(0, SessionInputValidation.maximumPromptBytes - reserved)
+    }
+
+    /// The prompt with every `{url}` replaced by a 2,048-byte URL, or nil when that
+    /// rendering cannot fit. Skipping the allocation keeps a corrupt stored template
+    /// from building a multi-gigabyte string on the launch path.
+    private static func worstCasePrompt(_ template: String, placeholderCount: Int) -> String? {
+        let expansion = PullRequestReviewTarget.maximumInputBytes - urlPlaceholder.utf8.count
+        let (reserved, overflow) = placeholderCount.multipliedReportingOverflow(by: expansion)
+        guard !overflow else { return nil }
+        let (renderedCount, renderedOverflow) = template.utf8.count.addingReportingOverflow(reserved)
+        guard !renderedOverflow, renderedCount <= SessionInputValidation.maximumPromptBytes else {
+            return nil
+        }
+        let worstCaseURL = String(repeating: "a", count: PullRequestReviewTarget.maximumInputBytes)
+        return template.replacingOccurrences(of: urlPlaceholder, with: worstCaseURL)
+    }
+
+    private static func containsUnsupportedControls(_ value: String) -> Bool {
+        value.unicodeScalars.contains { scalar in
+            scalar.properties.generalCategory == .control && scalar != "\n" && scalar != "\t"
+        }
+    }
+}
+
+@MainActor
+enum PullRequestReviewPromptEditor {
+    static func runModal(
+        initialPrompt: PullRequestReviewPrompt,
+        present: @MainActor (NSAlert) -> NSApplication.ModalResponse = { $0.runModal() }
+    ) -> PullRequestReviewPrompt? {
+        var draft = initialPrompt.template
+        var errorMessage: String?
+        let restoreDefault = NSApplication.ModalResponse(
+            rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 2
+        )
+        while true {
+            let alert = NSAlert()
+            alert.messageText = "Pull Request Review Prompt"
+            alert.informativeText = informativeText(errorMessage: errorMessage)
+            let (scrollView, textView) = CopilotPromptComposer.makePromptEditorScrollView(
+                initialText: draft,
+                font: .systemFont(ofSize: NSFont.systemFontSize)
+            )
+            textView.setAccessibilityLabel("Pull request review prompt")
+            textView.setSelectedRange(NSRange(location: 0, length: (draft as NSString).length))
+            alert.accessoryView = scrollView
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
+            let restore = alert.addButton(withTitle: "Restore Default")
+            restore.keyEquivalent = ""
+            alert.buttons[0].keyEquivalent = "\r"
+            alert.buttons[0].keyEquivalentModifierMask = [.command]
+            alert.buttons[1].keyEquivalent = "\u{1b}"
+            alert.layout()
+            alert.window.initialFirstResponder = textView
+
+            let response = present(alert)
+            draft = textView.string
+            if response == .alertFirstButtonReturn {
+                switch PullRequestReviewPrompt.validated(draft) {
+                case .success(let prompt):
+                    return prompt
+                case .failure(let error):
+                    errorMessage = error.message
+                }
+            } else if response == restoreDefault {
+                draft = PullRequestReviewPrompt.builtIn.template
+                errorMessage = nil
+            } else {
+                return nil
+            }
+        }
+    }
+
+    private static func informativeText(errorMessage: String?) -> String {
+        guard let errorMessage else {
+            return "This prompt is sent to Copilot when you start Review Pull Request… "
+                + "Include \(PullRequestReviewPrompt.urlPlaceholder) where the pull request URL should be inserted. "
+                + "Command-Return saves."
+        }
+        return errorMessage + " Command-Return saves."
     }
 }
