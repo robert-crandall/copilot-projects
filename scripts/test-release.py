@@ -1267,5 +1267,16 @@ class KeychainSearchTests(unittest.TestCase):
         self.assertEqual(self.deletes, [])
 
 
+class CiWorkflowTests(unittest.TestCase):
+    def test_ci_cancels_superseded_runs_and_skips_main_pushes_covered_by_release(self):
+        workflow = WORKFLOW.with_name("ci.yml").read_text()
+        self.assertIn("on:\n  pull_request:\n  workflow_dispatch:\n", workflow)
+        self.assertNotIn("  push:", workflow)
+        self.assertIn(
+            "concurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n",
+            workflow,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
