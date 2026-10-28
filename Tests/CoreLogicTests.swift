@@ -4921,4 +4921,78 @@ final class CoreLogicTests: XCTestCase {
             [expected]
         )
     }
+
+    func testProcessTreeSnapshotCacheHitsWithinMaxAgeExpiresAndBypassesOnZero() throws {
+        var now = ContinuousClock.now
+        var reads = 0
+        let cache = ProcessTree.SnapshotCache(
+            now: { now },
+            read: {
+                reads += 1
+                var snapshot = ProcessTree.Snapshot()
+                snapshot.parentOf = [pid_t(reads): 1]
+                snapshot.nameOf = [pid_t(reads): "proc-\(reads)"]
+                return snapshot
+            }
+        )
+
+        let first = cache.snapshot()
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(first.nameOf[1], "proc-1")
+
+        // Younger than maxAge (149ms < 150ms): returns cached snapshot without re-reading.
+        now = now.advanced(by: .milliseconds(149))
+        XCTAssertEqual(cache.snapshot(), first)
+        XCTAssertEqual(reads, 1)
+
+        // Exact maxAge boundary (150ms >= 150ms): expires and refreshes.
+        now = now.advanced(by: .milliseconds(1))
+        let second = cache.snapshot()
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(second.nameOf[2], "proc-2")
+
+        // maxAge: .zero bypasses a fresh cache entry and updates the cache with the new read.
+        let uncached = cache.snapshot(maxAge: .zero)
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(uncached.nameOf[3], "proc-3")
+        XCTAssertEqual(cache.snapshot(), uncached)
+        XCTAssertEqual(reads, 3)
+
+        // Explicit invalidation forces the next read even within maxAge.
+        cache.invalidate()
+        let afterInvalidate = cache.snapshot()
+        XCTAssertEqual(reads, 4)
+        XCTAssertEqual(afterInvalidate.nameOf[4], "proc-4")
+
+        // Live kernel integration: verify public snapshot(maxAge:), descendants(of:),
+        // and invalidateSnapshotCache().
+        ProcessTree.invalidateSnapshotCache()
+        let baseline = ProcessTree.snapshot(maxAge: .zero)
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        try child.run()
+        let childPID = child.processIdentifier
+        defer {
+            if child.isRunning {
+                child.terminate()
+                child.waitUntilExit()
+            }
+            ProcessTree.invalidateSnapshotCache()
+        }
+        XCTAssertNil(baseline.nameOf[childPID])
+
+        // descendants(of:) bypasses the cached pre-spawn baseline and refreshes the cache.
+        XCTAssertTrue(ProcessTree.descendants(of: getpid()).contains { $0.pid == childPID })
+        XCTAssertNotNil(ProcessTree.snapshot(maxAge: .seconds(5)).nameOf[childPID])
+
+        child.terminate()
+        child.waitUntilExit()
+
+        // Within a generous TTL window, the cached snapshot still contains the exited child PID.
+        XCTAssertNotNil(ProcessTree.snapshot(maxAge: .seconds(5)).nameOf[childPID])
+
+        // Zero maxAge bypasses the cache and observes that the child has exited.
+        XCTAssertNil(ProcessTree.snapshot(maxAge: .zero).nameOf[childPID])
+    }
 }
