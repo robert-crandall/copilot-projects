@@ -6,7 +6,7 @@ import Darwin
 /// Minimal read-only view of the process tree, used to decide whether a coding
 /// agent is still alive inside a session's shell.
 public enum ProcessTree {
-    public struct Snapshot {
+    public struct Snapshot: Equatable, Sendable {
         public var childrenOf: [pid_t: [pid_t]] = [:]
         public var parentOf: [pid_t: pid_t] = [:]
         public var nameOf: [pid_t: String] = [:]
@@ -14,8 +14,60 @@ public enum ProcessTree {
         public init() {}
     }
 
+    public static let defaultSnapshotMaxAge: Duration = .milliseconds(150)
+
+    final class SnapshotCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private let now: @Sendable () -> ContinuousClock.Instant
+        private let read: @Sendable () -> Snapshot
+        private var cached: (snapshot: Snapshot, capturedAt: ContinuousClock.Instant)?
+
+        init(
+            now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
+            read: @escaping @Sendable () -> Snapshot = { ProcessTree.readSnapshot() }
+        ) {
+            self.now = now
+            self.read = read
+        }
+
+        func snapshot(maxAge: Duration = ProcessTree.defaultSnapshotMaxAge) -> Snapshot {
+            lock.lock()
+            defer { lock.unlock() }
+            let current = now()
+            if maxAge > .zero,
+               let cached,
+               cached.capturedAt <= current,
+               cached.capturedAt.duration(to: current) < maxAge {
+                return cached.snapshot
+            }
+            let fresh = read()
+            if !fresh.nameOf.isEmpty {
+                cached = (fresh, current)
+            }
+            return fresh
+        }
+
+        func invalidate() {
+            lock.lock()
+            cached = nil
+            lock.unlock()
+        }
+    }
+
+    private static let snapshotCache = SnapshotCache()
+
     /// One pass over all processes: parent links + short process names.
-    public static func snapshot() -> Snapshot {
+    /// Reuses a cached snapshot when younger than `maxAge` (pass `.zero` for an
+    /// uncached kernel read).
+    public static func snapshot(maxAge: Duration = defaultSnapshotMaxAge) -> Snapshot {
+        snapshotCache.snapshot(maxAge: maxAge)
+    }
+
+    public static func invalidateSnapshotCache() {
+        snapshotCache.invalidate()
+    }
+
+    static func readSnapshot() -> Snapshot {
         var snap = Snapshot()
         let needed = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
         guard needed > 0 else { return snap }
@@ -87,7 +139,7 @@ public enum ProcessTree {
     /// Every process descended from `root`, read before it is signalled because
     /// orphans are re-parented and can no longer be traced back to it.
     public static func descendants(of root: pid_t) -> [Identity] {
-        let tree = snapshot()
+        let tree = snapshot(maxAge: .zero)
         var seen = Set<pid_t>()
         var found: [Identity] = []
         var pending = tree.childrenOf[root] ?? []

@@ -127,6 +127,12 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         let version: UInt64
     }
 
+    private struct FileSignature: Codable, Equatable {
+        let fileNumber: UInt64
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+    }
+
     private struct ManifestEntryRecord: Codable, Equatable {
         let sessionId: String
         let imageId: UInt32
@@ -134,6 +140,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         let byteCount: Int
         let displayedAt: Date?
         let awaitingFirstDisplay: Bool?
+        let fileSignature: FileSignature?
 
         init(
             sessionId: String,
@@ -141,7 +148,8 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
             version: UInt64,
             byteCount: Int,
             displayedAt: Date? = nil,
-            awaitingFirstDisplay: Bool? = nil
+            awaitingFirstDisplay: Bool? = nil,
+            fileSignature: FileSignature? = nil
         ) {
             self.sessionId = sessionId
             self.imageId = imageId
@@ -149,6 +157,19 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
             self.byteCount = byteCount
             self.displayedAt = displayedAt
             self.awaitingFirstDisplay = (awaitingFirstDisplay == true && displayedAt == nil) ? true : nil
+            self.fileSignature = fileSignature
+        }
+
+        func withFileSignature(_ signature: FileSignature) -> ManifestEntryRecord {
+            ManifestEntryRecord(
+                sessionId: sessionId,
+                imageId: imageId,
+                version: version,
+                byteCount: byteCount,
+                displayedAt: displayedAt,
+                awaitingFirstDisplay: awaitingFirstDisplay,
+                fileSignature: signature
+            )
         }
     }
 
@@ -194,6 +215,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
     private var overflowCleanupScheduledSessionIds: Set<String> = []
     private var futureRetainsDisabled = false
     private var manifestPersistCount = 0
+    private var fullValidationReadCount = 0
     private let activationLock = NSLock()
     private var activated = false
 
@@ -605,6 +627,14 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         }
     }
 
+    func fullValidationReadCountForTesting() async -> Int {
+        await withCheckedContinuation { continuation in
+            enqueue { [self] in
+                continuation.resume(returning: fullValidationReadCount)
+            }
+        }
+    }
+
     /// The exact on-disk path an entry's bytes are (or would be) stored at.
     /// Pure/synchronous (path computation only touches no shared state), so
     /// safe to call from any thread. Exposed only so tests can directly
@@ -665,7 +695,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         }
         victims.append(contentsOf: capacityVictims)
         let fileURL = dataFileURL(sessionId: sessionId, imageId: imageId, version: version)
-        guard writeAtomically(data: data, to: fileURL) else {
+        guard let signature = writeAtomically(data: data, to: fileURL) else {
             manifest = originalManifest
             return
         }
@@ -675,7 +705,8 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
             version: version,
             byteCount: data.count,
             displayedAt: displayedAt,
-            awaitingFirstDisplay: awaitingFirstDisplay
+            awaitingFirstDisplay: awaitingFirstDisplay,
+            fileSignature: signature
         ))
         manifest.selections.removeAll { $0.sessionId == sessionId && $0.imageId == imageId }
         for selection in normalizedSelections {
@@ -789,7 +820,8 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                 imageId: existing.imageId,
                 version: existing.version,
                 byteCount: existing.byteCount,
-                displayedAt: displayedAt
+                displayedAt: displayedAt,
+                fileSignature: existing.fileSignature
             )
         }
         manifest.selections.removeAll { $0.sessionId == sessionId && $0.imageId == imageId }
@@ -1025,14 +1057,24 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         let beforeSelectionCount = manifest.selections.count
 
         var keptEntries: [ManifestEntryRecord] = []
+        var signaturesUpdated = false
         for entry in manifest.entries {
             let path = dataFileURL(sessionId: entry.sessionId, imageId: entry.imageId, version: entry.version)
+            guard let currentSignature = Self.fileSignature(at: path, expectedByteCount: entry.byteCount) else {
+                try? FileManager.default.removeItem(at: path)
+                continue
+            }
+            if entry.fileSignature == currentSignature {
+                keptEntries.append(entry)
+                continue
+            }
             guard readValidatedData(entry: entry, at: path) != nil
             else {
                 try? FileManager.default.removeItem(at: path)
                 continue
             }
-            keptEntries.append(entry)
+            keptEntries.append(entry.withFileSignature(currentSignature))
+            signaturesUpdated = true
         }
         manifest.entries = keptEntries
         let keptKeys = Set(keptEntries.map {
@@ -1053,6 +1095,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         // have nothing persisted, or by any test that never configures an
         // isolated root) must leave no trace on disk purely from existing.
         guard !reconciledTombstones.isEmpty
+            || signaturesUpdated
             || manifest.entries.count != beforeEntryCount
             || manifest.selections.count != beforeSelectionCount
         else { return }
@@ -1066,17 +1109,34 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
         }
     }
 
+    private static func fileSignature(
+        at url: URL,
+        expectedByteCount: Int
+    ) -> FileSignature? {
+        guard expectedByteCount > 0,
+              expectedByteCount <= maxTotalBytes
+        else { return nil }
+        var statBuf = stat()
+        guard lstat(url.path, &statBuf) == 0,
+              (statBuf.st_mode & S_IFMT) == S_IFREG,
+              statBuf.st_size == Int64(expectedByteCount),
+              statBuf.st_ino > 0
+        else { return nil }
+        return FileSignature(
+            fileNumber: statBuf.st_ino,
+            modificationSeconds: Int64(statBuf.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(statBuf.st_mtimespec.tv_nsec)
+        )
+    }
+
     private func readValidatedData(
         entry: ManifestEntryRecord,
         at url: URL
     ) -> Data? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber,
-              size.intValue == entry.byteCount,
-              size.intValue > 0,
-              size.intValue <= Self.maxTotalBytes,
-              let data = try? Data(contentsOf: url),
+        guard Self.fileSignature(at: url, expectedByteCount: entry.byteCount) != nil
+        else { return nil }
+        fullValidationReadCount += 1
+        guard let data = try? Data(contentsOf: url),
               data.count == entry.byteCount,
               RemoteKittyPNGValidation.isStructurallyValid(data)
         else { return nil }
@@ -1196,7 +1256,7 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
     /// startup cleanup also removes any staging leftovers it does find (via
     /// `removeOrphanAndStagingFiles`, since a staging file is never
     /// referenced by any manifest entry).
-    private func writeAtomically(data: Data, to url: URL) -> Bool {
+    private func writeAtomically(data: Data, to url: URL) -> FileSignature? {
         try? FileManager.default.createDirectory(
             at: dataDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
         )
@@ -1211,10 +1271,14 @@ final class RemoteKittyImageDiskStore: @unchecked Sendable {
                 try FileManager.default.removeItem(at: url)
             }
             try FileManager.default.moveItem(at: staging, to: url)
-            return true
+            guard let signature = Self.fileSignature(at: url, expectedByteCount: data.count) else {
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            }
+            return signature
         } catch {
             try? FileManager.default.removeItem(at: staging)
-            return false
+            return nil
         }
     }
 
