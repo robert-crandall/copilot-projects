@@ -143,6 +143,137 @@ final class ImagePersistenceOptimizationTests: XCTestCase {
         XCTAssertTrue(restored.entries.isEmpty)
         XCTAssertTrue(restored.currentSelections.isEmpty)
     }
+
+    @MainActor
+    func testStartupReconciliationSkipsFullByteReadsForSignatureMatchedEntriesAndEvictsModifiedOrSymlinkedFiles() async throws {
+        let root = imagePersistenceTestRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = "startup-signature"
+        let png1 = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let png2 = remoteKittyTestPNGBytes(width: 3, height: 3)
+        let png3 = remoteKittyTestPNGBytes(width: 4, height: 4)
+
+        let writer = RemoteKittyImageDiskStore(root: root)
+        writer.persistRetain(
+            sessionId: sessionId,
+            imageId: 1,
+            version: 1,
+            data: png1,
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: 1, placementId: nil, rows: 1, columns: 2, x: nil, y: nil, z: nil
+            )]
+        )
+        writer.persistRetain(
+            sessionId: sessionId,
+            imageId: 2,
+            version: 1,
+            data: png2,
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: 1, placementId: nil, rows: 1, columns: 3, x: nil, y: nil, z: nil
+            )]
+        )
+        writer.persistRetain(
+            sessionId: sessionId,
+            imageId: 3,
+            version: 1,
+            data: png3,
+            currentSelections: [RemoteKittyPersistedPlacementSelection(
+                version: 1, placementId: nil, rows: 1, columns: 4, x: nil, y: nil, z: nil
+            )]
+        )
+        await writer.flush()
+
+        // Reload 1: all entries match their recorded file signatures, so startup
+        // cleanup validates via stat without reading any PNG payloads or rewriting manifest.json.
+        let cleanReload = RemoteKittyImageDiskStore(root: root)
+        cleanReload.activate()
+        await cleanReload.flush()
+        let cleanReads = await cleanReload.fullValidationReadCountForTesting()
+        let cleanPersists = await cleanReload.manifestPersistCountForTesting()
+        let cleanCount = await cleanReload.totalEntryCountForTesting()
+        XCTAssertEqual(cleanReads, 0)
+        XCTAssertEqual(cleanPersists, 0)
+        XCTAssertEqual(cleanCount, 3)
+
+        // Overwrite image 2 in place with same-byte-count non-PNG bytes (size still matches,
+        // signature mismatches -> full validation runs and evicts image 2).
+        let image2URL = cleanReload.dataFileURLForTesting(sessionId: sessionId, imageId: 2, version: 1)
+        try Data(repeating: 0x5A, count: png2.count).write(to: image2URL)
+
+        // Replace image 3 with a symlink to a valid PNG outside dataDir (rejected by lstat regular-file check).
+        let image3URL = cleanReload.dataFileURLForTesting(sessionId: sessionId, imageId: 3, version: 1)
+        let externalTargetURL = root.appendingPathComponent("external-target.png", isDirectory: false)
+        try FileManager.default.moveItem(at: image3URL, to: externalTargetURL)
+        try FileManager.default.createSymbolicLink(at: image3URL, withDestinationURL: externalTargetURL)
+
+        let tamperedReload = RemoteKittyImageDiskStore(root: root)
+        tamperedReload.activate()
+        await tamperedReload.flush()
+        let tamperedReads = await tamperedReload.fullValidationReadCountForTesting()
+        let image1Exists = await tamperedReload.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        let image2Exists = await tamperedReload.entryExistsForTesting(sessionId: sessionId, imageId: 2, version: 1)
+        let image3Exists = await tamperedReload.entryExistsForTesting(sessionId: sessionId, imageId: 3, version: 1)
+        XCTAssertEqual(tamperedReads, 1, "only the same-size modified regular file should trigger a full byte read; untouched image 1 and rejected symlink image 3 should not")
+        XCTAssertTrue(image1Exists)
+        XCTAssertFalse(image2Exists)
+        XCTAssertFalse(image3Exists)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: image2URL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: image3URL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: externalTargetURL.path))
+
+        let restored = await tamperedReload.restore(sessionId: sessionId)
+        XCTAssertEqual(restored.entries.map(\.imageId), [1])
+        XCTAssertEqual(restored.entries.first?.data, png1)
+        XCTAssertEqual(restored.currentSelections.map(\.imageId), [1])
+    }
+
+    @MainActor
+    func testLegacyManifestWithoutSignatureBackfillsOnStartupAndSkipsFullReadOnNextLaunch() async throws {
+        let root = imagePersistenceTestRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionId = "legacy-signature"
+        let png = remoteKittyTestPNGBytes(width: 2, height: 2)
+        let pathStore = RemoteKittyImageDiskStore(root: root)
+        let dataURL = pathStore.dataFileURLForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        try FileManager.default.createDirectory(
+            at: dataURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try png.write(to: dataURL)
+        let legacyManifest = """
+        {
+          "schemaVersion": 1,
+          "entries": [{
+            "sessionId": "\(sessionId)",
+            "imageId": 1,
+            "version": 1,
+            "byteCount": \(png.count)
+          }],
+          "selections": []
+        }
+        """
+        try Data(legacyManifest.utf8).write(to: root.appendingPathComponent("manifest.json", isDirectory: false))
+
+        let firstLaunch = RemoteKittyImageDiskStore(root: root)
+        firstLaunch.activate()
+        await firstLaunch.flush()
+        let firstReads = await firstLaunch.fullValidationReadCountForTesting()
+        let firstPersists = await firstLaunch.manifestPersistCountForTesting()
+        let firstExists = await firstLaunch.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        XCTAssertEqual(firstReads, 1)
+        XCTAssertEqual(firstPersists, 1)
+        XCTAssertTrue(firstExists)
+
+        let secondLaunch = RemoteKittyImageDiskStore(root: root)
+        secondLaunch.activate()
+        await secondLaunch.flush()
+        let secondReads = await secondLaunch.fullValidationReadCountForTesting()
+        let secondPersists = await secondLaunch.manifestPersistCountForTesting()
+        let secondExists = await secondLaunch.entryExistsForTesting(sessionId: sessionId, imageId: 1, version: 1)
+        XCTAssertEqual(secondReads, 0)
+        XCTAssertEqual(secondPersists, 0)
+        XCTAssertTrue(secondExists)
+    }
 }
 
 @MainActor
