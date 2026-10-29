@@ -25,10 +25,18 @@ final class RemoteAttachmentTests: XCTestCase {
         let metadata = try store.store(bytes, id: id, sessionId: session, conversationEpoch: "first", now: now)
         XCTAssertEqual(try store.store(bytes, id: id, sessionId: session, conversationEpoch: "first"), metadata)
         let reopened = RemoteAttachmentStore(sessionsDirectory: root)
+        XCTAssertEqual(try reopened.metadata(id: id, sessionId: session, conversationEpoch: "first", now: now), metadata)
         XCTAssertEqual(try reopened.image(id: id, sessionId: session, conversationEpoch: "first").1, bytes)
+        XCTAssertThrowsError(try reopened.metadata(id: id, sessionId: session, conversationEpoch: "second"))
         XCTAssertThrowsError(try reopened.image(id: id, sessionId: session, conversationEpoch: "second"))
+        XCTAssertThrowsError(try reopened.metadata(id: id, sessionId: UUID().uuidString, conversationEpoch: "first"))
         XCTAssertThrowsError(try reopened.image(id: id, sessionId: UUID().uuidString, conversationEpoch: "first"))
+        XCTAssertThrowsError(try reopened.metadata(id: "../anything", sessionId: session, conversationEpoch: "first"))
         XCTAssertThrowsError(try reopened.image(id: "../anything", sessionId: session, conversationEpoch: "first"))
+        XCTAssertThrowsError(try reopened.metadata(
+            id: id, sessionId: session, conversationEpoch: "first",
+            now: now.addingTimeInterval(RemoteAttachmentContract.lifetime + 1)
+        ))
         XCTAssertThrowsError(try reopened.image(
             id: id, sessionId: session, conversationEpoch: "first",
             now: now.addingTimeInterval(RemoteAttachmentContract.lifetime + 1)
@@ -36,8 +44,18 @@ final class RemoteAttachmentTests: XCTestCase {
         let file = store.root.appendingPathComponent("\(id).image")
         let permissions = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber
         XCTAssertEqual(permissions?.intValue, 0o600)
-        try Data("changed".utf8).write(to: file)
+        // Same-length mutation passes fast metadata preflight (size + regular file) but fails full SHA-256 verification.
+        var sameLengthTampered = bytes
+        sameLengthTampered[sameLengthTampered.count - 1] ^= 0xFF
+        try sameLengthTampered.write(to: file)
+        XCTAssertEqual(try reopened.metadata(id: id, sessionId: session, conversationEpoch: "first", now: now), metadata)
         XCTAssertThrowsError(try reopened.image(id: id, sessionId: session, conversationEpoch: "first"))
+        // Size-mismatched and missing payloads fail metadata preflight too.
+        try Data("changed".utf8).write(to: file)
+        XCTAssertThrowsError(try reopened.metadata(id: id, sessionId: session, conversationEpoch: "first"))
+        XCTAssertThrowsError(try reopened.image(id: id, sessionId: session, conversationEpoch: "first"))
+        try FileManager.default.removeItem(at: file)
+        XCTAssertThrowsError(try reopened.metadata(id: id, sessionId: session, conversationEpoch: "first"))
     }
 
     func testRejectsNonImagesOversizeAndSymbolicLinks() throws {
@@ -54,6 +72,11 @@ final class RemoteAttachmentTests: XCTestCase {
         let file = store.root.appendingPathComponent("\(id).image")
         try FileManager.default.removeItem(at: file)
         try FileManager.default.createSymbolicLink(at: file, withDestinationURL: root.appendingPathComponent("secret"))
+        XCTAssertThrowsError(try store.metadata(id: id, sessionId: session, conversationEpoch: "epoch"))
+        XCTAssertThrowsError(try store.image(id: id, sessionId: session, conversationEpoch: "epoch"))
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try store.metadata(id: id, sessionId: session, conversationEpoch: "epoch"))
         XCTAssertThrowsError(try store.image(id: id, sessionId: session, conversationEpoch: "epoch"))
     }
 
@@ -397,6 +420,7 @@ final class RemoteAttachmentTests: XCTestCase {
         XCTAssertEqual(jsonMeta.mimeType, "application/json")
         XCTAssertEqual(jsonMeta.displayName, "config.json")
         XCTAssertFalse(jsonMeta.isImage)
+        XCTAssertEqual(try store.metadata(id: jsonId, sessionId: session, conversationEpoch: "epoch-1", now: now), jsonMeta)
         XCTAssertEqual(try store.image(id: jsonId, sessionId: session, conversationEpoch: "epoch-1", now: now).1, jsonBytes)
 
         // UTF-8 BOM is stripped cleanly when storing Markdown.
@@ -539,7 +563,8 @@ final class RemoteAttachmentTests: XCTestCase {
         XCTAssertEqual(composer.attachments.count, 2)
         XCTAssertTrue(composer.canSend(workflow: fileOnlyWorkflow, operation: epoch1, now: now))
 
-        // Picker content types include all supported text extensions (including .tsv, .json, .md).
+        // Picker content types include all supported text extensions (including .tsv, .json, .md),
+        // and picker-eligible script/source extensions outside extensionToTextMimeType normalize as text/plain.
         let pickerTypes = DesktopScreenshotAttachmentImage.allowedPickerContentTypes(
             allowImages: false,
             allowTextFiles: true
@@ -548,6 +573,15 @@ final class RemoteAttachmentTests: XCTestCase {
             let utType = try XCTUnwrap(UTType(filenameExtension: ext))
             XCTAssertTrue(pickerTypes.contains(utType), "Expected picker content types to include .\(ext)")
         }
+        let applescriptURL = root.appendingPathComponent("hello.applescript")
+        try Data("return \"hello\"\n".utf8).write(to: applescriptURL)
+        let normalizedApplescript = try DesktopScreenshotAttachmentImage.normalizedFile(
+            applescriptURL,
+            imageLimits: nil,
+            allowTextFiles: true
+        )
+        XCTAssertEqual(normalizedApplescript.mimeType, "text/plain")
+        XCTAssertEqual(normalizedApplescript.displayName, "hello.applescript")
 
         // Mixed pasteboard selection with an unsupported image on a non-vision model fails closed.
         let pasteboard = NSPasteboard.withUniqueName()

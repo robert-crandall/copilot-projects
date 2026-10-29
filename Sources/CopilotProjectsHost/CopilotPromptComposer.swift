@@ -177,9 +177,11 @@ enum DesktopScreenshotAttachmentImage {
             types.append(contentsOf: [.png, .jpeg, .image])
         }
         if allowTextFiles {
-            types.append(contentsOf: [
-                .json, .plainText, .sourceCode, .script, .xml, .yaml, .commaSeparatedText, .html,
-            ])
+            for fallbackType in pickerTextContentTypes {
+                if !types.contains(fallbackType) {
+                    types.append(fallbackType)
+                }
+            }
             let extraExtensions = RemoteAttachmentContract.extensionToTextMimeType.keys.sorted()
             for ext in extraExtensions {
                 if let utType = UTType(filenameExtension: ext), !types.contains(utType) {
@@ -189,6 +191,10 @@ enum DesktopScreenshotAttachmentImage {
         }
         return types
     }
+
+    private static let pickerTextContentTypes: [UTType] = [
+        .json, .plainText, .sourceCode, .script, .xml, .yaml, .commaSeparatedText, .tabSeparatedText, .html,
+    ]
 
     static func hasPasteboardImage(
         _ pasteboard: NSPasteboard = .general,
@@ -322,7 +328,17 @@ enum DesktopScreenshotAttachmentImage {
 
     static func canonicalTextMimeType(for url: URL) -> String? {
         guard !url.pathExtension.isEmpty else { return nil }
-        return RemoteAttachmentContract.canonicalTextMimeType(forExtension: url.pathExtension)
+        if let mapped = RemoteAttachmentContract.canonicalTextMimeType(forExtension: url.pathExtension) {
+            return mapped
+        }
+        guard let utType = UTType(filenameExtension: url.pathExtension),
+              !utType.conforms(to: .image) else {
+            return nil
+        }
+        if pickerTextContentTypes.contains(where: { utType.conforms(to: $0) }) {
+            return "text/plain"
+        }
+        return nil
     }
 
     static func isSupportedTextFileURL(_ url: URL) -> Bool {
