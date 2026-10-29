@@ -102,6 +102,9 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
     /// includes it; this says why. Present only while set, so unmarked sessions
     /// and older hosts omit it.
     public let markedUnread: Bool?
+    /// Effective root parent session ID within the same project when this session
+    /// is grouped as a child tab. Omitted when top-level or on older hosts.
+    public let parentSessionId: String?
 
     public init(
         id: String,
@@ -122,7 +125,8 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         operationReceipts: [RemoteOperationReceipt]? = nil,
         workflow: RemoteSessionWorkflow? = nil,
         lastError: TranscriptTurnError? = nil,
-        markedUnread: Bool? = nil
+        markedUnread: Bool? = nil,
+        parentSessionId: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -143,6 +147,7 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         self.workflow = workflow
         self.lastError = lastError
         self.markedUnread = markedUnread
+        self.parentSessionId = parentSessionId
     }
 }
 

@@ -265,6 +265,7 @@ extension AppModel {
         projectId: String,
         title: String,
         prompt: String,
+        parentSessionId: String? = nil,
         now: Date = Date()
     ) -> RemoteSessionCreationOutcome {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -282,6 +283,7 @@ extension AppModel {
             kind: .copilot,
             title: title,
             initialPrompt: prompt,
+            parentSessionId: parentSessionId,
             now: now
         )
     }
@@ -364,6 +366,7 @@ extension AppModel {
         placement: CreatedSessionPlacement = .remote,
         fingerprintOverride: String? = nil,
         pullRequestKeys: [String]? = nil,
+        parentSessionId: String? = nil,
         now: Date
     ) -> RemoteSessionCreationOutcome {
         // A failed startup load leaves the in-memory workspace empty, so neither
@@ -479,8 +482,18 @@ extension AppModel {
             }
         }
 
+        let resolvedParentSessionId = projects[pi].resolvedParentSessionId(
+            for: parentSessionId,
+            excluding: sessionId
+        )
         let session = Session(
-            id: sessionId, title: title, cwd: cwd, creationFingerprint: fingerprint, pullRequestKeys: pullRequestKeys)
+            id: sessionId,
+            title: title,
+            cwd: cwd,
+            creationFingerprint: fingerprint,
+            pullRequestKeys: pullRequestKeys,
+            parentSessionId: resolvedParentSessionId
+        )
         let previousSelection = projects[pi].selectedSessionId
         projects[pi].sessions.append(session)
         // A remote client must NOT steal the Mac's selected tab: only adopt the new
@@ -623,7 +636,8 @@ extension AppModel {
         let promptLiveSessions = remotePromptLiveSessions?(agentProcessNames) ?? liveAgentSessions
         return RemoteWorkspaceSnapshot(
             projects: projects.map { project in
-                RemoteProjectSnapshot(
+                let effectiveParents = project.effectiveParentSessionIdsBySessionId()
+                return RemoteProjectSnapshot(
                     id: project.id,
                     name: project.name,
                     selectedSessionId: project.selectedSessionId,
@@ -687,7 +701,8 @@ extension AppModel {
                             lastError: status == .idle
                                 ? session.agentActivity?.remoteLastError()
                                 : nil,
-                            markedUnread: session.markedUnread ? true : nil
+                            markedUnread: session.markedUnread ? true : nil,
+                            parentSessionId: effectiveParents[session.id]
                         )
                     }
                 )
