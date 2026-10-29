@@ -266,6 +266,7 @@ extension AppModel {
         title: String,
         prompt: String,
         hostId: String? = nil,
+        parentSessionId: String? = nil,
         now: Date = Date()
     ) -> RemoteSessionCreationOutcome {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -288,6 +289,7 @@ extension AppModel {
             kind: .copilot,
             title: title,
             initialPrompt: prompt,
+            parentSessionId: parentSessionId,
             now: now
         )
     }
@@ -370,6 +372,7 @@ extension AppModel {
         placement: CreatedSessionPlacement = .remote,
         fingerprintOverride: String? = nil,
         pullRequestKeys: [String]? = nil,
+        parentSessionId: String? = nil,
         now: Date
     ) -> RemoteSessionCreationOutcome {
         // A failed startup load leaves the in-memory workspace empty, so neither
@@ -529,6 +532,10 @@ extension AppModel {
             return .persistenceUnavailable
         }
 
+        let resolvedParentSessionId = projects[pi].resolvedParentSessionId(
+            for: parentSessionId,
+            excluding: sessionId
+        )
         let sessionHostId = resolvedHost.isLocal ? nil : resolvedHost.id
         let session = Session(
             id: sessionId,
@@ -536,7 +543,8 @@ extension AppModel {
             cwd: cwd,
             hostId: sessionHostId,
             creationFingerprint: fingerprint,
-            pullRequestKeys: pullRequestKeys
+            pullRequestKeys: pullRequestKeys,
+            parentSessionId: resolvedParentSessionId
         )
         let previousSelection = projects[pi].selectedSessionId
         projects[pi].sessions.append(session)
@@ -681,7 +689,8 @@ extension AppModel {
         let hosts = availableHosts
         return RemoteWorkspaceSnapshot(
             projects: projects.map { project in
-                RemoteProjectSnapshot(
+                let effectiveParents = project.effectiveParentSessionIdsBySessionId()
+                return RemoteProjectSnapshot(
                     id: project.id,
                     name: project.name,
                     selectedSessionId: project.selectedSessionId,
@@ -749,7 +758,8 @@ extension AppModel {
                                 : nil,
                             markedUnread: session.markedUnread ? true : nil,
                             hostId: remoteHost?.id,
-                            hostDisplayName: remoteHost?.displayName
+                            hostDisplayName: remoteHost?.displayName,
+                            parentSessionId: effectiveParents[session.id]
                         )
                     }
                 )
