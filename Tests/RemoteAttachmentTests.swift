@@ -569,9 +569,12 @@ final class RemoteAttachmentTests: XCTestCase {
             allowImages: false,
             allowTextFiles: true
         )
-        for ext in ["json", "md", "tsv"] {
+        for ext in ["json", "md", "tsv", "applescript"] {
             let utType = try XCTUnwrap(UTType(filenameExtension: ext))
-            XCTAssertTrue(pickerTypes.contains(utType), "Expected picker content types to include .\(ext)")
+            XCTAssertTrue(
+                pickerTypes.contains(where: { utType.conforms(to: $0) }),
+                "Expected picker content types to allow .\(ext)"
+            )
         }
         let applescriptURL = root.appendingPathComponent("hello.applescript")
         try Data("return \"hello\"\n".utf8).write(to: applescriptURL)
