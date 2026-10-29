@@ -147,6 +147,9 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
     public let hostId: String?
     /// Human-readable label for the remote host running this session (`nil` for local Mac sessions).
     public let hostDisplayName: String?
+    /// Effective root parent session ID within the same project when this session
+    /// is grouped as a child tab. Omitted when top-level or on older hosts.
+    public let parentSessionId: String?
 
     public init(
         id: String,
@@ -169,7 +172,8 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         lastError: TranscriptTurnError? = nil,
         markedUnread: Bool? = nil,
         hostId: String? = nil,
-        hostDisplayName: String? = nil
+        hostDisplayName: String? = nil,
+        parentSessionId: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -192,6 +196,7 @@ public struct RemoteSessionSnapshot: Codable, Equatable, Sendable {
         self.markedUnread = markedUnread
         self.hostId = hostId
         self.hostDisplayName = hostDisplayName
+        self.parentSessionId = parentSessionId
     }
 }
 
