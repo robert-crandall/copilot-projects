@@ -265,6 +265,7 @@ extension AppModel {
         projectId: String,
         title: String,
         prompt: String,
+        hostId: String? = nil,
         now: Date = Date()
     ) -> RemoteSessionCreationOutcome {
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,7 +278,12 @@ extension AppModel {
             .replacingOccurrences(of: "\r", with: "\n")
         return createRemoteSession(
             RemoteCreateSessionRequest(
-                requestId: requestId, projectId: projectId, kind: .copilot, initialPrompt: prompt),
+                requestId: requestId,
+                projectId: projectId,
+                kind: .copilot,
+                initialPrompt: prompt,
+                hostId: hostId
+            ),
             isPlainCreate: false,
             kind: .copilot,
             title: title,
@@ -371,6 +377,10 @@ extension AppModel {
         if didFailToLoadWorkspaceState {
             return .persistenceUnavailable
         }
+        let trimmedRequestedHostId = request.hostId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedRequestedHostId = (trimmedRequestedHostId?.isEmpty == false)
+            ? trimmedRequestedHostId?.lowercased()
+            : nil
         let sessionId = request.requestId.uuidString
         let fingerprint = fingerprintOverride ?? SessionCreationRecord.fingerprint(
             projectId: request.projectId,
@@ -378,7 +388,8 @@ extension AppModel {
             // Review retries stay keyed by the pull request URL. The review prompt
             // is a user setting and can change between a client's retries.
             initialPrompt: request.pullRequestURL == nil ? initialPrompt : nil,
-            pullRequestURL: request.pullRequestURL
+            pullRequestURL: request.pullRequestURL,
+            hostId: normalizedRequestedHostId
         )
         let creationRecord: SessionCreationRecord?
         do {
@@ -446,10 +457,40 @@ extension AppModel {
         }
 
         guard let pi = projectIndex(request.projectId) else { return .unknownProject }
+        if let normalizedRequestedHostId,
+           resolvedRemoteHost(hostId: normalizedRequestedHostId) == nil {
+            return .badRequest
+        }
+        guard let resolvedHost = resolvedRemoteHost(
+            hostId: normalizedRequestedHostId,
+            projectDefaultHostId: projects[pi].defaultHostId
+        ) else {
+            return .unavailable
+        }
+        if isPlainCreate,
+           FileManager.default.fileExists(atPath: Paths.dtachSocketPath(sessionId: sessionId))
+               || resumeMarkerValue(sessionId: sessionId, suffix: "copilot-session") != nil
+               || resumeMarkerValue(sessionId: sessionId, suffix: "remote-host") != nil {
+            let recordedHost = resumeMarkerValue(sessionId: sessionId, suffix: "remote-host")
+                .flatMap { raw -> String? in
+                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty,
+                          trimmed.caseInsensitiveCompare(RemoteHostInfo.localId) != .orderedSame else {
+                        return nil
+                    }
+                    return resolvedRemoteHost(hostId: trimmed)?.id ?? trimmed
+                }
+            let targetHost = resolvedHost.isLocal ? nil : resolvedHost.id
+            if recordedHost?.lowercased() != targetHost?.lowercased() {
+                return .conflict
+            }
+        }
         guard remoteSessionBackendAvailable() else { return .unavailable }
         let copilotExecutable: String?
         if kind == .copilot {
-            guard let executable = remoteCopilotExecutable() else { return .unavailable }
+            guard let executable = resolvedHost.isLocal
+                ? remoteCopilotExecutable()
+                : remoteWrapperExecutable() else { return .unavailable }
             copilotExecutable = executable
         } else {
             copilotExecutable = nil
@@ -457,30 +498,46 @@ extension AppModel {
         let cwd: String
         switch placement {
         case .remote:
-            guard let repos = remoteReposDirectory() else { return .invalid }
-            cwd = repos
+            if resolvedHost.isLocal {
+                guard let repos = remoteReposDirectory() else { return .invalid }
+                cwd = repos
+            } else {
+                cwd = resolvedHost.defaultCwd ?? remoteReposDirectory() ?? Paths.defaultStartupDir
+            }
         case .local, .project:
-            let folder = Paths.normalizedDirectory(defaultCwd(forProjectIndex: pi))
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: folder, isDirectory: &isDirectory),
-                  isDirectory.boolValue else { return .invalid }
+            let folder = Paths.normalizedDirectory(defaultCwd(forProjectIndex: pi, targetHost: resolvedHost))
+            if resolvedHost.isLocal {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: folder, isDirectory: &isDirectory),
+                      isDirectory.boolValue else { return .invalid }
+            }
             cwd = folder
         }
 
         if !isPlainCreate {
             let marker = resumeMarkerDirectory.appendingPathComponent("\(sessionId).copilot-session")
-            if unlink(marker.path) != 0 {
-                let code = errno
-                guard code == ENOENT else {
-                    NSLog("copilot-projects: could not clear stale resume marker for remote session "
-                        + "\(sessionId) (errno \(code))")
-                    return .persistenceUnavailable
-                }
+            if unlink(marker.path) != 0 && errno != ENOENT {
+                return .persistenceUnavailable
             }
         }
+        let hostMarker = resumeMarkerDirectory.appendingPathComponent("\(sessionId).remote-host")
+        if resolvedHost.isLocal {
+            if unlink(hostMarker.path) != 0 && errno != ENOENT {
+                return .persistenceUnavailable
+            }
+        } else if (try? Data(resolvedHost.id.utf8).write(to: hostMarker, options: .atomic)) == nil {
+            return .persistenceUnavailable
+        }
 
+        let sessionHostId = resolvedHost.isLocal ? nil : resolvedHost.id
         let session = Session(
-            id: sessionId, title: title, cwd: cwd, creationFingerprint: fingerprint, pullRequestKeys: pullRequestKeys)
+            id: sessionId,
+            title: title,
+            cwd: cwd,
+            hostId: sessionHostId,
+            creationFingerprint: fingerprint,
+            pullRequestKeys: pullRequestKeys
+        )
         let previousSelection = projects[pi].selectedSessionId
         projects[pi].sessions.append(session)
         // A remote client must NOT steal the Mac's selected tab: only adopt the new
@@ -621,12 +678,14 @@ extension AppModel {
         let promptNow = Date()
         let promptNowMs = SessionArtifacts.currentStatusTimestamp()
         let promptLiveSessions = remotePromptLiveSessions?(agentProcessNames) ?? liveAgentSessions
+        let hosts = availableHosts
         return RemoteWorkspaceSnapshot(
             projects: projects.map { project in
                 RemoteProjectSnapshot(
                     id: project.id,
                     name: project.name,
                     selectedSessionId: project.selectedSessionId,
+                    defaultHostId: project.defaultHostId,
                     sessions: project.sessions.map { session in
                         let operation = session.agentActivity?
                             .remoteOperationProjection(at: promptNow)
@@ -637,6 +696,7 @@ extension AppModel {
                         let status = projectedStatus(
                             for: session, foreground: foreground, now: promptNow
                         )
+                        let remoteHost = resolvedRemoteHost(for: session, in: hosts)
                         return RemoteSessionSnapshot(
                             id: session.id,
                             title: session.title,
@@ -687,13 +747,16 @@ extension AppModel {
                             lastError: status == .idle
                                 ? session.agentActivity?.remoteLastError()
                                 : nil,
-                            markedUnread: session.markedUnread ? true : nil
+                            markedUnread: session.markedUnread ? true : nil,
+                            hostId: remoteHost?.id,
+                            hostDisplayName: remoteHost?.displayName
                         )
                     }
                 )
             },
             selectedProjectId: selectedProjectId,
-            protocolInfo: .current.supportingReplaySafeControl(epoch: remoteControlDeliveryEpoch)
+            protocolInfo: .current.supportingReplaySafeControl(epoch: remoteControlDeliveryEpoch),
+            availableHosts: hosts.count > 1 ? hosts : nil
         )
     }
 
@@ -1884,6 +1947,7 @@ extension AppModel {
         requestId: UUID,
         projectId: String,
         pullRequestURL: String,
+        hostId: String? = nil,
         selectOnMac: Bool = true,
         now: Date = Date()
     ) -> ControlResponse {
@@ -1898,7 +1962,11 @@ extension AppModel {
         let canonicalKey = "\(target.owner.lowercased())/\(target.repository.lowercased())#\(target.number)"
         let outcome = createRemoteSession(
             RemoteCreateSessionRequest(
-                requestId: requestId, projectId: projectId, pullRequestURL: target.url),
+                requestId: requestId,
+                projectId: projectId,
+                pullRequestURL: target.url,
+                hostId: hostId
+            ),
             isPlainCreate: false,
             kind: .copilot,
             title: target.title,
@@ -1929,7 +1997,8 @@ extension AppModel {
         case .projectUnavailable: code = "unknown-project"
         case .invalidPrompt: code = "bad-request"
         case .workingDirectoryUnavailable: code = "invalid"
-        case .shuttingDown, .backendUnavailable, .copilotUnavailable, .terminalUnavailable: code = "unavailable"
+        case .shuttingDown, .backendUnavailable, .copilotUnavailable, .remoteWrapperUnavailable, .terminalUnavailable:
+            code = "unavailable"
         }
         return .failure(error.localizedDescription, code: code)
     }
@@ -2011,13 +2080,18 @@ extension AppModel {
         }
         let executable: String
         do {
-            executable = try copilotSessionExecutable(toProjectId: projectId)
+            executable = try copilotSessionExecutable(
+                toProjectId: projectId,
+                hostId: RemoteHostInfo.localId
+            )
         } catch {
             return Self.pullRequestsFailure(error)
         }
         guard let pi = projectIndex(projectId) else {
             return .failure(CopilotSessionStartError.projectUnavailable.localizedDescription, code: "unknown-project")
         }
+        let hostMarker = resumeMarkerDirectory.appendingPathComponent("\(tabId).remote-host")
+        if unlink(hostMarker.path) != 0 && errno != ENOENT { return unsaved }
         let resolvedTitle = initialTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let session = Session(
             id: tabId,
