@@ -1396,9 +1396,29 @@ extension AppModel {
                       workflow.supports(action.kind, at: clock()) else { return false }
                 switch action.kind {
                 case .send:
-                    if action.attachmentIds != nil {
-                        guard workflow.capabilities.contains(RemoteAttachmentContract.capability),
-                              workflow.imageAttachments?.isValid == true else { return false }
+                    if let attachmentIds = action.attachmentIds {
+                        let now = clock()
+                        if let epoch = snapshot.conversationEpoch,
+                           let attachments = try? attachmentIds.map({ id in
+                               try self.attachmentStore.image(
+                                   id: id,
+                                   sessionId: sessionId,
+                                   conversationEpoch: epoch,
+                                   now: now
+                               ).0
+                           }) {
+                            guard RemoteAttachmentContract.accepts(
+                                attachments,
+                                capabilities: workflow.capabilities,
+                                imageLimits: workflow.imageAttachments,
+                                at: now
+                            ) else { return false }
+                        } else {
+                            guard workflow.capabilities.contains(RemoteAttachmentContract.capability),
+                                  let limits = workflow.imageAttachments,
+                                  limits.isValid,
+                                  attachmentIds.count <= limits.maxImages else { return false }
+                        }
                     }
                     return workflow.sendReady && !snapshot.hasPendingInput
                 case .abort:
