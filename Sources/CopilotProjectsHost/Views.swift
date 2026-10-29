@@ -182,6 +182,9 @@ private struct WorkspaceHeading: View {
             if let session, let hostName = model.resolvedRemoteHost(for: session)?.displayName {
                 HostBadge(name: hostName)
             }
+            if let session, let memoryBytes = session.memoryUsageBytes, memoryBytes > 0 {
+                SessionMemoryBadge(bytes: memoryBytes)
+            }
             Spacer(minLength: 0)
             Image(systemName: "terminal")
                 .foregroundStyle(StudioStyle.secondaryText)
@@ -277,6 +280,9 @@ struct FleetStatusBar: View {
                     .foregroundStyle(StudioStyle.secondaryText)
                     .allowsHitTesting(false)
             }
+            if !model.hostHealth.isEmpty {
+                HostHealthPill(model: model)
+            }
         }
         .font(.system(size: 12))
         .monospacedDigit()
@@ -284,7 +290,7 @@ struct FleetStatusBar: View {
         .fixedSize()
         .background(
             Group {
-                if running > 0 || background > 0 || scheduled > 0 || waiting > 0 || failed > 0 || ready > 0 {
+                if running > 0 || background > 0 || scheduled > 0 || waiting > 0 || failed > 0 || ready > 0 || !model.hostHealth.isEmpty {
                     FleetStatusBarHitArea()
                 }
             }
@@ -304,6 +310,176 @@ struct FleetStatusBar: View {
         .buttonStyle(.plain)
         .help(help)
         .accessibilityIdentifier("fleet-status-\(kind.rawValue)")
+    }
+}
+
+struct HostHealthPill: View {
+    @ObservedObject var model: AppModel
+    @State private var showsPopover = false
+
+    static func overallLevel(for hosts: [RemoteHostHealth]) -> RemoteHostHealthLevel {
+        hosts.map(\.level).max() ?? .healthy
+    }
+
+    static func color(for level: RemoteHostHealthLevel) -> Color {
+        switch level {
+        case .healthy: .green
+        case .warning: .orange
+        case .critical: .red
+        }
+    }
+
+    static let maximumSummaryLabelCharacters = 36
+
+    static func summaryLabel(for hosts: [RemoteHostHealth]) -> String {
+        guard !hosts.isEmpty else { return "Hosts" }
+        let raw: String
+        if let worst = hosts.max(by: { $0.level < $1.level }), worst.level > .healthy {
+            let reason = worst.statusSummary ?? worst.level.rawValue.capitalized
+            raw = hosts.count > 1 ? "\(worst.displayName): \(reason)" : reason
+        } else {
+            let primary = hosts.first(where: \.isLocal) ?? hosts[0]
+            if let cpu = primary.cpuUsagePercent, let memory = primary.memoryUsagePercent {
+                raw = hosts.count > 1
+                    ? "\(hosts.count) hosts · CPU \(cpu)%"
+                    : "CPU \(cpu)% · Mem \(memory)%"
+            } else {
+                raw = hosts.count > 1 ? "\(hosts.count) hosts" : "Healthy"
+            }
+        }
+        guard raw.count > maximumSummaryLabelCharacters else { return raw }
+        return String(raw.prefix(maximumSummaryLabelCharacters - 1)) + "…"
+    }
+
+    static func formattedDiskFree(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useMB, .useGB, .useTB]
+        formatter.includesUnit = true
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    static func metricsDescription(for host: RemoteHostHealth) -> String {
+        guard host.reachable else { return "Unreachable" }
+        var parts: [String] = []
+        if let cpu = host.cpuUsagePercent {
+            parts.append("CPU \(cpu)%")
+        }
+        if let memory = host.memoryUsagePercent {
+            parts.append("Mem \(memory)%")
+        }
+        if let available = host.diskAvailableBytes {
+            if let total = host.diskTotalBytes, total > 0 {
+                parts.append("\(formattedDiskFree(available)) / \(formattedDiskFree(total)) free")
+            } else {
+                parts.append("\(formattedDiskFree(available)) free")
+            }
+        }
+        if !host.isLocal, let latency = host.latencyMilliseconds {
+            parts.append("\(latency) ms")
+        }
+        return parts.isEmpty ? "Connected" : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        let hosts = model.hostHealth
+        let level = Self.overallLevel(for: hosts)
+        let label = Self.summaryLabel(for: hosts)
+
+        Button {
+            showsPopover.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(Self.color(for: level))
+                    .frame(width: 7, height: 7)
+                Text(label)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 220, alignment: .leading)
+                    .foregroundStyle(level == .healthy ? StudioStyle.secondaryText : Self.color(for: level))
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(StudioStyle.raised)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Show host health details")
+        .accessibilityLabel("Host health: \(level.rawValue.capitalized). \(label)")
+        .accessibilityIdentifier("fleet-status-host-health")
+        .popover(isPresented: $showsPopover, arrowEdge: .bottom) {
+            HostHealthPopover(model: model)
+        }
+    }
+}
+
+private struct HostHealthPopover: View {
+    @ObservedObject var model: AppModel
+
+    private var hostRows: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(model.hostHealth) { host in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(HostHealthPill.color(for: host.level))
+                            .frame(width: 7, height: 7)
+                        Text(host.displayName)
+                            .font(.caption.weight(.semibold))
+                        Spacer(minLength: 8)
+                        if let summary = host.statusSummary {
+                            Text(summary)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(HostHealthPill.color(for: host.level))
+                        } else {
+                            Text("Healthy")
+                                .font(.caption2)
+                                .foregroundStyle(StudioStyle.secondaryText)
+                        }
+                    }
+                    Text(HostHealthPill.metricsDescription(for: host))
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(StudioStyle.secondaryText)
+                        .padding(.leading, 13)
+                }
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Host Health")
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 16)
+                Button("Refresh") {
+                    model.refreshHostHealth()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.weight(.medium))
+                .accessibilityIdentifier("host-health-refresh")
+            }
+
+            Divider()
+
+            ViewThatFits(in: .vertical) {
+                hostRows
+                ScrollView {
+                    hostRows
+                }
+            }
+            .frame(maxHeight: 280)
+        }
+        .padding(12)
+        .frame(minWidth: 260)
     }
 }
 
@@ -1086,6 +1262,44 @@ struct HostBadge: View, Equatable {
     }
 }
 
+struct SessionMemoryBadge: View, Equatable {
+    let bytes: Int64
+
+    static func formattedBytes(_ bytes: Int64) -> String {
+        guard bytes > 0 else { return "0 MB" }
+        if bytes >= 1_000_000_000 {
+            let tenths = Int((Double(bytes) / 100_000_000.0).rounded())
+            if tenths % 10 == 0 {
+                return "\(tenths / 10) GB"
+            }
+            return "\(tenths / 10).\(tenths % 10) GB"
+        }
+        let megabytes = max(1, Int((Double(bytes) / 1_000_000.0).rounded()))
+        return "\(megabytes) MB"
+    }
+
+    var body: some View {
+        let label = Self.formattedBytes(bytes)
+        Text(label)
+            .font(.system(size: 10, weight: .medium))
+            .monospacedDigit()
+            .foregroundStyle(StudioStyle.secondaryText)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(StudioStyle.raised)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.5)
+            )
+            .help("Session memory footprint: \(label)")
+            .accessibilityIdentifier("session-memory-badge")
+    }
+}
+
 struct SessionRow: View, Equatable {
     let session: Session
     var hostDisplayName: String? = nil
@@ -1110,6 +1324,7 @@ struct SessionRow: View, Equatable {
             && lhs.session.id == rhs.session.id
             && lhs.session.title == rhs.session.title
             && lhs.session.hostId == rhs.session.hostId
+            && lhs.session.memoryUsageBytes == rhs.session.memoryUsageBytes
             && lhs.session.statusText == rhs.session.statusText
             && lhs.session.displayStatus == rhs.session.displayStatus
             && lhs.session.failedRequest == rhs.session.failedRequest
@@ -1133,6 +1348,9 @@ struct SessionRow: View, Equatable {
         states.append(stateLabel)
         if let hostLabel = hostDisplayName ?? session.hostId, !hostLabel.isEmpty {
             states.append("Running on \(hostLabel)")
+        }
+        if let memoryBytes = session.memoryUsageBytes, memoryBytes > 0 {
+            states.append("Memory \(SessionMemoryBadge.formattedBytes(memoryBytes))")
         }
         if let childSummary {
             states.append(childSummary.label)
@@ -1174,6 +1392,9 @@ struct SessionRow: View, Equatable {
                             .help(session.statusText ?? session.title)
                         HStack(spacing: 6) {
                             Text(stateLabel)
+                            if let memoryBytes = session.memoryUsageBytes, memoryBytes > 0 {
+                                SessionMemoryBadge(bytes: memoryBytes)
+                            }
                             if session.hasBackgroundWork { BackgroundWorkBadge() }
                             if !session.schedules.isEmpty { ScheduleBadge(schedules: session.schedules) }
                             if showsUnreadIndicator {

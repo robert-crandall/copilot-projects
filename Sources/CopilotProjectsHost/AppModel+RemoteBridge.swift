@@ -687,6 +687,8 @@ extension AppModel {
         let promptNowMs = SessionArtifacts.currentStatusTimestamp()
         let promptLiveSessions = remotePromptLiveSessions?(agentProcessNames) ?? liveAgentSessions
         let hosts = availableHosts
+        let resolvedHostHealth = hostHealthProvider?() ?? hostHealth
+        let providedSessionMemory = sessionMemoryProvider?()
         return RemoteWorkspaceSnapshot(
             projects: projects.map { project in
                 let effectiveParents = project.effectiveParentSessionIdsBySessionId()
@@ -759,14 +761,18 @@ extension AppModel {
                             markedUnread: session.markedUnread ? true : nil,
                             hostId: remoteHost?.id,
                             hostDisplayName: remoteHost?.displayName,
-                            parentSessionId: effectiveParents[session.id]
+                            parentSessionId: effectiveParents[session.id],
+                            memoryUsageBytes: providedSessionMemory.map {
+                                ProcessTree.quantizeSessionMemoryBytes($0[session.id])
+                            } ?? session.memoryUsageBytes
                         )
                     }
                 )
             },
             selectedProjectId: selectedProjectId,
             protocolInfo: .current.supportingReplaySafeControl(epoch: remoteControlDeliveryEpoch),
-            availableHosts: hosts.count > 1 ? hosts : nil
+            availableHosts: hosts.count > 1 ? hosts : nil,
+            hostHealth: resolvedHostHealth.isEmpty ? nil : resolvedHostHealth
         )
     }
 

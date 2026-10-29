@@ -57,6 +57,7 @@ final class AppModel: ObservableObject {
     @Published var numberHint: NumberHint = .none
     @Published var expandedParentSessionIds: Set<String> = []
     @Published private(set) var transcriptOpenSessions: Set<String> = []
+    @Published private(set) var hostHealth: [RemoteHostHealth] = []
     var requestMainWindow: (() -> Void)?
 
     var controllers: [String: TerminalController] = [:]
@@ -336,6 +337,10 @@ final class AppModel: ObservableObject {
     var livenessTimer: Timer?
     var footerTimer: Timer?
     var agentActivityTimer: Timer?
+    var hostHealthTimer: Timer?
+    private var hostHealthRefreshTask: Task<Void, Never>?
+    private var hostHealthRefreshQueued = false
+    private var hostHealthGeneration = 0
     var agentActivitySource: DispatchSourceFileSystemObject?
     // Throttle state for the sessions-directory watcher: the directory holds a
     // file per session (activity/status/marker/transcript) and receives frequent
@@ -465,6 +470,9 @@ final class AppModel: ObservableObject {
     let remoteReposDirectory: () -> String?
     let remoteSessionBackendAvailable: () -> Bool
     let availableHostsProvider: () -> [RemoteHostInfo]
+    let hostHealthProvider: (() -> [RemoteHostHealth])?
+    let sessionMemoryProvider: (() -> [String: Int64])?
+    let hostHealthMonitor: HostHealthMonitor
     /// Overrides the controller launch for a freshly-created Copilot session (tests
     /// record it instead of spawning a real terminal). Nil in production, where the
     /// real cached terminal controller is created with a one-shot Copilot launch.
@@ -535,6 +543,9 @@ final class AppModel: ObservableObject {
             Paths.dtachExecutable != nil
         },
         availableHostsProvider: (() -> [RemoteHostInfo])? = nil,
+        hostHealthProvider: (() -> [RemoteHostHealth])? = nil,
+        sessionMemoryProvider: (() -> [String: Int64])? = nil,
+        hostHealthMonitor: HostHealthMonitor = HostHealthMonitor(),
         remoteSessionLauncher: ((String, String?, String?) -> Void)? = nil,
         sessionCreationLedger: SessionCreationLedger = SessionCreationLedger(),
         projectCreationLedger: ProjectCreationLedger = ProjectCreationLedger(),
@@ -595,6 +606,9 @@ final class AppModel: ObservableObject {
         self.availableHostsProvider = availableHostsProvider ?? {
             SSHHostCatalog.defaultAvailableHosts(statePath: stateRepository.path)
         }
+        self.hostHealthProvider = hostHealthProvider
+        self.sessionMemoryProvider = sessionMemoryProvider
+        self.hostHealthMonitor = hostHealthMonitor
         self.remoteSessionLauncher = remoteSessionLauncher
         self.sessionCreationLedger = sessionCreationLedger
         self.projectCreationLedger = projectCreationLedger
@@ -607,7 +621,13 @@ final class AppModel: ObservableObject {
         self.forcedSessionDestroyer = forcedSessionDestroyer
         self.alertPresenter = alertPresenter
         self.defaults = defaults
+        if let hostHealthProvider {
+            self.hostHealth = hostHealthProvider()
+        }
         load()
+        if let sessionMemoryProvider {
+            self.applySessionMemoryUsage(sessionMemoryProvider())
+        }
     }
 
     // MARK: - lifecycle wiring
@@ -1717,6 +1737,12 @@ final class AppModel: ObservableObject {
         footerTimer?.invalidate()
         livenessTimer?.invalidate()
         agentActivityTimer?.invalidate()
+        hostHealthTimer?.invalidate()
+        hostHealthTimer = nil
+        hostHealthGeneration += 1
+        hostHealthRefreshQueued = false
+        hostHealthRefreshTask?.cancel()
+        hostHealthRefreshTask = nil
         agentActivitySource?.cancel()
         agentActivitySource = nil
         agentActivityRefreshGeneration += 1
@@ -1780,7 +1806,119 @@ final class AppModel: ObservableObject {
     }
 
     func startIntegration() {
+        if stateRepository.path.standardizedFileURL == Paths.statePath.standardizedFileURL
+            || hostHealthProvider != nil {
+            startHostHealthMonitoring()
+        }
         integration?.start()
+    }
+
+    func startHostHealthMonitoring(interval: TimeInterval = 30) {
+        hostHealthTimer?.invalidate()
+        refreshHostHealth()
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshHostHealth()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hostHealthTimer = timer
+    }
+
+    func applySessionMemoryUsage(_ memoryBySessionId: [String: Int64]) {
+        guard !projects.isEmpty else { return }
+        var nextProjects = projects
+        var changed = false
+        for pi in nextProjects.indices {
+            for si in nextProjects[pi].sessions.indices {
+                let sid = nextProjects[pi].sessions[si].id
+                let nextValue = ProcessTree.quantizeSessionMemoryBytes(memoryBySessionId[sid])
+                if nextProjects[pi].sessions[si].memoryUsageBytes != nextValue {
+                    nextProjects[pi].sessions[si].memoryUsageBytes = nextValue
+                    changed = true
+                }
+            }
+        }
+        if changed {
+            projects = nextProjects
+        }
+    }
+
+    func refreshHostHealth() {
+        guard !isTerminating else { return }
+        if let sessionMemoryProvider {
+            applySessionMemoryUsage(sessionMemoryProvider())
+        }
+        if let hostHealthProvider {
+            hostHealthGeneration += 1
+            hostHealthRefreshQueued = false
+            hostHealthRefreshTask?.cancel()
+            hostHealthRefreshTask = nil
+            let next = hostHealthProvider()
+            if hostHealth != next {
+                hostHealth = next
+            }
+            return
+        }
+        guard hostHealthRefreshTask == nil else {
+            hostHealthRefreshQueued = true
+            return
+        }
+        let hosts = availableHosts
+        let targetHosts = hosts.isEmpty ? [RemoteHostInfo.local] : hosts
+        let monitor = hostHealthMonitor
+        let generation = hostHealthGeneration
+        let sessionsDir = resumeMarkerDirectory
+        let shouldSampleSessionMemory = sessionMemoryProvider == nil
+        let activeDirectRoots: [String: pid_t] = shouldSampleSessionMemory
+            ? Dictionary(uniqueKeysWithValues: controllers.compactMap { sid, ctrl in
+                ctrl.shellPID > 0 ? (sid, ctrl.shellPID) : nil
+            })
+            : [:]
+        hostHealthRefreshTask = Task { @MainActor [weak self] in
+            async let sampledHealth = monitor.sampleAll(hosts: targetHosts)
+            let sampledMemory: [String: Int64]? = shouldSampleSessionMemory
+                ? await Task.detached(priority: .utility) {
+                    let snap = ProcessTree.snapshot(maxAge: .zero)
+                    return ProcessTree.sessionMemoryUsageBytes(
+                        in: snap,
+                        additionalRootPIDsBySession: activeDirectRoots,
+                        sessionsDirectory: sessionsDir
+                    )
+                }.value
+                : nil
+            let sampled = await sampledHealth
+            guard let self else { return }
+            self.hostHealthRefreshTask = nil
+            guard !Task.isCancelled,
+                  !self.isTerminating,
+                  self.hostHealthGeneration == generation else {
+                return
+            }
+            if self.hostHealth != sampled {
+                self.hostHealth = sampled
+            }
+            if let sampledMemory, self.sessionMemoryProvider == nil {
+                let localSessionIds = Set(self.projects.flatMap(\.sessions)
+                    .filter { self.resolvedRemoteHost(for: $0) == nil }
+                    .map(\.id))
+                self.applySessionMemoryUsage(sampledMemory.filter {
+                    localSessionIds.contains($0.key)
+                })
+            }
+            if self.hostHealthRefreshQueued {
+                self.hostHealthRefreshQueued = false
+                self.refreshHostHealth()
+            }
+        }
+    }
+
+    func refreshHostHealthNow() async {
+        guard !isTerminating else { return }
+        refreshHostHealth()
+        while let task = hostHealthRefreshTask {
+            await task.value
+        }
     }
 
     /// Fleet roll-ups across every project, for the title-bar status line.
