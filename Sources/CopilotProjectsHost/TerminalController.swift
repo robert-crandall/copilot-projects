@@ -1,6 +1,7 @@
 import AppKit
 import SwiftTerm
 import CopilotProjectsCore
+import CopilotProjectsProtocol
 
 /// Owns a single SwiftTerm terminal + its child shell, and republishes the
 /// process-delegate callbacks as plain closures. Deliberately NOT an
@@ -204,6 +205,8 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
          dtachExecutable: String?, dtachSocket: String?, copilotSessionId: String? = nil,
          launchCopilotExecutable: String? = nil,
          launchCopilotInitialPrompt: String? = nil,
+         remoteHost: RemoteHostInfo? = nil,
+         remoteWrapperExecutable: String? = Paths.remoteCopilotWrapperExecutable,
          kittyImageDiskStore: RemoteKittyImageDiskStore = .shared,
          view: ProjectsTerminalView? = nil) {
         self.sessionId = sessionId
@@ -252,7 +255,9 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
                        dtachExecutable: dtachExecutable, dtachSocket: dtachSocket,
                        copilotSessionId: copilotSessionId,
                        launchCopilotExecutable: launchCopilotExecutable,
-                       launchCopilotInitialPrompt: launchCopilotInitialPrompt)
+                       launchCopilotInitialPrompt: launchCopilotInitialPrompt,
+                       remoteHost: remoteHost,
+                       remoteWrapperExecutable: remoteWrapperExecutable)
         }
         launch?()
     }
@@ -294,7 +299,9 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
                        dtachExecutable: String?, dtachSocket: String?,
                        copilotSessionId: String? = nil,
                        launchCopilotExecutable: String? = nil,
-                       launchCopilotInitialPrompt: String? = nil) {
+                       launchCopilotInitialPrompt: String? = nil,
+                       remoteHost: RemoteHostInfo? = nil,
+                       remoteWrapperExecutable: String? = Paths.remoteCopilotWrapperExecutable) {
         let processEnv = ProcessInfo.processInfo.environment
         let shell = processEnv["SHELL"] ?? "/bin/zsh"
         let shellName = (shell as NSString).lastPathComponent
@@ -311,10 +318,64 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
-        let resumeCopilotExecutable = launchCopilotExecutable ?? Paths.copilotExecutable
+        let dir = cwd.isEmpty ? Paths.defaultStartupDir : Paths.normalizedDirectory(cwd)
+
+        var localProcessDir = dir
+        let validCopilotSessionId = copilotSessionId.flatMap { Self.isSafeSessionId($0) ? $0 : nil }
+        let remoteWrapper = launchCopilotExecutable ?? remoteWrapperExecutable
+        if let remoteHost, !remoteHost.isLocal {
+            var isDir: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: localProcessDir, isDirectory: &isDir) || !isDir.boolValue {
+                localProcessDir = Paths.defaultStartupDir
+            }
+            env["COPILOT_PROJECTS_REMOTE_HOST"] = remoteHost.id
+            if let sshTarget = remoteHost.sshTarget, !sshTarget.isEmpty {
+                env["COPILOT_PROJECTS_REMOTE_TARGET"] = sshTarget
+            }
+            if let defaultCwd = remoteHost.defaultCwd, !defaultCwd.isEmpty {
+                env["COPILOT_PROJECTS_REMOTE_DEFAULT_CWD"] = defaultCwd
+            }
+            env["COPILOT_PROJECTS_REMOTE_CWD"] = dir
+            if remoteWrapper != nil, launchCopilotExecutable == nil, validCopilotSessionId == nil {
+                env["COPILOT_PROJECTS_REMOTE_MODE"] = "shell"
+            }
+        }
 
         let envArray = env.map { "\($0.key)=\($0.value)" }
-        let dir = cwd.isEmpty ? Paths.defaultStartupDir : Paths.normalizedDirectory(cwd)
+        let program: [String]
+        if let remoteHost, !remoteHost.isLocal {
+            let target = (remoteHost.sshTarget?.isEmpty == false) ? remoteHost.sshTarget! : remoteHost.id
+            let remoteShellCmd = "cd -- \(Self.shellSingleQuote(dir)) 2>/dev/null || cd \"$HOME/Repos\" 2>/dev/null || cd; TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=ghostty exec \"${SHELL:-/bin/bash}\" -l"
+            let sshShell = "/usr/bin/ssh -tt \(Self.shellSingleQuote(target)) \(Self.shellSingleQuote(remoteShellCmd))"
+            let retry = "run() { while ! \"$@\"; do printf '\\n[Copilot Projects] remote session failed; press Return to retry.\\n'; read -r _ || exit 1; done; }; "
+            let script: String
+            if let wrapper = remoteWrapper {
+                var arguments: [String] = []
+                if let cid = validCopilotSessionId {
+                    arguments = ["--resume=\(cid)"]
+                } else if launchCopilotExecutable != nil,
+                          let prompt = launchCopilotInitialPrompt, !prompt.isEmpty {
+                    arguments = ["--interactive", prompt]
+                }
+                let command = Self.profiledCopilotCommand(wrapper, arguments: arguments)
+                let postExit = (launchCopilotExecutable != nil || validCopilotSessionId != nil)
+                    ? "; run \(sshShell)" : ""
+                script = "\(retry)run \(command)\(postExit)"
+            } else if validCopilotSessionId != nil {
+                script = "\(retry)run /bin/sh -c 'printf \"%s\\n\" \"Remote Copilot resume requires the remote wrapper.\" >&2; exit 1'"
+            } else {
+                script = "\(retry)run \(sshShell)"
+            }
+            program = [shell, "-l", "-c", "exec /bin/sh -c \(Self.shellSingleQuote(script))"]
+        } else {
+            program = Self.startupProgram(
+                shell: shell,
+                copilotSessionId: copilotSessionId,
+                resumeCopilotExecutable: launchCopilotExecutable ?? Paths.copilotExecutable,
+                launchCopilotExecutable: launchCopilotExecutable,
+                launchCopilotInitialPrompt: launchCopilotInitialPrompt
+            )
+        }
 
         if let dtach = dtachExecutable, let socket = dtachSocket {
             // Resumable: dtach owns the shell PTY and survives app quit.
@@ -327,19 +388,20 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
             // recorded Copilot session id auto-resumes THAT exact session, and a
             // freshly-created remote session launches Copilot once, then both drop to
             // a normal login shell when the agent exits.
-            let program = Self.startupProgram(
-                shell: shell,
-                copilotSessionId: copilotSessionId,
-                resumeCopilotExecutable: resumeCopilotExecutable,
-                launchCopilotExecutable: launchCopilotExecutable,
-                launchCopilotInitialPrompt: launchCopilotInitialPrompt
-            )
             terminalView.startProcess(
                 executable: dtach,
                 args: ["-A", socket, "-r", "winch", "-z", "-E"] + program,
                 environment: envArray,
                 execName: nil,
-                currentDirectory: dir
+                currentDirectory: localProcessDir
+            )
+        } else if let remoteHost, !remoteHost.isLocal {
+            terminalView.startProcess(
+                executable: program[0],
+                args: Array(program.dropFirst()),
+                environment: envArray,
+                execName: nil,
+                currentDirectory: localProcessDir
             )
         } else {
             // Fallback (no dtach helper): direct login shell, not resumable.
@@ -348,7 +410,7 @@ final class TerminalController: NSObject, ProcessTerminalViewDelegate {
                 args: [],
                 environment: envArray,
                 execName: "-\(shellName)",
-                currentDirectory: dir
+                currentDirectory: localProcessDir
             )
         }
 

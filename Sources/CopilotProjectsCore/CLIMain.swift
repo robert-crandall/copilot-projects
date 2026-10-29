@@ -11,6 +11,8 @@ public enum CLIMain {
         "set-status", "status",
         "notify",
         "list-projects", "projects",
+        "list-hosts", "hosts",
+        "set-default-host",
         "list-status", "ls",
         "new-project",
         "new-session",
@@ -162,8 +164,12 @@ public enum CLIMain {
         case "new-project":
             req.name = parsed.flags["name"] ?? parsed.positionals.first
             req.cwd = parsed.flags["cwd"]
+            req.hostId = parsed.flags["default-host"] ?? parsed.flags["host"]
         case "new-session":
             req.cwd = parsed.flags["cwd"]
+            req.hostId = parsed.flags["host"]
+        case "set-default-host":
+            req.hostId = parsed.flags["host"] ?? parsed.positionals.first
         case "rename-project":
             req.name = parsed.flags["name"] ?? parsed.positionals.first
             if req.name == nil {
@@ -176,7 +182,7 @@ public enum CLIMain {
             req.path = p
         case "remote":
             req.action = parsed.positionals.first ?? "status"
-        case "focus", "list-projects", "list-status", "ping":
+        case "focus", "list-projects", "list-hosts", "list-status", "ping":
             break
         default:
             fail("unknown command: \(command)")
@@ -251,10 +257,10 @@ public enum CLIMain {
 
     private static func newCopilotSession(_ args: [String], environment: [String: String]) -> Int32 {
         let usage = "usage: copilot-projects new-copilot-session --project ID --request-id UUID "
-            + "--prompt-file PATH [--title TITLE] [--parent-session ID | --no-parent]"
+            + "--prompt-file PATH [--title TITLE] [--host HOST] [--parent-session ID | --no-parent]"
         let parsed = parseFlags(args)
         let allowed: Set<String> = [
-            "project", "request-id", "prompt-file", "title", "parent-session", "no-parent",
+            "project", "request-id", "prompt-file", "title", "host", "parent-session", "no-parent",
         ]
         let unknown = parsed.flags.keys.filter { !allowed.contains($0) }.sorted()
         guard unknown.isEmpty, parsed.positionals.isEmpty else {
@@ -291,6 +297,7 @@ public enum CLIMain {
         req.requestId = requestId.uuidString
         req.prompt = prompt
         req.title = parsed.flags["title"]
+        req.hostId = parsed.flags["host"]
         if parsed.flags["no-parent"] == nil {
             let rawParent = (parsed.flags["parent-session"] ?? Env.sessionId(environment))?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -354,6 +361,7 @@ public enum CLIMain {
         switch command {
         case "status": return "set-status"
         case "projects": return "list-projects"
+        case "hosts": return "list-hosts"
         case "ls": return "list-status"
         case "--help", "-h": return "help"
         case "--version", "-v": return "version"
@@ -577,12 +585,14 @@ public enum CLIMain {
           copilot-projects notify <title> [body]   Post a macOS notification
               [--title T] [--body B] [--session ID] [--project ID]
           copilot-projects list-projects           List projects and their status
+          copilot-projects list-hosts              List available execution hosts
           copilot-projects list-status (ls)        List per-session status + ids
           copilot-projects attach [session]        Attach/resume a session (also works over SSH)
-          copilot-projects new-project [name]      Create a project [--cwd DIR]
-          copilot-projects new-session             Add a session to a project [--cwd DIR] [--project ID]
+          copilot-projects new-project [name]      Create a project [--cwd DIR] [--default-host HOST]
+          copilot-projects new-session             Add a session to a project [--cwd DIR] [--project ID] [--host HOST]
           copilot-projects new-copilot-session     Start Copilot with a prompt, idempotent by request id
-              --project ID --request-id UUID --prompt-file PATH [--title T] [--parent-session ID | --no-parent]
+              --project ID --request-id UUID --prompt-file PATH [--title T] [--host HOST] [--parent-session ID | --no-parent]
+          copilot-projects set-default-host [host] Set default host for a project [--project ID]
           copilot-projects close-session           End an idle session that is not the selected tab
               --session ID [--project ID]
           copilot-projects rename-project <name>   Rename a project [--project ID]

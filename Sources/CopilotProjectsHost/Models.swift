@@ -8,6 +8,7 @@ struct Session: Identifiable, Codable, Equatable {
     var id: String
     var title: String
     var cwd: String
+    var hostId: String?
     var creationFingerprint: String?
     var pullRequestKeys: [String]?
     var parentSessionId: String?
@@ -93,7 +94,7 @@ struct Session: Identifiable, Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, cwd, creationFingerprint, pullRequestKeys, parentSessionId
+        case id, title, cwd, hostId, creationFingerprint, pullRequestKeys, parentSessionId
         case manuallyMarkedUnread = "markedUnread"
     }
 
@@ -101,6 +102,7 @@ struct Session: Identifiable, Codable, Equatable {
         id: String = UUID().uuidString,
         title: String,
         cwd: String,
+        hostId: String? = nil,
         creationFingerprint: String? = nil,
         pullRequestKeys: [String]? = nil,
         parentSessionId: String? = nil
@@ -108,6 +110,7 @@ struct Session: Identifiable, Codable, Equatable {
         self.id = id
         self.title = title
         self.cwd = cwd
+        self.hostId = hostId
         self.creationFingerprint = creationFingerprint
         self.pullRequestKeys = pullRequestKeys
         self.parentSessionId = parentSessionId
@@ -155,23 +158,26 @@ struct Project: Identifiable, Codable, Equatable {
     var id: String
     var name: String
     var cwd: String
+    var defaultHostId: String?
     var sessions: [Session]
     var selectedSessionId: String?
     var creationFingerprint: String?
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, cwd, sessions, selectedSessionId, creationFingerprint
+        case id, name, cwd, defaultHostId, sessions, selectedSessionId, creationFingerprint
     }
 
     init(id: String = UUID().uuidString,
          name: String,
          cwd: String,
+         defaultHostId: String? = nil,
          sessions: [Session] = [],
          selectedSessionId: String? = nil,
          creationFingerprint: String? = nil) {
         self.id = id
         self.name = name
         self.cwd = cwd
+        self.defaultHostId = defaultHostId
         self.sessions = sessions
         self.selectedSessionId = selectedSessionId
         self.creationFingerprint = creationFingerprint
@@ -182,6 +188,7 @@ struct Project: Identifiable, Codable, Equatable {
         self.id = try container.decode(String.self, forKey: .id)
         self.name = try container.decode(String.self, forKey: .name)
         self.cwd = try container.decode(String.self, forKey: .cwd)
+        self.defaultHostId = try container.decodeIfPresent(String.self, forKey: .defaultHostId)
         self.sessions = try container.decode([Session].self, forKey: .sessions)
         self.selectedSessionId = try container.decodeIfPresent(String.self, forKey: .selectedSessionId)
         self.creationFingerprint = try container.decodeIfPresent(String.self, forKey: .creationFingerprint)
