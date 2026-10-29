@@ -1410,12 +1410,12 @@ extension AppModel {
                         let now = clock()
                         if let epoch = snapshot.conversationEpoch,
                            let attachments = try? attachmentIds.map({ id in
-                               try self.attachmentStore.image(
+                               try self.attachmentStore.metadata(
                                    id: id,
                                    sessionId: sessionId,
                                    conversationEpoch: epoch,
                                    now: now
-                               ).0
+                               )
                            }) {
                             guard RemoteAttachmentContract.accepts(
                                 attachments,

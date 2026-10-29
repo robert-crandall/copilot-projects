@@ -163,10 +163,10 @@ test("native workflow RPCs target the requested session", {
     await idle;
     const serializedUserMessages = JSON.stringify(
       requests.slice(before).flatMap((request) => request.messages ?? [])
-        .filter((message) => message.role === "user")
+        .filter((message) => message.role === "user").at(-1) ?? null
     );
     assert.ok(serializedUserMessages.includes("settings.json"), "JSON filename must reach the provider");
-    assert.ok(serializedUserMessages.includes('"feature":"file-attachments"'), "JSON content must reach the provider");
+    assert.ok(serializedUserMessages.includes(JSON.stringify('"feature":"file-attachments"').slice(1, -1)), "JSON content must reach the provider");
     assert.ok(serializedUserMessages.includes("NOTES.md"), "Markdown filename must reach the provider");
     assert.ok(serializedUserMessages.includes("Support JSON and Markdown attachments."), "Markdown content must reach the provider");
   }

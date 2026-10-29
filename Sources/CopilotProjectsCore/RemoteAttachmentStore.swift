@@ -125,6 +125,20 @@ public struct RemoteAttachmentStore: Sendable {
         return attachment
     }
 
+    public func metadata(
+        id: String, sessionId: String, conversationEpoch: String, now: Date = Date()
+    ) throws -> RemoteAttachment {
+        let record = try record(id: id, sessionId: sessionId, conversationEpoch: conversationEpoch, now: now)
+        let payloadURL = root.appendingPathComponent("\(id).image")
+        let values = try payloadURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              values.fileSize == record.attachment.byteCount else {
+            throw RemoteAttachmentError.invalid
+        }
+        return record.attachment
+    }
+
     public func image(
         id: String, sessionId: String, conversationEpoch: String, now: Date = Date()
     ) throws -> (RemoteAttachment, Data) {
