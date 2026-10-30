@@ -1416,7 +1416,8 @@ if (validSessionId && socketPath) {
         if (!runtimeActivityUnsupported) {
             runtimeActivity = {
                 processing: null, observedAtMilliseconds: null,
-                idleAtMilliseconds: null, error: "pending",
+                idleAtMilliseconds: null,
+                error: runtimeActivity?.error ?? "pending",
             };
         }
     }
@@ -1480,12 +1481,13 @@ if (validSessionId && socketPath) {
         runtimeActivityRefresh = token;
         const observedAtMilliseconds = Date.now();
         let timeout = null;
-        const current = () => !shuttingDown
+        const authorityCurrent = () => !shuttingDown
             && token.generation === conversationGeneration
-            && token.revision === runtimeActivityRevision
             && token.sessionId === copilotSessionId
             && token.epoch === conversationEpoch
             && ownsSharedFiles();
+        const current = () => authorityCurrent()
+            && token.revision === runtimeActivityRevision;
         try {
             const params = { sessionId: token.sessionId };
             const values = await Promise.race([
@@ -1500,13 +1502,14 @@ if (validSessionId && socketPath) {
                     );
                 }),
             ]);
-            if (!current()) return;
+            if (!authorityCurrent()) return;
             const [metadata, processing] = values;
             if (metadata?.sessionId !== token.sessionId
                 || typeof metadata?.isRemote !== "boolean") {
                 throw new Error("invalid runtime session metadata");
             }
             if (metadata.isRemote) {
+                if (!current()) return;
                 const changed = runtimeActivity?.error !== "remote";
                 if (changed) {
                     console.error("[copilot-projects] remote session uses legacy activity signals");
@@ -1516,6 +1519,24 @@ if (validSessionId && socketPath) {
                     idleAtMilliseconds: null, error: "remote",
                 };
                 if (changed || token.forcePublish) publish();
+                return;
+            }
+            let observationAdvanced = false;
+            if (workflowObservation && workflowRuntime && workflowObservation.capabilities.length > 0) {
+                // A workflow refresh that settled first can already hold a
+                // newer observation; never replace it with this older read.
+                observationAdvanced = observedAtMilliseconds
+                    > workflowObservation.observedAtMilliseconds;
+                if (observationAdvanced) {
+                    workflowObservation.observedAtMilliseconds = observedAtMilliseconds;
+                    workflowObservation.limitsKnown = Object.hasOwn(metadata, "sessionLimits")
+                        && (metadata.sessionLimits === null || finiteNonnegative(metadata.sessionLimits?.maxAiCredits));
+                    workflowObservation.maxAiCredits = workflowObservation.limitsKnown
+                        ? metadata.sessionLimits?.maxAiCredits ?? null : null;
+                }
+            }
+            if (!current()) {
+                if (token.heartbeat && observationAdvanced) publish();
                 return;
             }
             if (typeof processing?.processing !== "boolean") {
@@ -1529,20 +1550,6 @@ if (validSessionId && socketPath) {
                 idleAtMilliseconds: runtimeIdleAtMilliseconds,
                 error: null,
             };
-            let observationAdvanced = false;
-            if (workflowObservation && workflowRuntime) {
-                // A workflow refresh that settled first can already hold a
-                // newer observation; never replace it with this older read.
-                observationAdvanced = observedAtMilliseconds
-                    > workflowObservation.observedAtMilliseconds;
-                if (observationAdvanced) {
-                    workflowObservation.observedAtMilliseconds = observedAtMilliseconds;
-                    workflowObservation.limitsKnown = Object.hasOwn(metadata, "sessionLimits")
-                        && (metadata.sessionLimits === null || finiteNonnegative(metadata.sessionLimits?.maxAiCredits));
-                    workflowObservation.maxAiCredits = workflowObservation.limitsKnown
-                        ? metadata.sessionLimits?.maxAiCredits ?? null : null;
-                }
-            }
             // Transitions and input completions publish immediately. So does the
             // heartbeat's own observation: remote clients only act on an
             // observation younger than 15s, and riding the next tick would make
@@ -1577,7 +1584,7 @@ if (validSessionId && socketPath) {
                 runtimeActivityRefresh = null;
                 if (!shuttingDown && token.generation === conversationGeneration
                     && token.revision !== runtimeActivityRevision) {
-                    queueMicrotask(() => refreshRuntimeActivity(true));
+                    queueMicrotask(() => refreshRuntimeActivity(true, { heartbeat: token.heartbeat }));
                 }
             }
         }
@@ -1652,7 +1659,8 @@ if (validSessionId && socketPath) {
 
     function workflowSnapshot() {
         const observation = workflowObservation;
-        const fresh = observation && runtimeActivity?.error == null
+        const fresh = observation
+            && (runtimeActivity?.error == null || runtimeActivity.error === "pending")
             && !terminalDisconnectError && Date.now() - observation.observedAtMilliseconds <= 15_000;
         const capabilities = fresh && !bounceRequested ? observation.capabilities.filter(
             (kind) => !unavailableWorkflowActions.has(kind)
@@ -1667,6 +1675,7 @@ if (validSessionId && socketPath) {
                 (model) => model.id === currentModel?.name
             )?.imageAttachments ?? null : null,
             legacyPromptFallback: !bounceRequested && (workflowRuntime === false || runtimeActivityUnsupported
+                || runtimeActivity?.error === "remote"
                 || observation?.legacyPromptFallback === true
                 || unavailableWorkflowActions.has("session-send")),
             totalAiCredits: observation?.totalAiCredits ?? null,
@@ -1715,38 +1724,64 @@ if (validSessionId && socketPath) {
                     || finiteNonnegative(metadata.sessionLimits?.maxAiCredits));
             let totalAiCredits = null;
             let usageError = null;
-            try {
-                const metrics = await workflowRead("session.usage.getMetrics", {}, context);
-                if (finiteNonnegative(metrics?.totalNanoAiu)) {
-                    totalAiCredits = metrics.totalNanoAiu / 1e9;
-                } else {
-                    usageError = "Session credit usage is unavailable";
-                }
-            } catch (error) {
-                usageError = "Session credit usage is unavailable";
-                console.error("[copilot-projects] workflow usage query failed:", error);
-            }
             let bounceAvailable = false;
-            try {
-                bounceAvailable = await hasBounceCommand(context);
-            } catch (error) {
-                console.error("[copilot-projects] bounce command discovery failed:", error);
-            }
+            await Promise.all([
+                (async () => {
+                    try {
+                        const metrics = await workflowRead("session.usage.getMetrics", {}, context);
+                        if (finiteNonnegative(metrics?.totalNanoAiu)) {
+                            totalAiCredits = metrics.totalNanoAiu / 1e9;
+                        } else {
+                            usageError = "Session credit usage is unavailable";
+                        }
+                    } catch (error) {
+                        usageError = "Session credit usage is unavailable";
+                        console.error("[copilot-projects] workflow usage query failed:", error);
+                    }
+                })(),
+                (async () => {
+                    try {
+                        bounceAvailable = await hasBounceCommand(context);
+                    } catch (error) {
+                        console.error("[copilot-projects] bounce command discovery failed:", error);
+                    }
+                })(),
+            ]);
             if (!operationAuthorityCurrent(context)) return;
+            const newerHeartbeat = workflowObservation
+                && workflowObservation.capabilities.length > 0
+                && workflowObservation.observedAtMilliseconds > observedAtMilliseconds
+                ? workflowObservation : null;
+            const effectiveLimitsKnown = newerHeartbeat ? newerHeartbeat.limitsKnown : limitsKnown;
             workflowObservation = {
-                observedAtMilliseconds,
+                observedAtMilliseconds: newerHeartbeat
+                    ? newerHeartbeat.observedAtMilliseconds
+                    : observedAtMilliseconds,
                 capabilities: [
                     "session-send", "session-abort", "answer-session-budget", "image-attachments-v1",
-                    ...(limitsKnown ? ["set-session-budget"] : []),
+                    ...(effectiveLimitsKnown ? ["set-session-budget"] : []),
                     ...(bounceAvailable ? ["session-bounce"] : []),
                 ],
-                totalAiCredits, limitsKnown,
-                maxAiCredits: metadata.sessionLimits?.maxAiCredits ?? null,
+                totalAiCredits,
+                limitsKnown: effectiveLimitsKnown,
+                maxAiCredits: newerHeartbeat
+                    ? newerHeartbeat.maxAiCredits
+                    : (metadata.sessionLimits?.maxAiCredits ?? null),
                 error: usageError,
             };
             publish();
         } catch (error) {
             if (!operationAuthorityCurrent(context)) return;
+            const unsupported = error?.message === "unsupported-runtime"
+                || error?.message === "unsupported-session"
+                || error?.legacyPromptFallback === true
+                || error?.code === -32601;
+            if (!unsupported) {
+                workflowRefreshAt = 0;
+                console.error("[copilot-projects] workflow metadata query failed:", error);
+                if (isTerminalDisconnect(error)) publish(error);
+                return;
+            }
             workflowObservation = {
                 observedAtMilliseconds, capabilities: [], limitsKnown: false,
                 legacyPromptFallback: error?.legacyPromptFallback === true || error?.code === -32601,
@@ -4520,6 +4555,7 @@ if (validSessionId && socketPath) {
         completedPermissionRequests.clear();
         inputCompletions.clear();
         runtimeActivityUnsupported = false;
+        runtimeActivity = null;
         invalidateRuntimeActivity();
 
         foregroundTurnActive = false;

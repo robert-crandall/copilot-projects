@@ -3892,6 +3892,116 @@ test("an older runtime read never overwrites a newer workflow observation", {
   assert.equal(liveness.workflow.maxAiCredits, 60);
 });
 
+test("turn transitions and transient RPC errors keep fresh workflow capabilities intact", {
+  concurrency: false,
+}, async (t) => {
+  const runtime = await createRuntime(t);
+  await workflowReady(runtime);
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+
+  // 1. user.message and assistant.turn_start publish before refreshRuntimeActivity resolves;
+  //    neither intermediate write may strip session-send while the observation is fresh.
+  let releaseProcessing;
+  runtime.session.processingHandler = () => new Promise((resolve) => { releaseProcessing = resolve; });
+  const beforeTurnWrites = runtime.activityWrites.length;
+  await runtime.session.emit("user.message", { content: "follow up" });
+  await runtime.session.emit("assistant.turn_start", { turnId: "0" });
+  const turnWrites = runtime.activityWrites.slice(beforeTurnWrites);
+  assert.ok(turnWrites.length >= 2);
+  for (const snapshot of turnWrites) {
+    assert.equal(snapshot.runtimeActivity.error, "pending");
+    assert.ok(snapshot.workflow.capabilities.includes("session-send"));
+    assert.equal(snapshot.workflow.sendReady, true);
+  }
+  runtime.session.processingHandler = async () => ({ processing: true });
+  releaseProcessing({ processing: true });
+  await waitForActivity(runtime, (activity) => activity?.processing === true);
+
+  // 2. A heartbeat metadata read interrupted by a turn transition still advances
+  //    workflow observation immediately, even while the follow-up processing retry is in flight.
+  const baselineObservedAt = readSnapshot(runtime).workflow.observedAtMilliseconds;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  let releaseInterrupted;
+  runtime.session.processingHandler = () => new Promise((resolve) => { releaseInterrupted = resolve; });
+  runtime.intervalCallback();
+  await waitFor(() => releaseInterrupted, "heartbeat query did not start");
+  await runtime.session.emit("assistant.idle");
+  let releaseRetry;
+  runtime.session.processingHandler = () => new Promise((resolve) => { releaseRetry = resolve; });
+  releaseInterrupted({ processing: true });
+  await waitFor(
+    () => readSnapshot(runtime).workflow.observedAtMilliseconds > baselineObservedAt,
+    "heartbeat metadata did not advance workflow observation across turn transition"
+  );
+  await waitFor(() => releaseRetry, "retry query did not start");
+  runtime.session.processingHandler = async () => ({ processing: false });
+  releaseRetry({ processing: false });
+  await waitForActivity(runtime, (activity) => activity?.processing === false);
+
+  // 3. A transient workflow refresh error preserves existing capabilities and retries on the next tick.
+  let metadataFailures = 0;
+  runtime.session.metadataHandler = async () => {
+    metadataFailures += 1;
+    throw new Error("workflow-read-timeout");
+  };
+  await runtime.session.emit("session.usage_checkpoint", { totalNanoAiu: 5e9 });
+  await waitFor(() => metadataFailures > 0, "workflow refresh did not attempt metadata read");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(readSnapshot(runtime).workflow.capabilities.includes("session-send"));
+  runtime.session.sessionLimits = { maxAiCredits: 90 };
+  runtime.session.usageHandler = async () => ({ totalNanoAiu: 7e9 });
+  runtime.session.metadataHandler = async ({ sessionId }) => ({
+    sessionId, isRemote: false, sessionLimits: runtime.session.sessionLimits,
+  });
+  runtime.intervalCallback();
+  await waitFor(
+    () => {
+      const workflow = readSnapshot(runtime).workflow;
+      return workflow.maxAiCredits === 90 && workflow.totalAiCredits === 7;
+    },
+    "transient workflow refresh failure did not retry on the next heartbeat"
+  );
+
+  // 4. An older workflow refresh waiting on usage merges usage without rewinding a newer heartbeat.
+  let releaseUsage;
+  runtime.session.usageHandler = () => new Promise((resolve) => { releaseUsage = resolve; });
+  await runtime.session.emit("session.usage_checkpoint", { totalNanoAiu: 11e9 });
+  await waitFor(() => releaseUsage, "workflow usage query did not start");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  delete runtime.session.sessionLimits;
+  runtime.session.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: false });
+  runtime.intervalCallback();
+  await waitFor(
+    () => readSnapshot(runtime).workflow.limitsKnown === false,
+    "heartbeat did not update limitsKnown"
+  );
+  const heartbeatObservedAt = readSnapshot(runtime).workflow.observedAtMilliseconds;
+  releaseUsage({ totalNanoAiu: 11e9 });
+  await waitFor(
+    () => readSnapshot(runtime).workflow.totalAiCredits === 11,
+    "workflow refresh did not publish merged usage"
+  );
+  const merged = readSnapshot(runtime).workflow;
+  assert.equal(merged.observedAtMilliseconds, heartbeatObservedAt);
+  assert.equal(merged.limitsKnown, false);
+  assert.equal(merged.maxAiCredits, null);
+  assert.equal(merged.capabilities.includes("set-session-budget"), false);
+
+  // 5. A user.message after a remote-session heartbeat preserves the remote error until locality recovers.
+  runtime.session.metadataHandler = async ({ sessionId }) => ({ sessionId, isRemote: true });
+  runtime.intervalCallback();
+  await waitForActivity(runtime, (activity) => activity?.error === "remote");
+  assert.deepEqual(readSnapshot(runtime).workflow.capabilities, []);
+  assert.equal(readSnapshot(runtime).workflow.legacyPromptFallback, true);
+  let releaseRemoteTurn;
+  runtime.session.processingHandler = () => new Promise((resolve) => { releaseRemoteTurn = resolve; });
+  await runtime.session.emit("user.message", { content: "still remote" });
+  assert.equal(readSnapshot(runtime).runtimeActivity.error, "remote");
+  assert.deepEqual(readSnapshot(runtime).workflow.capabilities, []);
+  assert.equal(readSnapshot(runtime).workflow.legacyPromptFallback, true);
+  releaseRemoteTurn?.({ processing: false });
+});
+
 test("only observed input completions certify the matching sender", {
   concurrency: false,
 }, async (t) => {
