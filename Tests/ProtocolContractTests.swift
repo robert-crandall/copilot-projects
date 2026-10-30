@@ -993,6 +993,19 @@ final class ProtocolContractTests: XCTestCase {
         let okScript = scriptDir.appendingPathComponent("fake-ssh-ok.sh")
         try """
         #!/bin/sh
+        case "$*" in
+          *-T*ServerAliveInterval=5*StdinNull=no*) ;;
+          *) exit 99 ;;
+        esac
+        case "$*" in
+          *ControlMaster=auto*ControlPath=~/.ssh/cp-mux/%C*ControlPersist=10m*) ;;
+          *ControlMaster=*|*ControlPath=*|*ControlPersist=*) exit 99 ;;
+        esac
+        sleep 0.6
+        printf 'READY\\n'
+        IFS= read -r _ || true
+        sleep 0.04
+        printf 'PONG\\n'
         printf '/dev/sda1 209715200 104857600 83886080 55%% /\\nMEM 48\\nCPU_TICKS 30 100\\n'
         """.write(to: okScript, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: okScript.path)
@@ -1017,7 +1030,9 @@ final class ProtocolContractTests: XCTestCase {
             timeoutSeconds: 2.0
         )
         XCTAssertTrue(okResult.reachable)
-        XCTAssertNotEqual(okResult.level, .critical)
+        XCTAssertEqual(okResult.level, .healthy)
+        XCTAssertGreaterThanOrEqual(okResult.latencyMilliseconds ?? 0, 20)
+        XCTAssertLessThan(okResult.latencyMilliseconds ?? 999, 300)
         XCTAssertEqual(okResult.cpuUsagePercent, 30)
         XCTAssertEqual(okResult.memoryUsagePercent, 48)
         XCTAssertEqual(okResult.diskAvailableBytes, 85_800_000_000)

@@ -354,6 +354,7 @@ public final class HostHealthMonitor: @unchecked Sendable {
     // MARK: - Remote SSH Probe
 
     private static let sshRemoteProbeScript = """
+    printf 'READY\\n'; IFS= read -r _ || true; printf 'PONG\\n'; \
     df -Pk . | tail -n 1; \
     if [ -r /proc/meminfo ]; then \
     awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2; haveAvailable=1} END{if(t>0 && haveAvailable && a>=0) printf "MEM %d\\n", int(((t-a)*100 + t/2)/t)}' /proc/meminfo 2>/dev/null || true; \
@@ -573,12 +574,20 @@ public final class HostHealthMonitor: @unchecked Sendable {
     }
 
     private final class BoundedPipeBuffer: @unchecked Sendable {
+        private static let readyMarker = Data("READY\n".utf8)
+        private static let pongMarker = Data("PONG\n".utf8)
+
         private let lock = NSLock()
         private var data = Data()
         private let limit: Int
+        private var stdinWriteHandle: FileHandle?
+        private var sentPing = false
+        private var pingStart: ContinuousClock.Instant?
+        private var rttDuration: Duration?
 
-        init(limit: Int = 65_536) {
+        init(limit: Int = 65_536, stdinWriteHandle: FileHandle) {
             self.limit = limit
+            self.stdinWriteHandle = stdinWriteHandle
         }
 
         func append(_ chunk: Data) {
@@ -591,13 +600,75 @@ public final class HostHealthMonitor: @unchecked Sendable {
                 let combined = data + chunk
                 data = Data(combined.suffix(limit))
             }
+            if !sentPing, let readyRange = data.range(of: Self.readyMarker) {
+                sentPing = true
+                let startedAt = ContinuousClock.now
+                pingStart = startedAt
+                if data[readyRange.upperBound...].range(of: Self.pongMarker) != nil {
+                    rttDuration = .zero
+                }
+                if let handle = stdinWriteHandle {
+                    stdinWriteHandle = nil
+                    try? handle.write(contentsOf: Data("\n".utf8))
+                    try? handle.close()
+                }
+            } else if sentPing,
+                      rttDuration == nil,
+                      let pingStart,
+                      let readyRange = data.range(of: Self.readyMarker),
+                      data[readyRange.upperBound...].range(of: Self.pongMarker) != nil {
+                rttDuration = pingStart.duration(to: ContinuousClock.now)
+            }
         }
 
-        func snapshot() -> Data {
+        func closeStdin() {
+            lock.lock()
+            let handle = stdinWriteHandle
+            stdinWriteHandle = nil
+            lock.unlock()
+            try? handle?.close()
+        }
+
+        func snapshot() -> (data: Data, rttMilliseconds: Int?) {
             lock.lock()
             defer { lock.unlock() }
-            return data
+            let rttMs = rttDuration.map { duration in
+                max(
+                    0,
+                    Int(duration.components.seconds * 1_000)
+                        + Int(duration.components.attoseconds / 1_000_000_000_000_000)
+                )
+            }
+            return (data, rttMs)
         }
+    }
+
+    private static func preparedSSHControlArgs() -> [String] {
+        let sshDir = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent(".ssh", isDirectory: true)
+        let muxDir = sshDir.appendingPathComponent("cp-mux", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: muxDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        var st = Darwin.stat()
+        guard Darwin.lstat(muxDir.path, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFDIR,
+              st.st_uid == getuid(),
+              Darwin.chmod(muxDir.path, 0o700) == 0 else {
+            return []
+        }
+        // %C is a 40-byte hash; OpenSSH adds a 17-byte temporary suffix.
+        let socketPathBytes = muxDir.path.utf8.count + 1 + 40 + 17
+        guard socketPathBytes < MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
+            return []
+        }
+        return [
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPath=~/.ssh/cp-mux/%C",
+            "-o", "ControlPersist=10m",
+        ]
     }
 
     public static func probeSSHHost(
@@ -618,8 +689,13 @@ public final class HostHealthMonitor: @unchecked Sendable {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: sshExecutablePath)
                     process.arguments = [
+                        "-T",
                         "-o", "BatchMode=yes",
                         "-o", "ConnectTimeout=4",
+                    ] + preparedSSHControlArgs() + [
+                        "-o", "ServerAliveInterval=5",
+                        "-o", "ServerAliveCountMax=2",
+                        "-o", "StdinNull=no",
                         "-o", "ClearAllForwardings=yes",
                         "-o", "ForwardAgent=no",
                         "-o", "PermitLocalCommand=no",
@@ -627,33 +703,42 @@ public final class HostHealthMonitor: @unchecked Sendable {
                         target,
                         "/bin/sh -c \(TerminalController.shellSingleQuote(sshRemoteProbeScript))",
                     ]
-                    process.standardInput = FileHandle.nullDevice
+                    let stdinPipe = Pipe()
+                    let stdinWriteHandle = stdinPipe.fileHandleForWriting
+                    _ = fcntl(stdinWriteHandle.fileDescriptor, F_SETNOSIGPIPE, 1)
+                    process.standardInput = stdinPipe
                     let stdoutPipe = Pipe()
                     process.standardOutput = stdoutPipe
                     process.standardError = FileHandle.nullDevice
 
+                    let stdoutBuffer = BoundedPipeBuffer(stdinWriteHandle: stdinWriteHandle)
                     guard box.attach(process) else {
+                        stdoutBuffer.closeStdin()
                         continuation.resume(
                             returning: HostHealthEvaluator.makeHealth(host: host, reachable: false)
                         )
                         return
                     }
 
-                    let stdoutBuffer = BoundedPipeBuffer()
                     let readGroup = DispatchGroup()
                     let readHandle = stdoutPipe.fileHandleForReading
                     readGroup.enter()
                     DispatchQueue.global(qos: .utility).async {
-                        defer { readGroup.leave() }
+                        defer {
+                            try? readHandle.close()
+                            stdoutBuffer.closeStdin()
+                            readGroup.leave()
+                        }
                         while true {
-                            let chunk = (try? readHandle.read(upToCount: 4_096)) ?? nil
-                            guard let chunk, !chunk.isEmpty else { break }
+                            let chunk = readHandle.availableData
+                            guard !chunk.isEmpty else { break }
                             stdoutBuffer.append(chunk)
                         }
                     }
 
                     let finishedSemaphore = DispatchSemaphore(value: 0)
                     process.terminationHandler = { _ in
+                        stdoutBuffer.closeStdin()
                         finishedSemaphore.signal()
                     }
 
@@ -661,6 +746,7 @@ public final class HostHealthMonitor: @unchecked Sendable {
                     do {
                         try process.run()
                     } catch {
+                        stdoutBuffer.closeStdin()
                         try? stdoutPipe.fileHandleForWriting.close()
                         _ = readGroup.wait(timeout: .now() + 0.2)
                         continuation.resume(
@@ -674,9 +760,10 @@ public final class HostHealthMonitor: @unchecked Sendable {
 
                     let waitResult = finishedSemaphore.wait(timeout: .now() + timeoutSeconds)
                     if waitResult == .timedOut {
+                        stdoutBuffer.closeStdin()
                         box.cancel()
-                        try? readHandle.close()
                         _ = finishedSemaphore.wait(timeout: .now() + 0.5)
+                        _ = readGroup.wait(timeout: .now() + 0.2)
                         box.markDrained()
                         continuation.resume(
                             returning: HostHealthEvaluator.makeHealth(host: host, reachable: false)
@@ -693,10 +780,9 @@ public final class HostHealthMonitor: @unchecked Sendable {
 
                     if readGroup.wait(timeout: .now() + 0.2) == .timedOut {
                         box.cancel()
-                        try? readHandle.close()
                     }
                     box.markDrained()
-                    let data = stdoutBuffer.snapshot()
+                    let (data, rttMilliseconds) = stdoutBuffer.snapshot()
                     guard process.terminationStatus == 0 else {
                         continuation.resume(
                             returning: HostHealthEvaluator.makeHealth(host: host, reachable: false)
@@ -715,7 +801,7 @@ public final class HostHealthMonitor: @unchecked Sendable {
                             memoryUsagePercent: parsed.memoryUsagePercent,
                             diskAvailableBytes: parsed.diskAvailableBytes,
                             diskTotalBytes: parsed.diskTotalBytes,
-                            latencyMilliseconds: elapsedMs
+                            latencyMilliseconds: rttMilliseconds ?? elapsedMs
                         )
                     )
                 }
