@@ -2460,6 +2460,7 @@ final class AppModel: ObservableObject {
         // work drains. Idle events without one (aborts, session end) need attention now.
         if status == .idle, previous == .running || previous == .waiting,
            !hasCompletionSignal, !startsScheduledTurn, !endsScheduledTurn,
+           projects[loc.p].effectiveParentSessionId(for: sessionId) == nil,
            !isVisible(projectIndex: loc.p, sessionIndex: loc.s) {
             projects[loc.p].sessions[loc.s].finishedUnseen = true
         }

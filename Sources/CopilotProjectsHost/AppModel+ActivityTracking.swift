@@ -738,7 +738,9 @@ extension AppModel {
             var updated = projects[pi].sessions[si]
             updated.status = .idle
             updated.statusText = nil
-            if markFinished, !isVisible(projectIndex: pi, sessionIndex: si) {
+            if markFinished,
+               projects[pi].effectiveParentSessionId(for: sid) == nil,
+               !isVisible(projectIndex: pi, sessionIndex: si) {
                 updated.finishedUnseen = true
             }
             projects[pi].sessions[si] = updated
@@ -940,6 +942,7 @@ extension AppModel {
         projectStorage[loc.p].sessions[loc.s].turnCompleted = true
         foregroundIdleGenerationBaselines.removeValue(forKey: sessionId)
 
+        guard projects[loc.p].effectiveParentSessionId(for: sessionId) == nil else { return }
         guard !isVisible(projectIndex: loc.p, sessionIndex: loc.s) else { return }
         // Light the finished-and-unseen dot here too. When a session was already
         // demoted to idle early (stale-working recovery, while background subagents
