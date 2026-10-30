@@ -406,9 +406,11 @@ copilot-projects set-status running               # set the current session's st
 copilot-projects set-status waiting --text "review my diff"
 copilot-projects notify "Build finished" "All tests green"
 copilot-projects list-projects
+copilot-projects list-hosts                       # list This Mac + ~/.ssh/config hosts
 copilot-projects list-status
-copilot-projects new-project myapp                # name only; --cwd optional
-copilot-projects new-session --project <id> --cwd /tmp
+copilot-projects new-project myapp                # name only; --cwd and --default-host optional
+copilot-projects set-default-host woodhaven --project <id>
+copilot-projects new-session --project <id> --cwd /tmp --host woodhaven
 copilot-projects focus --session <id>             # bring app forward + select
 copilot-projects doctor                           # diagnose state/session/runtime health
 copilot-projects version                          # print installed version
@@ -454,7 +456,11 @@ to `SessionHost.createConfiguredSession`. In addition to `requestId` and
 Omitted kind means Copilot; omitted prompt means an unprompted session. Copilot
 launches without `--allow-all`, so tool approvals appear in the session's terminal;
 a terminal opens a plain shell without requiring Copilot.
-Both retain the remote `~/Repos` working-directory and desktop-selection policy.
+On the local host, both use `COPILOT_PROJECTS_DEFAULT_DIR` from the app's
+environment, or `~/Repos` when unset, without changing desktop selection.
+The path must expand to an existing absolute directory.
+The app must inherit the variable at launch; an rc export does not affect an
+already-running app or Finder/Dock launches.
 
 A supplied prompt must be nonempty after whitespace trimming, at most 8,192
 UTF-8 bytes after CRLF/CR normalization to LF, and free of terminal control

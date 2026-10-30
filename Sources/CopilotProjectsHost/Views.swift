@@ -182,6 +182,9 @@ private struct WorkspaceHeading: View {
             if let session, let hostName = model.resolvedRemoteHost(for: session)?.displayName {
                 HostBadge(name: hostName)
             }
+            if let session, let memoryBytes = session.memoryUsageBytes, memoryBytes > 0 {
+                SessionMemoryBadge(bytes: memoryBytes)
+            }
             Spacer(minLength: 0)
             Image(systemName: "terminal")
                 .foregroundStyle(StudioStyle.secondaryText)
@@ -277,6 +280,9 @@ struct FleetStatusBar: View {
                     .foregroundStyle(StudioStyle.secondaryText)
                     .allowsHitTesting(false)
             }
+            if !model.hostHealth.isEmpty {
+                HostHealthPill(model: model)
+            }
         }
         .font(.system(size: 12))
         .monospacedDigit()
@@ -284,7 +290,7 @@ struct FleetStatusBar: View {
         .fixedSize()
         .background(
             Group {
-                if running > 0 || background > 0 || scheduled > 0 || waiting > 0 || failed > 0 || ready > 0 {
+                if running > 0 || background > 0 || scheduled > 0 || waiting > 0 || failed > 0 || ready > 0 || !model.hostHealth.isEmpty {
                     FleetStatusBarHitArea()
                 }
             }
@@ -304,6 +310,176 @@ struct FleetStatusBar: View {
         .buttonStyle(.plain)
         .help(help)
         .accessibilityIdentifier("fleet-status-\(kind.rawValue)")
+    }
+}
+
+struct HostHealthPill: View {
+    @ObservedObject var model: AppModel
+    @State private var showsPopover = false
+
+    static func overallLevel(for hosts: [RemoteHostHealth]) -> RemoteHostHealthLevel {
+        hosts.map(\.level).max() ?? .healthy
+    }
+
+    static func color(for level: RemoteHostHealthLevel) -> Color {
+        switch level {
+        case .healthy: .green
+        case .warning: .orange
+        case .critical: .red
+        }
+    }
+
+    static let maximumSummaryLabelCharacters = 36
+
+    static func summaryLabel(for hosts: [RemoteHostHealth]) -> String {
+        guard !hosts.isEmpty else { return "Hosts" }
+        let raw: String
+        if let worst = hosts.max(by: { $0.level < $1.level }), worst.level > .healthy {
+            let reason = worst.statusSummary ?? worst.level.rawValue.capitalized
+            raw = hosts.count > 1 ? "\(worst.displayName): \(reason)" : reason
+        } else {
+            let primary = hosts.first(where: \.isLocal) ?? hosts[0]
+            if let cpu = primary.cpuUsagePercent, let memory = primary.memoryUsagePercent {
+                raw = hosts.count > 1
+                    ? "\(hosts.count) hosts · CPU \(cpu)%"
+                    : "CPU \(cpu)% · Mem \(memory)%"
+            } else {
+                raw = hosts.count > 1 ? "\(hosts.count) hosts" : "Healthy"
+            }
+        }
+        guard raw.count > maximumSummaryLabelCharacters else { return raw }
+        return String(raw.prefix(maximumSummaryLabelCharacters - 1)) + "…"
+    }
+
+    static func formattedDiskFree(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useMB, .useGB, .useTB]
+        formatter.includesUnit = true
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    static func metricsDescription(for host: RemoteHostHealth) -> String {
+        guard host.reachable else { return "Unreachable" }
+        var parts: [String] = []
+        if let cpu = host.cpuUsagePercent {
+            parts.append("CPU \(cpu)%")
+        }
+        if let memory = host.memoryUsagePercent {
+            parts.append("Mem \(memory)%")
+        }
+        if let available = host.diskAvailableBytes {
+            if let total = host.diskTotalBytes, total > 0 {
+                parts.append("\(formattedDiskFree(available)) / \(formattedDiskFree(total)) free")
+            } else {
+                parts.append("\(formattedDiskFree(available)) free")
+            }
+        }
+        if !host.isLocal, let latency = host.latencyMilliseconds {
+            parts.append("\(latency) ms")
+        }
+        return parts.isEmpty ? "Connected" : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        let hosts = model.hostHealth
+        let level = Self.overallLevel(for: hosts)
+        let label = Self.summaryLabel(for: hosts)
+
+        Button {
+            showsPopover.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(Self.color(for: level))
+                    .frame(width: 7, height: 7)
+                Text(label)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 220, alignment: .leading)
+                    .foregroundStyle(level == .healthy ? StudioStyle.secondaryText : Self.color(for: level))
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(StudioStyle.raised)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Show host health details")
+        .accessibilityLabel("Host health: \(level.rawValue.capitalized). \(label)")
+        .accessibilityIdentifier("fleet-status-host-health")
+        .popover(isPresented: $showsPopover, arrowEdge: .bottom) {
+            HostHealthPopover(model: model)
+        }
+    }
+}
+
+private struct HostHealthPopover: View {
+    @ObservedObject var model: AppModel
+
+    private var hostRows: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(model.hostHealth) { host in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(HostHealthPill.color(for: host.level))
+                            .frame(width: 7, height: 7)
+                        Text(host.displayName)
+                            .font(.caption.weight(.semibold))
+                        Spacer(minLength: 8)
+                        if let summary = host.statusSummary {
+                            Text(summary)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(HostHealthPill.color(for: host.level))
+                        } else {
+                            Text("Healthy")
+                                .font(.caption2)
+                                .foregroundStyle(StudioStyle.secondaryText)
+                        }
+                    }
+                    Text(HostHealthPill.metricsDescription(for: host))
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(StudioStyle.secondaryText)
+                        .padding(.leading, 13)
+                }
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Host Health")
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 16)
+                Button("Refresh") {
+                    model.refreshHostHealth()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.weight(.medium))
+                .accessibilityIdentifier("host-health-refresh")
+            }
+
+            Divider()
+
+            ViewThatFits(in: .vertical) {
+                hostRows
+                ScrollView {
+                    hostRows
+                }
+            }
+            .frame(maxHeight: 280)
+        }
+        .padding(12)
+        .frame(minWidth: 260)
     }
 }
 
@@ -357,6 +533,7 @@ struct SidebarView: View {
     @State private var dropTargetProjectId: String?
 
     var body: some View {
+        let hosts = model.availableHosts
         List(selection: Binding(
             get: { model.selectedProjectId },
             set: { model.selectProject($0) }
@@ -364,6 +541,10 @@ struct SidebarView: View {
             ForEach(Array(model.projects.enumerated()), id: \.element.id) { index, project in
                 ProjectRow(
                     project: project,
+                    hostDisplayName: project.defaultHostId.flatMap { raw in
+                        guard !raw.isEmpty else { return nil }
+                        return SSHHostCatalog.resolve(hostId: raw, in: hosts)?.displayName ?? raw
+                    },
                     number: index < 9 ? index + 1 : nil,
                     showNumber: model.numberHint == .projects,
                     isDropTarget: dropTargetProjectId == project.id
@@ -435,6 +616,7 @@ struct SidebarView: View {
 
 struct ProjectRow: View, Equatable {
     let project: Project
+    var hostDisplayName: String? = nil
     var number: Int? = nil
     var showNumber: Bool = false
     var isDropTarget: Bool = false
@@ -443,6 +625,7 @@ struct ProjectRow: View, Equatable {
         lhs.number == rhs.number
             && lhs.showNumber == rhs.showNumber
             && lhs.isDropTarget == rhs.isDropTarget
+            && lhs.hostDisplayName == rhs.hostDisplayName
             && lhs.project.id == rhs.project.id
             && lhs.project.name == rhs.project.name
             && lhs.project.defaultHostId == rhs.project.defaultHostId
@@ -458,14 +641,12 @@ struct ProjectRow: View, Equatable {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 5) {
-                    Text(project.name)
-                        .font(.body.weight(.medium))
-                        .lineLimit(1)
-                        .help(project.name)
-                    if let defaultHostId = project.defaultHostId, !defaultHostId.isEmpty {
-                        HostBadge(name: defaultHostId)
-                    }
+                Text(project.name)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
+                    .help(project.name)
+                if let hostLabel = hostDisplayName ?? project.defaultHostId, !hostLabel.isEmpty {
+                    HostBadge(name: hostLabel)
                 }
                 Text("\(project.sessions.count) session\(project.sessions.count == 1 ? "" : "s")")
                     .font(.caption)
@@ -783,10 +964,15 @@ private struct SessionList: View {
                             description: Text("Start Copilot or a terminal for this project.")
                         )
                     }
+                    let hosts = model.availableHosts
                     ForEach(Array(displayItems.enumerated()), id: \.element.id) { index, item in
                         let session = item.session
                         SessionRow(
                             session: session,
+                            hostDisplayName: session.hostId.flatMap { raw in
+                                guard !raw.isEmpty else { return nil }
+                                return SSHHostCatalog.resolve(hostId: raw, in: hosts)?.displayName ?? raw
+                            },
                             isActive: session.id == project.selectedSessionId,
                             number: index < 9 ? index + 1 : nil,
                             showNumber: showTabNumbers,
@@ -1076,8 +1262,48 @@ struct HostBadge: View, Equatable {
     }
 }
 
+struct SessionMemoryBadge: View, Equatable {
+    let bytes: Int64
+
+    static func formattedBytes(_ bytes: Int64) -> String {
+        guard bytes > 0 else { return "0 MB" }
+        if bytes >= 1_000_000_000 {
+            let tenths = Int((Double(bytes) / 100_000_000.0).rounded())
+            if tenths % 10 == 0 {
+                return "\(tenths / 10) GB"
+            }
+            return "\(tenths / 10).\(tenths % 10) GB"
+        }
+        let megabytes = max(1, Int((Double(bytes) / 1_000_000.0).rounded()))
+        return "\(megabytes) MB"
+    }
+
+    var body: some View {
+        let label = Self.formattedBytes(bytes)
+        Text(label)
+            .font(.system(size: 10, weight: .medium))
+            .monospacedDigit()
+            .foregroundStyle(StudioStyle.secondaryText)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(StudioStyle.raised)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.5)
+            )
+            .help("Session memory footprint: \(label)")
+            .accessibilityIdentifier("session-memory-badge")
+    }
+}
+
 struct SessionRow: View, Equatable {
     let session: Session
+    var hostDisplayName: String? = nil
     let isActive: Bool
     var number: Int? = nil
     var showNumber: Bool = false
@@ -1092,12 +1318,14 @@ struct SessionRow: View, Equatable {
         lhs.isActive == rhs.isActive
             && lhs.number == rhs.number
             && lhs.showNumber == rhs.showNumber
+            && lhs.hostDisplayName == rhs.hostDisplayName
             && lhs.isChild == rhs.isChild
             && lhs.childSummary == rhs.childSummary
             && lhs.isExpanded == rhs.isExpanded
             && lhs.session.id == rhs.session.id
             && lhs.session.title == rhs.session.title
             && lhs.session.hostId == rhs.session.hostId
+            && lhs.session.memoryUsageBytes == rhs.session.memoryUsageBytes
             && lhs.session.statusText == rhs.session.statusText
             && lhs.session.displayStatus == rhs.session.displayStatus
             && lhs.session.failedRequest == rhs.session.failedRequest
@@ -1119,8 +1347,11 @@ struct SessionRow: View, Equatable {
         if isActive { states.append("Selected") }
         if isChild { states.append("Child session") }
         states.append(stateLabel)
-        if let hostId = session.hostId, !hostId.isEmpty {
-            states.append("Running on \(hostId)")
+        if let hostLabel = hostDisplayName ?? session.hostId, !hostLabel.isEmpty {
+            states.append("Running on \(hostLabel)")
+        }
+        if let memoryBytes = session.memoryUsageBytes, memoryBytes > 0 {
+            states.append("Memory \(SessionMemoryBadge.formattedBytes(memoryBytes))")
         }
         if let childSummary {
             states.append(childSummary.label)
@@ -1162,8 +1393,9 @@ struct SessionRow: View, Equatable {
                             .help(session.statusText ?? session.title)
                         HStack(spacing: 6) {
                             Text(stateLabel)
-                            if let hostId = session.hostId, !hostId.isEmpty {
-                                HostBadge(name: hostId)
+                                .lineLimit(1)
+                            if let memoryBytes = session.memoryUsageBytes, memoryBytes > 0 {
+                                SessionMemoryBadge(bytes: memoryBytes)
                             }
                             if session.hasBackgroundWork { BackgroundWorkBadge() }
                             if !session.schedules.isEmpty { ScheduleBadge(schedules: session.schedules) }
@@ -1173,30 +1405,43 @@ struct SessionRow: View, Equatable {
                                     .foregroundStyle(.blue)
                                     .accessibilityHidden(true)
                             }
-                            if let childSummary {
-                                Text(childSummary.label)
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(
-                                        Capsule(style: .continuous)
-                                            .fill(Color.primary.opacity(0.08))
-                                    )
-                            }
                         }
                         .font(.caption)
                         .foregroundStyle(StudioStyle.secondaryText)
+                        if let childSummary {
+                            Text(childSummary.label)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(StudioStyle.secondaryText)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(
+                                    Capsule(style: .continuous)
+                                        .fill(Color.primary.opacity(0.08))
+                                )
+                                .contentShape(Capsule(style: .continuous))
+                                .onTapGesture { onToggleExpand?() }
+                                .help("\(isExpanded ? "Collapse" : "Expand") (\(childSummary.label))")
+                                .accessibilityIdentifier("session-child-summary")
+                        }
+                        if let hostLabel = hostDisplayName ?? session.hostId, !hostLabel.isEmpty {
+                            HostBadge(name: hostLabel)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .onTapGesture(perform: onSelect)
-                .simultaneousGesture(TapGesture(count: 2).onEnded {
-                    // Finish the second click's selection before removing its row.
-                    DispatchQueue.main.async(execute: onClose)
-                })
+                .gesture(
+                    TapGesture(count: 1)
+                        .onEnded(onSelect)
+                        .simultaneously(with: TapGesture(count: 2).onEnded {
+                            // Finish the second click's selection before removing its row.
+                            DispatchQueue.main.async(execute: onClose)
+                        })
+                )
                 if let childSummary {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 10, weight: .semibold))

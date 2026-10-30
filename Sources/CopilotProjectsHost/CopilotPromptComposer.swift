@@ -327,13 +327,18 @@ enum DesktopScreenshotAttachmentImage {
     }
 
     static func canonicalTextMimeType(for url: URL) -> String? {
-        guard !url.pathExtension.isEmpty else { return nil }
-        if let mapped = RemoteAttachmentContract.canonicalTextMimeType(forExtension: url.pathExtension) {
+        if !url.pathExtension.isEmpty,
+           let mapped = RemoteAttachmentContract.canonicalTextMimeType(forExtension: url.pathExtension) {
             return mapped
         }
-        guard let utType = UTType(filenameExtension: url.pathExtension),
+        guard let utType = (!url.pathExtension.isEmpty ? UTType(filenameExtension: url.pathExtension) : nil)
+                ?? (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType,
               !utType.conforms(to: .image) else {
             return nil
+        }
+        if let ext = utType.preferredFilenameExtension,
+           let mapped = RemoteAttachmentContract.canonicalTextMimeType(forExtension: ext) {
+            return mapped
         }
         if pickerTextContentTypes.contains(where: { utType.conforms(to: $0) }) {
             return "text/plain"

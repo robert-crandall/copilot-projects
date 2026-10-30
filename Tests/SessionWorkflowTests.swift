@@ -344,5 +344,17 @@ final class SessionWorkflowTests: XCTestCase {
             action: mixedTooManyImagesSend,
             operation: CLIOperationRequest(operationId: "mixed-too-many-images", conversationEpoch: "epoch-1")
         ), .invalid)
+
+        let missingAttachmentSend = RemoteSessionAction(
+            kind: .send,
+            prompt: "missing attachment",
+            mode: .enqueue,
+            attachmentIds: [UUID().uuidString.lowercased()]
+        )
+        XCTAssertEqual(model.performSessionAction(
+            sessionId: session.id,
+            action: missingAttachmentSend,
+            operation: CLIOperationRequest(operationId: "missing-attachment", conversationEpoch: "epoch-1")
+        ), .invalid)
     }
 }

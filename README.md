@@ -114,6 +114,9 @@ discards it. Closing the drawer or switching sessions dismisses that preview.
   Prompt…**. Put `{url}` where the pull request URL goes.
 - **Resumable terminals.** The bundled `dtach` backend keeps shells and agents
   alive when the app quits or relaunches. You can also reattach over SSH.
+- **Remote SSH hosts.** Run Copilot or plain-shell sessions on **This Mac** or any
+  SSH host discovered from `~/.ssh/config`. Set a default host per project or
+  choose a host when starting a session.
 
 Copilot CLI hooks and a local tracker supply automatic status and session
 details. Other command-line tools work as ordinary terminal sessions and can
@@ -365,6 +368,31 @@ and plain-terminal creation. New projects
 created with `⌘N` also start with Copilot. Copilot Projects never adds `--allow-all`;
 tool approvals follow your normal Copilot CLI permission settings.
 
+### Remote SSH hosts
+
+Copilot Projects discovers remote execution hosts automatically from `~/.ssh/config`
+(and any `Include` files), skipping wildcards, loopback addresses, and Git hosting
+providers (`github.com`, `*.ghe.com`, `gitlab.com`, `bitbucket.org`, Azure DevOps).
+
+Add an optional `# copilot-projects:` comment above a `Host` entry to customize its
+display name, default working directory, or visibility:
+
+```sshconfig
+# copilot-projects: name="woodhaven" cwd="/root/Repos"
+Host woodhaven.thefergies.com
+  User root
+
+# copilot-projects: ignore=true
+Host jumpbox.internal
+```
+
+- **Per-project default host:** right-click a project and choose **Default Host ▸**
+  to run new sessions in that project on a remote host by default.
+- **Per-session host override:** choose a host under **Run on Host** in the **+**
+  split button menu, or pick a host in **Start with Prompt…** and **Review Pull
+  Request…**. Projects and sessions running on a remote machine show a host badge on
+  their own line in the sidebar.
+
 In the composer, Return adds a line, `⌘Return` starts Copilot, and Cancel creates
 no session. Failed preflight checks keep your draft. If Copilot or its backend becomes
 unavailable, choosing **New Terminal** discards the draft and opens a plain shell
@@ -403,28 +431,35 @@ Add that directory to your `PATH` if needed.
 ```bash
 copilot-projects ping
 copilot-projects list-projects
+copilot-projects list-hosts
 copilot-projects list-status
-copilot-projects new-session --project <id> --cwd /path/to/repo
+copilot-projects new-project myapp --default-host woodhaven
+copilot-projects set-default-host woodhaven --project <id>
+copilot-projects new-session --project <id> --cwd /path/to/repo --host woodhaven
 copilot-projects focus --session <id>
 copilot-projects doctor
 ```
 
 The automation command `new-session` still creates a plain shell. To start Copilot
-with a prompt from a script, use `new-copilot-session`:
+with a prompt from a script, use `new-copilot-session` (pass `--host <host>` to
+override the project's default host):
 
 ```bash
 copilot-projects new-copilot-session --project <id> \
-  --request-id <uuid> --prompt-file prompt.md --title "Review owner/repo#123"
+  --request-id <uuid> --prompt-file prompt.md --title "Review owner/repo#123" \
+  --host woodhaven
 ```
 
-It launches Copilot in `~/Repos` with the file's contents (UTF-8,
-at most 8 KiB) as the starting prompt, then prints the session id. The request id
+It launches Copilot with the file's contents (UTF-8, at most 8 KiB) as the starting
+prompt, then prints the session id. Local sessions use `COPILOT_PROJECTS_DEFAULT_DIR`
+from the app's environment, or `~/Repos` when unset; the path must expand to an
+existing absolute directory. The request id
 is the session id, so retries are idempotent while the app remembers the request
 (about a week): replaying the same id and prompt prints the existing session, a
 different prompt or project exits 3 (conflict), and an id whose session has since
 ended exits 4 (gone, not recreated). Exit 5 means
 Copilot or persistence is temporarily unavailable; retry with the same id. Other
-exits: 2 invalid arguments, 6 unknown project, 7 missing `~/Repos`, 1 anything else
+exits: 2 invalid arguments, 6 unknown project, 7 missing or invalid working directory, 1 anything else
 (including an older app that does not support the command). Unknown flags are
 rejected before anything is sent.
 
