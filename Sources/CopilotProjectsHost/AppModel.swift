@@ -2788,6 +2788,58 @@ final class AppModel: ObservableObject {
         save()
     }
 
+    func groupSessionUnderParent(projectId pid: String, sessionId sid: String, parentSessionId parentId: String) {
+        guard sid != parentId,
+              let pi = projectIndex(pid),
+              let si = projects[pi].sessions.firstIndex(where: { $0.id == sid }),
+              let parentIndex = projects[pi].sessions.firstIndex(where: { $0.id == parentId }),
+              projects[pi].sessions[parentIndex].parentSessionId == nil,
+              !projects[pi].sessions.contains(where: { $0.parentSessionId == sid }) else { return }
+        projects[pi].sessions[si].parentSessionId = parentId
+        expandedParentSessionIds.insert(parentId)
+        projects[pi].normalizeParentSessions()
+        save()
+    }
+
+    func markAllSessionsRead(inProjectId pid: String) {
+        guard let pi = projectIndex(pid),
+              projects[pi].sessions.contains(where: \.offersMarkAsRead) else { return }
+        var clearedMark = false
+        withCoalescedProjectPublications {
+            for si in projects[pi].sessions.indices where projects[pi].sessions[si].offersMarkAsRead {
+                projects[pi].sessions[si].hasUnread = false
+                projects[pi].sessions[si].finishedUnseen = false
+                if projects[pi].sessions[si].markedUnread {
+                    projects[pi].sessions[si].markedUnread = false
+                    clearedMark = true
+                }
+            }
+        }
+        updateDockBadge()
+        if clearedMark { save() }
+    }
+
+    func bounceIdleSessions(inProjectId pid: String) {
+        guard let pi = projectIndex(pid) else { return }
+        let sessionIds = projects[pi].sessions
+            .filter { $0.displayStatus == .idle && !$0.hasBackgroundWork }
+            .map(\.id)
+        for sessionId in sessionIds where sessionWorkflow(sessionId: sessionId)?.supports(.bounce) == true {
+            let epoch = sessionOperationProjection(sessionId: sessionId).conversationEpoch
+            Task { @MainActor in
+                guard let loc = self.locateIndex(sessionId),
+                      self.projects[loc.p].sessions[loc.s].displayStatus == .idle,
+                      !self.projects[loc.p].sessions[loc.s].hasBackgroundWork,
+                      self.sessionWorkflow(sessionId: sessionId)?.supports(.bounce) == true else { return }
+                _ = await performLocalSessionAction(
+                    sessionId: sessionId,
+                    action: RemoteSessionAction(kind: .bounce),
+                    expectedConversationEpoch: epoch
+                )
+            }
+        }
+    }
+
     func setNumberHint(_ hint: NumberHint) {
         if numberHint != hint { numberHint = hint }
     }
