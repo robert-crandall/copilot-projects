@@ -509,6 +509,19 @@ copilot-projects attach <id-or-prefix>
 
 Use `Ctrl-\` to detach without ending the session.
 
+### Coordinating parallel sessions from Copilot CLI
+
+The bundled [`coordinate-copilot-sessions`](.github/skills/coordinate-copilot-sessions)
+skill teaches Copilot CLI to stagger-launch child sessions (`--parent-session`),
+steer them over the control socket (`send-session-prompt`), or spin off a
+tangent into a standalone tab (`--no-parent`). Symlink it into `~/.copilot/skills/`
+to make it available in every repository:
+
+```bash
+mkdir -p ~/.copilot/skills
+ln -s "$(pwd)/.github/skills/coordinate-copilot-sessions" ~/.copilot/skills/coordinate-copilot-sessions
+```
+
 ## Studio Console visual system
 
 Studio Console frames the native terminal workspace with adaptive graphite/satin
