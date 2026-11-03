@@ -10472,6 +10472,263 @@ final class AppLogicTests: XCTestCase {
         XCTAssertEqual(reencoded.images?.first?.contentVersionText, "18000000000000000001")
     }
 
+    func testTranscriptTurnExtractReasoningHeadingParsesAndTruncates() {
+        XCTAssertEqual(
+            TranscriptTurn.extractReasoningHeading(
+                from: "\n  **Analyzing Copilot Project Opportunities**\n\nLook at files."
+            ),
+            "Analyzing Copilot Project Opportunities"
+        )
+        XCTAssertEqual(
+            TranscriptTurn.extractReasoningHeading(from: "###   Checking   test   cases  \nMore text"),
+            "Checking test cases"
+        )
+        XCTAssertEqual(
+            TranscriptTurn.extractReasoningHeading(from: "- _Inspecting edge cases_\nDetails"),
+            "Inspecting edge cases"
+        )
+        XCTAssertNil(TranscriptTurn.extractReasoningHeading(from: "   \n  \n "))
+        XCTAssertNil(TranscriptTurn.extractReasoningHeading(from: "***"))
+
+        let longLine = String(repeating: "a", count: 95)
+        let truncated = TranscriptTurn.extractReasoningHeading(from: longLine)
+        XCTAssertEqual(truncated, String(repeating: "a", count: 80) + "…")
+    }
+
+    func testTranscriptTurnReasoningSummaryLabelFormatsSingleAndMultipleSteps() {
+        let singleWithHeading = TranscriptTurn(
+            id: "t1",
+            startedAt: Date(timeIntervalSince1970: 100),
+            endedAt: nil,
+            kind: "foreground",
+            userContent: "hi",
+            assistantMessages: [],
+            tools: [],
+            isAborted: false,
+            reasoningSteps: ["**Planning Changes**\n\nStep 1 details"]
+        )
+        XCTAssertEqual(singleWithHeading.nonEmptyReasoningSteps, ["**Planning Changes**\n\nStep 1 details"])
+        XCTAssertEqual(singleWithHeading.latestReasoningHeading, "Planning Changes")
+        XCTAssertEqual(singleWithHeading.reasoningSummaryLabel, "Thinking · Planning Changes")
+
+        let multiSteps = TranscriptTurn(
+            id: "t2",
+            startedAt: Date(timeIntervalSince1970: 100),
+            endedAt: nil,
+            kind: "foreground",
+            userContent: "hi",
+            assistantMessages: [],
+            tools: [],
+            isAborted: false,
+            reasoningSteps: [
+                "**Step One**\n\nFirst thought",
+                "   ",
+                "**Step Two**\n\nSecond thought",
+            ]
+        )
+        XCTAssertEqual(multiSteps.nonEmptyReasoningSteps.count, 2)
+        XCTAssertEqual(multiSteps.latestReasoningHeading, "Step Two")
+        XCTAssertEqual(multiSteps.reasoningSummaryLabel, "Thinking (2 steps) · Step Two")
+
+        let noHeading = TranscriptTurn(
+            id: "t3",
+            startedAt: Date(timeIntervalSince1970: 100),
+            endedAt: nil,
+            kind: "foreground",
+            userContent: "hi",
+            assistantMessages: [],
+            tools: [],
+            isAborted: false,
+            reasoningSteps: ["***"]
+        )
+        XCTAssertNil(noHeading.latestReasoningHeading)
+        XCTAssertEqual(noHeading.reasoningSummaryLabel, "Thinking")
+    }
+
+    func testTranscriptTurnReasoningStepsCodableRoundTripAndLegacyDecode() throws {
+        let legacyJSON = Data("""
+        {"id":"t1","startedAt":"1970-01-01T00:01:40Z","endedAt":null,"kind":"foreground",\
+        "userContent":"hi","assistantMessages":[],"tools":[],"isAborted":false}
+        """.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decodedLegacy = try decoder.decode(TranscriptTurn.self, from: legacyJSON)
+        XCTAssertNil(decodedLegacy.reasoningSteps)
+        XCTAssertTrue(decodedLegacy.nonEmptyReasoningSteps.isEmpty)
+
+        let withReasoning = TranscriptTurn(
+            id: "t2",
+            startedAt: Date(timeIntervalSince1970: 100),
+            endedAt: Date(timeIntervalSince1970: 120),
+            kind: "foreground",
+            userContent: "hi",
+            assistantMessages: [],
+            tools: [],
+            isAborted: false,
+            reasoningSteps: ["**Checking Protocol**\n\nDetails", "**Updating View**\n\nMore"]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let encoded = try encoder.encode(withReasoning)
+        let roundTripped = try decoder.decode(TranscriptTurn.self, from: encoded)
+        XCTAssertEqual(
+            roundTripped.reasoningSteps,
+            ["**Checking Protocol**\n\nDetails", "**Updating View**\n\nMore"]
+        )
+    }
+
+    func testTranscriptImageAssociationPreservesReasoningSteps() {
+        let turn = TranscriptTurn(
+            id: "t1",
+            startedAt: Date(timeIntervalSince1970: 100),
+            endedAt: Date(timeIntervalSince1970: 200),
+            kind: "foreground",
+            userContent: "hi",
+            assistantMessages: [],
+            tools: [],
+            isAborted: false,
+            reasoningSteps: ["**Inspecting Image Association**\n\nPreserve reasoningSteps."]
+        )
+        let snapshot = makeSnapshot([turn])
+        let resultWithImage = TranscriptImageAssociation.attach(
+            images: [img(5, 42, at: 150)],
+            to: snapshot
+        )
+        XCTAssertEqual(
+            resultWithImage.turns.first?.reasoningSteps,
+            ["**Inspecting Image Association**\n\nPreserve reasoningSteps."]
+        )
+        XCTAssertEqual(resultWithImage.turns.first?.images?.map(\.imageId), [5])
+    }
+
+    func testCopilotExtensionReplayAttributesExecutionErrorToReasoningOnlyUnansweredTurn() throws {
+        try requireNodeForJavaScriptTests()
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/copilot-extension-reasoning-replay-\(UUID().uuidString)")
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let appSessionId = "12345678-1234-1234-1234-123456789abc"
+
+        let prelude = #"""
+        const fakeSession = {
+          sessionId: "11111111-1111-1111-1111-111111111111",
+          rpc: { schedule: { list: async () => ({entries:[]}) } },
+          on() {},
+          async getEvents() {
+            return [
+              {
+                id: "u1",
+                type: "user.message",
+                timestamp: "2026-07-12T03:00:00.000Z",
+                data: { content: "run build" }
+              },
+              {
+                id: "ts1",
+                type: "assistant.turn_start",
+                timestamp: "2026-07-12T03:00:01.000Z",
+                data: {}
+              },
+              {
+                id: "am1",
+                type: "assistant.message",
+                timestamp: "2026-07-12T03:00:02.000Z",
+                data: {
+                  messageId: "m1",
+                  content: "",
+                  reasoningText: "**Checking Build Setup**\n\nInspecting build scripts."
+                }
+              },
+              {
+                id: "te1",
+                type: "assistant.turn_end",
+                timestamp: "2026-07-12T03:00:03.000Z",
+                data: {}
+              },
+              {
+                id: "err1",
+                type: "session.error",
+                timestamp: "2026-07-12T03:00:04.000Z",
+                data: {
+                  errorType: "execution",
+                  message: "Execution failed before producing an answer"
+                }
+              },
+              {
+                id: "idle1",
+                type: "session.idle",
+                timestamp: "2026-07-12T03:00:05.000Z",
+                data: { aborted: false }
+              }
+            ];
+          }
+        };
+        const joinSession = async () => fakeSession;
+        """#
+        let extensionScript = CopilotExtension.script.replacingOccurrences(
+            of: #"import { joinSession } from "@github/copilot-sdk/extension";"#,
+            with: prelude
+        )
+        let epilogue = #"""
+
+        const sealed = JSON.parse(readFileSync(
+          `${process.env.COPILOT_PROJECTS_ROOT}/sessions/`
+            + `${process.env.COPILOT_PROJECTS_SESSION}.transcript.json`,
+          "utf8"
+        ));
+        console.log(JSON.stringify({
+          turns: sealed.turns
+        }));
+        process.exit(0);
+        """#
+        let scriptURL = root.appendingPathComponent("reasoning-replay.mjs")
+        try (extensionScript + epilogue).write(
+            to: scriptURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["node", scriptURL.path]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": root.path,
+            "COPILOT_PROJECTS_SESSION": appSessionId,
+            "COPILOT_PROJECTS_SOCKET": root.appendingPathComponent("app.sock").path,
+            "COPILOT_PROJECTS_ROOT": root.path,
+        ]) { _, new in new }
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorOutput, encoding: .utf8) ?? "node harness failed"
+        )
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: output) as? [String: Any]
+        )
+        let turns = try XCTUnwrap(payload["turns"] as? [[String: Any]])
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(turns[0]["id"] as? String, "u1")
+        XCTAssertEqual(
+            turns[0]["reasoningSteps"] as? [String],
+            ["**Checking Build Setup**\n\nInspecting build scripts."]
+        )
+        let turnError = try XCTUnwrap(turns[0]["error"] as? [String: Any])
+        XCTAssertEqual(turnError["errorType"] as? String, "execution")
+        XCTAssertEqual(
+            turnError["message"] as? String,
+            "Execution failed before producing an answer"
+        )
+    }
+
     // MARK: - Remote Kitty APC capture (byte-level parser, bounded + fail-closed)
 
     @MainActor
