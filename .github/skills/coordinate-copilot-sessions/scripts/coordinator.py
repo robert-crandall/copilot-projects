@@ -299,6 +299,25 @@ def _is_unsupported_parent_flag_error(exc: CoordinatorError) -> bool:
     return "unexpected --parent-session" in detail or "unexpected --no-parent" in detail
 
 
+def _session_has_turn_evidence(session_id: str, env: dict[str, str] | None = None) -> bool:
+    environment = env if env is not None else os.environ
+    state_dir = environment.get("COPILOT_PROJECTS_STATE_DIR", "").strip()
+    sdir = (Path(state_dir).expanduser() if state_dir else Path(control_socket_path(environment)).parent) / "sessions"
+    if any((sdir / f"{session_id}.{s}").is_file() for s in ("session-idle-hook", "agent-stop-completion", "active-turn")):
+        return True
+    try:
+        data = json.loads((sdir / f"{session_id}.agent-activity.json").read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and bool(
+        data.get("foregroundTurnActive") is True
+        or (type(data.get("idleGeneration")) is int and data["idleGeneration"] > 0)
+        or data.get("sessionIdleAtMilliseconds") is not None
+        or data.get("foregroundTransitionAt")
+        or data.get("startingPrompt")
+    )
+
+
 def launch_session_and_wait(
     project_id: str,
     title: str,
@@ -319,22 +338,12 @@ def launch_session_and_wait(
     read_prompt_file(prompt_file)
     environment = env if env is not None else os.environ
     effective_parent = (
-        None
-        if no_parent
-        else (parent_session_id or environment.get("COPILOT_PROJECTS_SESSION", "")).strip()
-        or None
+        None if no_parent else (parent_session_id or environment.get("COPILOT_PROJECTS_SESSION", "")).strip() or None
     )
     req_uuid = str(uuid.UUID(request_id)) if request_id else str(uuid.uuid4())
     base_cmd = [
-        "new-copilot-session",
-        "--project",
-        project_id,
-        "--request-id",
-        req_uuid,
-        "--title",
-        title,
-        "--prompt-file",
-        str(Path(prompt_file).resolve()),
+        "new-copilot-session", "--project", project_id, "--request-id", req_uuid,
+        "--title", title, "--prompt-file", str(Path(prompt_file).resolve()),
     ]
     if host and host.strip():
         base_cmd.extend(["--host", host.strip()])
@@ -376,10 +385,10 @@ def launch_session_and_wait(
             match = next((s for s in entries if s.id == session_id), None)
             if match is not None:
                 observed_status = match.status
-                # 'running' means the CLI + MCP servers booted and accepted the initial prompt.
-                # Also accept 'waiting' if the session immediately asked a question/permission,
-                # or 'unread' when an idempotent retry replays a completed session.
-                if match.status in ("running", "waiting") or match.unread:
+                # 'running'/'waiting' means the CLI + MCP servers booted and accepted the prompt.
+                # Also accept 'unread' or recorded turn/startup evidence when a grouped child
+                # finishes between polls or an already-read session is replayed on retry.
+                if match.status in ("running", "waiting") or match.unread or _session_has_turn_evidence(session_id, environment):
                     elapsed = round(time.monotonic() - start_mono, 2)
                     break
             if time.monotonic() >= deadline:

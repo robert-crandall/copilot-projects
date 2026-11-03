@@ -261,6 +261,73 @@ class CoordinatorTests(unittest.TestCase):
             )
             self.assertEqual(replayed["status"], "idle")
 
+            # Grouped child finishing with plain 'idle' (no '[unread]') between polls
+            # and already-read replay both advance once turn/startup evidence exists.
+            sessions_dir = Path(tmp) / "sessions"
+            sessions_dir.mkdir()
+            state_env = {"COPILOT_PROJECTS_STATE_DIR": tmp, "COPILOT_PROJECTS_SESSION": "S-PARENT"}
+            grouped_polls = 0
+
+            def grouped_cli(args: list[str]) -> str:
+                nonlocal grouped_polls
+                if args[0] == "new-copilot-session":
+                    title = args[args.index("--title") + 1]
+                    return "S-GROUPED" if title == "Track 1" else "S-NEXT"
+                if args[0] == "list-status":
+                    grouped_polls += 1
+                    if grouped_polls == 2:
+                        (sessions_dir / "S-GROUPED.session-idle-hook").write_text("", encoding="utf-8")
+                    return "Proj/Track 1  idle  S-GROUPED\nProj/Track 2  running  S-NEXT"
+                raise AssertionError(f"unexpected command: {args}")
+
+            grouped_batch = coordinator.launch_batch(
+                project_id="P1",
+                items=[
+                    {"title": "Track 1", "prompt_file": str(p1)},
+                    {"title": "Track 2", "prompt_file": str(p2)},
+                ],
+                env=state_env,
+                cli_runner=grouped_cli,
+                sleep_fn=lambda _: None,
+            )
+            self.assertEqual([r["session_id"] for r in grouped_batch], ["S-GROUPED", "S-NEXT"])
+            self.assertEqual(grouped_batch[0]["status"], "idle")
+            self.assertEqual(grouped_polls, 3)
+
+            (sessions_dir / "S-READ.agent-activity.json").write_text(
+                json.dumps({"schemaVersion": 1, "foregroundTurnActive": False, "idleGeneration": 1}),
+                encoding="utf-8",
+            )
+            read_replay = coordinator.launch_session_and_wait(
+                project_id="P1",
+                title="Track 1",
+                prompt_file=p1,
+                request_id=str(uuid.uuid4()),
+                env={**state_env, "COPILOT_PROJECTS_SOCKET": str(Path(tmp) / "other" / "cp.sock")},
+                cli_runner=lambda args: "S-READ"
+                if args[0] == "new-copilot-session"
+                else "Proj/Track 1  idle  S-READ",
+                sleep_fn=lambda _: None,
+            )
+            self.assertEqual(read_replay["status"], "idle")
+
+            fwd_box = Path(tmp) / "by-session" / "S-PARENT"
+            (fwd_box / "sessions").mkdir(parents=True)
+            (fwd_box / "sessions" / "S-FWD.agent-stop-completion").write_text("", encoding="utf-8")
+            fwd_res = coordinator.launch_session_and_wait(
+                project_id="P1",
+                title="Track 1",
+                prompt_file=p1,
+                request_id=str(uuid.uuid4()),
+                timeout_seconds=1.0,
+                env={"COPILOT_PROJECTS_SOCKET": str(fwd_box / "control.sock")},
+                cli_runner=lambda args: "S-FWD"
+                if args[0] == "new-copilot-session"
+                else "Proj/Track 1  idle  S-FWD",
+                sleep_fn=lambda _: None,
+            )
+            self.assertEqual(fwd_res["status"], "idle")
+
             # main(["launch-batch", ...]) persists request_id and session_id across partial failure
             manifest_file = Path(tmp) / "manifest.json"
             manifest_file.write_text(
