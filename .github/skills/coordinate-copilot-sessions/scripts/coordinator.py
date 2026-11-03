@@ -244,9 +244,7 @@ def run_cli(args: list[str]) -> str:
 
 
 def send_control_request(
-    payload: dict[str, object],
-    socket_path: str | None = None,
-    timeout: float = 5.0,
+    payload: dict[str, object], socket_path: str | None = None, timeout: float = 5.0
 ) -> dict[str, object]:
     sock_path = socket_path or control_socket_path()
     line = json.dumps(payload, separators=(",", ":")) + "\n"
@@ -264,9 +262,7 @@ def send_control_request(
                 if b"\n" in chunk:
                     break
         except OSError as exc:
-            raise CoordinatorError(
-                f"control socket request to {sock_path} failed: {exc}"
-            ) from exc
+            raise CoordinatorError(f"control socket request to {sock_path} failed: {exc}") from exc
     raw_resp = b"".join(chunks).decode("utf-8", errors="replace").strip()
     if not raw_resp:
         raise CoordinatorError("empty response from control socket")
@@ -278,8 +274,7 @@ def send_control_request(
     if not resp.get("ok"):
         code = resp.get("code")
         err = resp.get("error") or "unknown error"
-        suffix = f" ({code})" if code else ""
-        raise CoordinatorError(f"control socket error{suffix}: {err}")
+        raise CoordinatorError(f"control socket error{f' ({code})' if code else ''}: {err}")
     return resp
 
 
@@ -298,9 +293,7 @@ def resolve_project(
             return by_id.id
         matches = [p for p in projects if p.name.lower() == lower]
         if len(matches) > 1:
-            raise CoordinatorError(
-                f"project name {name!r} is ambiguous; use a project ID"
-            )
+            raise CoordinatorError(f"project name {name!r} is ambiguous; use a project ID")
         if matches:
             return matches[0].id
         if create_if_missing:
@@ -312,14 +305,9 @@ def resolve_project(
 
     env_project = environment.get("COPILOT_PROJECTS_PROJECT", "").strip()
     if env_project:
-        for p in projects:
-            if p.id == env_project:
-                return p.id
-        return env_project
-
-    for p in projects:
-        if p.selected:
-            return p.id
+        return next((p.id for p in projects if p.id == env_project), env_project)
+    if selected := next((p.id for p in projects if p.selected), None):
+        return selected
     if projects:
         return projects[0].id
     raise CoordinatorError("no projects found in Copilot Projects")
@@ -471,12 +459,20 @@ def launch_batch(
     env: dict[str, str] | None = None,
     cli_runner: Callable[[list[str]], str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    manifest_path: Path | None = None,
 ) -> list[dict[str, object]]:
     if cli_runner is None:
         cli_runner = run_cli
     item_list = list(items)
     if not item_list:
         raise CoordinatorError("launch-batch manifest must contain at least one item")
+
+    def _save_manifest() -> None:
+        if manifest_path is not None:
+            tmp = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(item_list, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, manifest_path)
+
     # Pre-validate all prompt files and assign deterministic request_ids before
     # launching the first session so a mid-batch failure can be retried idempotently.
     for idx, item in enumerate(item_list, start=1):
@@ -489,6 +485,7 @@ def launch_batch(
         read_prompt_file(prompt_file)
         raw_req = str(item.get("request_id") or "").strip()
         item["request_id"] = str(uuid.UUID(raw_req)) if raw_req else str(uuid.uuid4())
+    _save_manifest()
 
     results: list[dict[str, object]] = []
     for item in item_list:
@@ -504,18 +501,25 @@ def launch_batch(
             item_no_parent = False
         else:
             item_no_parent = no_parent
-        item_host = str(item.get("host") or "").strip() or host
+        item_host = (str(item.get("host") or "").strip() or host or "").strip() or None
         existing_sid = str(item.get("session_id") or "").strip()
         effective_item_parent = None if item_no_parent else (
             item_parent or parent_session_id or (env if env is not None else os.environ).get("COPILOT_PROJECTS_SESSION", "").strip() or None
         )
+        resolved_prompt = str(Path(str(item["prompt_file"]).strip()).resolve())
         if existing_sid:
+            if (
+                (item.get("project_id") or project_id) != project_id
+                or (item.get("effective_host") or None) != item_host
+                or (item.get("effective_parent") if "effective_parent" in item else effective_item_parent) != effective_item_parent
+                or (item.get("resolved_prompt_file") or resolved_prompt) != resolved_prompt
+            ):
+                raise CoordinatorError(f"saved session {existing_sid} parameters do not match retry target")
             res = {
                 "session_id": existing_sid, "project_id": project_id,
                 "parent_session_id": effective_item_parent,
                 "request_id": str(item["request_id"]).strip(),
-                "title": str(item["title"]).strip(),
-                "prompt_file": str(Path(str(item["prompt_file"]).strip()).resolve()),
+                "title": str(item["title"]).strip(), "prompt_file": resolved_prompt,
                 "status": "existing", "startup_seconds": 0.0,
             }
         else:
@@ -529,6 +533,11 @@ def launch_batch(
                 cli_runner=cli_runner, sleep_fn=sleep_fn,
             )
             item["session_id"] = res["session_id"]
+            item["project_id"] = project_id
+            item["effective_host"] = item_host
+            item["effective_parent"] = effective_item_parent
+            item["resolved_prompt_file"] = resolved_prompt
+            _save_manifest()
         if item.get("worktree"):
             res["worktree"] = str(item["worktree"])
         results.append(res)
@@ -648,21 +657,15 @@ def main(argv: list[str] | None = None) -> int:
             items = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(items, list):
                 raise CoordinatorError("manifest root must be a JSON array")
-            for item in items:
-                if isinstance(item, dict) and not str(item.get("request_id") or "").strip():
-                    item["request_id"] = str(uuid.uuid4())
-            manifest_path.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
-            try:
-                results = launch_batch(
-                    project_id=args.project,
-                    items=items,
-                    timeout_seconds=args.timeout,
-                    parent_session_id=args.parent_session,
-                    no_parent=args.no_parent,
-                    host=args.host,
-                )
-            finally:
-                manifest_path.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
+            results = launch_batch(
+                project_id=args.project,
+                items=items,
+                timeout_seconds=args.timeout,
+                parent_session_id=args.parent_session,
+                no_parent=args.no_parent,
+                host=args.host,
+                manifest_path=manifest_path,
+            )
             print(json.dumps(results, indent=2))
             return 0
         if args.subcommand == "send":

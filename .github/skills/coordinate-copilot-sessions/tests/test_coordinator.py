@@ -399,10 +399,15 @@ class CoordinatorTests(unittest.TestCase):
             )
             orig_run_cli = coordinator.run_cli
             try:
+                mid_batch_saved: list[dict[str, object]] = []
+
                 def partial_fail_cli(args: list[str]) -> str:
                     if args[0] == "new-copilot-session":
                         t_name = args[args.index("--title") + 1]
                         if t_name == "Track 2":
+                            mid_batch_saved.extend(
+                                json.loads(manifest_file.read_text(encoding="utf-8"))
+                            )
                             raise coordinator.CoordinatorError("simulated launch failure")
                         return "S1"
                     return "Proj/Track 1  running  S1"
@@ -412,13 +417,37 @@ class CoordinatorTests(unittest.TestCase):
                     ["launch-batch", "--project", "P1", "--manifest", str(manifest_file)]
                 )
                 self.assertEqual(rc, 1)
+                # Track 1's session_id is already persisted on disk before Track 2 starts
+                self.assertEqual(mid_batch_saved[0].get("session_id"), "S1")
                 saved = json.loads(manifest_file.read_text(encoding="utf-8"))
                 self.assertTrue(saved[0].get("request_id"))
                 self.assertTrue(saved[1].get("request_id"))
                 self.assertEqual(saved[0].get("session_id"), "S1")
                 self.assertIsNone(saved[1].get("session_id"))
 
-                # Retrying the saved manifest skips new-copilot-session for Track 1 (even if closed)
+                # Retrying with mismatched --project or --host rejects the saved session
+                self.assertEqual(
+                    coordinator.main(
+                        ["launch-batch", "--project", "P-OTHER", "--manifest", str(manifest_file)]
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    coordinator.main(
+                        [
+                            "launch-batch",
+                            "--project",
+                            "P1",
+                            "--host",
+                            "other-host",
+                            "--manifest",
+                            str(manifest_file),
+                        ]
+                    ),
+                    1,
+                )
+
+                # Retrying the saved manifest with matching parameters skips new-copilot-session for Track 1
                 retry_launches: list[str] = []
 
                 def retry_cli(args: list[str]) -> str:
