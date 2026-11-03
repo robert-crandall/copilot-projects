@@ -99,13 +99,64 @@ class CoordinatorTests(unittest.TestCase):
             "* [running] Org/Repo  (1 session)  44444444-4444-4444-4444-444444444444\n"
         )
         raw_status = (
-            "Org/Top Track  idle  S-ORG\n"
+            "Org/Repo/Track  idle  S-ORG\n"
             "Org/Repo/Track 1/Part A  running  S-SLASH\n"
         )
-        entries = coordinator.parse_status(raw_status, project_names=[p.name for p in projects])
+        workspace = {
+            "version": 1,
+            "hostProcessIdentifier": 123,
+            "selectedProjectId": "44444444-4444-4444-4444-444444444444",
+            "projects": [
+                {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "name": "Org",
+                    "sessions": [
+                        {
+                            "id": "S-ORG",
+                            "title": "Repo/Track",
+                            "status": "idle",
+                            "finishedUnseen": False,
+                            "hasPendingInput": False,
+                        }
+                    ],
+                },
+                {
+                    "id": "44444444-4444-4444-4444-444444444444",
+                    "name": "Org/Repo",
+                    "sessions": [
+                        {
+                            "id": "S-SLASH",
+                            "title": "Track 1/Part A",
+                            "status": "running",
+                            "finishedUnseen": False,
+                            "hasPendingInput": False,
+                        }
+                    ],
+                },
+            ],
+        }
+        entries = coordinator.parse_status(
+            raw_status,
+            project_names=[p.name for p in projects],
+            workspace=workspace,
+        )
         self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].project, "Org")
+        self.assertEqual(entries[0].project_id, "33333333-3333-3333-3333-333333333333")
+        self.assertEqual(entries[0].title, "Repo/Track")
         self.assertEqual(entries[1].project, "Org/Repo")
+        self.assertEqual(entries[1].project_id, "44444444-4444-4444-4444-444444444444")
         self.assertEqual(entries[1].title, "Track 1/Part A")
+        # Without structured workspace metadata, overlapping 'Org' and 'Org/Repo' raises rather than guessing
+        with self.assertRaises(coordinator.CoordinatorError):
+            coordinator.parse_status(raw_status, project_names=[p.name for p in projects])
+        # Unambiguous slash in project name still resolves without workspace metadata
+        unambiguous = coordinator.parse_status(
+            "Org/Repo/Track 1/Part A  running  S-SLASH",
+            project_names=["General", "Org/Repo"],
+        )
+        self.assertEqual(unambiguous[0].project, "Org/Repo")
+        self.assertEqual(unambiguous[0].title, "Track 1/Part A")
         filtered_org = coordinator.filter_status(
             entries,
             "33333333-3333-3333-3333-333333333333",
@@ -120,6 +171,13 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0].project, "Org/Repo")
         self.assertEqual(filtered[0].title, "Track 1/Part A")
+
+        # Title containing '  running — ' must not make an idle session appear running
+        colliding = coordinator.parse_status("Proj/Task  running — fake  idle  S-TITLE-COLLIDE")
+        self.assertEqual(len(colliding), 1)
+        self.assertEqual(colliding[0].title, "Task  running — fake")
+        self.assertEqual(colliding[0].status, "idle")
+        self.assertIsNone(colliding[0].status_text)
 
     def test_control_socket_path_falls_back_to_newest_forwarded_session_socket(self) -> None:
         sock_dir = Path("/tmp") / f"cp-state-{uuid.uuid4().hex[:8]}"
@@ -218,7 +276,7 @@ class CoordinatorTests(unittest.TestCase):
                         s1_polls += 1
                         state = "idle" if s1_polls < 2 else "running"
                         events.append(f"poll:S1:{state}")
-                        return f"Proj/Track 1  {state}  S1"
+                        return f"Proj/Track 1  running — fake  {state}  S1"
                     s2_polls += 1
                     state = "running"
                     events.append(f"poll:S2:{state}")
@@ -359,6 +417,23 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertTrue(saved[1].get("request_id"))
                 self.assertEqual(saved[0].get("session_id"), "S1")
                 self.assertIsNone(saved[1].get("session_id"))
+
+                # Retrying the saved manifest skips new-copilot-session for Track 1 (even if closed)
+                retry_launches: list[str] = []
+
+                def retry_cli(args: list[str]) -> str:
+                    if args[0] == "new-copilot-session":
+                        t_name = args[args.index("--title") + 1]
+                        retry_launches.append(t_name)
+                        return "S2"
+                    return "Proj/Track 2  running  S2"
+
+                coordinator.run_cli = retry_cli
+                rc_retry = coordinator.main(
+                    ["launch-batch", "--project", "P1", "--manifest", str(manifest_file)]
+                )
+                self.assertEqual(rc_retry, 0)
+                self.assertEqual(retry_launches, ["Track 2"])
             finally:
                 coordinator.run_cli = orig_run_cli
 

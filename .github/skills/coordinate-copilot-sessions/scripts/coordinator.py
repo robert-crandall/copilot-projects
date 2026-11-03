@@ -27,7 +27,7 @@ PROJECT_LINE_RE = re.compile(
     r"^(?:(?P<selected>\*)\s+|\s*)\[(?P<status>[^\]]+)\]\s+(?P<name>.+?)\s+\(\d+\s+sessions?\)\s+(?P<id>\S+)\s*$"
 )
 STATUS_LINE_RE = re.compile(
-    r"^(?P<project>.+?)/(?P<title>.+?)\s\s+(?P<status>idle|running|waiting)(?P<unread>\s+\[unread\])?(?:\s+—\s+(?P<status_text>.*))?\s\s+(?P<id>\S+)\s*$"
+    r"^(?P<project>.+?)/(?P<title>.+?)\s\s+(?P<status>idle|running|waiting)(?P<unread>\s+\[unread\])?(?:\s+—\s+(?P<status_text>(?!.*\s\s+(?:idle|running|waiting)(?:\s+\[unread\])?(?:\s+—\s+.*)?\s\s+\S+\s*$).*))?\s\s+(?P<id>\S+)\s*$"
 )
 
 
@@ -51,6 +51,7 @@ class SessionEntry:
     status: str
     unread: bool
     status_text: str | None
+    project_id: str | None = None
 
 
 def app_binary() -> str:
@@ -126,28 +127,49 @@ def parse_projects(output: str) -> list[ProjectEntry]:
     return entries
 
 
+def _parse_workspace_sessions(raw: str | dict[str, object]) -> list[SessionEntry]:
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(data, dict) and isinstance(data.get("text"), str):
+            data = json.loads(data["text"])
+    except json.JSONDecodeError as exc:
+        raise CoordinatorError(f"invalid list-sessions JSON: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        raise CoordinatorError("invalid list-sessions payload")
+    return [
+        SessionEntry(
+            id=str(s["id"]),
+            project=str(p.get("name") or ""),
+            title=str(s.get("title") or ""),
+            status="waiting" if s.get("hasPendingInput") else str(s.get("status") or "idle"),
+            unread=bool(s.get("finishedUnseen") or s.get("unread")),
+            status_text=s.get("statusText"),
+            project_id=str(p["id"]) if p.get("id") else None,
+        )
+        for p in data["projects"] if isinstance(p, dict)
+        for s in (p.get("sessions") or []) if isinstance(s, dict) and s.get("id")
+    ]
+
+
 def _split_project_and_title(
     project: str,
     title: str,
     project_names: Iterable[str],
 ) -> tuple[str, str]:
-    known_names = sorted(
-        {name.strip() for name in project_names if name and name.strip()},
-        key=len,
-        reverse=True,
-    )
+    known = sorted({n.strip() for n in project_names if n and n.strip()}, key=len, reverse=True)
     combined = f"{project}/{title}"
-    for candidate in known_names:
-        prefix = f"{candidate}/"
-        if combined.lower().startswith(prefix.lower()) and len(combined) > len(prefix):
-            return candidate, combined[len(prefix) :]
-    return project, title
+    matches = [c for c in known if combined.lower().startswith(f"{c.lower()}/") and len(combined) > len(c) + 1]
+    if len(matches) > 1:
+        raise CoordinatorError(f"ambiguous project/title boundary in {combined!r}; use list-sessions workspace data")
+    return (matches[0], combined[len(matches[0]) + 1 :]) if matches else (project, title)
 
 
 def parse_status(
     output: str,
     project_names: Iterable[str] = (),
+    workspace: str | dict[str, object] | None = None,
 ) -> list[SessionEntry]:
+    ws_by_id = {e.id: e for e in _parse_workspace_sessions(workspace)} if workspace else {}
     entries: list[SessionEntry] = []
     for raw_line in output.splitlines():
         line = raw_line.rstrip("\r\n")
@@ -156,21 +178,27 @@ def parse_status(
         match = STATUS_LINE_RE.match(line)
         if not match:
             continue
-        project, title = _split_project_and_title(
-            match.group("project"),
-            match.group("title"),
-            project_names,
-        )
+        sid = match.group("id")
+        ws = ws_by_id.get(sid)
+        if ws is not None:
+            project, title = ws.project, ws.title
+        else:
+            project, title = _split_project_and_title(
+                match.group("project"), match.group("title"), project_names
+            )
         entries.append(
             SessionEntry(
-                id=match.group("id"),
+                id=sid,
                 project=project,
                 title=title,
-                status=match.group("status"),
-                unread=bool(match.group("unread")),
-                status_text=match.group("status_text"),
+                status=ws.status if ws else match.group("status"),
+                unread=bool(match.group("unread")) or bool(ws and ws.unread),
+                status_text=match.group("status_text") or (ws.status_text if ws else None),
+                project_id=ws.project_id if ws else None,
             )
         )
+    parsed_ids = {e.id for e in entries}
+    entries.extend(e for sid, e in ws_by_id.items() if sid not in parsed_ids)
     return entries
 
 
@@ -183,19 +211,22 @@ def filter_status(
         return list(entries)
     norm = needle.strip().lower()
     by_id = next((p for p in projects if p.id.lower() == norm), None)
-    target_name: str | None = None
-    if by_id is not None:
-        target_name = by_id.name.lower()
-    elif any(p.name.lower() == norm for p in projects):
-        target_name = norm
-
+    target_name = by_id.name.lower() if by_id is not None else (
+        norm if any(p.name.lower() == norm for p in projects) else None
+    )
     if target_name is not None:
         same_name = [p for p in projects if p.name.lower() == target_name]
+        if by_id is not None and all(e.project_id for e in entries):
+            return [e for e in entries if (e.project_id or "").lower() == by_id.id.lower()]
         if len(same_name) > 1:
             raise CoordinatorError(
                 f"project filter {needle!r} maps to ambiguous project name {same_name[0].name!r}"
             )
-        return [e for e in entries if e.project.lower() == target_name]
+        target_id = same_name[0].id.lower()
+        return [
+            e for e in entries
+            if (e.project_id.lower() == target_id if e.project_id else e.project.lower() == target_name)
+        ]
 
     direct = [e for e in entries if e.id.lower() == norm]
     if direct:
@@ -299,23 +330,38 @@ def _is_unsupported_parent_flag_error(exc: CoordinatorError) -> bool:
     return "unexpected --parent-session" in detail or "unexpected --no-parent" in detail
 
 
+def _query_workspace(env: dict[str, str] | None = None) -> dict[str, object] | None:
+    sock = control_socket_path(env)
+    if not Path(sock).is_socket():
+        return None
+    try:
+        return send_control_request({"command": "list-sessions"}, socket_path=sock)
+    except CoordinatorError:
+        return None
+
+
 def _session_has_turn_evidence(session_id: str, env: dict[str, str] | None = None) -> bool:
     environment = env if env is not None else os.environ
     state_dir = environment.get("COPILOT_PROJECTS_STATE_DIR", "").strip()
-    sdir = (Path(state_dir).expanduser() if state_dir else Path(control_socket_path(environment)).parent) / "sessions"
-    if any((sdir / f"{session_id}.{s}").is_file() for s in ("session-idle-hook", "agent-stop-completion", "active-turn")):
-        return True
-    try:
-        data = json.loads((sdir / f"{session_id}.agent-activity.json").read_text("utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and bool(
-        data.get("foregroundTurnActive") is True
-        or (type(data.get("idleGeneration")) is int and data["idleGeneration"] > 0)
-        or data.get("sessionIdleAtMilliseconds") is not None
-        or data.get("foregroundTransitionAt")
-        or data.get("startingPrompt")
-    )
+    dirs = [Path(control_socket_path(environment)).parent / "sessions"]
+    if state_dir:
+        dirs.append(Path(state_dir).expanduser() / "sessions")
+    for sdir in dirs:
+        if any((sdir / f"{session_id}.{s}").is_file() for s in ("session-idle-hook", "agent-stop-completion", "active-turn")):
+            return True
+        try:
+            data = json.loads((sdir / f"{session_id}.agent-activity.json").read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and (
+            data.get("foregroundTurnActive") is True
+            or (type(data.get("idleGeneration")) is int and data["idleGeneration"] > 0)
+            or data.get("sessionIdleAtMilliseconds") is not None
+            or data.get("foregroundTransitionAt")
+            or data.get("startingPrompt")
+        ):
+            return True
+    return False
 
 
 def launch_session_and_wait(
@@ -381,7 +427,10 @@ def launch_session_and_wait(
                     f"{exc}; session {session_id} was already launched; "
                     f"if retrying launch, reuse --request-id {req_uuid}"
                 ) from exc
-            entries = parse_status(status_output)
+            entries = parse_status(
+                status_output,
+                workspace=_query_workspace(environment) if cli_runner is run_cli else None,
+            )
             match = next((s for s in entries if s.id == session_id), None)
             if match is not None:
                 observed_status = match.status
@@ -456,23 +505,30 @@ def launch_batch(
         else:
             item_no_parent = no_parent
         item_host = str(item.get("host") or "").strip() or host
-        already_launched = bool(item.get("session_id"))
-        res = launch_session_and_wait(
-            project_id=project_id,
-            title=str(item["title"]).strip(),
-            prompt_file=str(item["prompt_file"]).strip(),
-            request_id=str(item["request_id"]).strip() if item.get("request_id") else None,
-            wait_running=not already_launched,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-            parent_session_id=None if item_no_parent else (item_parent or parent_session_id),
-            no_parent=item_no_parent,
-            host=item_host,
-            env=env,
-            cli_runner=cli_runner,
-            sleep_fn=sleep_fn,
+        existing_sid = str(item.get("session_id") or "").strip()
+        effective_item_parent = None if item_no_parent else (
+            item_parent or parent_session_id or (env if env is not None else os.environ).get("COPILOT_PROJECTS_SESSION", "").strip() or None
         )
-        item["session_id"] = res["session_id"]
+        if existing_sid:
+            res = {
+                "session_id": existing_sid, "project_id": project_id,
+                "parent_session_id": effective_item_parent,
+                "request_id": str(item["request_id"]).strip(),
+                "title": str(item["title"]).strip(),
+                "prompt_file": str(Path(str(item["prompt_file"]).strip()).resolve()),
+                "status": "existing", "startup_seconds": 0.0,
+            }
+        else:
+            res = launch_session_and_wait(
+                project_id=project_id, title=str(item["title"]).strip(),
+                prompt_file=str(item["prompt_file"]).strip(),
+                request_id=str(item["request_id"]).strip() if item.get("request_id") else None,
+                timeout_seconds=timeout_seconds, poll_interval_seconds=poll_interval_seconds,
+                parent_session_id=None if item_no_parent else (item_parent or parent_session_id),
+                no_parent=item_no_parent, host=item_host, env=env,
+                cli_runner=cli_runner, sleep_fn=sleep_fn,
+            )
+            item["session_id"] = res["session_id"]
         if item.get("worktree"):
             res["worktree"] = str(item["worktree"])
         results.append(res)
@@ -525,75 +581,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_resolve = sub.add_parser("resolve-project", help="Resolve or create a project ID.")
     p_resolve.add_argument("--name", help="Project name or ID to resolve.")
-    p_resolve.add_argument(
-        "--create",
-        action="store_true",
-        help="Create the project via new-project if --name is not found.",
-    )
+    p_resolve.add_argument("--create", action="store_true", help="Create the project via new-project if --name is not found.")
 
-    p_launch = sub.add_parser(
-        "launch",
-        help="Launch one Copilot session and wait until it reaches 'running'.",
-    )
+    p_launch = sub.add_parser("launch", help="Launch one Copilot session and wait until it reaches 'running'.")
     p_launch.add_argument("--project", required=True, help="Target project ID.")
     p_launch.add_argument("--title", required=True, help="Session tab title.")
     p_launch.add_argument("--prompt-file", required=True, help="Path to <=8192B UTF-8 prompt.")
     p_launch.add_argument("--request-id", help="Optional UUID request ID.")
     p_launch.add_argument("--host", help="Optional SSH host override.")
-    p_launch.add_argument(
-        "--no-wait",
-        action="store_true",
-        help="Return immediately without waiting for status 'running'.",
-    )
-    p_launch.add_argument(
-        "--timeout",
-        type=float,
-        default=90.0,
-        help="Seconds to wait for session to transition to 'running' (default: 90).",
-    )
+    p_launch.add_argument("--no-wait", action="store_true", help="Return immediately without waiting for status 'running'.")
+    p_launch.add_argument("--timeout", type=float, default=90.0, help="Seconds to wait for session to transition to 'running' (default: 90).")
     p_launch_parent = p_launch.add_mutually_exclusive_group()
-    p_launch_parent.add_argument(
-        "--parent-session",
-        help="Explicit parent session ID override (defaults to $COPILOT_PROJECTS_SESSION).",
-    )
-    p_launch_parent.add_argument(
-        "--no-parent",
-        action="store_true",
-        help="Do not group the launched session under a parent session.",
-    )
+    p_launch_parent.add_argument("--parent-session", help="Explicit parent session ID override (defaults to $COPILOT_PROJECTS_SESSION).")
+    p_launch_parent.add_argument("--no-parent", action="store_true", help="Do not group the launched session under a parent session.")
 
-    p_batch = sub.add_parser(
-        "launch-batch",
-        help="Stagger-launch multiple sessions sequentially, waiting for each to reach 'running'.",
-    )
+    p_batch = sub.add_parser("launch-batch", help="Stagger-launch multiple sessions sequentially, waiting for each to reach 'running'.")
     p_batch.add_argument("--project", required=True, help="Target project ID.")
-    p_batch.add_argument(
-        "--manifest",
-        required=True,
-        help="JSON file containing a list of {title, prompt_file, request_id?, worktree?, parent_session_id?, no_parent?}.",
-    )
-    p_batch.add_argument(
-        "--timeout",
-        type=float,
-        default=90.0,
-        help="Per-session startup timeout in seconds (default: 90).",
-    )
+    p_batch.add_argument("--manifest", required=True, help="JSON file containing a list of {title, prompt_file, request_id?, worktree?, parent_session_id?, no_parent?}.")
+    p_batch.add_argument("--timeout", type=float, default=90.0, help="Per-session startup timeout in seconds (default: 90).")
     p_batch.add_argument("--host", help="Optional SSH host override for launched sessions.")
     p_batch_parent = p_batch.add_mutually_exclusive_group()
-    p_batch_parent.add_argument(
-        "--parent-session",
-        help="Explicit parent session ID override for launched sessions (defaults to $COPILOT_PROJECTS_SESSION).",
-    )
-    p_batch_parent.add_argument(
-        "--no-parent",
-        action="store_true",
-        help="Do not group launched sessions under a parent session.",
-    )
+    p_batch_parent.add_argument("--parent-session", help="Explicit parent session ID override for launched sessions (defaults to $COPILOT_PROJECTS_SESSION).")
+    p_batch_parent.add_argument("--no-parent", action="store_true", help="Do not group launched sessions under a parent session.")
 
-    p_send = sub.add_parser(
-        "send",
-        help="Send a follow-up prompt to a spawned session over the control socket.",
-    )
+    p_send = sub.add_parser("send", help="Send a follow-up prompt to a spawned session over the control socket.")
     p_send.add_argument("--session", required=True, help="Target session ID.")
     p_send.add_argument("--project", help="Optional project ID.")
     group = p_send.add_mutually_exclusive_group(required=True)
@@ -674,6 +685,7 @@ def main(argv: list[str] | None = None) -> int:
             entries = parse_status(
                 run_cli(["list-status"]),
                 project_names=[p.name for p in projects],
+                workspace=_query_workspace(),
             )
             if args.project:
                 entries = filter_status(entries, args.project, projects)
