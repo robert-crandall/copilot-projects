@@ -1554,6 +1554,20 @@ extension AppModel {
         return projects[location.p].sessions[location.s].agentActivity?.workflow
     }
 
+    func sessionPendingUserInputs(sessionId: String) -> [RemoteUserInputRequest] {
+        guard let location = locateIndex(sessionId),
+              let snapshot = projects[location.p].sessions[location.s].agentActivity,
+              !snapshot.reportsTerminalDisconnect else { return [] }
+        return snapshot.remoteUserInputRequests() ?? []
+    }
+
+    func sessionPendingElicitations(sessionId: String) -> [RemoteElicitationRequest] {
+        guard let location = locateIndex(sessionId),
+              let snapshot = projects[location.p].sessions[location.s].agentActivity,
+              !snapshot.reportsTerminalDisconnect else { return [] }
+        return snapshot.remoteElicitationRequests() ?? []
+    }
+
     func sessionOperationProjection(sessionId: String) -> AgentOperationProjection {
         guard let location = locateIndex(sessionId) else { return .unavailable }
         return projects[location.p].sessions[location.s].agentActivity?
@@ -1604,6 +1618,124 @@ extension AppModel {
             state: .indeterminate,
             message: "Couldn't confirm the outcome. Inspect the terminal before trying again.",
             operationId: operation.operationId
+        )
+    }
+
+    func performLocalUserInputAnswer(
+        sessionId: String,
+        answer: RemoteUserInputAnswer
+    ) async -> RemoteWorkflowActionResult {
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        let snapshot = adapter.loadFreshSnapshot(sessionId: sessionId, now: { Date() })
+        let epoch = snapshot?.remoteOperationProjection().conversationEpoch
+        let operation = epoch.map {
+            CLIOperationRequest(operationId: UUID().uuidString, conversationEpoch: $0)
+        }
+        let outcome = answerUserInput(sessionId: sessionId, answer: answer, operation: operation)
+        guard outcome == .accepted else {
+            return RemoteWorkflowActionResult(
+                state: .rejected,
+                message: outcome == .conflict
+                    ? "Another answer is already in progress."
+                    : "The answer could not be sent."
+            )
+        }
+        for _ in 0..<40 {
+            do { try await ContinuousClock().sleep(until: .now.advanced(by: .milliseconds(500))) }
+            catch { break }
+            guard let fresh = adapter.loadFreshSnapshot(sessionId: sessionId, now: { Date() }),
+                  !fresh.reportsTerminalDisconnect,
+                  epoch == nil || fresh.conversationEpoch == epoch else { break }
+            if let operation,
+               let receipt = fresh.remoteOperationProjection().receipts?.first(where: {
+                   $0.operationId == operation.operationId
+                       && $0.kind == CLISDKOperationKind.answerUserInput.rawValue
+               }), receipt.state.isTerminal {
+                return RemoteWorkflowActionResult(
+                    state: receipt.state,
+                    message: receipt.state == .applied ? nil : receipt.state == .rejected
+                        ? "Copilot did not apply this answer."
+                        : "Outcome unknown. Inspect the terminal before trying again.",
+                    operationId: operation.operationId
+                )
+            }
+            if let tracked = fresh.trackedUserInputs,
+               !tracked.contains(where: { $0.requestId == answer.requestId }) {
+                return RemoteWorkflowActionResult(
+                    state: .applied,
+                    operationId: operation?.operationId
+                )
+            }
+        }
+        return RemoteWorkflowActionResult(
+            state: .indeterminate,
+            message: "Couldn't confirm the outcome. Inspect the terminal before trying again.",
+            operationId: operation?.operationId
+        )
+    }
+
+    func performLocalElicitationAnswer(
+        sessionId: String,
+        answer: RemoteElicitationAnswer
+    ) async -> RemoteWorkflowActionResult {
+        let adapter = CLIOperationAdapter(
+            activityDirectory: agentActivityDirectory,
+            resumeMarkerDirectory: resumeMarkerDirectory
+        )
+        let isSynthetic = answer.requestId.hasPrefix("synthetic::durable-ask-user::")
+        let snapshot = isSynthetic
+            ? nil
+            : adapter.loadFreshSnapshot(sessionId: sessionId, now: { Date() })
+        let epoch = snapshot?.remoteOperationProjection().conversationEpoch
+        let operation = epoch.map {
+            CLIOperationRequest(operationId: UUID().uuidString, conversationEpoch: $0)
+        }
+        let outcome = answerElicitation(sessionId: sessionId, answer: answer, operation: operation)
+        guard outcome == .accepted else {
+            return RemoteWorkflowActionResult(
+                state: .rejected,
+                message: outcome == .conflict
+                    ? "Another answer is already in progress."
+                    : "The answer could not be sent."
+            )
+        }
+        if isSynthetic {
+            return RemoteWorkflowActionResult(state: .applied)
+        }
+        for _ in 0..<40 {
+            do { try await ContinuousClock().sleep(until: .now.advanced(by: .milliseconds(500))) }
+            catch { break }
+            guard let fresh = adapter.loadFreshSnapshot(sessionId: sessionId, now: { Date() }),
+                  !fresh.reportsTerminalDisconnect,
+                  epoch == nil || fresh.conversationEpoch == epoch else { break }
+            if let operation,
+               let receipt = fresh.remoteOperationProjection().receipts?.first(where: {
+                   $0.operationId == operation.operationId
+                       && $0.kind == CLISDKOperationKind.answerElicitation.rawValue
+               }), receipt.state.isTerminal {
+                return RemoteWorkflowActionResult(
+                    state: receipt.state,
+                    message: receipt.state == .applied ? nil : receipt.state == .rejected
+                        ? "Copilot did not apply this answer."
+                        : "Outcome unknown. Inspect the terminal before trying again.",
+                    operationId: operation.operationId
+                )
+            }
+            if let tracked = fresh.trackedElicitations,
+               !tracked.contains(where: { $0.requestId == answer.requestId }) {
+                return RemoteWorkflowActionResult(
+                    state: .applied,
+                    operationId: operation?.operationId
+                )
+            }
+        }
+        return RemoteWorkflowActionResult(
+            state: .indeterminate,
+            message: "Couldn't confirm the outcome. Inspect the terminal before trying again.",
+            operationId: operation?.operationId
         )
     }
 
